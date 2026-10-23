@@ -53,11 +53,15 @@ HOSTED_REJECTED_ROUTES: frozenset[str] = frozenset({
   "copilot.api",
   "anthropic.oauth",
 })
-HOSTED_REJECTED_ENTITLEMENT_KINDS: frozenset[str] = frozenset({
+# Flat-rate seats: the entitlement kinds whose credential is a subscription,
+# whatever form it takes on the wire (Muse's seat reaches the wire as a key).
+SUBSCRIPTION_ENTITLEMENT_KINDS: frozenset[str] = frozenset({
   "consumer_subscription",
   "operator_personal_subscription",
-  "local_unauthenticated",
 })
+HOSTED_REJECTED_ENTITLEMENT_KINDS: frozenset[str] = SUBSCRIPTION_ENTITLEMENT_KINDS | {
+  "local_unauthenticated",
+}
 # Channels whose requests run on hosted infrastructure for external users.
 # Hosted key-channel egress is hosted_external by construction
 # (`api/runtime_egress.py`), not by channel.
@@ -440,6 +444,7 @@ __all__ = [
   "ENTITLEMENT_KINDS",
   "EntitlementKind",
   "HOSTED_REJECTED_ENTITLEMENT_KINDS",
+  "SUBSCRIPTION_ENTITLEMENT_KINDS",
   "HOSTED_REJECTED_ROUTES",
   "LOCAL_DAEMON_ROUTES",
   "MissingUserIdError",

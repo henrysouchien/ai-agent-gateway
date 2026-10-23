@@ -156,7 +156,7 @@ design: `docs/design/anthropic-quota-aware-account-selection-spec.md`.
 
 ## Spend ledger metering
 
-Every upstream call an adapter makes is one row in the machine-wide spend ledger
+Every upstream LLM call the gateway makes is one row in the machine-wide spend ledger
 (`model_authority.spend_ledger`; `~/.local/state/hank/spend/api_spend.sqlite`). The
 adapter does not write it: `agent_gateway/spend_metering.py` wraps `provider.stream`
 (`ProviderCallMeter.stream`) at the three places the gateway starts a stream —
@@ -165,7 +165,7 @@ and `provider_summarize` (compaction) — and `sdk_runner` records one row per A
 query. The row carries the tokens `runner_usage` already normalizes, this adapter's
 `estimate_cost` as the shadow cost (`NULL` when `rates_known` is false), the status
 from `classify_credential_failure` (`rate_limit` for a 429) and the credential's
-`auth_kind`, taken from the wire mechanism through `classify_auth_kind` (a vendor's
+`auth_kind`, taken from the credential's entitlement and wire mechanism through `classify_auth_kind` (a subscription seat is `oauth_subscription` even when it reaches the wire as a key; a vendor's
 flat plan, like `ollama_cloud`, is declared once in the model-authority
 `authority/spend/vendors.json`, never in an adapter). Before a `payg_api_key` call the
 meter enforces the shared ceilings (`spend-settings.json`); a refusal writes a
@@ -175,3 +175,7 @@ free of ledger code and raises provider-specific exceptions that
 `classify_credential_failure` / `is_retryable_error` recognise: a failure that neither
 yielded an event nor classifies as an upstream error is treated as local and writes
 nothing.
+
+Callers outside `agent_gateway` that start a provider stream themselves (the plan
+author, the citation judge, coverage-wire, the eval drivers) build a
+`ProviderCallMeter` and stream through it; none calls `provider.stream` bare.

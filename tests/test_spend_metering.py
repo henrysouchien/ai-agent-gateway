@@ -128,7 +128,7 @@ def _usage_then(failure: BaseException) -> list[Any]:
   ]
 
 
-def _meter(provider: _Provider, config: dict[str, Any] = API_CONFIG, **changes: Any) -> ProviderCallMeter:
+def _meter(provider: ModelProvider, config: dict[str, Any] = API_CONFIG, **changes: Any) -> ProviderCallMeter:
   kwargs: dict[str, Any] = dict(
     provider=provider,
     provider_name="anthropic",
@@ -223,11 +223,62 @@ def test_a_429_is_a_rate_limit_row_even_with_no_usage() -> None:
   assert row["input_tokens"] == 0 and row["shadow_cost_usd"] == 0.0
 
 
-def test_a_local_failure_before_any_request_writes_nothing() -> None:
-  with pytest.raises(ValueError, match="no credential"):
-    asyncio.run(_drain(_meter(_Provider([ValueError("no credential")]))))
+def test_a_failure_the_adapter_stream_raises_is_a_row_even_before_any_event() -> None:
+  with pytest.raises(RuntimeError, match="provider said no"):
+    asyncio.run(_drain(_meter(_Provider([RuntimeError("provider said no")]))))
 
+  [row] = _rows()
+  assert (row["status"], row["error_type"], row["input_tokens"]) == ("error", "RuntimeError", 0)
+  assert row["shadow_cost_usd"] == 0.0
+
+
+def test_a_failure_raised_before_the_stream_starts_writes_nothing() -> None:
+  class BadParams(_Provider):
+    def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
+      raise ValueError("cannot build the request")
+
+  provider = BadParams(_ok_step())
+  with pytest.raises(ValueError, match="cannot build"):
+    asyncio.run(send_prompt(
+      "hello",
+      capability_execution=_execution(provider),
+      user_id="alice",
+      completion_record_root=None,
+    ))
+
+  assert provider.stream_calls == 0
   assert _rows() == []
+
+
+def test_an_error_raised_after_message_end_is_an_error_row_not_ok() -> None:
+  provider = _Provider([
+    StreamEvent(type="message_start", input_tokens=10),
+    StreamEvent(type="usage_update", output_tokens=4),
+    StreamEvent(type="message_end", stop_reason="error"),
+    RuntimeError("response failed after inference"),
+  ])
+  with pytest.raises(RuntimeError, match="after inference"):
+    asyncio.run(_drain(_meter(provider)))
+
+  [row] = _rows()
+  assert (row["status"], row["error_type"], row["input_tokens"], row["output_tokens"]) == (
+    "error", "RuntimeError", 10, 4,
+  )
+
+
+def test_a_consumer_that_stops_after_message_end_is_a_completed_call() -> None:
+  async def stop_at_end() -> None:
+    meter = _meter(_Provider(_ok_step()))
+    stream = meter.stream(object(), {})
+    async for event in stream:
+      if event.type == "message_end":
+        break
+    await stream.aclose()
+
+  asyncio.run(stop_at_end())
+
+  [row] = _rows()
+  assert (row["status"], row["error_type"]) == ("ok", None)
 
 
 def test_a_cancelled_stream_writes_one_row_with_its_partial_usage() -> None:
@@ -636,3 +687,351 @@ def test_anthropic_rotation_material_stamps_the_class_of_the_member_it_names(
   material = _credential_material(selected, SEAT)  # type: ignore[arg-type]
 
   assert (material["auth_mechanism"], material["entitlement_kind"]) == expected
+
+
+# ── subscriptions whose wire credential is a minted key ───────────────────────────
+
+MUSE_SEAT = {
+  "provider": "muse", "auth_mode": "oauth", "api_key": "muse-minted-key", "auth_token": "",
+  "auth_mechanism": "api_key", "entitlement_kind": "operator_personal_subscription",
+}
+MUSE_KEY = {
+  "provider": "muse", "auth_mode": "api", "api_key": "muse-real-key", "auth_token": "",
+  "auth_mechanism": "api_key", "entitlement_kind": "org_commercial",
+}
+
+
+@pytest.mark.parametrize(
+  ("entitlement", "mechanism", "expected"),
+  [
+    ("consumer_subscription", "api_key", "oauth_subscription"),
+    ("operator_personal_subscription", "api_key", "oauth_subscription"),
+    ("consumer_subscription", "oauth_bearer", "oauth_subscription"),
+    ("local_unauthenticated", "api_key", "local_or_free"),
+    ("commercial_byok", "api_key", "payg_api_key"),
+    ("org_commercial", "api_key", "payg_api_key"),
+    ("platform_metered", "api_key", "payg_api_key"),
+  ],
+)
+def test_the_entitlement_overrides_the_wire_mechanism_for_every_kind(
+  entitlement: str, mechanism: str, expected: str,
+) -> None:
+  config = {
+    "provider": "anthropic", "auth_mode": "api", "api_key": "k", "auth_token": "",
+    "auth_mechanism": mechanism, "entitlement_kind": entitlement,
+  }
+
+  assert spend_credential("anthropic", config).auth_kind == expected
+
+
+def test_a_muse_subscription_is_a_seat_and_is_not_refused_under_a_freeze() -> None:
+  _freeze_payg()
+  meter = _meter(_Provider(_ok_step()), MUSE_SEAT, provider_name="muse")
+
+  assert meter.credential.auth_kind == "oauth_subscription"
+  assert meter.credential.fingerprint == fingerprint_credential("muse-minted-key")
+  meter.enforce()
+
+
+def test_a_real_muse_api_key_is_payg_and_refused_under_a_freeze() -> None:
+  _freeze_payg()
+  meter = _meter(_Provider(_ok_step()), MUSE_KEY, provider_name="muse")
+
+  assert meter.credential.auth_kind == "payg_api_key"
+  with pytest.raises(SpendBudgetBlocked):
+    meter.enforce()
+
+
+# ── the real OpenAI and Codex adapters on recorded event sequences ─────────────────
+
+
+class _OpenAIEvents:
+  def __init__(self, events: list[dict[str, Any]]) -> None:
+    self._events = events
+
+  def __aiter__(self):
+    self._iterator = iter(self._events)
+    return self
+
+  async def __anext__(self):
+    try:
+      return next(self._iterator)
+    except StopIteration as exc:
+      raise StopAsyncIteration from exc
+
+  async def __aenter__(self):
+    return self
+
+  async def __aexit__(self, *_exc: object) -> None:
+    return None
+
+
+class _OpenAIClient:
+  def __init__(self, events: list[dict[str, Any]]) -> None:
+    outer = self
+
+    class Responses:
+      async def create(self, **params: Any) -> _OpenAIEvents:
+        return _OpenAIEvents(outer.events)
+
+    self.events = events
+    self.responses = Responses()
+
+
+def _openai_meter(provider: ModelProvider, model: str = "gpt-5.6") -> ProviderCallMeter:
+  return _meter(
+    provider,
+    {"provider": "openai", "auth_mode": "api", "api_key": "sk-openai"},
+    provider_name="openai",
+    model=model,
+    call_site="chat_turn",
+  )
+
+
+def test_openai_response_failed_after_inference_is_one_error_row_with_its_usage() -> None:
+  from agent_gateway.providers import OpenAIProvider
+
+  client = _OpenAIClient([{
+    "type": "response.failed",
+    "response": {
+      "status": "failed",
+      "error": {"message": "request failed after inference"},
+      "usage": {"input_tokens": 18, "output_tokens": 7},
+    },
+  }])
+
+  async def drain() -> None:
+    async for _ in _openai_meter(OpenAIProvider()).stream(client, {"model": "gpt-5.6"}):
+      pass
+
+  with pytest.raises(RuntimeError, match="after inference"):
+    asyncio.run(drain())
+
+  [row] = _rows()
+  assert (row["status"], row["error_type"], row["input_tokens"], row["output_tokens"]) == (
+    "error", "RuntimeError", 18, 7,
+  )
+
+
+def test_openai_error_after_response_created_is_one_error_row() -> None:
+  from agent_gateway.providers import OpenAIProvider
+
+  client = _OpenAIClient([
+    {"type": "response.created", "response": {"model": "gpt-5.6"}},
+    {"type": "error", "message": "server had an error"},
+  ])
+
+  async def drain() -> None:
+    async for _ in _openai_meter(OpenAIProvider()).stream(client, {"model": "gpt-5.6"}):
+      pass
+
+  with pytest.raises(RuntimeError, match="server had an error"):
+    asyncio.run(drain())
+
+  [row] = _rows()
+  assert (row["status"], row["error_type"], row["input_tokens"]) == ("error", "RuntimeError", 0)
+
+
+@pytest.mark.parametrize(
+  "failure_event",
+  [
+    {"type": "error", "message": "something broke"},
+    {"type": "response.failed", "response": {"error": {"message": "no capacity"}}},
+  ],
+)
+def test_codex_failure_after_the_request_was_sent_is_one_error_row(failure_event: dict[str, Any]) -> None:
+  import base64
+
+  import httpx
+
+  from agent_gateway.providers import CodexProvider
+  from agent_gateway.providers.codex_helpers import JWT_CLAIM_PATH
+
+  def segment(value: dict[str, Any]) -> str:
+    raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+  token = ".".join([
+    segment({"alg": "none", "typ": "JWT"}),
+    segment({JWT_CLAIM_PATH: {"chatgpt_account_id": "acct_test"}}),
+    "sig",
+  ])
+  payload = "".join(
+    "data: " + json.dumps(event) + "\n\n"
+    for event in ({"type": "response.created", "response": {"model": "gpt-6-sol"}}, failure_event)
+  )
+
+  def handle(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=payload)
+
+  async def scenario() -> None:
+    provider = CodexProvider()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+      provider._client_state[client] = {
+        "token": token, "account_id": "acct_test",
+        "endpoint_url": "https://codex.example/responses", "init_headers": {},
+      }
+      meter = _meter(
+        provider,
+        {"provider": "codex", "auth_mode": "oauth", "auth_mechanism": "oauth_bearer",
+         "auth_token": token, "api_key": ""},
+        provider_name="codex",
+        model="gpt-6-sol",
+      )
+      async for _ in meter.stream(client, {"model": "gpt-6-sol"}):
+        pass
+
+  with pytest.raises(RuntimeError):
+    asyncio.run(scenario())
+
+  [row] = _rows()
+  assert (row["status"], row["error_type"], row["auth_kind"]) == ("error", "RuntimeError", "oauth_subscription")
+
+
+# ── Agent SDK: run() writes the row ──────────────────────────────────────────────────
+
+
+def _install_sdk(monkeypatch: pytest.MonkeyPatch, messages: list[Any]) -> SimpleNamespace:
+  import types
+
+  from agent_gateway.providers.agent_sdk import SDK_PINNED_VERSION
+
+  state = SimpleNamespace(clients=0)
+
+  class Messages:
+    def __init__(self) -> None:
+      self.items = list(messages)
+
+    def __aiter__(self):
+      return self
+
+    async def __anext__(self):
+      if not self.items:
+        raise StopAsyncIteration
+      item = self.items.pop(0)
+      if isinstance(item, BaseException):
+        raise item
+      return item
+
+    async def aclose(self) -> None:
+      self.items.clear()
+
+  class Client:
+    def __init__(self, *, options: Any) -> None:
+      state.clients += 1
+      self.iterator: Messages | None = None
+
+    async def connect(self) -> None:
+      return None
+
+    async def query(self, prompt: Any, session_id: str = "default") -> None:
+      self.iterator = Messages()
+
+    def receive_response(self) -> Any:
+      return self.iterator
+
+    async def disconnect(self) -> None:
+      return None
+
+  module = types.ModuleType("claude_agent_sdk")
+  module.__dict__.update({
+    "__version__": SDK_PINNED_VERSION,
+    "HookMatcher": lambda **kwargs: SimpleNamespace(**kwargs),
+    "ClaudeAgentOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+    "ClaudeSDKClient": Client,
+  })
+  monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
+  return state
+
+
+def _sdk_result() -> Any:
+  return SimpleNamespace(
+    subtype="success", is_error=False, duration_ms=5, num_turns=2, total_cost_usd=0.5,
+    usage={
+      "input_tokens": 100, "output_tokens": 40,
+      "cache_read_input_tokens": 300, "cache_creation_input_tokens": 20,
+    },
+  )
+
+
+def _sdk_runner(**auth: Any) -> AgentSDKRunner:
+  from agent_gateway import AgentSDKConfig, EventLog
+  from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_capability_execution
+
+  return AgentSDKRunner(
+    event_log=EventLog(),
+    session_id="sess-sdk-spend",
+    sdk_config=AgentSDKConfig(
+      user_id="alice", billing_mode="byok", rate_table_version="unknown", request_id="req-sdk-spend",
+    ),
+    capability_execution=stub_sdk_capability_execution(**auth),
+    system_prompt="test",
+  )
+
+
+def test_an_sdk_run_writes_one_row_from_its_result_message(monkeypatch: pytest.MonkeyPatch) -> None:
+  _install_sdk(monkeypatch, [_sdk_result()])
+  runner = _sdk_runner()
+
+  asyncio.run(runner.run([{"role": "user", "content": "go"}]))
+
+  [row] = _rows()
+  assert (row["call_site"], row["session_id"], row["request_id"]) == ("agent_sdk", "sess-sdk-spend", "req-sdk-spend")
+  assert (row["status"], row["auth_kind"], row["api_calls"]) == ("ok", "payg_api_key", 2)
+  assert (row["input_tokens"], row["cache_read_tokens"], row["cache_write_tokens"], row["output_tokens"]) == (
+    100, 300, 20, 40,
+  )
+  assert row["shadow_cost_usd"] == 0.5
+
+
+def test_an_sdk_run_that_fails_after_its_usage_is_an_error_row(monkeypatch: pytest.MonkeyPatch) -> None:
+  failed = _sdk_result()
+  failed.subtype = "error_during_execution"
+  failed.is_error = True
+  _install_sdk(monkeypatch, [failed])
+
+  with pytest.raises(RuntimeError, match="agent_sdk_result_error"):
+    asyncio.run(_sdk_runner().run([{"role": "user", "content": "go"}]))
+
+  [row] = _rows()
+  assert (row["status"], row["error_type"], row["input_tokens"]) == ("error", "RuntimeError", 100)
+
+
+def test_an_sdk_run_under_a_freeze_is_refused_before_the_sdk_starts(monkeypatch: pytest.MonkeyPatch) -> None:
+  state = _install_sdk(monkeypatch, [_sdk_result()])
+  _freeze_payg()
+
+  with pytest.raises(SpendBudgetBlocked):
+    asyncio.run(_sdk_runner().run([{"role": "user", "content": "go"}]))
+
+  assert state.clients == 0
+  [row] = _rows()
+  assert (row["status"], row["call_site"], row["api_calls"]) == ("budget_blocked", "agent_sdk", 0)
+
+
+def test_an_sdk_run_on_an_oauth_seat_is_not_refused_under_a_freeze(monkeypatch: pytest.MonkeyPatch) -> None:
+  _install_sdk(monkeypatch, [_sdk_result()])
+  _freeze_payg()
+
+  asyncio.run(_sdk_runner(auth_mode="oauth", api_key="", auth_token="sk-ant-oat-seat").run(
+    [{"role": "user", "content": "go"}],
+  ))
+
+  [row] = _rows()
+  assert (row["status"], row["auth_kind"], row["payg_cost_usd"]) == ("ok", "oauth_subscription", 0.0)
+
+
+def test_compaction_summary_under_a_freeze_is_refused_for_payg_only() -> None:
+  _freeze_payg()
+  provider = _Provider(_ok_step("summary"))
+
+  with pytest.raises(SpendBudgetBlocked):
+    asyncio.run(provider_summarize(
+      capability_execution=_execution(provider),
+      messages=[{"role": "user", "content": "summarize"}],
+      system_prompt=None,
+      max_tokens=1000,
+    ))
+
+  assert provider.stream_calls == 0
+  assert [row["status"] for row in _rows()] == ["budget_blocked"]

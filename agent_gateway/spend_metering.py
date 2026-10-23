@@ -49,8 +49,13 @@ from model_authority.spend_settings import (
   enforce_spend_ceilings,
 )
 
-from .auth import derive_auth_mechanism_and_entitlement
-from .providers.base import _status_code_from_exception
+from .auth import (
+  SUBSCRIPTION_ENTITLEMENT_KINDS,
+  AuthMechanism,
+  EntitlementKind,
+  derive_auth_mechanism_and_entitlement,
+)
+from .providers.base import StreamEvent, _status_code_from_exception
 from .runner_usage import (
   apply_message_start_usage,
   apply_usage_update,
@@ -59,7 +64,7 @@ from .runner_usage import (
 )
 
 if TYPE_CHECKING:
-  from .providers.base import ModelProvider, StreamEvent
+  from .providers.base import ModelProvider
 
 log = logging.getLogger("agent_gateway.spend_metering")
 
@@ -86,16 +91,35 @@ class SpendCredential:
   fingerprint: str | None
 
 
+def _billing_mechanism(mechanism: AuthMechanism, entitlement: EntitlementKind) -> AuthMechanism:
+  """The mechanism ``classify_auth_kind`` should price: the entitlement overrides the wire form.
+
+  ``auth.py`` owns whether a credential is a subscription. A device-login seat
+  can reach the wire as a minted key (Muse: ``auth_mechanism="api_key"``), so the
+  wire mechanism alone would bill a flat seat as PAYG. Entitlement kinds:
+  ``consumer_subscription`` and ``operator_personal_subscription`` are seats
+  (``oauth_bearer``); ``local_unauthenticated`` is local (``none``);
+  ``commercial_byok``, ``org_commercial`` and ``platform_metered`` are keys, so
+  the wire mechanism stands and ``classify_auth_kind`` applies the provider's
+  vendor plan.
+  """
+  if entitlement in SUBSCRIPTION_ENTITLEMENT_KINDS:
+    return "oauth_bearer"
+  if entitlement == "local_unauthenticated":
+    return "none"
+  return mechanism
+
+
 def spend_credential(provider_name: str, config: Mapping[str, Any]) -> SpendCredential:
   """The credential kind and fingerprint of the material ``config`` carries."""
-  mechanism, _ = derive_auth_mechanism_and_entitlement({**config, "provider": provider_name})
+  mechanism, entitlement = derive_auth_mechanism_and_entitlement({**config, "provider": provider_name})
   api_key = str(config.get("api_key") or "").strip()
   auth_token = str(config.get("auth_token") or "").strip()
   secret = (auth_token or api_key) if mechanism == "oauth_bearer" else (api_key or auth_token)
   if mechanism == "none":
     secret = ""
   return SpendCredential(
-    auth_kind=classify_auth_kind(provider_name, mechanism),
+    auth_kind=classify_auth_kind(provider_name, _billing_mechanism(mechanism, entitlement)),
     fingerprint=fingerprint_credential(secret) if secret else None,
   )
 
@@ -116,8 +140,8 @@ def _blocked_message(breaches: tuple[SpendBreach, ...], provider: str, model: st
   )
 
 
-def _failure_status(provider: ModelProvider | None, exc: BaseException) -> tuple[SpendStatus, int | None, bool]:
-  """(ledger status, http status, whether the provider says the request reached upstream)."""
+def _failure_status(provider: ModelProvider | None, exc: BaseException) -> tuple[SpendStatus, int | None]:
+  """(ledger status, http status) of a failure the provider's stream raised."""
   failure = None
   if provider is not None and isinstance(exc, Exception):
     try:
@@ -127,15 +151,8 @@ def _failure_status(provider: ModelProvider | None, exc: BaseException) -> tuple
   http_status = failure.status_code if failure is not None else None
   if http_status is None and isinstance(exc, Exception):
     http_status = _status_code_from_exception(exc)
-  retryable = False
-  if provider is not None and isinstance(exc, Exception):
-    try:
-      retryable = bool(provider.is_retryable_error(exc))
-    except Exception:
-      retryable = False
   rate_limited = (failure is not None and failure.kind == "rate_limit") or http_status == 429
-  reached_upstream = failure is not None or http_status is not None or retryable
-  return ("rate_limit" if rate_limited else "error"), http_status, reached_upstream
+  return ("rate_limit" if rate_limited else "error"), http_status
 
 
 class ProviderCallMeter:
@@ -300,21 +317,29 @@ class ProviderCallMeter:
 
     The row is written when the generator is finished or closed: normal end,
     provider error (with or without usage), cancellation and watchdog stall.
-    A failure before any request could have been sent (no event, no usage and
-    nothing a provider would call an upstream error) writes nothing.
+    Whatever the adapter's stream raises is a call that reached the provider:
+    an adapter raises from ``stream`` only once it is making the request, and
+    some (OpenAI/Codex ``error`` after ``response.created``) raise before any
+    event maps, so the row never depends on having seen one. A failure that is
+    raised outside ``stream`` (request params, client construction, the ceiling
+    check) never reaches this meter and writes nothing. An error raised after
+    ``message_end`` (``response.failed``) is still an error row; a consumer
+    that stops reading after ``message_end`` is a completed call.
     """
     provider = self._provider
     if provider is None:
       raise TypeError("ProviderCallMeter.stream requires a provider adapter")
     totals = empty_usage_totals()
     started = time.monotonic()
-    saw_event = False
-    completed = False
+    ended = False
     failure: BaseException | None = None
     reported_model: str | None = None
     try:
       async for event in provider.stream(client, params):
-        saw_event = True
+        if not isinstance(event, StreamEvent):
+          # Not ours to interpret: the consumer owns its protocol errors.
+          yield event
+          continue
         event_type = event.type
         if event_type == "message_start":
           apply_message_start_usage(
@@ -340,27 +365,22 @@ class ProviderCallMeter:
             provider_unit_deltas=event.provider_unit_deltas,
           )
         elif event_type == "message_end":
-          completed = True
+          ended = True
         yield event
-      completed = True
     except BaseException as exc:
-      failure = exc
+      # A consumer that cancels or closes after the provider's own end marker
+      # has its answer; only a raised provider error fails a finished stream.
+      closed_after_end = ended and isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+      failure = None if closed_after_end else exc
       raise
     finally:
-      self._record_stream(
-        totals,
-        started=started,
-        saw_event=saw_event,
-        failure=None if completed else failure,
-        reported_model=reported_model,
-      )
+      self._record_stream(totals, started=started, failure=failure, reported_model=reported_model)
 
   def _record_stream(
     self,
     totals: dict[str, Any],
     *,
     started: float,
-    saw_event: bool,
     failure: BaseException | None,
     reported_model: str | None,
   ) -> None:
@@ -376,11 +396,7 @@ class ProviderCallMeter:
       status: SpendStatus = "ok"
       http_status: int | None = None
       if failure is not None:
-        status, http_status, reached_upstream = _failure_status(self._provider, failure)
-        interrupted = isinstance(failure, (asyncio.CancelledError, GeneratorExit))
-        if not (has_tokens or saw_event or interrupted or reached_upstream):
-          # Local failure before a request could have been sent: nothing was spent.
-          return
+        status, http_status = _failure_status(self._provider, failure)
       attrs: dict[str, object] = {}
       units = totals.get("provider_unit_deltas")
       if units:

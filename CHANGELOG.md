@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.28.2 (2026-10-23)
+
+### Changed
+
+- Requires `hank-model-authority>=1.7.2,<2` (ledger write-failure stop; `ledger_path` / `settings_path` take an environ).
+
+### Fixed
+
+- Spend metering classifies a credential by its entitlement before its wire form: `consumer_subscription` and `operator_personal_subscription` (`auth.SUBSCRIPTION_ENTITLEMENT_KINDS`) price as `oauth_subscription`, `local_unauthenticated` as `local_or_free`, and `commercial_byok`, `org_commercial` and `platform_metered` keep the wire mechanism (so the provider's vendor plan applies). A Muse device-login seat, which reaches the wire as a minted key, was counted as PAYG and refused under `freeze_payg`. `HOSTED_REJECTED_ENTITLEMENT_KINDS` is now built from the same set.
+
+- A provider stream that raises after `message_end` (OpenAI/Codex `response.failed`) writes an `error` row with its usage, not `ok`; a consumer that stops reading after `message_end` is still a completed call.
+
+- Any exception an adapter's `stream` raises writes an `error` (or `rate_limit`) row, including an OpenAI/Codex `error` event after `response.created` that maps no stream event. A failure raised before the stream starts (request params, client construction, the ceiling check) writes nothing. `ProviderCallMeter.stream` passes through any item that is not a `StreamEvent` untouched.
+
 ## 0.28.1 (2026-10-23)
 
 ### Fixed
