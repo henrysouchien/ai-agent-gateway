@@ -14,6 +14,8 @@ from typing import AbstractSet, TYPE_CHECKING, Any, Callable, Dict, List, Mappin
 
 from agent_workflow_contracts import AgentCompletionEnvelope, TaskResult
 
+from model_authority.spend_ledger import spend_context
+
 from .artifact_readback import readback_artifact_ready_event
 from .runner_background_tasks import (
   _BACKGROUND_RESULT_ACK_RESULT_KEY,
@@ -35,6 +37,7 @@ from .secret_boundary import (
   sanitize_tool_event,
   sanitization_failure_tool_input,
 )
+from .skill_context import current_skill
 from .tool_display import resolve_display
 from .tool_policy_registry import PreparedToolCall, ToolInputPreparationError
 from .tool_dispatcher_helpers import LocalToolHandler, ToolResult
@@ -585,6 +588,28 @@ class RunnerToolExecutionMixin:
       message["content"] = replaced
 
   async def _execute_single_tool(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    base_kwargs: Dict[str, Any],
+    call_index: int = 0,
+    *,
+    approved_call: ApprovedCallRef | None = None,
+  ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
+    # Every vendor call a tool makes (HTTP headers, ledger rows) reads this turn's
+    # attribution from `spend_context`, the same ids the provider meter stamps.
+    with spend_context(
+      session_id=self._full_session_id,
+      request_id=self._request_id,
+      run_id=self._skill_run_id or None,
+      skill=current_skill(),
+    ):
+      return await self._execute_single_tool_unattributed(
+        tool_id, tool_name, tool_input, base_kwargs, call_index, approved_call=approved_call,
+      )
+
+  async def _execute_single_tool_unattributed(
     self,
     tool_id: str,
     tool_name: str,

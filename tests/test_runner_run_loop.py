@@ -1,7 +1,6 @@
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
-import dataclasses
 import hashlib
 import inspect
 import json
@@ -33,6 +32,7 @@ from agent_gateway import (  # noqa: E402
   ToolDispatcher,
 )
 from model_authority.binding import CapabilityResolutionError, CredentialHandle
+from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.fork_request_handoff import ForkRequestHandoff  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
@@ -471,9 +471,7 @@ def _soft_budget_threshold(runner: AgentRunner, turns: int) -> None:
   """Give a test runner a delegated run's ladder, lowered to ``turns``."""
 
   runner._soft_budget_kind = "sub_agent"
-  runner._containment = dataclasses.replace(
-    runner._containment, soft_turn_budget_cap=turns,
-  )
+  runner._containment = ContainmentSettings(child_soft_turn_budget=turns)
 
 
 def _after_pause_turns(
@@ -6684,6 +6682,38 @@ def test_a_child_that_never_answers_after_the_forced_final_is_aborted() -> None:
     assert completion["type"] == "stream_complete"
     assert completion["terminal_disposition"] == "interrupted"
     assert completion["reason"] == "soft_budget_abort"
+
+  asyncio.run(case())
+
+
+def test_writer_session_with_a_writer_budget_is_aborted_by_the_ladder() -> None:
+  async def case() -> None:
+    runner = _make_credential_runner()
+    calls = 0
+
+    async def stream_turn(**_kwargs: Any):
+      nonlocal calls
+      calls += 1
+      return object(), StreamTurnResult(
+        full_text="",
+        stop_reason="pause_turn",
+        content_blocks=[{"type": "text", "text": "still thinking"}],
+      )
+
+    runner._stream_turn = stream_turn
+    runner._soft_budget_kind = "writer"
+    runner._containment = ContainmentSettings(
+      writer_soft_turn_budget=1, soft_budget_grace_turns=0,
+    )
+    await runner.run(
+      messages=[{"role": "user", "content": "work"}],
+    )
+
+    completion = runner._log.entries[-1].event
+    assert completion["type"] == "stream_complete"
+    assert completion["terminal_disposition"] == "interrupted"
+    assert completion["reason"] == "soft_budget_abort"
+    assert calls < 10
 
   asyncio.run(case())
 

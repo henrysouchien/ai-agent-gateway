@@ -1,4 +1,4 @@
-"""The one soft containment guard for delegated runs.
+"""The one soft containment guard for delegated runs (and writer sessions that opt in).
 
 A delegated run (a ``run_agent`` child, a learning fork, an autonomous skill
 child) can loop with nobody watching, so it meets exactly one runaway guard,
@@ -24,13 +24,15 @@ its credits are spent (``runner_run_loop._run_chat_loop``), and a child's
 answers unbounded.
 
 The first two stages return a result; only the third ends the run. Threshold,
-final factor and grace come from ``ContainmentSettings``: the threshold is
-``soft_turn_threshold(kind)`` over its ``soft_turn_budget`` table, keyed by run
-kind with a ``default`` (a ``run_agent``/skill child and a learning fork are
-kinds; nothing a run declares feeds it); ``soft_turn_budget_cap``
-(``HANK_SOFT_TURN_BUDGET``) can only lower it and ``0`` disables the guard;
-``soft_budget_final_factor`` and ``soft_budget_grace_turns`` set the other
-two. A primary run has no ladder. The ladder counts provider requests
+final factor and grace come from ``ContainmentSettings`` (the run settings
+file, ``model_authority.run_settings``): the threshold is
+``soft_turn_threshold(kind)``, keyed by run kind (``child_soft_turn_budget``
+for a ``run_agent``/skill child, ``fork_soft_turn_budget`` for a learning fork,
+``writer_soft_turn_budget`` for the root writer session; nothing a run
+declares feeds it); ``soft_budget_final_factor`` and ``soft_budget_grace_turns``
+set the other two. A writer session has a ladder only when
+``writer_soft_turn_budget`` is set. The ladder is built per run, so it reads
+all three at run start. The ladder counts provider requests
 (completed turns plus completed ``max_tokens`` continuation segments), so a
 child whose provider never completes a turn still meets every stage; cost is a
 measurement on the run record, never a rung. Shape and rationale:

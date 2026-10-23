@@ -45,7 +45,7 @@ from model_authority.selection import CapabilityDefault, ProductModelSelectionPo
 from .providers import AnthropicProvider, ModelProvider
 from model_authority.rates import load_rate_table
 from .admission import current_parent_context, root_context
-from .containment_settings import resolve_containment_settings
+from .containment_settings import ContainmentSettings
 from .runner import AgentRunner, ToolResultContext
 from .runtime_spill import build_spill_sink
 from .tool_result_spill import (
@@ -423,8 +423,9 @@ def create_agent(
     )
     ```
   """
-  # This application's composition root: its containment bounds resolve once.
-  containment = resolve_containment_settings(os.environ)
+  # This application's composition root: its containment bounds are the live
+  # run settings, read at each use.
+  containment = ContainmentSettings()
   if skills_dir is not None and operation_catalog is not None:
     raise ValueError(
       "create_agent accepts either skills_dir or operation_catalog, not both"

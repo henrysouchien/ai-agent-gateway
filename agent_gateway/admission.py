@@ -12,7 +12,7 @@ are log lines: one ``admitted`` line and one line per unknown name.
 unknown value; ``runner_soft_budget`` owns spend containment. Fresh spawns
 default to depth two (root 0 → lead 1 → worker 2); the bound is
 ``AdmissionOwners.containment.max_spawn_depth``, which ``ContainmentSettings``
-resolves from ``HANK_MAX_SPAWN_DEPTH``, and a negative value disables it. At
+reads from the ``max_spawn_depth`` run setting, and a negative value disables it. At
 the deepest tier the executable grant omits ``run_agent``; continuations retain
 their original grant and lineage without applying a fresh-spawn bound.
 """

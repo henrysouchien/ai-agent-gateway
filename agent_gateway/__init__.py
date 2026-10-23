@@ -174,11 +174,7 @@ if TYPE_CHECKING:
     RunIdentityCarrierError,
     validate_run_identity,
   )
-  from .containment_settings import (
-    ContainmentSettingError,
-    ContainmentSettings,
-    resolve_containment_settings,
-  )
+  from .containment_settings import ContainmentSettings
   from .runner import AgentRunner, SubAgentConfig, ToolResultContext, _derive_sub_agent_id
   from .runner_background_tasks import WorkflowTaskMetadata
   from .sdk_runner import AgentSDKRunner
@@ -409,12 +405,7 @@ _EXPORTS = {
   "RunIdentityCarrier": ("agent_gateway.run_identity", "RunIdentityCarrier"),
   "RunIdentityCarrierError": ("agent_gateway.run_identity", "RunIdentityCarrierError"),
   "validate_run_identity": ("agent_gateway.run_identity", "validate_run_identity"),
-  "ContainmentSettingError": ("agent_gateway.containment_settings", "ContainmentSettingError"),
   "ContainmentSettings": ("agent_gateway.containment_settings", "ContainmentSettings"),
-  "resolve_containment_settings": (
-    "agent_gateway.containment_settings",
-    "resolve_containment_settings",
-  ),
   "AgentRunner": ("agent_gateway.runner", "AgentRunner"),
   "SubAgentConfig": ("agent_gateway.runner", "SubAgentConfig"),
   "ToolResultContext": ("agent_gateway.runner", "ToolResultContext"),
@@ -569,7 +560,6 @@ __all__ = [
   "CommercialWorkStartFacts",
   "CommercialWorkStartGate",
   "COORDINATOR_DEFAULT_PREAMBLE",
-  "ContainmentSettingError",
   "ContainmentSettings",
   "CoordinatorConfig",
   "CostEstimate",
@@ -644,7 +634,6 @@ __all__ = [
   "resolve_agent_session_id",
   "resolve_auth_config",
   "resolve_autonomous_capability_binding",
-  "resolve_containment_settings",
   "send_prompt",
   "send_prompt_sync",
   "SessionRecapEvent",

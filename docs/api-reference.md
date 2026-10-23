@@ -68,10 +68,10 @@ Key parameters:
 - `state_dir`: optional directory for persisted run state (JSON load/save between runs)
 - `delivery`: optional `DeliveryConfig` for webhook, Telegram, briefing file, or callback output
 - `containment`: optional `ContainmentSettings` (spawn depth, concurrent children,
-  soft-ladder knobs, hung-child silence, context thresholds); `None` resolves
-  `resolve_containment_settings(os.environ)` when the call starts; an unreadable
-  `HANK_MAX_SPAWN_DEPTH` raises `ContainmentSettingError` naming the setting, and
-  any other invalid value logs a warning and keeps its default
+  soft-ladder knobs, hung-child silence, context thresholds); `None` uses `ContainmentSettings()`, a live
+  view of the operator settings file (`~/.config/hank/run-settings.json`, see
+  [agent-run-containment.md](../../../docs/reference/agent-run-containment.md#resource-bounds-containment-settings)).
+  A value an operator sets takes effect at the next read; `ContainmentSettings(**kw)` pins the given keys over the packaged defaults for tests
 - `compaction_instructions`: optional instructions for context compaction
 - `interceptors`: optional trusted interceptor sequence; automatic `run_agent`
   children retain the same stateful instances in the same order as the parent
@@ -102,13 +102,10 @@ delegated run (a `run_agent` child or a learning fork) meets the soft-budget lad
 forced final report at 1.5x, and an `interrupted` run with reason
 `soft_budget_abort` only if the child still has not finished two provider
 requests later. The ladder counts provider requests (turns plus `max_tokens`
-continuation segments). Its threshold has one source, the
-`ContainmentSettings.soft_turn_budget` table keyed by run kind (`default` 100,
-`autonomous` 100, `fork` 10); nothing a skill, profile or caller declares feeds
-it. `HANK_SOFT_TURN_BUDGET` (`soft_turn_budget_cap`) can only
-lower it, and `0` disables the ladder. A primary run has no ladder, and no run
-carries a cost ceiling: spend is measured (`stream_complete.usage`, usage
-events), never enforced.
+continuation segments). Its threshold is a key of the operator settings file, read live: `child_soft_turn_budget`
+(100, for `sub_agent` and `autonomous` runs) and `fork_soft_turn_budget` (10). Nothing a skill, profile or caller
+declares feeds it. A primary run has no ladder unless `writer_soft_turn_budget` is set (default null), and no run
+carries a cost ceiling: spend is measured (`stream_complete.usage`, usage events), never enforced.
 
 Returns a `RunOutput`; see the complete field list below.
 

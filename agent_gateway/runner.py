@@ -218,9 +218,9 @@ class AgentRunner(
   - `get_tool_definitions` supplies the current tool schema visible to the
     model.
   - `on_tool_result`, `on_usage`, and `on_tool_timing` are observability hooks.
-  - A delegated run (sub-agent or fork) meets the soft-budget ladder
-    (`runner_soft_budget`), keyed by `_soft_budget_kind`; a primary
-    (`writer`) run has none.
+  - A run meets the soft-budget ladder (`runner_soft_budget`), keyed by
+    `_soft_budget_kind`; a primary (`writer`) run has one only when
+    `writer_soft_turn_budget` is set in the run settings.
   - Concurrent children queue on this runner's
     `ContainmentSettings.max_concurrent_children` slots (`containment`). A
     child runner inherits the slot count, not the semaphore: its own queue
@@ -573,6 +573,9 @@ class AgentRunner(
     self._compaction_trigger = compaction_trigger
     self._compaction_instructions = compaction_instructions
     self._containment = containment
+    # The reminder cursor is seeded when the runner is built and reset to the
+    # live setting at each compaction; the thresholds the decision compares
+    # against (``runner_run_loop``) are read live each turn.
     self._context_pressure_next_reminder_pct = (
       containment.context_pressure_reminder_pct
     )
@@ -586,6 +589,9 @@ class AgentRunner(
     self._last_reported_cost = 0.0
     self._coordinator = coordinator
     self._max_resume_chain_depth = max_resume_chain_depth
+    # A snapshot of the setting when this runner is built (the registry's
+    # retention operand); the children semaphore is sized from the live
+    # setting when it is first created.
     self._max_background_tasks = containment.max_concurrent_children
     self._result_requirement = result_requirement
     self._sub_agent_semaphore: asyncio.Semaphore | None = None
@@ -715,9 +721,10 @@ class AgentRunner(
     self._admitted_self_task = admitted_self_task
     # The restored attempt's own durable evidence; usage settles cumulatively.
     self._admitted_self_prior_evidence = admitted_self_prior_evidence
-    # The run kind keying ``SOFT_TURN_BUDGET``. By default the session role:
-    # a ``sub_agent`` child meets the ladder, a ``writer`` (a watched primary
-    # chat) has none. A composition root names a kind explicitly when the
+    # The run kind keying ``soft_turn_threshold``. By default the session role:
+    # a ``sub_agent`` child meets the child ladder, a ``writer`` (a watched
+    # primary chat) meets one only when ``writer_soft_turn_budget`` is set. A
+    # composition root names a kind explicitly when the
     # role would lie: an autonomous ``bg_*`` run is a top-level session nobody
     # watches, so ``runtime_session_objects`` passes ``"autonomous"``; a fork
     # runner is re-keyed ``fork`` where it is made one (``runner_fork_agents``).

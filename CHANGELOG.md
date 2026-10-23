@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.29.0 (2026-10-24)
+
+### Changed
+
+- Requires `hank-model-authority>=1.7.7,<2` (`model_authority.operator_settings`, the file machinery `agent_gateway.run_settings` shares with spend settings).
+- The containment bounds come from the operator run-settings file (`~/.config/hank/run-settings.json`, override `HANK_RUN_SETTINGS_PATH`), not from `HANK_*` environment variables. `ContainmentSettings()` is live: each attribute read resolves the file (stamp-cached), so a change is in force at the next read without a restart; `ContainmentSettings(**overrides)` is pinned to the packaged defaults plus the overrides and never reads the file. A malformed file raises `RunSettingsError` at the read.
+- Writer sessions climb the soft-budget ladder (steer, forced final, `soft_budget_abort`) when `writer_soft_turn_budget` is set; unset (the default) leaves them without one. The ladder reads its threshold, final factor and grace at run start.
+- The autonomous child launch projection carries `HANK_RUN_SETTINGS_PATH` instead of the ten containment env names.
+
+### Removed
+
+- `resolve_containment_settings`, `ContainmentSettingError`, `CONTAINMENT_ENV`, `CONTAINMENT_ENV_NAMES`, and the `soft_turn_budget` / `soft_turn_budget_cap` fields: use `ContainmentSettings()` with `soft_turn_threshold(kind)`, or the `writer_soft_turn_budget` / `child_soft_turn_budget` / `fork_soft_turn_budget` fields. `HANK_MAX_SPAWN_DEPTH`, `HANK_SOFT_TURN_BUDGET`, `HANK_SOFT_BUDGET_FINAL_FACTOR`, `HANK_SOFT_BUDGET_GRACE_TURNS`, `HANK_CHILD_SILENCE_TIMEOUT_SECONDS`, `HANK_MODEL_CONTEXT_LIMIT`, `HANK_CONTEXT_WARNING_PCT`, `HANK_CONTEXT_PRESSURE_REMINDER_PCT`, `HANK_CONTEXT_PRESSURE_REMINDER_STEP_PCT` and `HANK_COMPACTION_TRIGGER_PCT` are no longer read.
+
+### Fixed
+
+- The spend-metering docs state what a failing `stream` writes: any exception an adapter's `stream` raises is one `error` row with the usage seen so far, including a precondition checked inside `stream` before a request is sent (Google Antigravity's missing `project_id`, an httpx adapter's missing client state), which is a zero-token, $0 row. A failure raised before `stream` starts writes nothing. No behaviour change.
+
+- The spend-metering docs no longer say the ceiling check writes nothing: a refusal writes a zero-token `budget_blocked` row before `SpendBudgetBlocked` is raised. Only failures before `stream` starts in request params or client construction write no row.
+
 ## 0.28.2 (2026-10-23)
 
 ### Changed

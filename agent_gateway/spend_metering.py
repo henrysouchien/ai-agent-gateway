@@ -317,14 +317,18 @@ class ProviderCallMeter:
 
     The row is written when the generator is finished or closed: normal end,
     provider error (with or without usage), cancellation and watchdog stall.
-    Whatever the adapter's stream raises is a call that reached the provider:
-    an adapter raises from ``stream`` only once it is making the request, and
-    some (OpenAI/Codex ``error`` after ``response.created``) raise before any
-    event maps, so the row never depends on having seen one. A failure that is
-    raised outside ``stream`` (request params, client construction, the ceiling
-    check) never reaches this meter and writes nothing. An error raised after
-    ``message_end`` (``response.failed``) is still an error row; a consumer
-    that stops reading after ``message_end`` is a completed call.
+    Whatever the adapter's stream raises writes a row, whether or not a request
+    was sent: adapters have no typed "nothing sent" error, and some raise before
+    any event maps (OpenAI/Codex ``error`` after ``response.created``), so the
+    row cannot depend on having seen one. A precondition an adapter checks inside
+    ``stream`` before it sends (Google Antigravity's missing ``project_id``, an
+    httpx adapter's missing client state) therefore writes an ``error`` row with
+    zero tokens and $0 shadow cost: it counts as a failed call in the ledger, never
+    as spend. A failure raised outside ``stream`` (request params, client
+    construction) never reaches this meter and writes nothing; the ceiling check
+    writes its own zero-token ``budget_blocked`` row (``enforce``).
+    An error raised after ``message_end`` (``response.failed``) is still an error
+    row; a consumer that stops reading after ``message_end`` is a completed call.
     """
     provider = self._provider
     if provider is None:

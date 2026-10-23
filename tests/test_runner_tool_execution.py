@@ -9,6 +9,7 @@ from typing import Any, Never
 
 import pytest
 from mcp.types import CallToolResult
+from model_authority.spend_ledger import resolve_attribution
 from gateway_test_support.host_policy import owner_session_host_policy
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -759,6 +760,49 @@ def test_execute_single_tool_emits_readable_resource_event_without_model_leak() 
   assert resource["source_path"] == "daily/2026-06-12.md"
   assert resource["content"] == "## Daily note\n\nCaptured markdown.\n"
   assert resource["content_sha256"] == hashlib.sha256(resource["content"].encode("utf-8")).hexdigest()
+
+
+class _AttributionCapturingDispatcher(_Dispatcher):
+  def __init__(self) -> None:
+    self.seen: dict[str, str | None] = {}
+
+  async def dispatch_prepared(
+    self,
+    tool_id: str,
+    tool_name: str,
+    prepared_call: PreparedToolCall,
+    **_dispatch_kwargs: Any,
+  ):
+    _ = tool_id, tool_name, prepared_call
+    for name in ("session_id", "request_id", "run_id"):
+      self.seen[name] = resolve_attribution(name)
+    return {"status": "ok"}, None
+
+
+def test_tool_runs_under_the_turns_spend_attribution() -> None:
+  dispatcher = _AttributionCapturingDispatcher()
+  runner = AgentRunner(
+    event_log=EventLog(session_id="test"),
+    dispatcher=dispatcher,  # type: ignore[arg-type]
+    session_id="attribution-session",
+    request_id="attribution-request",
+    capability_execution=_capability_execution(),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+    skill_run_id="attribution-run",
+  )
+
+  _run(runner._execute_single_tool("tool-attr", "lookup", {"query": "x"}, {"tools": []}))
+
+  assert dispatcher.seen == {
+    "session_id": "attribution-session",
+    "request_id": "attribution-request",
+    "run_id": "attribution-run",
+  }
+  assert resolve_attribution("session_id") is None
+  assert resolve_attribution("request_id") is None
+  assert resolve_attribution("run_id") is None
 
 
 def test_readable_resource_snapshot_copies_producer_stamped_type(caplog) -> None:

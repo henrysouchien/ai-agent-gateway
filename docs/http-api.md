@@ -1067,7 +1067,7 @@ Informational markers from the one soft containment guard on delegated runs
 (`runner_soft_budget.py`; `docs/engineering/soft-budget-containment-reference.md`).
 Neither stops the run. `soft_budget_steer` says the run's provider requests
 (turns plus `max_tokens` continuation segments) reached the threshold from the
-`ContainmentSettings.soft_turn_budget` table, and a wrap-up notice naming the `observed`
+`soft_turn_threshold(kind)` (the `child_soft_turn_budget` / `fork_soft_turn_budget` keys of the operator settings file), and a wrap-up notice naming the `observed`
 request count and the `threshold` rides the child's next turn;
 `soft_budget_final` says 1.5x the threshold was reached and the next turn
 is the forced final report. `kind` is always `"turns"`; `observed` is the
@@ -1075,7 +1075,7 @@ request count. Only a run that still has not answered after the grace turns is
 aborted: an `interrupted` event with `reason: "soft_budget_abort"` carries
 `kind`, `observed`, `threshold` and `grace_turns`, and the stream then closes
 with an interrupted `stream_complete` whose `reason` is `soft_budget_abort`.
-A primary run emits none of these.
+A primary run emits none of these unless `writer_soft_turn_budget` is set.
 
 For interactive children, the durable steer/final record also contains
 `notice`: the exact text injected into the subsequent provider request,

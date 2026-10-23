@@ -1,0 +1,16 @@
+{
+  "writer_soft_turn_budget": null,
+  "child_soft_turn_budget": 100,
+  "fork_soft_turn_budget": 10,
+  "soft_budget_final_factor": 1.5,
+  "soft_budget_grace_turns": 2,
+  "child_silence_timeout_seconds": 600,
+  "max_spawn_depth": 2,
+  "max_concurrent_children": 6,
+  "repeat_tool_error_limit": null,
+  "model_context_limit": 200000,
+  "context_warning_pct": 80,
+  "context_pressure_reminder_pct": 60,
+  "context_pressure_reminder_step_pct": 10,
+  "compaction_trigger_pct": 25
+}

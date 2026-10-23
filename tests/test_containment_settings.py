@@ -1,6 +1,7 @@
-"""``ContainmentSettings`` resolves once and every bound reads it."""
+"""``ContainmentSettings`` is a live view over the run settings file; every bound reads it."""
 
 import asyncio
+import json
 import math
 import sys
 import time
@@ -20,13 +21,9 @@ from agent_gateway.child_environment import (  # noqa: E402
   AUTONOMOUS_CHILD_ENVIRONMENT,
   filter_child_environment,
 )
-from agent_gateway.containment_settings import (  # noqa: E402
-  CONTAINMENT_ENV,
-  CONTAINMENT_ENV_NAMES,
-  ContainmentSettings,
-  resolve_containment_settings,
-)
+from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 from agent_gateway.event_log import EventLog  # noqa: E402
+from agent_gateway.run_settings import SETTINGS_PATH_ENV, RunSettingsError  # noqa: E402
 from agent_gateway.runner import AgentRunner, StreamTurnResult  # noqa: E402
 from agent_gateway.runner_soft_budget import SoftBudgetLadder  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
@@ -38,16 +35,31 @@ from gateway_test_support.runner_dispatcher_test_support import (  # noqa: E402
 from test_admission import _PlainResolver, _owners, _request, _root  # noqa: E402
 
 
-def test_defaults_are_the_ratified_values() -> None:
+@pytest.fixture
+def settings_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+  """The operator file a live ``ContainmentSettings()`` reads; absent until written."""
+
+  path = tmp_path / "run-settings.json"
+  monkeypatch.setenv(SETTINGS_PATH_ENV, str(path))
+  return path
+
+
+def _write_settings(path: Path, values: dict[str, Any]) -> None:
+  path.write_text(json.dumps(values))
+
+
+def test_defaults_are_the_ratified_values(settings_file: Path) -> None:
   settings = ContainmentSettings()
 
   assert settings.max_spawn_depth == 2
   assert settings.max_concurrent_children == 6
-  assert dict(settings.soft_turn_budget) == {"default": 100, "autonomous": 100, "fork": 10}
-  assert settings.soft_turn_budget_cap is None
+  assert settings.writer_soft_turn_budget is None
+  assert settings.child_soft_turn_budget == 100
+  assert settings.fork_soft_turn_budget == 10
   assert settings.soft_budget_final_factor == 1.5
   assert settings.soft_budget_grace_turns == 2
   assert settings.child_silence_timeout_seconds == 600.0
+  assert settings.repeat_tool_error_limit is None
   assert settings.model_context_limit == 200_000
   assert settings.context_warning_pct == 80
   assert settings.context_pressure_reminder_pct == 60
@@ -55,66 +67,53 @@ def test_defaults_are_the_ratified_values() -> None:
   assert settings.compaction_trigger_pct == 25
 
 
-@pytest.mark.parametrize(("setting", "env"), [
-  (setting, env) for setting, (env, _parse) in CONTAINMENT_ENV.items()
-])
-def test_each_env_name_parses_into_its_setting(setting: str, env: str) -> None:
-  parse = CONTAINMENT_ENV[setting][1]
-  raw = "2.5" if parse is float else "7"
+def test_live_settings_see_a_file_change_on_the_next_read(settings_file: Path) -> None:
+  settings = ContainmentSettings()
+  assert settings.max_spawn_depth == 2
 
-  settings = resolve_containment_settings({env: raw})
+  _write_settings(settings_file, {"max_spawn_depth": 5})
 
-  assert getattr(settings, setting) == parse(raw)
-  defaults = ContainmentSettings()
-  for other in CONTAINMENT_ENV:
-    if other != setting:
-      assert getattr(settings, other) == getattr(defaults, other)
+  assert settings.max_spawn_depth == 5
 
 
-def test_unset_or_blank_env_keeps_the_defaults() -> None:
-  assert resolve_containment_settings({}) == ContainmentSettings()
-  assert resolve_containment_settings(
-    {env: "  " for env in CONTAINMENT_ENV_NAMES},
-  ) == ContainmentSettings()
+def test_pinned_settings_ignore_the_file(settings_file: Path) -> None:
+  _write_settings(settings_file, {"max_spawn_depth": 5})
+  pinned = ContainmentSettings(max_concurrent_children=3)
+
+  _write_settings(settings_file, {"max_spawn_depth": 7})
+
+  assert pinned.max_concurrent_children == 3
+  assert pinned.max_spawn_depth == 2
 
 
-@pytest.mark.parametrize(("env", "raw", "setting"), [
-  ("HANK_MAX_SPAWN_DEPTH", "lots", "max_spawn_depth"),
-  ("HANK_MAX_SPAWN_DEPTH", "2.5", "max_spawn_depth"),
-  ("HANK_SOFT_TURN_BUDGET", "lots", "soft_turn_budget_cap"),
-  ("HANK_SOFT_BUDGET_FINAL_FACTOR", "steep", "soft_budget_final_factor"),
-  ("HANK_SOFT_BUDGET_FINAL_FACTOR", "0.5", "soft_budget_final_factor"),
-  ("HANK_SOFT_BUDGET_GRACE_TURNS", "-1", "soft_budget_grace_turns"),
-  ("HANK_CHILD_SILENCE_TIMEOUT_SECONDS", "-1", "child_silence_timeout_seconds"),
-  ("HANK_SOFT_BUDGET_FINAL_FACTOR", "nan", "soft_budget_final_factor"),
-  ("HANK_SOFT_BUDGET_FINAL_FACTOR", "inf", "soft_budget_final_factor"),
-  ("HANK_CHILD_SILENCE_TIMEOUT_SECONDS", "nan", "child_silence_timeout_seconds"),
-  ("HANK_CHILD_SILENCE_TIMEOUT_SECONDS", "inf", "child_silence_timeout_seconds"),
-  ("HANK_CONTEXT_WARNING_PCT", "101", "context_warning_pct"),
-])
-def test_invalid_values_warn_naming_the_value_and_keep_the_default(
-  env: str, raw: str, setting: str, caplog: pytest.LogCaptureFixture,
-) -> None:
-  with caplog.at_level("WARNING", logger="agent_gateway.containment_settings"):
-    settings = resolve_containment_settings({env: raw})
-
-  assert settings == ContainmentSettings()
-  assert getattr(settings, setting) == getattr(ContainmentSettings(), setting)
-  warnings = [record.getMessage() for record in caplog.records]
-  assert len(warnings) == 1
-  assert setting in warnings[0] and env in warnings[0] and raw in warnings[0]
-
-
-def test_unreadable_soft_turn_budget_leaves_the_table_in_force() -> None:
-  settings = resolve_containment_settings({"HANK_SOFT_TURN_BUDGET": "lots"})
-
-  assert settings.soft_turn_budget_cap is None
+def test_soft_turn_threshold_is_keyed_by_kind(settings_file: Path) -> None:
+  settings = ContainmentSettings()
+  assert settings.soft_turn_threshold("writer") is None
   assert settings.soft_turn_threshold("sub_agent") == 100
+  assert settings.soft_turn_threshold("autonomous") == 100
   assert settings.soft_turn_threshold("fork") == 10
+
+  _write_settings(
+    settings_file,
+    {"writer_soft_turn_budget": 40, "child_soft_turn_budget": 25, "fork_soft_turn_budget": 4},
+  )
+
+  assert settings.soft_turn_threshold("writer") == 40
+  assert settings.soft_turn_threshold("sub_agent") == 25
+  assert settings.soft_turn_threshold("autonomous") == 25
+  assert settings.soft_turn_threshold("fork") == 4
+
+
+def test_a_malformed_file_raises_on_read(settings_file: Path) -> None:
+  settings = ContainmentSettings()
+  settings_file.write_text("{not json")
+
+  with pytest.raises(RunSettingsError):
+    settings.max_spawn_depth
 
 
 def test_zero_child_silence_timeout_is_the_off_value() -> None:
-  settings = resolve_containment_settings({"HANK_CHILD_SILENCE_TIMEOUT_SECONDS": "0"})
+  settings = ContainmentSettings(child_silence_timeout_seconds=0)
 
   assert settings.child_silence_timeout_seconds == 0.0
 
@@ -143,17 +142,14 @@ def test_spawn_depth_bound_comes_from_the_admission_owners(maximum: int) -> None
   assert refused.classification == "resource"
 
 
-@pytest.mark.parametrize("parent_depth", [0, 2, 9])
-def test_negative_spawn_depth_env_disables_the_bound(parent_depth: int) -> None:
-  settings = resolve_containment_settings({"HANK_MAX_SPAWN_DEPTH": "-1"})
+def test_spawn_depth_follows_the_file_at_the_next_admission(settings_file: Path) -> None:
+  owners = _spawn_owners(ContainmentSettings())
+  assert isinstance(admit(_request(), _root(depth=1), owners=owners), AdmittedContext)
+  assert isinstance(admit(_request(), _root(depth=2), owners=owners), Refusal)
 
-  result = admit(
-    _request(), _root(depth=parent_depth), owners=_spawn_owners(settings),
-  )
+  _write_settings(settings_file, {"max_spawn_depth": 3})
 
-  assert isinstance(result, AdmittedContext)
-  assert result.wire.lineage.depth == parent_depth + 1
-  assert result.wire.tool_grant == ("file_read", "run_agent")
+  assert isinstance(admit(_request(), _root(depth=2), owners=owners), AdmittedContext)
 
 
 class _FakeProvider:
@@ -234,9 +230,9 @@ def test_soft_ladder_final_stage_follows_the_factor() -> None:
   assert fired == {4: "steer", math.ceil(4 * 2.25): "final", 10: "abort"}
 
 
-def test_runner_ladder_follows_the_cap_factor_and_grace() -> None:
+def test_runner_ladder_follows_the_threshold_factor_and_grace() -> None:
   runner = _runner(ContainmentSettings(
-    soft_turn_budget_cap=2, soft_budget_final_factor=2.0, soft_budget_grace_turns=1,
+    child_soft_turn_budget=2, soft_budget_final_factor=2.0, soft_budget_grace_turns=1,
   ))
   runner._soft_budget_kind = "sub_agent"
   requests = 0
@@ -292,12 +288,10 @@ def test_zero_child_silence_timeout_never_cancels(monkeypatch: pytest.MonkeyPatc
   assert finished is False
 
 
-def test_autonomous_child_projection_carries_every_containment_name() -> None:
-  environ = {name: "1" for name in CONTAINMENT_ENV_NAMES}
-
+def test_autonomous_child_projection_carries_the_run_settings_path() -> None:
   projected = filter_child_environment(
-    {**environ, "UNLISTED_SECRET": "x"},
+    {SETTINGS_PATH_ENV: "/operator/run-settings.json", "UNLISTED_SECRET": "x"},
     purpose=AUTONOMOUS_CHILD_ENVIRONMENT,
   )
 
-  assert projected == environ
+  assert projected == {SETTINGS_PATH_ENV: "/operator/run-settings.json"}

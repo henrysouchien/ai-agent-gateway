@@ -171,10 +171,13 @@ flat plan, like `ollama_cloud`, is declared once in the model-authority
 meter enforces the shared ceilings (`spend-settings.json`); a refusal writes a
 `budget_blocked` row and raises `SpendBudgetBlocked`, which the runner reports as the
 turn's error and no retry, rotation or fallback sees. An adapter keeps `stream`
-free of ledger code and raises provider-specific exceptions that
-`classify_credential_failure` / `is_retryable_error` recognise: a failure that neither
-yielded an event nor classifies as an upstream error is treated as local and writes
-nothing.
+free of ledger code; whatever its `stream` raises writes one `error` (or `rate_limit`,
+from `classify_credential_failure`) row carrying the usage seen so far. That includes
+a precondition the adapter checks inside `stream` before it sends (Google Antigravity's
+missing `project_id`, an httpx adapter's missing client state): the row has zero tokens
+and $0 shadow cost, so it counts as a failed call and never as spend. A failure raised
+before `stream` starts (request params, client construction) writes nothing; a
+ceiling refusal there writes its `budget_blocked` row, as above.
 
 Callers outside `agent_gateway` that start a provider stream themselves (the plan
 author, the citation judge, coverage-wire, the eval drivers) build a

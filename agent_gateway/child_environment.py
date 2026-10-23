@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Dict, Mapping
 
 from .agent_session_log_layout import SESSION_LOG_LAYOUT_ENV
-from .containment_settings import CONTAINMENT_ENV_NAMES
 from .gateway_address import GATEWAY_BASE_URL_ENV
+from .run_settings import SETTINGS_PATH_ENV
 
 
 RUN_BASH_ENVIRONMENT = "run_bash"
@@ -145,7 +145,9 @@ _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES = frozenset({
   "MODEL_ENGINE_OVERRIDES_DIR",
   "GATEWAY_SURFACE_CONTENT_CAPTURE_ENABLED",
   "GATEWAY_SURFACE_CONTENT_PATH",
-}) | CONTAINMENT_ENV_NAMES
+  # The operator file the child's live ``ContainmentSettings`` reads.
+  SETTINGS_PATH_ENV,
+})
 
 # Profiles whose runtime limits and delivery destination are configured per
 # profile. Every autonomous child receives every profile's limit names alike.

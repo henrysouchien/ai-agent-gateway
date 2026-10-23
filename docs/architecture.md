@@ -217,12 +217,12 @@ Use it when you need:
 - tracks usage and estimated cost
 - retries transient stream failures
 - runs the one soft-budget ladder (`runner_soft_budget`) on a delegated run:
-  steer at the `ContainmentSettings.soft_turn_budget` threshold, forced final at
-  `soft_budget_final_factor` (1.5×), and an abort only when the child still has
-  not answered after `soft_budget_grace_turns`; a primary run has no ladder, and
-  cost is a measurement, never a stop
+  steer at the `soft_turn_threshold(kind)` threshold (a key of the operator settings file, read through
+  `ContainmentSettings`), forced final at `soft_budget_final_factor` (1.5×), and an abort only when the child
+  still has not answered after `soft_budget_grace_turns`; a primary run has no ladder unless
+  `writer_soft_turn_budget` is set, and cost is a measurement, never a stop
 - takes every containment bound from its `containment` argument
-  (`ContainmentSettings`, `agent_gateway/containment_settings.py`); child
+  (`ContainmentSettings`, `agent_gateway/containment_settings.py`, a live view over `agent_gateway/run_settings.py`); child
   runners inherit the parent's object
 
 ## Tool Dispatch

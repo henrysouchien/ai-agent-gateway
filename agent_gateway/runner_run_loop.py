@@ -3645,12 +3645,11 @@ class RunnerRunLoopMixin:
       last_ordinary_turn: int | None = None
       forced_final_delivery_turns = 0
       soft_budget_kind = self._soft_budget_kind
+      # The ladder is built per run, so its threshold, final factor and grace
+      # are the run settings as read at run start; a change reaches the next
+      # run. ``None`` (writer sessions by default) is no ladder.
       soft_budget_ladder = SoftBudgetLadder(
-        turn_threshold=(
-          None
-          if soft_budget_kind == "writer"
-          else containment.soft_turn_threshold(soft_budget_kind)
-        ),
+        turn_threshold=containment.soft_turn_threshold(soft_budget_kind),
         final_factor=containment.soft_budget_final_factor,
         grace_turns=containment.soft_budget_grace_turns,
       )

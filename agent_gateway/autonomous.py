@@ -58,7 +58,7 @@ from .openai_history_fence import (
 )
 from .admission import current_parent_context, root_context
 from .approval_policy import RunContext
-from .containment_settings import ContainmentSettings, resolve_containment_settings
+from .containment_settings import ContainmentSettings
 from .runner import AgentRunner, ToolResultContext
 from .runner_session_lifecycle import WriterLeaseAlreadyHeldError
 from .skill_lifecycle import (
@@ -760,13 +760,13 @@ async def run_autonomous(
   `on_usage` / `on_session_summary`.
   Supplied execution-limit observations are optional and pass through to the
   session's RunContext unchanged, whether or not this is a named skill run.
-  `containment` is the process's resolved `ContainmentSettings`; `None`
-  resolves it from `os.environ` here, at this standalone entry point.
+  `containment` is the process's `ContainmentSettings`; `None` constructs the
+  live one (the run settings file) here, at this standalone entry point.
   Standalone top-level skill callers must bind both `top_level_skill_name` and
   a unique `skill_run_id`; these values are trusted runtime context, not model input.
   """
   if containment is None:
-    containment = resolve_containment_settings(os.environ)
+    containment = ContainmentSettings()
   if skills_dir is not None and operation_catalog is not None:
     raise ValueError(
       "run_autonomous accepts either skills_dir or operation_catalog, not both"

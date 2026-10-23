@@ -257,7 +257,7 @@ def test_child_max_tokens_segments_advance_the_soft_budget(
       _StubProvider(),
       session_id="sub_parent:2",
       agent_session_log=AgentSessionLog(tmp_path / "child.jsonl"),
-      containment=ContainmentSettings(soft_turn_budget_cap=3),
+      containment=ContainmentSettings(child_soft_turn_budget=3),
     )
     calls = 0
 
@@ -510,7 +510,7 @@ def test_child_max_tokens_chain_that_never_answers_meets_the_abort(
       _StubProvider(),
       session_id="sub_parent:3",
       agent_session_log=AgentSessionLog(tmp_path / "child.jsonl"),
-      containment=ContainmentSettings(soft_turn_budget_cap=3),
+      containment=ContainmentSettings(child_soft_turn_budget=3),
     )
     calls = 0
 
