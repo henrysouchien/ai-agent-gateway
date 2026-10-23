@@ -127,6 +127,7 @@ async def send_prompt(
   from .spend_metering import ProviderCallMeter
   from .multi_user.billing import UsageEvent, UsageState, normalize_identity
   from .runner_streaming import _stream_with_stall_timeout
+  from .runner_usage import apply_provider_diagnostics, apply_thinking_event
 
   sid = str(session_id or "send-prompt")
   normalized_request_id = str(request_id or "").strip()
@@ -168,6 +169,9 @@ async def send_prompt(
   provider_unit_deltas: dict[str, int] = {}
   provider_reported_model: str | None = None
   stop_reason = ""
+  # Per-call provider diagnostics from message_start/message_end plus the thinking tally.
+  diagnostics: dict[str, Any] = {}
+  thinking_block_chars = 0
   content_blocks: list[dict[str, Any]] = []
   attempt_started_at = datetime.now(timezone.utc)
   params: dict[str, Any] = {}
@@ -186,7 +190,14 @@ async def send_prompt(
       capture_level="stream",
       request=dict(params),
       response=(
-        {"content_blocks": list(content_blocks), "stop_reason": stop_reason or None}
+        {
+          "content_blocks": list(content_blocks),
+          "stop_reason": stop_reason or None,
+          "provider_response_id": diagnostics.get("provider_response_id"),
+          "provider_request_id": diagnostics.get("provider_request_id"),
+          "service_tier": diagnostics.get("service_tier"),
+          "rate_limit": diagnostics.get("rate_limit"),
+        }
         if status == "ok" else None
       ),
       status=status,  # type: ignore[arg-type]
@@ -205,6 +216,7 @@ async def send_prompt(
         "cache_read_tokens": cache_read_tokens,
         "cache_creation_tokens": cache_creation_tokens,
         "reasoning_tokens": reasoning_tokens,
+        "thinking_chars": int(diagnostics.get("thinking_chars", 0) or 0),
       },
       error_type=None if exc is None else type(exc).__name__,
       error_message=None if exc is None else str(exc)[:2000],
@@ -241,6 +253,10 @@ async def send_prompt(
       channel=resolved_channel,
       capability_bind=capability_bind.to_json(),
       provider_reported_model=provider_reported_model,
+      provider_response_id=diagnostics.get("provider_response_id"),
+      provider_request_id=diagnostics.get("provider_request_id"),
+      service_tier=diagnostics.get("service_tier"),
+      thinking_chars=int(diagnostics.get("thinking_chars", 0) or 0),
     )
     if commercial_usage_producer is not None:
       await commercial_usage_producer.emit(usage_event, usage_state=usage_state)
@@ -288,12 +304,19 @@ async def send_prompt(
               text_parts.append(text)
             continue
 
+          if event.type == "thinking_delta":
+            thinking_block_chars = apply_thinking_event(diagnostics, event, thinking_block_chars)
+            continue
+
           if event.type in ("text_end", "thinking_end"):
             if isinstance(event.raw_block, dict):
               content_blocks.append(event.raw_block)
+            if event.type == "thinking_end":
+              thinking_block_chars = apply_thinking_event(diagnostics, event, thinking_block_chars)
             continue
 
           if event.type == "message_start":
+            apply_provider_diagnostics(diagnostics, event)
             input_tokens += int(event.input_tokens or 0)
             cache_read_tokens += int(event.cache_read_tokens or 0)
             cache_creation_tokens += int(event.cache_creation_tokens or 0)
@@ -316,6 +339,7 @@ async def send_prompt(
 
           if event.type == "message_end":
             stop_reason = str(event.stop_reason or "")
+            apply_provider_diagnostics(diagnostics, event)
       except asyncio.CancelledError as exc:
         if input_tokens or output_tokens or cache_read_tokens or cache_creation_tokens:
           await _emit_usage("canceled")
@@ -341,6 +365,8 @@ async def send_prompt(
         provider_unit_deltas.clear()
         provider_reported_model = None
         stop_reason = ""
+        diagnostics.clear()
+        thinking_block_chars = 0
         continue
       break
 

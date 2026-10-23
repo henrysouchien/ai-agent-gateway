@@ -16,7 +16,12 @@ from .base import (
   ModelInfo, ModelProvider, StreamEvent, _is_context_length_exception,
   authority_rate_table,
 )
-from .openai_responses_helpers import reasoning_effort_fragment, responses_compat, responses_model_info
+from .openai_responses_helpers import (
+  reasoning_effort_fragment,
+  responses_compat,
+  responses_model_info,
+)
+from .response_diagnostics import response_diagnostics
 from .codex import CodexProvider
 from .xai_helpers import (
   DEFAULT_INSTRUCTIONS,
@@ -322,6 +327,7 @@ class XAIProvider(ModelProvider):
           raise httpx.HTTPStatusError(message, request=response.request, response=response)
         else:
           stream_state = _ResponsesStreamState()
+          stream_state.provider_request_id, stream_state.rate_limit = response_diagnostics(response.headers)
           buffer = ""
           async for chunk in response.aiter_text():
             buffer += chunk

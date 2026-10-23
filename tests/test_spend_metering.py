@@ -298,6 +298,37 @@ def test_a_cancelled_stream_writes_one_row_with_its_partial_usage() -> None:
   assert json.loads(row["attrs_json"])["canceled"] is True
 
 
+def test_the_row_attrs_carry_provider_diagnostics() -> None:
+  provider = _Provider([
+    StreamEvent(
+      type="message_start", input_tokens=10, provider_wait_ms=7,
+      provider_response_id="msg_abc", provider_request_id="req_123",
+    ),
+    StreamEvent(type="thinking_delta", thinking_text="abc"),
+    StreamEvent(
+      type="thinking_end", thinking_text="abc",
+      raw_block={"type": "thinking", "thinking": "abc", "signature": "s"},
+    ),
+    StreamEvent(type="usage_update", output_tokens=4),
+    StreamEvent(type="message_end", stop_reason="end_turn", service_tier="standard"),
+  ])
+  asyncio.run(_drain(_meter(provider)))
+
+  [row] = _rows()
+  attrs = json.loads(row["attrs_json"])
+  assert {key: attrs[key] for key in (
+    "provider_response_id", "provider_request_id", "service_tier",
+    "stop_reason", "provider_wait_ms", "thinking_chars",
+  )} == {
+    "provider_response_id": "msg_abc",
+    "provider_request_id": "req_123",
+    "service_tier": "standard",
+    "stop_reason": "end_turn",
+    "provider_wait_ms": 7,
+    "thinking_chars": 3,
+  }
+
+
 def test_an_enclosing_spend_context_call_site_names_the_real_caller() -> None:
   with spend_context(call_site="eval_jury", run_id="run-9"):
     asyncio.run(_drain(_meter(_Provider(_ok_step()))))

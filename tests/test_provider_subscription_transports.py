@@ -12,7 +12,9 @@ from agent_gateway.auth import AuthConfig, ProviderCredentialFailure
 from agent_gateway.providers import installed_adapter_route_support
 from agent_gateway.providers import base as provider_base
 from agent_gateway.providers.google_antigravity import GoogleAntigravityProvider
+from agent_gateway.providers.google import GoogleGenerateContentProvider
 from agent_gateway.providers.ollama_cloud import OllamaCloudProvider
+from agent_gateway.providers.ollama import OllamaLocalProvider
 from gateway_test_support.model_defaults import compat_for_profile
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
@@ -688,3 +690,162 @@ def test_ollama_tool_call_accumulator_preserves_repeated_brace_prefix_deltas() -
     emitted = acc.apply(raw)
     assert emitted == delta
   assert acc.arguments == '{"judgment": {"company": {"name": "PCTY"}}}'
+
+
+_DIAGNOSTIC_HEADERS = {
+  "content-type": "text/event-stream",
+  "x-request-id": "req-1",
+  "x-ratelimit-remaining-requests": "99",
+  "x-ratelimit-reset-requests": "1s",
+  "retry-after": "3",
+}
+_DIAGNOSTIC_RATE_LIMIT = {
+  "x-ratelimit-remaining-requests": "99",
+  "x-ratelimit-reset-requests": "1s",
+  "retry-after": "3",
+}
+
+
+def _collect_events(
+  provider: Any,
+  config: dict[str, object],
+  body: bytes,
+  model: str,
+) -> list[Any]:
+  def handle(_request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, headers=_DIAGNOSTIC_HEADERS, content=body)
+
+  async def collect() -> list[Any]:
+    client = provider.create_client({**config, "_transport": httpx.MockTransport(handle)})
+    try:
+      return [event async for event in provider.stream(client, {"model": model})]
+    finally:
+      await provider.close_client(client)
+
+  return asyncio.run(collect())
+
+
+def _chat_completions_body(reasoning_key: str) -> bytes:
+  return _sse(
+    {"id": "chatcmpl-1", "model": "m", "choices": [{"delta": {reasoning_key: "weigh it"}}]},
+    {"id": "chatcmpl-1", "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]},
+    {
+      "id": "chatcmpl-1",
+      "choices": [],
+      "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 7,
+        "completion_tokens_details": {"reasoning_tokens": 5},
+      },
+    },
+  )
+
+
+@pytest.mark.parametrize("reasoning_key", ["reasoning", "reasoning_content", "thinking"])
+@pytest.mark.parametrize(
+  ("provider_cls", "config", "model"),
+  [
+    (OllamaLocalProvider, {"api_key": ""}, "llama-fixture"),
+    (OllamaCloudProvider, {"api_key": _API_KEY}, _OLLAMA_MODEL),
+  ],
+  ids=["ollama-local", "ollama-cloud"],
+)
+def test_chat_completions_stream_surfaces_reasoning_ids_headers_and_reasoning_tokens(
+  provider_cls: type,
+  config: dict[str, object],
+  model: str,
+  reasoning_key: str,
+) -> None:
+  events = _collect_events(provider_cls(), config, _chat_completions_body(reasoning_key), model)
+  start = next(event for event in events if event.type == "message_start")
+  end = next(event for event in events if event.type == "message_end")
+  usage = next(event for event in events if event.type == "usage_update")
+
+  assert [event.thinking_text for event in events if event.type == "thinking_delta"] == ["weigh it"]
+  assert next(event for event in events if event.type == "thinking_end").raw_block == {
+    "type": "thinking", "thinking": "weigh it",
+  }
+  assert start.provider_response_id == "chatcmpl-1"
+  assert start.provider_request_id == "req-1"
+  assert start.rate_limit == _DIAGNOSTIC_RATE_LIMIT
+  assert end.provider_response_id == "chatcmpl-1"
+  assert usage.reasoning_tokens == 5
+
+
+def test_chat_completions_reasoning_key_priority_is_first_non_empty() -> None:
+  body = _sse(
+    {"choices": [{"delta": {"reasoning": "", "reasoning_content": "second", "thinking": "third"}}]},
+    {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]},
+  )
+  events = _collect_events(OllamaLocalProvider(), {"api_key": ""}, body, "llama-fixture")
+  start = next(event for event in events if event.type == "message_start")
+
+  assert [event.thinking_text for event in events if event.type == "thinking_delta"] == ["second"]
+  assert start.provider_response_id is None
+  assert start.rate_limit == _DIAGNOSTIC_RATE_LIMIT
+
+
+def test_google_stream_reports_response_id_and_response_headers() -> None:
+  body = _sse({
+    "responseId": "gem-resp-1",
+    "candidates": [{"content": {"role": "model", "parts": [{"text": _TEXT}]}, "finishReason": "STOP"}],
+  })
+  events = _collect_events(
+    GoogleGenerateContentProvider(), {"api_key": _API_KEY}, body, "gemini-fixture",
+  )
+  start = next(event for event in events if event.type == "message_start")
+  end = next(event for event in events if event.type == "message_end")
+
+  assert (start.provider_response_id, start.provider_request_id) == ("gem-resp-1", "req-1")
+  assert start.rate_limit == _DIAGNOSTIC_RATE_LIMIT
+  assert end.provider_response_id == "gem-resp-1"
+
+
+def test_antigravity_stream_reports_response_id_and_response_headers() -> None:
+  body = _sse({
+    "response": {
+      "responseId": "ag-resp-1",
+      "candidates": [{"content": {"parts": [{"text": _TEXT}]}, "finishReason": "STOP"}],
+    },
+  })
+  events = _collect_events(
+    GoogleAntigravityProvider(),
+    {"auth_token": _TOKEN, "project_id": _PROJECT},
+    body,
+    _ANTIGRAVITY_MODEL,
+  )
+  start = next(event for event in events if event.type == "message_start")
+  end = next(event for event in events if event.type == "message_end")
+
+  assert (start.provider_response_id, start.provider_request_id) == ("ag-resp-1", "req-1")
+  assert start.rate_limit == _DIAGNOSTIC_RATE_LIMIT
+  assert end.provider_response_id == "ag-resp-1"
+
+
+def test_response_diagnostics_yields_nothing_without_the_headers() -> None:
+  from agent_gateway.providers.response_diagnostics import response_diagnostics
+
+  assert response_diagnostics(httpx.Headers({"content-type": "text/event-stream"})) == (None, None)
+  assert response_diagnostics(None) == (None, None)
+
+
+def test_chat_completions_start_without_response_headers_carries_no_rate_limit() -> None:
+  def handle(_request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+      200,
+      headers={"content-type": "text/event-stream"},
+      content=_sse({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}),
+    )
+
+  async def collect() -> list[Any]:
+    provider = OllamaLocalProvider()
+    client = provider.create_client({"api_key": "", "_transport": httpx.MockTransport(handle)})
+    try:
+      return [event async for event in provider.stream(client, {"model": "llama-fixture"})]
+    finally:
+      await provider.close_client(client)
+
+  start = next(event for event in asyncio.run(collect()) if event.type == "message_start")
+
+  assert (start.provider_request_id, start.rate_limit) == (None, None)
+

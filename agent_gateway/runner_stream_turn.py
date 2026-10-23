@@ -47,6 +47,9 @@ from .runner_streaming import (
 from .runner_usage import (
   apply_message_start_usage as _apply_message_start_usage,
   apply_usage_update as _apply_usage_update,
+  PROVIDER_DIAGNOSTIC_KEYS,
+  apply_provider_diagnostics,
+  apply_thinking_event,
   usage_snapshot,
   usage_delta_state as _usage_delta_state,
 )
@@ -620,6 +623,7 @@ class RunnerStreamTurnMixin:
       nonlocal last_progress_at, progress_events
       first_turn = turn_count == 1
       logger.debug("[%s] Turn %d stream open", self._sid, turn_count)
+      thinking_block_chars = 0
 
       async for event in events:
         event_type = event.type
@@ -632,6 +636,7 @@ class RunnerStreamTurnMixin:
           usage_totals.update({
             "capability_bind": bind.to_json(),
           })
+          apply_provider_diagnostics(usage_totals, event)
           if event.provider_reported_model is not None:
             usage_totals["provider_reported_model"] = validate_reported_identity(
               bind,
@@ -721,13 +726,14 @@ class RunnerStreamTurnMixin:
           continue
 
         if event_type == "thinking_delta":
-          thinking_text = str(event.thinking_text or "")
-          self._append({"type": "thinking_delta", "text": thinking_text})
+          thinking_block_chars = apply_thinking_event(usage_totals, event, thinking_block_chars)
+          self._append({"type": "thinking_delta", "text": str(event.thinking_text or "")})
           continue
 
         if event_type == "thinking_end":
           if isinstance(event.raw_block, dict):
             result.content_blocks.append(event.raw_block)
+          thinking_block_chars = apply_thinking_event(usage_totals, event, thinking_block_chars)
           logger.info("[%s] Thinking block complete | %d chars", self._sid, len(str(event.thinking_text or "")))
           continue
 
@@ -776,6 +782,7 @@ class RunnerStreamTurnMixin:
           result.stop_reason = event.stop_reason or None
           result.stop_details = event.stop_details
           result.request_input_tokens = event.request_input_tokens
+          apply_provider_diagnostics(usage_totals, event)
 
       logger.debug("[%s] Turn %d stream end", self._sid, turn_count)
 
@@ -983,6 +990,8 @@ class RunnerStreamTurnMixin:
       params, advertised_tool_names = _make_params()
       result = _runner_attr(self, "StreamTurnResult", StreamTurnResult)()
       result.advertised_tool_names = advertised_tool_names
+      for diagnostic_key in PROVIDER_DIAGNOSTIC_KEYS:
+        usage_totals.pop(diagnostic_key, None)
       usage_before_attempt = usage_snapshot(usage_totals)
       guard_reason = None
       stream_task = asyncio_module.create_task(_consume_metered(params, result, meter))

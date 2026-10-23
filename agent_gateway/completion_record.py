@@ -145,6 +145,7 @@ def build_completion_record(
         "cache_read_tokens",
         "cache_creation_tokens",
         "reasoning_tokens",
+        "thinking_chars",
       )
     },
     "outcome": {

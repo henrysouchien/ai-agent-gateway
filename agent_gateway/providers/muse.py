@@ -56,6 +56,7 @@ from .openai_responses_helpers import (
   responses_model_info,
   _system_prompt_text,
 )
+from .response_diagnostics import response_diagnostics
 from .xai_helpers import (
   DEFAULT_INSTRUCTIONS,
   _parse_sse,
@@ -437,6 +438,7 @@ class MuseResponsesProvider(ModelProvider):
         message = await _error_detail(response)
         raise httpx.HTTPStatusError(message, request=response.request, response=response)
       stream_state = _ResponsesStreamState()
+      stream_state.provider_request_id, stream_state.rate_limit = response_diagnostics(response.headers)
       buffer = ""
       async for chunk in response.aiter_text():
         buffer += chunk

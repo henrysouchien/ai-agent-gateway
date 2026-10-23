@@ -39,6 +39,7 @@ from .base import (
 )
 from .credential_pool import rotate_provider_credential
 from .google_tool_schema import sanitize_tool_schema
+from .response_diagnostics import response_diagnostics
 
 log = logging.getLogger(__name__)
 
@@ -959,6 +960,9 @@ class _StreamState:
   reported_output: int = 0
   reported_reasoning: int = 0
   terminal: bool = False
+  response_id: str | None = None
+  request_id: str | None = None
+  rate_limit: dict[str, str] | None = None
 
 
 def _int_field(value: Any) -> int:
@@ -984,6 +988,9 @@ def _usage_events(state: _StreamState, *, starting: bool) -> list[StreamEvent]:
       provider_reported_model=state.model,
       input_tokens=input_total,
       cache_read_tokens=state.cached_tokens,
+      provider_response_id=state.response_id,
+      provider_request_id=state.request_id,
+      rate_limit=state.rate_limit,
     ))
     return events
   if not state.started:
@@ -1134,6 +1141,9 @@ def _apply_payload(state: _StreamState, payload: dict[str, Any]) -> list[StreamE
   if "error" in payload and "candidates" not in payload:
     _raise_error_payload(payload, state=state)
   events: list[StreamEvent] = []
+  response_id = str(_field(payload, "responseId", "response_id") or "").strip()
+  if response_id:
+    state.response_id = response_id
   _read_usage(state, payload)
   feedback = _field(payload, "promptFeedback", "prompt_feedback")
   if isinstance(feedback, dict):
@@ -1200,6 +1210,7 @@ def _finalize(state: _StreamState) -> list[StreamEvent]:
     stop_details=details or None,
     provider_reported_model=state.model,
     request_input_tokens=state.prompt_tokens,
+    provider_response_id=state.response_id,
   ))
   return events
 
@@ -1442,6 +1453,7 @@ class GoogleAntigravityProvider(ModelProvider):
       if response.status_code != 200:
         message = await _error_message(response)
         raise httpx.HTTPStatusError(message, request=response.request, response=response)
+      stream_state.request_id, stream_state.rate_limit = response_diagnostics(response.headers)
       buffer = ""
       saw_event = False
       async for chunk in response.aiter_text():

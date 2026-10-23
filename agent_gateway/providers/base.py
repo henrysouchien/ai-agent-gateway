@@ -222,6 +222,12 @@ class StreamEvent:
   raw_block: Any = None
   caller: dict[str, Any] | None = None
   provider_reported_model: str | None = None
+  # Provider diagnostics, reported on message_start (headers, ids) and message_end (ids, tier).
+  provider_response_id: str | None = None      # Anthropic message.id; Responses response.id; Gemini responseId; chat-completions id
+  provider_request_id: str | None = None       # response header request-id / x-request-id / anthropic-request-id
+  service_tier: str | None = None              # Anthropic usage.service_tier; Responses service_tier; else None
+  rate_limit: dict[str, str] | None = None     # the provider's rate-limit response headers, verbatim lowercase name -> value
+                                               # (anthropic-ratelimit-*, x-ratelimit-*, retry-after); None when none
   # On message_end: absolute final invocation prompt, including both cache
   # categories, not summed billable iterations. Zero is known; None unavailable.
   request_input_tokens: int | None = None

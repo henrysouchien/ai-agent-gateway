@@ -851,3 +851,66 @@ def test_accumulator_reaches_finalization_when_the_item_omits_arguments() -> Non
   """Fallback path: nothing on the completed item -> use what the deltas built."""
   _, durable = _drive_tool_call("", ['{"path":"', 'README.md"}'])
   assert durable == '{"path":"README.md"}'
+
+
+def test_stream_reports_response_diagnostics_and_keeps_reasoning_item_verbatim() -> None:
+  """response.id / service_tier / reasoning_tokens / x-request-id / rate-limit headers reach the events.
+
+  The reasoning item (encrypted_content + summary) must still land whole in thinking_end.
+  """
+  reasoning_item = {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC",
+                    "summary": [{"type": "summary_text", "text": "weighed it"}]}
+  stream_events: list[dict[str, Any]] = [
+    {"type": "response.created", "response": {"id": "resp_abc", "model": "gpt-6-sol", "status": "in_progress"}},
+    *_reasoning_events(["weighed it"]),
+    {"type": "response.completed", "response": {
+      "id": "resp_abc", "model": "gpt-6-sol", "status": "completed", "service_tier": "priority",
+      "usage": {"input_tokens": 10, "output_tokens": 9, "output_tokens_details": {"reasoning_tokens": 5}},
+    }},
+  ]
+  payload = "".join("data: " + json.dumps(item) + "\n\n" for item in stream_events)
+
+  def handle_request(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, headers={
+      "content-type": "text/event-stream",
+      "X-Request-Id": "req_123",
+      "x-ratelimit-remaining-requests": "99",
+      "x-ratelimit-reset-tokens": "1s",
+      "retry-after": "3",
+    }, content=payload)
+
+  async def collect():
+    provider = CodexProvider()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle_request)) as client:
+      provider._client_state[client] = {
+        "token": _fake_jwt("acct_test"),
+        "account_id": "acct_test",
+        "endpoint_url": "https://codex.example/responses",
+        "init_headers": {},
+      }
+      return [event async for event in provider.stream(client, {"model": "gpt-6-sol"})]
+
+  events = asyncio.run(collect())
+  start = next(event for event in events if event.type == "message_start")
+  end = next(event for event in events if event.type == "message_end")
+  usage = next(event for event in events if event.type == "usage_update")
+  thinking = next(event for event in events if event.type == "thinking_end")
+  assert start.provider_response_id == "resp_abc"
+  assert start.provider_request_id == "req_123"
+  assert start.rate_limit == {
+    "x-ratelimit-remaining-requests": "99",
+    "x-ratelimit-reset-tokens": "1s",
+    "retry-after": "3",
+  }
+  assert (end.provider_response_id, end.service_tier) == ("resp_abc", "priority")
+  assert usage.reasoning_tokens == 5
+  assert thinking.raw_block["thinking"] == "weighed it"
+  assert json.loads(thinking.raw_block["signature"]) == reasoning_item
+
+
+def test_stream_without_diagnostics_leaves_the_fields_unset() -> None:
+  state = _ResponsesStreamState()
+  events = _map_event({"type": "response.completed", "response": {"status": "completed"}}, state)
+  start, _, end = events
+  assert (start.provider_response_id, start.provider_request_id, start.rate_limit) == (None, None, None)
+  assert (end.provider_response_id, end.service_tier) == (None, None)

@@ -488,3 +488,50 @@ def test_xai_reasoning_summary_streams_what_it_persists() -> None:
 
   assert durable == "first\n\nsecond"
   assert "".join(streamed) == durable
+
+
+def test_stream_reports_response_diagnostics_reasoning_tokens_and_reasoning_item() -> None:
+  """xAI rides the codex mapper: response.id, service_tier, reasoning_tokens and the headers surface."""
+  stream_events: list[dict[str, Any]] = [
+    {"type": "response.created", "response": {"id": "resp_xai", "model": "grok-4.5", "status": "in_progress"}},
+    {"type": "response.output_item.added",
+     "item": {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "ENC"}},
+    {"type": "response.output_item.done",
+     "item": {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC",
+              "summary": [{"type": "summary_text", "text": "thought"}]}},
+    {"type": "response.completed", "response": {
+      "id": "resp_xai", "model": "grok-4.5", "status": "completed", "service_tier": "default",
+      "usage": {"input_tokens": 4, "output_tokens": 8, "output_tokens_details": {"reasoning_tokens": 6}},
+    }},
+  ]
+  payload = "".join("data: " + json.dumps(item) + "\n\n" for item in stream_events)
+
+  def handle_request(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, headers={
+      "content-type": "text/event-stream",
+      "x-request-id": "xreq_1",
+      "x-ratelimit-limit-requests": "60",
+    }, content=payload)
+
+  async def collect():
+    provider = XAIProvider()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle_request)) as client:
+      provider._client_state[client] = {
+        "token": "xai-test",
+        "auth_mode": "api",
+        "endpoint_url": "https://xai.example/v1/responses",
+        "headers": {},
+      }
+      return [event async for event in provider.stream(client, {"model": "grok-4.5"})]
+
+  events = asyncio.run(collect())
+  start = next(event for event in events if event.type == "message_start")
+  end = next(event for event in events if event.type == "message_end")
+  usage = next(event for event in events if event.type == "usage_update")
+  thinking = next(event for event in events if event.type == "thinking_end")
+  assert (start.provider_response_id, start.provider_request_id) == ("resp_xai", "xreq_1")
+  assert start.rate_limit == {"x-ratelimit-limit-requests": "60"}
+  assert (end.provider_response_id, end.service_tier) == ("resp_xai", "default")
+  assert usage.reasoning_tokens == 6
+  assert json.loads(thinking.raw_block["signature"])["encrypted_content"] == "ENC"
+  assert thinking.raw_block["thinking"] == "thought"

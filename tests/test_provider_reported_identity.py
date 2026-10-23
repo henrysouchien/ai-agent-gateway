@@ -259,6 +259,71 @@ def test_runner_usage_delta_and_event_keep_identity_fields_distinct() -> None:
   assert event.model == event.capability_bind["upstream_model"]
 
 
+def test_usage_delta_and_event_carry_provider_diagnostics_for_the_turn_only() -> None:
+  zero = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "reasoning_tokens_observed": 0,
+    "provider_units": 0,
+    "provider_unit_deltas": {},
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+  }
+  after_first = {
+    **zero,
+    "input_tokens": 3,
+    "output_tokens": 2,
+    "capability_bind": _bind_receipt(),
+    "provider_response_id": "msg_1",
+    "provider_request_id": "req_1",
+    "service_tier": "standard",
+    "rate_limit": {"retry-after": "2"},
+    "thinking_chars": 40,
+    "redacted_thinking_blocks": 1,
+  }
+  delta = usage_delta(zero, after_first)
+  assert {
+    key: delta[key] for key in (
+      "provider_response_id", "provider_request_id", "service_tier", "rate_limit",
+      "thinking_chars", "redacted_thinking_blocks",
+    )
+  } == {
+    "provider_response_id": "msg_1",
+    "provider_request_id": "req_1",
+    "service_tier": "standard",
+    "rate_limit": {"retry-after": "2"},
+    "thinking_chars": 40,
+    "redacted_thinking_blocks": 1,
+  }
+  event = build_usage_event(
+    user_id="user-1",
+    session_id="session-1",
+    request_id="request-1",
+    parent_turn_id=None,
+    timestamp=1.0,
+    model="claude-opus-5",
+    provider_name="anthropic",
+    usage_totals=delta,
+    cost_total=0.01,
+    rate_table_version="rates-v1",
+    billing_mode="byok",
+    channel="cli",
+  )
+  assert (
+    event.provider_response_id, event.provider_request_id, event.service_tier, event.thinking_chars,
+  ) == ("msg_1", "req_1", "standard", 40)
+
+  # The stream turn clears the point values before each call, so a second turn whose
+  # provider reported none carries none; the summed counts report only the turn's share.
+  cleared = {key: value for key, value in after_first.items() if key not in (
+    "provider_response_id", "provider_request_id", "service_tier", "rate_limit",
+  )}
+  second = usage_delta(after_first, {**cleared, "thinking_chars": 55})
+  assert second["thinking_chars"] == 15
+  assert "redacted_thinking_blocks" not in second
+  assert not {"provider_response_id", "provider_request_id", "service_tier", "rate_limit"} & set(second)
+
+
 def test_session_summary_keeps_admitted_and_reported_identity_distinct() -> None:
   aggregator = _UsageAggregator(
     user_id="user-1",

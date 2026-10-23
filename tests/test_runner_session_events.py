@@ -698,6 +698,9 @@ def test_stream_complete_event_includes_static_token_estimates_with_provider_usa
     "output_tokens": 20,
     "cache_creation_input_tokens": 3,
     "cache_read_input_tokens": 4,
+    "reasoning_tokens_observed": 6,
+    "provider_wait_ms": 250,
+    "thinking_chars": 1800,
   }
 
   assert build_stream_complete_event(
@@ -713,6 +716,9 @@ def test_stream_complete_event_includes_static_token_estimates_with_provider_usa
       "output_tokens": 20,
       "cache_creation_input_tokens": 3,
       "cache_read_input_tokens": 4,
+      "reasoning_tokens_observed": 6,
+      "provider_wait_ms": 250,
+      "thinking_chars": 1800,
       "estimated_cost": 0.1235,
       "est_system_tokens": 1200,
       "est_tools_tokens": 3400,
@@ -1422,6 +1428,9 @@ def test_approval_park_closure_preserves_attempt_usage_without_final_skill_effec
     "output_tokens": 7,
     "cache_creation_input_tokens": 3,
     "cache_read_input_tokens": 11,
+    "reasoning_tokens_observed": 0,
+    "provider_wait_ms": 0,
+    "thinking_chars": 0,
     "estimated_cost": 0.0312,
     "est_system_tokens": 101,
     "est_tools_tokens": 203,

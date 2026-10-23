@@ -945,6 +945,77 @@ def test_end_turn_assistant_message_carries_no_stop_details() -> None:
   assert "stop_details" not in assistant_message
 
 
+class _DiagnosticsProvider(_RefusingProvider):
+  """One turn with provider ids, rate-limit headers, two thinking deltas and a redacted block."""
+
+  async def stream(self, client, params):
+    _ = client, params
+    yield StreamEvent(
+      type="message_start",
+      input_tokens=10,
+      provider_response_id="msg_abc",
+      provider_request_id="req_123",
+      rate_limit={"anthropic-ratelimit-requests-remaining": "41", "retry-after": "2"},
+    )
+    yield StreamEvent(type="thinking_delta", thinking_text="step one, ")
+    yield StreamEvent(type="thinking_delta", thinking_text="step two")
+    yield StreamEvent(
+      type="thinking_end",
+      thinking_text="step one, step two",
+      raw_block={"type": "thinking", "thinking": "step one, step two", "signature": "sig"},
+    )
+    # A provider that sends only the final block: counted from the raw block.
+    yield StreamEvent(
+      type="thinking_end",
+      thinking_text="",
+      raw_block={"type": "redacted_thinking", "data": "opaque"},
+    )
+    yield StreamEvent(
+      type="thinking_end",
+      thinking_text="final only",
+      raw_block={"type": "thinking", "thinking": "final only", "signature": "sig2"},
+    )
+    yield StreamEvent(type="text_delta", text="ok")
+    yield StreamEvent(type="text_end", raw_block={"type": "text", "text": "ok"})
+    yield StreamEvent(type="usage_update", output_tokens=5, reasoning_tokens=3)
+    yield StreamEvent(type="message_end", stop_reason="end_turn", service_tier="standard")
+
+
+def test_turn_usage_carries_provider_diagnostics_and_thinking_counts() -> None:
+  provider = _DiagnosticsProvider(stop_reasons=("end_turn",))
+  durable_events: list[dict[str, object]] = []
+  runner = _refusal_runner(provider, durable_events)
+
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "Think."}]))
+
+  [assistant_message] = [
+    event for event in durable_events if event.get("type") == "assistant_message"
+  ]
+  expected = {
+    "provider_response_id": "msg_abc",
+    "provider_request_id": "req_123",
+    "service_tier": "standard",
+    "rate_limit": {"anthropic-ratelimit-requests-remaining": "41", "retry-after": "2"},
+    "thinking_chars": len("step one, step two") + len("final only"),
+    "redacted_thinking_blocks": 1,
+  }
+  usage = assistant_message["usage"]
+  content_blocks = assistant_message["content_blocks"]
+  assert isinstance(usage, dict) and isinstance(content_blocks, list)
+  assert {key: usage[key] for key in expected} == expected
+  # The redacted block is replayed intact beside the readable thinking blocks.
+  assert [block["type"] for block in content_blocks] == [
+    "thinking", "redacted_thinking", "thinking", "text",
+  ]
+  events = [entry.event for entry in runner._log.entries]
+  [turn_complete] = [event for event in events if event["type"] == "turn_complete"]
+  assert {key: turn_complete["usage"][key] for key in expected} == expected
+  [stream_complete] = [event for event in events if event["type"] == "stream_complete"]
+  assert stream_complete["usage"]["reasoning_tokens_observed"] == 3
+  assert stream_complete["usage"]["provider_wait_ms"] == 0
+  assert stream_complete["usage"]["thinking_chars"] == expected["thinking_chars"]
+
+
 def test_refusal_with_running_background_child_waits_for_delivery_like_end_turn() -> None:
   from agent_gateway.task_registry import TaskState
 

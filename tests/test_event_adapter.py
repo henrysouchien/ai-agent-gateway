@@ -323,6 +323,22 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
     assert set(event) <= allowed, event["type"]
 
 
+def test_v1_adapter_delivers_turn_usage_diagnostics_whole() -> None:
+  # The projection enumerates top-level fields only: `usage` is a nested mapping that
+  # passes whole, so provider ids and thinking counts reach the wire without an entry.
+  usage = {
+    "input_tokens": 3,
+    "provider_response_id": "msg_1",
+    "provider_request_id": "req_1",
+    "service_tier": "standard",
+    "rate_limit": {"retry-after": "2"},
+    "thinking_chars": 40,
+    "redacted_thinking_blocks": 1,
+  }
+  event = {"type": "turn_complete", "turn": 1, "usage": usage}
+  assert V1Adapter().transform(event) == event
+
+
 def test_v1_adapter_delivers_model_fallback_notice_fields() -> None:
   event = {
     "type": "model_fallback",

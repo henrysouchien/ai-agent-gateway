@@ -82,6 +82,12 @@ class UsageEvent:
   projection_divergence: dict[str, str] | None = None
   selection_provenance: dict[str, Any] | None = None
   stage_id: str | None = None
+  # Provider diagnostics for the call (providers/base.py StreamEvent); not billed,
+  # not copied into the commercial usage payload.
+  provider_response_id: str | None = None
+  provider_request_id: str | None = None
+  service_tier: str | None = None
+  thinking_chars: int = 0
 
   def __post_init__(self) -> None:
     bind = CapabilityBind.from_json(self.capability_bind)

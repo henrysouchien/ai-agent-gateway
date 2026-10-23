@@ -79,7 +79,8 @@
         "output_tokens": {"$ref": "#/$defs/nullableCount"},
         "cache_read_tokens": {"$ref": "#/$defs/nullableCount"},
         "cache_creation_tokens": {"$ref": "#/$defs/nullableCount"},
-        "reasoning_tokens": {"$ref": "#/$defs/nullableCount"}
+        "reasoning_tokens": {"$ref": "#/$defs/nullableCount"},
+        "thinking_chars": {"description": "Characters of thinking text the provider returned; the thinking blocks themselves are in response.content_blocks.", "$ref": "#/$defs/nullableCount"}
       }
     },
     "outcome": {

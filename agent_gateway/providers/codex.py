@@ -18,7 +18,12 @@ from .base import (
 from model_authority.registry import AdapterRouteSupport
 from model_authority.rates import RateTable
 from model_authority.thinking import EffortResolution, ThinkingLevel, clamp_effort
-from .openai_responses_helpers import reasoning_effort_fragment, responses_compat, responses_model_info
+from .openai_responses_helpers import (
+  reasoning_effort_fragment,
+  responses_compat,
+  responses_model_info,
+)
+from .response_diagnostics import response_diagnostics
 from .codex_helpers import (
   DEFAULT_INSTRUCTIONS as DEFAULT_INSTRUCTIONS,
   _RETRYABLE_STATUSES as _RETRYABLE_STATUSES,
@@ -377,6 +382,7 @@ class CodexProvider(ModelProvider):
         raise httpx.HTTPStatusError(str(info["message"] or "Request failed"), request=response.request, response=response)
 
       stream_state = _ResponsesStreamState()
+      stream_state.provider_request_id, stream_state.rate_limit = response_diagnostics(response.headers)
       buffer = ""
       async for chunk in response.aiter_text():
         buffer += chunk

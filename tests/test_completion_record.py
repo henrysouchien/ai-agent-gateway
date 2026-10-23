@@ -99,12 +99,64 @@ def test_send_prompt_records_the_stream_and_returns_the_same_text(tmp_path: Path
   jsonschema.validate(row, _schema())
   assert row["capture_level"] == "stream"
   assert row["outcome"]["status"] == "ok"
-  assert row["response"] == {"content_blocks": [thinking, text_block], "stop_reason": "end_turn"}
+  assert row["response"] == {
+    "content_blocks": [thinking, text_block],
+    "stop_reason": "end_turn",
+    "provider_response_id": None,
+    "provider_request_id": None,
+    "service_tier": None,
+    "rate_limit": None,
+  }
   assert row["request"]["messages"] == [{"role": "user", "content": "What was the gross margin?"}]
   assert row["usage"]["input_tokens"] == 12 and row["usage"]["output_tokens"] == 7
   assert row["join"]["session_id"] == "newsletter-1"
   assert row["model"]["capability_bind"]["upstream_model"] == "claude-sonnet-4-6"
   assert row["source"]["call_site"] == row["model"]["capability_bind"]["capability_id"]
+
+
+def test_send_prompt_records_provider_diagnostics_and_reaches_the_usage_event(tmp_path: Path) -> None:
+  thinking = {"type": "thinking", "thinking": "weigh it", "signature": "sig"}
+  redacted = {"type": "redacted_thinking", "data": "opaque"}
+  limits = {"anthropic-ratelimit-requests-remaining": "41", "retry-after": "2"}
+  provider = _Provider([
+    StreamEvent(
+      type="message_start", input_tokens=12, provider_response_id="msg_abc",
+      provider_request_id="req_123", rate_limit=limits,
+    ),
+    StreamEvent(type="thinking_delta", thinking_text="weigh "),
+    StreamEvent(type="thinking_delta", thinking_text="it"),
+    StreamEvent(type="thinking_end", thinking_text="weigh it", raw_block=thinking),
+    StreamEvent(type="thinking_end", raw_block=redacted),
+    StreamEvent(type="text_delta", text="ok"),
+    StreamEvent(type="usage_update", output_tokens=7),
+    StreamEvent(type="message_end", stop_reason="end_turn", service_tier="standard"),
+  ])
+  usage_events: list[Any] = []
+  asyncio.run(send_prompt(
+    "q",
+    capability_execution=_execution(provider),
+    user_id="alice",
+    completion_record_root=tmp_path,
+    on_usage=usage_events.append,
+  ))
+
+  [row] = _rows(tmp_path)
+  jsonschema.validate(row, _schema())
+  # The thinking blocks themselves (including the redacted one) are in content_blocks.
+  assert row["response"] == {
+    "content_blocks": [thinking, redacted],
+    "stop_reason": "end_turn",
+    "provider_response_id": "msg_abc",
+    "provider_request_id": "req_123",
+    "service_tier": "standard",
+    "rate_limit": limits,
+  }
+  assert row["usage"]["thinking_chars"] == len("weigh it")
+  [usage_event] = usage_events
+  assert (
+    usage_event.provider_response_id, usage_event.provider_request_id,
+    usage_event.service_tier, usage_event.thinking_chars,
+  ) == ("msg_abc", "req_123", "standard", len("weigh it"))
 
 
 def test_send_prompt_records_a_failed_attempt_with_no_response(tmp_path: Path) -> None:

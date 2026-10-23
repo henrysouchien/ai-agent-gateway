@@ -497,3 +497,48 @@ def test_stream_wire(
     for event in events
   )
   assert any(event.type == "message_end" and event.stop_reason == "end_turn" for event in events)
+
+
+def test_muse_stream_reports_response_diagnostics_reasoning_tokens_and_reasoning_item() -> None:
+  """Muse rides the OpenAI Responses mapper: response.id, service_tier, reasoning_tokens, headers."""
+  stream_events: list[dict[str, Any]] = [
+    {"type": "response.created", "response": {"id": "resp_muse", "model": "muse-fixture", "status": "in_progress"}},
+    {"type": "response.output_item.added",
+     "item": {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "ENC"}},
+    {"type": "response.output_item.done",
+     "item": {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC",
+              "summary": [{"type": "summary_text", "text": "thought"}]}},
+    {"type": "response.completed", "response": {
+      "id": "resp_muse", "model": "muse-fixture", "status": "completed", "service_tier": "default",
+      "usage": {"input_tokens": 4, "output_tokens": 8, "output_tokens_details": {"reasoning_tokens": 6}},
+    }},
+  ]
+  payload = "".join("data: " + json.dumps(item) + "\n\n" for item in stream_events)
+
+  def handle(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, headers={
+      "content-type": "text/event-stream",
+      "x-request-id": "mreq_1",
+      "x-ratelimit-remaining-tokens": "500",
+      "retry-after": "2",
+    }, content=payload)
+
+  async def collect():
+    provider = MuseResponsesProvider()
+    client = provider.create_client({"api_key": "test-token", "_transport": httpx.MockTransport(handle)})
+    try:
+      return [event async for event in provider.stream(client, {"model": "muse-fixture"})]
+    finally:
+      await provider.close_client(client)
+
+  events = asyncio.run(collect())
+  start = next(event for event in events if event.type == "message_start")
+  end = next(event for event in events if event.type == "message_end")
+  usage = next(event for event in events if event.type == "usage_update")
+  thinking = next(event for event in events if event.type == "thinking_end")
+  assert (start.provider_response_id, start.provider_request_id) == ("resp_muse", "mreq_1")
+  assert start.rate_limit == {"x-ratelimit-remaining-tokens": "500", "retry-after": "2"}
+  assert (end.provider_response_id, end.service_tier) == ("resp_muse", "default")
+  assert usage.reasoning_tokens == 6
+  assert json.loads(thinking.raw_block["signature"])["item"]["encrypted_content"] == "ENC"
+  assert thinking.raw_block["thinking"] == "thought"

@@ -32,6 +32,7 @@ from .base import (
   model_info_from_entry,
   truncate_to_last_compaction,
 )
+from .response_diagnostics import response_diagnostics
 
 log = logging.getLogger(__name__)
 
@@ -521,6 +522,20 @@ def _parse_sse(buffer: str) -> tuple[list[Any], str]:
   return events, buffer
 
 
+# Chat-completions servers disagree on the key that carries streamed reasoning:
+# Ollama and OpenRouter send `reasoning`, DeepSeek/Kimi/vLLM `reasoning_content`,
+# and some daemons `thinking`. The first non-empty one wins.
+_REASONING_DELTA_KEYS = ("reasoning", "reasoning_content", "thinking")
+
+
+def _delta_reasoning(delta: dict[str, Any]) -> str:
+  for key in _REASONING_DELTA_KEYS:
+    value = delta.get(key)
+    if isinstance(value, str) and value:
+      return value
+  return ""
+
+
 def _delta_text(content: Any) -> str:
   if content is None or isinstance(content, bool):
     return ""
@@ -1004,6 +1019,8 @@ class OllamaLocalProvider(ModelProvider):
     buffer = ""
     message_started = False
     provider_model: str | None = None
+    response_id: str | None = None
+    request_id, rate_limit = response_diagnostics(response.headers)
     text = ""
     thinking = ""
     text_open = False
@@ -1021,6 +1038,9 @@ class OllamaLocalProvider(ModelProvider):
       return [StreamEvent(
         type="message_start",
         provider_reported_model=provider_model,
+        provider_response_id=response_id,
+        provider_request_id=request_id,
+        rate_limit=rate_limit,
       )]
 
     async for chunk in response.aiter_text():
@@ -1039,6 +1059,9 @@ class OllamaLocalProvider(ModelProvider):
         model_name = item.get("model")
         if isinstance(model_name, str) and model_name.strip():
           provider_model = model_name.strip()
+        chunk_id = item.get("id")
+        if isinstance(chunk_id, str) and chunk_id.strip():
+          response_id = chunk_id.strip()
         raw_usage = item.get("usage")
         if isinstance(raw_usage, dict):
           usage = raw_usage
@@ -1054,8 +1077,8 @@ class OllamaLocalProvider(ModelProvider):
           continue
         for event in start_events():
           yield event
-        reasoning = delta.get("reasoning")
-        if isinstance(reasoning, str) and reasoning:
+        reasoning = _delta_reasoning(delta)
+        if reasoning:
           if text_open:
             yield StreamEvent(
               type="text_end",
@@ -1171,6 +1194,7 @@ class OllamaLocalProvider(ModelProvider):
       stop_reason=_stop_reason(finish_reason, saw_tool_use=saw_tool_use),
       stop_details={"finish_reason": finish_reason} if finish_reason else None,
       request_input_tokens=request_input,
+      provider_response_id=response_id,
     )
 
   def is_retryable_error(self, exc: Exception) -> bool:

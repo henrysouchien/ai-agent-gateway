@@ -43,6 +43,12 @@ _SURROGATE_RE = re.compile(r"[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udb
 class _ResponsesStreamState:
   message_started: bool = False
   provider_reported_model: str | None = None
+  # Response-level diagnostics: ids/tier from the response envelope, request id and
+  # rate-limit headers set by the call site; reported on message_start/message_end.
+  provider_response_id: str | None = None
+  service_tier: str | None = None
+  provider_request_id: str | None = None
+  rate_limit: dict[str, str] | None = None
   current_item: dict[str, Any] | None = None
   current_block_type: str | None = None
   current_text: str = ""
@@ -503,6 +509,12 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
   reported_model = str(response_envelope.get("model") or "").strip() or None
   if reported_model is not None:
     state.provider_reported_model = reported_model
+  response_id = str(response_envelope.get("id") or "").strip() or None
+  if response_id is not None:
+    state.provider_response_id = response_id
+  service_tier = str(response_envelope.get("service_tier") or "").strip() or None
+  if service_tier is not None:
+    state.service_tier = service_tier
 
   if event_type == "error":
     code = str(event.get("code") or "")
@@ -544,6 +556,9 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
         StreamEvent(
           type="message_start",
           provider_reported_model=state.provider_reported_model,
+          provider_response_id=state.provider_response_id,
+          provider_request_id=state.provider_request_id,
+          rate_limit=state.rate_limit,
           input_tokens=input_tokens,
           cache_read_tokens=cached_tokens,
         )
@@ -557,6 +572,8 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
       StreamEvent(
         type="message_end",
         stop_reason=_map_stop_reason(normalized_response, saw_tool_use=state.saw_tool_use),
+        provider_response_id=state.provider_response_id,
+        service_tier=state.service_tier,
         # Responses input_tokens already includes cached prompt tokens.
         request_input_tokens=total_input if usage.get("input_tokens") is not None else None,
       )

@@ -538,3 +538,65 @@ def test_classify_credential_failure_maps_auth_and_billing_statuses(
   assert failure.provider == "kimi_code"
   assert failure.kind == kind
   assert failure.status_code == status
+
+
+def _kimi_sse(reasoning_key: str) -> bytes:
+  chunks = [
+    {"id": "cmpl-kimi-1", "model": "k3", "choices": [{"delta": {reasoning_key: "weigh it"}}]},
+    {"id": "cmpl-kimi-1", "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]},
+    {
+      "id": "cmpl-kimi-1",
+      "choices": [],
+      "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 7,
+        "completion_tokens_details": {"reasoning_tokens": 5},
+      },
+    },
+  ]
+  return "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks).encode() + b"data: [DONE]\n\n"
+
+
+@pytest.mark.parametrize("reasoning_key", ["reasoning_content", "reasoning", "thinking"])
+def test_stream_surfaces_reasoning_ids_headers_and_reasoning_tokens(
+  kimi_env: Path, reasoning_key: str,
+) -> None:
+  def handle(_request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+      200,
+      headers={
+        "content-type": "text/event-stream",
+        "x-request-id": "req-kimi-1",
+        "x-ratelimit-remaining-requests": "99",
+        "retry-after": "3",
+      },
+      content=_kimi_sse(reasoning_key),
+    )
+
+  async def collect() -> list[Any]:
+    provider = KimiCodeProvider()
+    client = provider.create_client({
+      "provider": "kimi_code",
+      "auth_mode": "api",
+      "api_key": "sk-api-key",
+      "_transport": httpx.MockTransport(handle),
+    })
+    try:
+      return [event async for event in provider.stream(client, {"model": "k3"})]
+    finally:
+      await provider.close_client(client)
+
+  events = asyncio.run(collect())
+  start = next(event for event in events if event.type == "message_start")
+  end = next(event for event in events if event.type == "message_end")
+  usage = next(event for event in events if event.type == "usage_update")
+
+  assert [event.thinking_text for event in events if event.type == "thinking_delta"] == ["weigh it"]
+  assert next(event for event in events if event.type == "thinking_end").raw_block == {
+    "type": "thinking", "thinking": "weigh it",
+  }
+  assert start.provider_response_id == "cmpl-kimi-1"
+  assert start.provider_request_id == "req-kimi-1"
+  assert start.rate_limit == {"x-ratelimit-remaining-requests": "99", "retry-after": "3"}
+  assert end.provider_response_id == "cmpl-kimi-1"
+  assert usage.reasoning_tokens == 5

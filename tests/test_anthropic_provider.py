@@ -2787,6 +2787,110 @@ def test_stream_message_end_without_stop_details_carries_none() -> None:
   assert message_end.stop_details is None
 
 
+class _DiagnosticStreamContext(_StaticStreamContext):
+  def __init__(self, events: list[object], headers: dict[str, str]):
+    super().__init__(events)
+    self.response = SimpleNamespace(headers=headers)
+
+
+def test_stream_carries_provider_diagnostics_and_redacted_thinking_block() -> None:
+  headers = {
+    "Request-Id": "req_011CA",
+    "anthropic-ratelimit-requests-remaining": "49",
+    "anthropic-ratelimit-tokens-reset": "2026-10-23T00:00:00Z",
+    "retry-after": "3",
+    "content-type": "application/json",
+  }
+  events: list[object] = [
+    SimpleNamespace(
+      type="message_start",
+      message=SimpleNamespace(
+        id="msg_01ABC",
+        model="claude-opus-5",
+        usage=SimpleNamespace(input_tokens=10, output_tokens=1, service_tier="priority"),
+      ),
+    ),
+    SimpleNamespace(
+      type="content_block_start",
+      content_block=SimpleNamespace(type="redacted_thinking", data="EmwKAhgB"),
+    ),
+    SimpleNamespace(type="content_block_stop"),
+    SimpleNamespace(type="content_block_start", content_block=SimpleNamespace(type="thinking")),
+    SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="thinking_delta", thinking="Plan.")),
+    SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type="signature_delta", signature="sig")),
+    SimpleNamespace(type="content_block_stop"),
+    SimpleNamespace(type="message_delta", delta=SimpleNamespace(stop_reason="end_turn"), usage=None),
+  ]
+  stream = lambda **_kwargs: _DiagnosticStreamContext(events, headers)  # noqa: E731
+  client = SimpleNamespace(
+    messages=SimpleNamespace(stream=stream),
+    beta=SimpleNamespace(messages=SimpleNamespace(stream=stream)),
+  )
+
+  emitted = asyncio.run(
+    _collect_stream_events(AnthropicProvider(), client, {"model": "claude-opus-5", "messages": []})
+  )
+
+  message_start = next(event for event in emitted if event.type == "message_start")
+  assert message_start.provider_response_id == "msg_01ABC"
+  assert message_start.provider_request_id == "req_011CA"
+  assert message_start.service_tier == "priority"
+  assert message_start.rate_limit == {
+    "anthropic-ratelimit-requests-remaining": "49",
+    "anthropic-ratelimit-tokens-reset": "2026-10-23T00:00:00Z",
+    "retry-after": "3",
+  }
+  thinking_ends = [event for event in emitted if event.type == "thinking_end"]
+  assert thinking_ends[0].thinking_text == ""
+  assert thinking_ends[0].raw_block == {"type": "redacted_thinking", "data": "EmwKAhgB"}
+  assert thinking_ends[1].raw_block == {"type": "thinking", "thinking": "Plan.", "signature": "sig"}
+  message_end = emitted[-1]
+  assert message_end.type == "message_end"
+  assert message_end.provider_response_id == "msg_01ABC"
+  assert message_end.service_tier == "priority"
+
+
+def test_stream_without_diagnostic_headers_or_ids_carries_none() -> None:
+  client = _FakeStreamingClient([
+    SimpleNamespace(type="message_start", message=SimpleNamespace(model="claude-opus-5", usage=None)),
+  ])
+
+  emitted = asyncio.run(
+    _collect_stream_events(AnthropicProvider(), client, {"model": "claude-opus-5", "messages": []})
+  )
+
+  message_start = emitted[0]
+  assert message_start.provider_response_id is None
+  assert message_start.provider_request_id is None
+  assert message_start.service_tier is None
+  assert message_start.rate_limit is None
+
+
+def test_normalize_messages_replays_redacted_thinking_only_to_its_own_model() -> None:
+  provider = AnthropicProvider()
+  info = _model_info()
+  block = {"type": "redacted_thinking", "data": "EmwKAhgB"}
+
+  def replay(model: str) -> list[dict[str, object]]:
+    normalized = provider.normalize_messages(
+      [
+        {"role": "user", "content": "q"},
+        {
+          "role": "assistant",
+          "content": [dict(block), {"type": "text", "text": "a"}],
+          "provider": "anthropic",
+          "model": model,
+        },
+        {"role": "user", "content": "next"},
+      ],
+      info,
+    )
+    return normalized[1]["content"]
+
+  assert replay(info.id) == [block, {"type": "text", "text": "a"}]
+  assert replay("claude-haiku-4-5") == [{"type": "text", "text": "a"}]
+
+
 def test_normalize_messages_drops_orphan_tool_result_message() -> None:
   provider = AnthropicProvider()
   messages = [

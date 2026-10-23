@@ -53,6 +53,7 @@ from .anthropic_helpers import (
   _to_plain_dict as _to_plain_dict,
   _truncate_error_detail as _truncate_error_detail,
 )
+from .response_diagnostics import response_diagnostics
 from . import anthropic_quota
 from .anthropic_oauth import (
   ANTHROPIC_DEPLOYMENT_API_KEY_FIELD,
@@ -1378,6 +1379,13 @@ class AnthropicProvider(ModelProvider):
               })
             continue
 
+          if block_type == "redacted_thinking":
+            # Encrypted and bound to the model that produced it: replayed
+            # verbatim to that model, and with no narrative to hand off otherwise.
+            if is_same_model:
+              next_content.append(dict(block))
+            continue
+
           if block_type in {"tool_use", "server_tool_use"}:
             next_block = dict(block)
             if not is_same_model:
@@ -1582,6 +1590,10 @@ class AnthropicProvider(ModelProvider):
     reported_provider_unit_deltas: dict[str, int] = {}
     request_prompt_usage: dict[str, int] = {}
     request_has_iterations = False
+    provider_response_id: str | None = None
+    service_tier: str | None = None
+    provider_request_id: str | None = None
+    rate_limit: dict[str, str] | None = None
 
     try:
       if use_compaction or use_structured_outputs:
@@ -1597,9 +1609,9 @@ class AnthropicProvider(ModelProvider):
         stream_cm = client.messages.stream(**stream_params)
 
       async with stream_cm as stream_obj:
-        _ingest_rate_limit_headers(
-          binding, getattr(getattr(stream_obj, "response", None), "headers", None),
-        )
+        response_headers = getattr(getattr(stream_obj, "response", None), "headers", None)
+        _ingest_rate_limit_headers(binding, response_headers)
+        provider_request_id, rate_limit = response_diagnostics(response_headers)
         async for event in stream_obj:
           event_type = getattr(event, "type", None)
 
@@ -1622,9 +1634,15 @@ class AnthropicProvider(ModelProvider):
               ),
               "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", 0) if usage is not None else 0,
             }
+            provider_response_id = str(getattr(message, "id", "") or "").strip() or None
+            service_tier = str(getattr(usage, "service_tier", "") or "").strip() or None
             yield StreamEvent(
               type="message_start",
               provider_reported_model=reported_model,
+              provider_response_id=provider_response_id,
+              provider_request_id=provider_request_id,
+              service_tier=service_tier,
+              rate_limit=rate_limit,
               input_tokens=message_start_usage["input_tokens"],
               output_tokens=getattr(usage, "output_tokens", 0) if usage is not None else 0,
               cache_creation_tokens=message_start_usage["cache_creation_input_tokens"],
@@ -1658,6 +1676,15 @@ class AnthropicProvider(ModelProvider):
               current_thinking = ""
               current_signature = ""
               yield StreamEvent(type="stream_progress")
+            elif block_type == "redacted_thinking":
+              # Opaque but replayable: Anthropic needs the block back verbatim
+              # on the next turn, and it is complete at start (no deltas).
+              current_block_type = None
+              yield StreamEvent(
+                type="thinking_end",
+                thinking_text="",
+                raw_block={"type": "redacted_thinking", "data": getattr(block, "data", "")},
+              )
             elif block_type == "text":
               current_block_type = "text"
               current_text = ""
@@ -1824,6 +1851,8 @@ class AnthropicProvider(ModelProvider):
     _record_stream_success(binding)
     yield StreamEvent(
       type="message_end",
+      provider_response_id=provider_response_id,
+      service_tier=service_tier,
       stop_reason=stop_reason,
       stop_details=stop_details,
       request_input_tokens=(

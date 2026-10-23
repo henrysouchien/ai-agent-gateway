@@ -23,6 +23,21 @@ USAGE_TOKEN_KEYS = (
   "cache_creation_input_tokens",
 )
 
+# Per-call provider diagnostics (providers/base.py StreamEvent). Point values:
+# the stream turn clears them before each attempt, so a turn's delta carries
+# only what that turn's provider call reported.
+PROVIDER_DIAGNOSTIC_KEYS = (
+  "provider_response_id",
+  "provider_request_id",
+  "service_tier",
+  "rate_limit",
+)
+# Summed within a run like the token counters, so usage_delta reports the turn's share.
+THINKING_COUNT_KEYS = (
+  "thinking_chars",
+  "redacted_thinking_blocks",
+)
+
 
 @dataclass(frozen=True)
 class UsageDeltaState:
@@ -49,6 +64,8 @@ def usage_snapshot(usage_totals: Dict[str, Any]) -> Dict[str, Any]:
     snapshot["provider_unit_deltas"] = dict(
       usage_totals.get("provider_unit_deltas") or {}
     )
+  if isinstance(snapshot.get("rate_limit"), dict):
+    snapshot["rate_limit"] = dict(snapshot["rate_limit"])
   return snapshot
 
 
@@ -71,6 +88,10 @@ def usage_delta(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]
     for key, value in after_units.items()
     if int(value or 0) > int(before_units.get(key, 0) or 0)
   }
+  # Real journal check (cli_analyst agentsess_sess_d2f7e6094bdd4e969e89ac96517b0b84_henry.jsonl,
+  # 2026-10-22 isolated gateway): its 273 assistant_message events carry exactly the token keys,
+  # provider_unit_deltas, capability_bind, provider_reported_model and estimated_cost; the
+  # diagnostics keys below ride this same last-write path into assistant_message.usage.
   for key in (
     "capability_bind",
     "provider_reported_model",
@@ -78,6 +99,14 @@ def usage_delta(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]
     value = after.get(key)
     if value is not None:
       delta[key] = value
+  for key in PROVIDER_DIAGNOSTIC_KEYS:
+    value = after.get(key)
+    if value is not None:
+      delta[key] = dict(value) if isinstance(value, dict) else value
+  for key in THINKING_COUNT_KEYS:
+    count = int(after.get(key, 0) or 0) - int(before.get(key, 0) or 0)
+    if count > 0:
+      delta[key] = count
   wait_ms = (
     int(after.get("provider_wait_ms", 0) or 0)
     - int(before.get("provider_wait_ms", 0) or 0)
@@ -154,6 +183,50 @@ def apply_usage_update(
   return usage_totals
 
 
+def apply_provider_diagnostics(usage_totals: Dict[str, Any], event: Any) -> None:
+  """Record the ids, tier and rate-limit headers a message_start/message_end carries.
+
+  Point values: a later event in the same call overwrites an earlier one.
+  """
+  for key in ("provider_response_id", "provider_request_id", "service_tier"):
+    value = getattr(event, key, None)
+    if value is not None:
+      usage_totals[key] = value
+  rate_limit = getattr(event, "rate_limit", None)
+  if rate_limit:
+    usage_totals["rate_limit"] = dict(rate_limit)
+
+
+def apply_thinking_event(
+  usage_totals: Dict[str, Any], event: Any, streamed_block_chars: int,
+) -> int:
+  """Count a thinking_delta/thinking_end event into thinking_chars and
+  redacted_thinking_blocks; returns the running char count of the open block.
+
+  A provider that sends only the final block never streams deltas, so
+  ``thinking_end`` reconciles to the raw block's text length.
+  """
+  if event.type == "thinking_delta":
+    chars = len(str(event.thinking_text or ""))
+    usage_totals["thinking_chars"] = int(usage_totals.get("thinking_chars", 0) or 0) + chars
+    return streamed_block_chars + chars
+  block = event.raw_block if isinstance(event.raw_block, dict) else None
+  block_text = block.get("thinking") if block is not None else None
+  final_chars = max(
+    len(block_text) if isinstance(block_text, str) else 0,
+    len(str(event.thinking_text or "")),
+  )
+  if final_chars > streamed_block_chars:
+    usage_totals["thinking_chars"] = (
+      int(usage_totals.get("thinking_chars", 0) or 0) + final_chars - streamed_block_chars
+    )
+  if block is not None and block.get("type") == "redacted_thinking":
+    usage_totals["redacted_thinking_blocks"] = (
+      int(usage_totals.get("redacted_thinking_blocks", 0) or 0) + 1
+    )
+  return 0
+
+
 def turn_usage_payload(
   usage_totals: Dict[str, Any],
   *,
@@ -194,6 +267,10 @@ _UNPRICED_ROUTES = frozenset({
   "ollama.daemon_cloud",
   "ollama.cloud",
 })
+
+
+def _optional_text(value: Any) -> str | None:
+  return str(value) if value is not None else None
 
 
 def build_usage_event(
@@ -253,6 +330,10 @@ def build_usage_event(
     provider_unit_deltas=dict(usage_totals.get("provider_unit_deltas") or {}) or None,
     cache_read_tokens=int(usage_totals["cache_read_input_tokens"]),
     cache_creation_tokens=int(usage_totals["cache_creation_input_tokens"]),
+    provider_response_id=_optional_text(usage_totals.get("provider_response_id")),
+    provider_request_id=_optional_text(usage_totals.get("provider_request_id")),
+    service_tier=_optional_text(usage_totals.get("service_tier")),
+    thinking_chars=int(usage_totals.get("thinking_chars", 0) or 0),
     cost_usd=float(cost_total),
     rate_table_version=rate_table_version,
     billing_mode=billing_mode,

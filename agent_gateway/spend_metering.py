@@ -58,6 +58,8 @@ from .auth import (
 from .providers.base import StreamEvent, _status_code_from_exception
 from .runner_usage import (
   apply_message_start_usage,
+  apply_provider_diagnostics,
+  apply_thinking_event,
   apply_usage_update,
   empty_usage_totals,
   estimate_usage_cost,
@@ -338,6 +340,8 @@ class ProviderCallMeter:
     ended = False
     failure: BaseException | None = None
     reported_model: str | None = None
+    stop_reason = ""
+    thinking_block_chars = 0
     try:
       async for event in provider.stream(client, params):
         if not isinstance(event, StreamEvent):
@@ -355,6 +359,7 @@ class ProviderCallMeter:
             provider_unit_deltas=event.provider_unit_deltas,
             provider_wait_ms=event.provider_wait_ms,
           )
+          apply_provider_diagnostics(totals, event)
           if event.provider_reported_model is not None:
             reported_model = event.provider_reported_model
         elif event_type == "usage_update":
@@ -370,6 +375,10 @@ class ProviderCallMeter:
           )
         elif event_type == "message_end":
           ended = True
+          stop_reason = str(event.stop_reason or "")
+          apply_provider_diagnostics(totals, event)
+        elif event_type in ("thinking_delta", "thinking_end"):
+          thinking_block_chars = apply_thinking_event(totals, event, thinking_block_chars)
         yield event
     except BaseException as exc:
       # A consumer that cancels or closes after the provider's own end marker
@@ -378,7 +387,9 @@ class ProviderCallMeter:
       failure = None if closed_after_end else exc
       raise
     finally:
-      self._record_stream(totals, started=started, failure=failure, reported_model=reported_model)
+      self._record_stream(
+        totals, started=started, failure=failure, reported_model=reported_model, stop_reason=stop_reason,
+      )
 
   def _record_stream(
     self,
@@ -387,6 +398,7 @@ class ProviderCallMeter:
     started: float,
     failure: BaseException | None,
     reported_model: str | None,
+    stop_reason: str,
   ) -> None:
     try:
       tokens = {
@@ -407,6 +419,15 @@ class ProviderCallMeter:
         attrs["provider_unit_deltas"] = dict(units)
       if reported_model:
         attrs["provider_reported_model"] = reported_model
+      for key in ("provider_response_id", "provider_request_id", "service_tier"):
+        if totals.get(key) is not None:
+          attrs[key] = totals[key]
+      if stop_reason:
+        attrs["stop_reason"] = stop_reason
+      if totals.get("provider_wait_ms"):
+        attrs["provider_wait_ms"] = int(totals["provider_wait_ms"])
+      if totals.get("thinking_chars"):
+        attrs["thinking_chars"] = int(totals["thinking_chars"])
       self._record(
         tokens=tokens,
         status=status,
