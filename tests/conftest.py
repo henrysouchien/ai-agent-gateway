@@ -28,6 +28,32 @@ def _isolated_gateway_state(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _pin_ollama_daemon_absent():
+  """Every test sees the Ollama daemon absent, whatever runs on the host.
+
+  ``OllamaLocalProvider.has_active_credential`` is a live ``GET /api/version`` probe
+  cached per base for the process lifetime; the loopback origin is seeded absent (the
+  repo-root ``conftest.py`` does the same for a root-collected run). A test whose subject
+  needs a present daemon requests ``ollama_daemon_present``. The probe's own tests
+  (``test_ollama_local_presence.py``) reset the cache and probe through their fake transports.
+  """
+  from agent_gateway.providers import ollama as ollama_provider
+
+  ollama_provider._reset_presence_cache()
+  ollama_provider._presence_cache[ollama_provider._DAEMON_ORIGIN] = False
+  yield
+  ollama_provider._reset_presence_cache()
+
+
+@pytest.fixture
+def ollama_daemon_present():
+  """Opt in: the loopback Ollama daemon answers its presence probe."""
+  from agent_gateway.providers import ollama as ollama_provider
+
+  ollama_provider._presence_cache[ollama_provider._DAEMON_ORIGIN] = True
+
+
+@pytest.fixture(autouse=True)
 def _isolated_server_policy():
   from agent_gateway.policy_imports import configure_server_policy, load_server_policy_module
 

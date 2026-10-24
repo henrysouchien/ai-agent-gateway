@@ -81,6 +81,8 @@ def make_code_execute_tool_def(
           "description": (
             "Compute timeout in milliseconds. On docker/kernel hosts, time the cell's own thread spends "
             "blocked on hank calls does not count; the result reports it as host_wait_ms beside compute_ms. "
+            "A cell queued behind another cell on the sticky kernel waits at most this long, then returns "
+            "error.code kernel_busy naming the holder in error.held_by. "
             f"Subprocess bounds total wall time. Default: {config.default_timeout_ms}."
           ),
         },

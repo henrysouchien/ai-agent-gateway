@@ -7,16 +7,21 @@ limit. This module is the only reader of the operator file (``~/.config/hank/run
 path override ``HANK_RUN_SETTINGS_PATH``) and the only writer of it (``set_operator_setting``,
 reached by ``scripts/hank_settings.py set``). Every ``load_run_settings()`` re-stats the file
 (``operator_settings.StampCache``), so a change is in force at the next read of a running
-process. ``pinned_run_settings`` is the fixed form: packaged defaults plus overrides, never the
-file. The file machinery is ``model_authority.operator_settings``, shared with
-``spend_settings``; a bound here is a measurement an operator sets, never a refusal of an
-artifact.
+process. Operator config inside the trust boundary is observed, never refused
+(``docs/engineering/fail-closed-local-guards.md``; ruled 2026-10-10): a file that is not a JSON
+object, an unknown key or an out-of-range value logs one warning per file change and that
+setting's packaged default applies, while every valid key in the same file still applies. Only
+the writer (``set_operator_setting``) and the fixed form (``pinned_run_settings``: packaged
+defaults plus overrides, never the file) raise ``RunSettingsError``. The file machinery is
+``model_authority.operator_settings``, shared with ``spend_settings``; a bound here is a
+measurement an operator sets, never a refusal of an artifact.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import threading
 from dataclasses import asdict, dataclass
@@ -25,6 +30,8 @@ from types import MappingProxyType
 from typing import Any, Final, Mapping
 
 from model_authority import operator_settings
+
+logger = logging.getLogger(__name__)
 
 SETTINGS_PATH_ENV: Final = "HANK_RUN_SETTINGS_PATH"
 DEFAULT_SETTINGS_PATH: Final = "~/.config/hank/run-settings.json"
@@ -109,7 +116,10 @@ def _check(key: str, value: object) -> int | float | None:
   if spec.integer:
     valid = isinstance(value, int) and not isinstance(value, bool)
   else:
-    valid = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    try:
+      valid = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    except OverflowError:  # an int too large for a float is not a number this setting takes
+      valid = False
   if not valid or not isinstance(value, (int, float)):
     raise RunSettingsError(f"{key} must be {kind}{' or null' if spec.nullable else ''}, got {value!r}")
   if spec.minimum is not None and (value < spec.minimum or (spec.maximum is not None and value > spec.maximum)):
@@ -158,6 +168,19 @@ def settings_lock_path(environ: Mapping[str, str] | None = None) -> Path:
 
 
 _cache: operator_settings.StampCache[RunSettings] = operator_settings.StampCache()
+_warned_lock = threading.Lock()
+_warned: tuple[Path, str] | None = None
+
+
+def _warn_once(path: Path, message: str) -> None:
+  """One warning per distinct problem on a file (a read every turn would otherwise repeat it)."""
+
+  global _warned
+  with _warned_lock:
+    if _warned == (path, message):
+      return
+    _warned = (path, message)
+  logger.warning("run settings file %s: %s", path, message)
 
 
 def _merged_settings(overrides: dict[str, Any], path: Path) -> RunSettings:
@@ -168,11 +191,41 @@ def _merged_settings(overrides: dict[str, Any], path: Path) -> RunSettings:
     raise RunSettingsError(f"run settings file {path}: {exc}") from exc
 
 
-def load_run_settings() -> RunSettings:
-  """Packaged defaults deep-merged under the operator file; re-stat'ed (mtime_ns + size) every call."""
+def _observed_settings(overrides: dict[str, Any], path: Path) -> RunSettings:
+  """The file's valid keys over the packaged defaults; each invalid one is warned about and dropped."""
 
+  kept: dict[str, Any] = {}
+  for key, value in overrides.items():
+    if key not in _SPECS:
+      logger.warning("run settings file %s: unknown key %s ignored", path, key)
+      continue
+    try:
+      _check(key, value)
+    except RunSettingsError as exc:
+      logger.warning("run settings file %s: %s; the default applies", path, exc)
+      continue
+    kept[key] = value
+  return _parse(operator_settings.merge(_packaged_defaults(), kept))
+
+
+def load_run_settings() -> RunSettings:
+  """Packaged defaults under the operator file's valid keys; re-stat'ed (mtime_ns + size) every call.
+
+  Never raises for the file's content: an unreadable file or one that is not a JSON object is
+  warned about once per change and the packaged defaults apply until it is repaired.
+  """
+
+  global _warned
   path = settings_path()
-  return _cache.load(path, lambda raw: _merged_settings(raw, path), error=RunSettingsError, label=_LABEL)
+  try:
+    settings = _cache.load(path, lambda raw: _observed_settings(raw, path), error=RunSettingsError, label=_LABEL)
+  except RunSettingsError as exc:
+    _warn_once(path, f"{exc}; the packaged defaults apply")
+    return _parse(_packaged_defaults())
+  if _warned is not None and _warned[0] == path:
+    with _warned_lock:
+      _warned = None  # repaired; a later break of the same kind warns again
+  return settings
 
 
 def pinned_run_settings(**overrides: object) -> RunSettings:

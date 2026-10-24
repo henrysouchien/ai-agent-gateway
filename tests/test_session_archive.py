@@ -192,3 +192,25 @@ def test_archive_discovers_user_without_transcript(tmp_path: Path, archive_tree:
   result = _archive(archive_tree, tmp_path / "output")
   assert (result.output_dir / "session/analyst" / archive_tree["active"].name).is_file()
   assert not any("Ambiguous" in value for value in result.warnings)
+
+
+def test_archive_resolves_chat_logs_directly_under_gateway_log_dir(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, archive_tree: dict[str, Any],
+) -> None:
+  gateway_log_dir = tmp_path / "gateway-logs"
+  chat_logs = gateway_log_dir / "chat_logs"
+  session_id = archive_tree["session_id"]
+  _jsonl(chat_logs / f"{session_id}.jsonl", [{"role": "user", "content": "from gateway_log_dir"}])
+  _json(chat_logs / f"{session_id}.meta.json", {"user_id": "alice"})
+  monkeypatch.delenv("GATEWAY_CHAT_LOG_DIR", raising=False)
+  monkeypatch.setenv("GATEWAY_LOG_DIR", str(gateway_log_dir))
+  result = session_archive.archive_session(
+    session_id,
+    tmp_path / "output",
+    session_log_base=archive_tree["sessions"],
+    autonomous_log_dir=archive_tree["auto"],
+    surface_content_path=archive_tree["surface"],
+  )
+  assert (result.output_dir / "session" / f"{session_id}.jsonl").is_file()
+  assert (result.output_dir / "session" / f"{session_id}.meta.json").is_file()
+  assert not any("logs/chat_logs" in value for value in result.warnings)

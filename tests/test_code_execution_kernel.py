@@ -5,7 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 import pytest
 
@@ -169,6 +169,104 @@ def test_cancel_queued_cell_does_not_interrupt_or_wait_for_running_cell(tmp_path
       following = await backend.execute("print(saved)", str(tmp_path))
       assert following["stdout"] == "29\n" and following["return_code"] == 0
       assert backend.runtime.pid == pid
+
+  asyncio.run(run())
+
+
+def test_a_release_landing_while_the_queued_cell_gives_up_never_runs_it_unlocked(tmp_path: Path) -> None:
+  """A holder that releases exactly while the waiter's cancelled acquire settles.
+
+  The waiter never owned the kernel, so it is answered kernel_busy and its code
+  never reaches the interpreter, even though the holder field is already clear.
+  """
+
+  async def run() -> None:
+    async with _kernel() as backend:
+      state = backend.runtime
+
+      class ReleasingOnCancelLock(asyncio.Lock):
+        async def acquire(self) -> Literal[True]:
+          try:
+            return await super().acquire()
+          except asyncio.CancelledError:
+            if self.locked():  # the holder finishes in the waiter's cancellation window
+              state.holder = None
+              self.release()
+            raise
+
+      state.lock = ReleasingOnCancelLock()
+      await state.lock.acquire()
+      state.holder = "ce_holder"
+      marker = tmp_path / "waiter-ran"
+      queued = await backend.start(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n",
+        str(tmp_path), task_id="ce_waiter", timeout_ms=200,
+      )
+      result = await asyncio.wait_for(backend.collect(queued), timeout=5)
+      assert (result.get("error") or {}).get("code") == "kernel_busy", result
+      assert result["error"]["held_by"] == "ce_holder"
+      assert result["cancelled"] is True and result["compute_ms"] == 0
+      assert not marker.exists() and state.runner is None  # the interpreter never saw the cell
+      assert state.holder is None and not state.lock.locked()
+
+  asyncio.run(run())
+
+
+def test_cell_queued_behind_held_kernel_is_answered_kernel_busy_in_its_own_bound(tmp_path: Path) -> None:
+  async def run() -> None:
+    async with _kernel() as backend:
+      ready = asyncio.Event()
+      release_file = tmp_path / "release-holder"
+      holder = await backend.start(
+        "import time\nfrom pathlib import Path\nprint('ready', flush=True)\n"
+        f"while not Path({str(release_file)!r}).exists():\n    time.sleep(0.01)\n"
+        "saved = 31\nprint('finished')",
+        str(tmp_path), task_id="ce_holder", timeout_ms=30_000,
+        on_output=lambda stream, text: ready.set() if stream == "stdout" and "ready" in text else None,
+      )
+      await asyncio.wait_for(ready.wait(), timeout=5)
+      pid = backend.runtime.pid
+      try:
+        started = asyncio.get_running_loop().time()
+        queued = await backend.start("print('queued ran')", str(tmp_path), task_id="ce_waiter", timeout_ms=1000)
+        result = await asyncio.wait_for(backend.collect(queued), timeout=5)
+        elapsed = asyncio.get_running_loop().time() - started
+        assert 0.9 <= elapsed < 3
+        assert result["cancelled"] is True and result["timed_out"] is False
+        assert result["error"]["code"] == "kernel_busy" and result["error"]["held_by"] == "ce_holder"
+        assert "ce_holder" in result["error"]["message"]
+        assert result["host_wait_ms"] >= 900 and result["compute_ms"] == 0 and result["duration_ms"] >= 900
+        assert result["stdout"] == ""
+        assert (await backend.poll(holder))["status"] == "running"
+        assert backend.runtime.pid == pid
+      finally:
+        release_file.touch()
+        holder_result = await backend.collect(holder)
+      assert holder_result["return_code"] == 0 and not holder_result["cancelled"]
+      assert holder_result["stdout"] == "ready\nfinished\n"
+      following = await backend.execute("print(saved)", str(tmp_path))
+      assert following["stdout"] == "31\n" and "error" not in following
+      assert backend.runtime.holder is None and not backend.runtime.lock.locked()
+
+  asyncio.run(run())
+
+
+def test_cell_queued_behind_kernel_that_frees_within_its_bound_runs_normally(tmp_path: Path) -> None:
+  async def run() -> None:
+    async with _kernel() as backend:
+      ready = asyncio.Event()
+      holder = await backend.start(
+        "import time\nprint('ready', flush=True)\ntime.sleep(0.3)\nsaved = 37",
+        str(tmp_path), task_id="ce_holder", timeout_ms=30_000,
+        on_output=lambda stream, text: ready.set() if stream == "stdout" and "ready" in text else None,
+      )
+      await asyncio.wait_for(ready.wait(), timeout=5)
+      queued = await backend.start("print(saved)", str(tmp_path), task_id="ce_waiter", timeout_ms=10_000)
+      result = await asyncio.wait_for(backend.collect(queued), timeout=15)
+      assert result["return_code"] == 0 and result["stdout"] == "37\n"
+      assert not result["cancelled"] and "error" not in result
+      assert (await backend.collect(holder))["return_code"] == 0
+      assert backend.runtime.holder is None
 
   asyncio.run(run())
 

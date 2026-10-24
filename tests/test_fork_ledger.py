@@ -595,6 +595,11 @@ def test_cross_process_admissions_count_each_exactly_once(
     process.join(15)
     assert process.exitcode == 0
 
+  # A worker that could not reserve sends its exception as `error:<type>:<message>`
+  # (`_process_reserve_worker`); name it here instead of letting `sorted` raise a
+  # TypeError that hides which worker failed and why.
+  worker_errors = [result for result in results if isinstance(result, str)]
+  assert not worker_errors, f"reserve workers failed: {worker_errors}"
   assert sorted(results) == list(range(1, 13))
 
 

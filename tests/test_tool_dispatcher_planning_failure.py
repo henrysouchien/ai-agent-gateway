@@ -1,7 +1,7 @@
 # ruff: noqa: E402
 """An exact-write planner or a local tool that raises reaches the agent as its own error.
 
-HUBS 2026-10-06 (``docs/inbox/planned-write-planning-catch-all-hides-the-planner-error.md``):
+HUBS 2026-10-06 (``docs/archive/inbox/2026-10/planned-write-planning-catch-all-hides-the-planner-error.md``):
 ``fms_persist_forecast_assumption_set`` planning raised ``LineageContractError`` twice and
 the agent read only "could not produce a trusted exact-write plan", no field, no next call.
 HUBS run 2 (seq 46): its executor raised ``ForecastArtifactRepositoryError`` and the

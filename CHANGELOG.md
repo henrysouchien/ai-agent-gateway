@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.29.1 (2026-10-23)
+
+### Fixed
+
+- The run-settings file is observed, never refused (fail-closed-local-guards; ruled 2026-10-10): a file that is not a JSON object, an unknown key or an out-of-range value logs one warning per file change and that setting's packaged default applies while the file's valid keys still apply. 0.29.0 raised `RunSettingsError` at the next read, which failed every in-flight run on one typo in the machine-wide file. `set_operator_setting` (the writer) and `pinned_run_settings` still raise.
+
+### Added
+
+- Every provider call's diagnostics and thinking reach the durable turn record: `StreamEvent` gains `provider_response_id`, `provider_request_id`, `service_tier` and `rate_limit` (all nine adapters; `providers/response_diagnostics.py` reads the header families), Anthropic `redacted_thinking` blocks land in `content_blocks` and replay to their own model, and `assistant_message.usage` / `turn_complete.usage` carry the four diagnostics plus `thinking_chars` and `redacted_thinking_blocks`. `stream_complete.usage` adds `reasoning_tokens_observed`, `provider_wait_ms` and `thinking_chars`; the spend-row attrs add the ids, tier, `stop_reason`, wait and thinking count; `UsageEvent` and the completion record carry the same fields.
+- `TunnelEndpoint` single-frame response (`{"t": "resp", "id", "status", "headers", "b64"}`, `RESP_MAX_BODY_BYTES = 40_000`): when `single_frame_responses=True` is set or negotiated via `bootstrap` `tunnel_features: ["resp"]`, `_serve` sends non-SSE responses whose declared `content-length` and serialized frame fit `MAX_FRAME_CHARS` as one `"resp"` frame instead of `head` + `data` + `end`, raising the 200 frames/s pacer cap from 66.7 to 200 responses/s while keeping SSE and larger bodies streaming.
+
 ## 0.29.0 (2026-10-24)
 
 ### Changed

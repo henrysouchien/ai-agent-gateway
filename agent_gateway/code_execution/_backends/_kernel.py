@@ -179,6 +179,7 @@ class KernelState:
     self.runner: _KernelProcess | None = None
     self.cells: Dict[str, Dict[str, Any]] = {}
     self.closed = False
+    self.holder: str | None = None  # task id of the cell holding `lock`
 
   @property
   def process(self) -> asyncio.subprocess.Process | None:
@@ -320,21 +321,40 @@ class KernelBackend(ExecutionBackend):
     return handle
 
   @contextlib.asynccontextmanager
-  async def _cell_slot(self, interrupt: asyncio.Event) -> AsyncIterator[None]:
-    """A queued cell settles on cancellation without interrupting the lock owner."""
-    acquire_task = asyncio.create_task(self._state.lock.acquire())
+  async def _cell_slot(self, handle: ExecutionHandle, timeout_ms: int) -> AsyncIterator[tuple[bool, str | None]]:
+    """A queued cell settles on cancellation without interrupting the lock owner.
+
+    Waits for the kernel at most `timeout_ms`. Yields `(acquired, held_by)`:
+    `acquired` is read from the acquire task's own outcome, never from the
+    holder field, so a release that lands while the cancelled acquire settles
+    cannot let an unacquired cell run; `held_by` is the holder seen at the
+    bound, for the busy result only.
+    """
+    interrupt = handle._backend_data["interrupt"]
+    cell_id = handle._backend_data["task_id"] or handle.handle_id
+
+    async def acquire() -> None:
+      await self._state.lock.acquire()
+      self._state.holder = cell_id  # no await between acquire and record
+
+    acquire_task = asyncio.create_task(acquire())
     interrupt_task = asyncio.create_task(interrupt.wait())
     try:
-      await asyncio.wait({acquire_task, interrupt_task}, return_when=asyncio.FIRST_COMPLETED)
+      await asyncio.wait({acquire_task, interrupt_task}, timeout=timeout_ms / 1000, return_when=asyncio.FIRST_COMPLETED)
+      # The holder at the bound, read before the cancelled acquire settles (its
+      # release may land during that await).
+      held_by = self._state.holder if not acquire_task.done() else None
       if not acquire_task.done():
         acquire_task.cancel()
         await asyncio.gather(acquire_task, return_exceptions=True)
-      yield
+      acquired = acquire_task.done() and not acquire_task.cancelled() and acquire_task.exception() is None
+      yield acquired, (held_by if not acquired and not interrupt.is_set() else None)
     finally:
       acquire_task.cancel()
       interrupt_task.cancel()
       await asyncio.gather(acquire_task, interrupt_task, return_exceptions=True)
-      if not acquire_task.cancelled() and acquire_task.exception() is None:
+      if acquire_task.done() and not acquire_task.cancelled() and acquire_task.exception() is None:
+        self._state.holder = None
         self._state.lock.release()
 
   async def _cell(
@@ -343,7 +363,19 @@ class KernelBackend(ExecutionBackend):
   ) -> Dict[str, Any]:
     data = handle._backend_data
     started_at = time.monotonic()
-    async with self._cell_slot(data["interrupt"]):
+    async with self._cell_slot(handle, timeout_ms) as (acquired, held_by):
+      if not acquired and not (self._state.closed or data["interrupt"].is_set()):
+        # Never run unlocked: a bound that passed, or a release that landed only
+        # after the cancelled acquire settled, both answer kernel_busy.
+        waited_ms = int((time.monotonic() - started_at) * 1000)
+        return {
+          "stdout": "", "stderr": "", "stdout_tail": "", "images": [], "displays": [],
+          "return_code": 130, "cancelled": True, "timed_out": False, "truncated": False,
+          "error": {
+            "code": "kernel_busy", "message": f"the session kernel is held by cell {held_by}", "held_by": held_by,
+          },
+          "host_wait_ms": waited_ms, "compute_ms": 0, "duration_ms": waited_ms,
+        }
       if self._state.closed or data["interrupt"].is_set():
         return {
           "stdout": "", "stderr": "", "stdout_tail": "", "images": [], "displays": [],

@@ -13,6 +13,7 @@ Frames (``id`` is unique per originating side; the edge uses even ids, the
 runtime odd ids, so the two sides never collide):
 
   {"t": "req",  "id": n, "method": str, "path": str, "headers": [[k, v]], "body": b64}
+  {"t": "resp", "id": n, "status": int, "headers": [[k, v]], "b64": str}
   {"t": "head", "id": n, "status": int, "headers": [[k, v]]}
   {"t": "data", "id": n, "b64": str}
   {"t": "end",  "id": n}
@@ -20,7 +21,10 @@ runtime odd ids, so the two sides never collide):
   {"t": "control", "kind": str, "body": {...}}   # bootstrap / credentials / ready
   {"t": "frag", "last": bool, "s": str}          # consecutive pieces of one larger frame
 
-A request body travels whole; a response streams (SSE stays incremental).
+A request body travels whole; a response streams (SSE stays incremental) or,
+when negotiated via ``bootstrap`` ``tunnel_features: ["resp"]`` (or enabled on
+the endpoint), travels as one ``resp`` frame when its declared non-SSE body fits
+inside one frame.
 """
 from __future__ import annotations
 
@@ -40,6 +44,7 @@ Headers = list[tuple[str, str]]
 # JSON, so characters are bytes.
 MAX_FRAME_CHARS = 60_000
 MAX_FRAMES_PER_SECOND = 200
+RESP_MAX_BODY_BYTES = 40_000
 
 
 @dataclass(frozen=True)
@@ -81,6 +86,7 @@ class TunnelEndpoint:
   def __init__(
     self, *, send: Callable[[str], Awaitable[None]], handler: Handler | None,
     on_control: ControlHandler | None = None, odd_ids: bool,
+    single_frame_responses: bool = False,
   ) -> None:
     self._send_text = send
     self._handler = handler
@@ -92,6 +98,7 @@ class TunnelEndpoint:
     self._closed: BaseException | None = None
     self._fragments: list[str] = []
     self._sent_at: collections.deque[float] = collections.deque()
+    self.single_frame_responses = bool(single_frame_responses)
 
   async def _paced_send(self, text: str, started: asyncio.Event | None = None) -> None:
     # AgentCore closes a session WebSocket that exceeds its frame rate.
@@ -189,11 +196,28 @@ class TunnelEndpoint:
       task.add_done_callback(self._tasks.discard)
       return
     if kind == "control":
+      body = dict(frame.get("body") or {})
+      features = body.get("tunnel_features")
+      if (
+        frame.get("kind") == "bootstrap"
+        and isinstance(features, Sequence)
+        and not isinstance(features, (str, bytes))
+        and "resp" in features
+      ):
+        self.single_frame_responses = True
       if self._on_control is not None:
-        await self._on_control(str(frame.get("kind")), dict(frame.get("body") or {}))
+        await self._on_control(str(frame.get("kind")), body)
       return
     pending = self._pending.get(int(frame.get("id", 0)))
     if pending is None:
+      return
+    if kind == "resp":
+      if not pending.head.done():
+        pending.head.set_result((int(frame["status"]), _pairs(frame.get("headers"))))
+      body_bytes = base64.b64decode(frame.get("b64") or "")
+      if body_bytes:
+        pending.chunks.put_nowait(body_bytes)
+      pending.chunks.put_nowait(None)
       return
     if kind == "head":
       if not pending.head.done():
@@ -217,6 +241,8 @@ class TunnelEndpoint:
         method=str(frame["method"]), path=str(frame["path"]),
         headers=_pairs(frame.get("headers")), body=base64.b64decode(frame.get("body") or ""),
       ))
+      if self.single_frame_responses and await self._send_resp(request_id, response):
+        return
       await self._send({
         "t": "head", "id": request_id, "status": response.status,
         "headers": [list(pair) for pair in response.headers],
@@ -232,6 +258,53 @@ class TunnelEndpoint:
         await self._send({"t": "fail", "id": request_id, "error": type(exc).__name__})
       except TunnelClosed:
         return
+
+  async def _send_resp(self, request_id: int, response: TunnelResponse) -> bool:
+    if any(
+      k.lower() == "content-type" and v.split(";", 1)[0].strip().lower() == "text/event-stream"
+      for k, v in response.headers
+    ):
+      return False
+    length = next((v.strip() for k, v in response.headers if k.lower() == "content-length"), None)
+    if length is None or not length.isdigit() or int(length) > RESP_MAX_BODY_BYTES:
+      return False
+    chunks: list[bytes] = []
+    total = 0
+    it = response.body.__aiter__()
+    async for chunk in it:
+      if not chunk:
+        continue
+      chunks.append(chunk)
+      total += len(chunk)
+      if total > RESP_MAX_BODY_BYTES:
+        await self._send({
+          "t": "head", "id": request_id, "status": response.status,
+          "headers": [list(pair) for pair in response.headers],
+        })
+        for part in chunks:
+          await self._send({"t": "data", "id": request_id, "b64": base64.b64encode(part).decode("ascii")})
+        async for rest in it:
+          if rest:
+            await self._send({"t": "data", "id": request_id, "b64": base64.b64encode(rest).decode("ascii")})
+        await self._send({"t": "end", "id": request_id})
+        return True
+    body = b"".join(chunks)
+    frame = {
+      "t": "resp", "id": request_id, "status": response.status,
+      "headers": [list(pair) for pair in response.headers],
+      "b64": base64.b64encode(body).decode("ascii"),
+    }
+    if len(json.dumps(frame, separators=(",", ":"))) > MAX_FRAME_CHARS:
+      await self._send({
+        "t": "head", "id": request_id, "status": response.status,
+        "headers": [list(pair) for pair in response.headers],
+      })
+      if body:
+        await self._send({"t": "data", "id": request_id, "b64": frame["b64"]})
+      await self._send({"t": "end", "id": request_id})
+      return True
+    await self._send(frame)
+    return True
 
   def close(self, reason: BaseException | None = None) -> None:
     """Fail every in-flight request; the socket is gone."""

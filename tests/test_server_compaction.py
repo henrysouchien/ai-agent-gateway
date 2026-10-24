@@ -667,6 +667,7 @@ def test_server_compaction_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize("rendered", [False, True])
 def test_portable_summary_inherits_packaged_parent_execution_whole(
   monkeypatch: pytest.MonkeyPatch,
+  request: pytest.FixtureRequest,
   model_key: str,
   effort: CapabilityEffort,
   principal,
@@ -674,6 +675,9 @@ def test_portable_summary_inherits_packaged_parent_execution_whole(
   rendered: bool,
 ) -> None:
   entry = INITIAL_MODEL_REGISTRY.require(model_key)
+  if entry.provider == "ollama":
+    # An ollama model's credential is the loopback daemon's presence; this test is about inheritance.
+    request.getfixturevalue("ollama_daemon_present")
   handle = CredentialHandle(
     handle_id=f"compact-test:{principal}:{entry.provider}",
     provider=entry.provider,

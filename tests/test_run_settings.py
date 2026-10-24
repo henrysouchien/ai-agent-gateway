@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -151,10 +152,52 @@ def test_soft_turn_threshold_by_kind(operator_file: Path) -> None:
   assert pinned_run_settings(writer_soft_turn_budget=2).soft_turn_threshold("writer") == 2
 
 
-@pytest.mark.parametrize("content", ["{not json", "[1, 2]", '{"unknown_bound": 1}', '{"max_spawn_depth": "deep"}'])
-def test_a_bad_operator_file_raises_at_the_next_read(operator_file: Path, content: str) -> None:
+@pytest.mark.parametrize(
+  ("content", "expected_depth", "expected_pct"),
+  [
+    ("{not json", 2, 80),                                   # not JSON: every default
+    ("[1, 2]", 2, 80),                                      # not an object: every default
+    ('{"unknown_bound": 1, "max_spawn_depth": 5}', 5, 80),  # unknown key dropped, valid key applies
+    ('{"max_spawn_depth": "deep", "context_warning_pct": 90}', 2, 90),  # bad value keeps ITS default
+    ('{"context_warning_pct": 500}', 2, 80),                # out of range keeps its default
+  ],
+)
+def test_a_bad_operator_file_is_observed_never_refused(
+  operator_file: Path, content: str, expected_depth: int, expected_pct: int, caplog: pytest.LogCaptureFixture,
+) -> None:
+  # Operator config inside the trust boundary is observed, never refused (ruled 2026-10-10):
+  # the run keeps going on the packaged default for the bad setting, with one warning per
+  # file change, and the writer is the only place a bad value is rejected.
   operator_file.parent.mkdir(parents=True)
   operator_file.write_text(content)
 
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.run_settings"):
+    first = load_run_settings()
+    second = load_run_settings()
+  assert first.max_spawn_depth == expected_depth
+  assert first.context_warning_pct == expected_pct
+  assert second == first
+  warnings = [rec for rec in caplog.records if "run settings file" in rec.getMessage()]
+  assert len(warnings) == 1, [rec.getMessage() for rec in warnings]
+  assert str(operator_file) in warnings[0].getMessage()
+
+
+def test_an_int_too_large_for_a_float_setting_is_observed_not_raised(
+  operator_file: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+  operator_file.parent.mkdir(parents=True)
+  operator_file.write_text(json.dumps({"child_silence_timeout_seconds": 10 ** 400, "max_spawn_depth": 3}))
+
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.run_settings"):
+    settings = load_run_settings()
+  assert settings.child_silence_timeout_seconds == 600.0
+  assert settings.max_spawn_depth == 3
+  assert any("child_silence_timeout_seconds" in rec.getMessage() for rec in caplog.records)
   with pytest.raises(RunSettingsError):
-    load_run_settings()
+    set_operator_setting("child_silence_timeout_seconds", 10 ** 400)
+
+
+def test_the_writer_still_rejects_a_bad_value(operator_file: Path) -> None:
+  with pytest.raises(RunSettingsError):
+    set_operator_setting("context_warning_pct", 500)
+  assert not operator_file.exists()

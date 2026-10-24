@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import math
 import sys
 import time
@@ -23,7 +24,7 @@ from agent_gateway.child_environment import (  # noqa: E402
 )
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 from agent_gateway.event_log import EventLog  # noqa: E402
-from agent_gateway.run_settings import SETTINGS_PATH_ENV, RunSettingsError  # noqa: E402
+from agent_gateway.run_settings import SETTINGS_PATH_ENV  # noqa: E402
 from agent_gateway.runner import AgentRunner, StreamTurnResult  # noqa: E402
 from agent_gateway.runner_soft_budget import SoftBudgetLadder  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
@@ -104,12 +105,22 @@ def test_soft_turn_threshold_is_keyed_by_kind(settings_file: Path) -> None:
   assert settings.soft_turn_threshold("fork") == 4
 
 
-def test_a_malformed_file_raises_on_read(settings_file: Path) -> None:
+def test_a_malformed_file_is_observed_not_refused(
+  settings_file: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
   settings = ContainmentSettings()
-  settings_file.write_text("{not json")
+  settings_file.write_text(json.dumps({"max_spawn_depth": 5}))
+  assert settings.max_spawn_depth == 5
 
-  with pytest.raises(RunSettingsError):
-    settings.max_spawn_depth
+  settings_file.write_text("{not json")
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.run_settings"):
+    assert settings.max_spawn_depth == 2  # the packaged default, not a refusal
+    assert settings.max_spawn_depth == 2
+  assert sum("run settings file" in rec.getMessage() for rec in caplog.records) == 1
+
+  settings_file.write_text(json.dumps({"max_spawn_depth": 5, "context_warning_pct": 500, "no_such_key": 1}))
+  assert settings.max_spawn_depth == 5  # the valid key applies
+  assert settings.context_warning_pct == 80  # the out-of-range one keeps its default
 
 
 def test_zero_child_silence_timeout_is_the_off_value() -> None:

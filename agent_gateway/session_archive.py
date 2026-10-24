@@ -36,7 +36,7 @@ def _configured_path(name: str, default: Path) -> Path:
 
 def _default_chat_dir() -> Path:
   # Precedence: records_root/state/logs/chat (selected by archive_session),
-  # GATEWAY_CHAT_LOG_DIR, GATEWAY_LOG_DIR/logs/chat_logs, then the production
+  # GATEWAY_CHAT_LOG_DIR, GATEWAY_LOG_DIR/chat_logs, then the production
   # data/gateway_logs/chat_logs convention below. Isolated launcher proof:
   # scripts/local_gateway_isolated.py:290 defines state/logs/chat; :1351 exports it.
   # Resolve offline without gateway_log_root's directory-creation side effects.
@@ -48,7 +48,7 @@ def _default_chat_dir() -> Path:
     return path
   log_root = os.environ.get("GATEWAY_LOG_DIR", "").strip()
   if log_root:
-    return Path(log_root).expanduser() / "logs/chat_logs"
+    return Path(log_root).expanduser() / "chat_logs"
   return Path.home() / ".local/state/hank/data/gateway_logs/chat_logs"
 
 

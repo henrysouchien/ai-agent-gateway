@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 
 from agent_gateway.runtime_tunnel import (
-  MAX_FRAME_CHARS, MAX_FRAMES_PER_SECOND, TunnelEndpoint, TunnelRequest, TunnelResponse,
+  MAX_FRAME_CHARS, MAX_FRAMES_PER_SECOND, RESP_MAX_BODY_BYTES,
+  TunnelEndpoint, TunnelRequest, TunnelResponse,
 )
-
 
 def test_large_bodies_and_many_chunks_cross_within_frame_limits() -> None:
   async def scenario() -> None:
@@ -111,4 +112,124 @@ def test_a_request_cancelled_before_its_first_frame_never_sends() -> None:
     while not wire.empty():
       await receiver.feed(wire.get_nowait())
     assert received == ["first", "after"]
+  asyncio.run(scenario())
+
+
+def test_single_frame_resp_negotiation_and_streaming_fallbacks() -> None:
+  async def scenario() -> None:
+    to_runtime: asyncio.Queue[str] = asyncio.Queue()
+    to_edge: asyncio.Queue[str] = asyncio.Queue()
+    runtime_frames: list[dict] = []
+
+    async def edge_send(text: str) -> None:
+      await to_runtime.put(text)
+
+    async def runtime_send(text: str) -> None:
+      runtime_frames.append(json.loads(text))
+      await to_edge.put(text)
+
+    async def handler(request: TunnelRequest) -> TunnelResponse:
+      if request.path == "/sse":
+        payload = b"data: hello\n\n"
+
+        async def sse_chunks():
+          yield payload
+
+        return TunnelResponse(
+          200,
+          [("content-type", "text/event-stream; charset=utf-8"), ("content-length", str(len(payload)))],
+          sse_chunks(),
+        )
+      if request.path == "/no-length":
+        async def unlengthed():
+          yield b'{"ok":true}'
+
+        return TunnelResponse(200, [("content-type", "application/json")], unlengthed())
+      if request.path == "/large":
+        big = b"x" * (RESP_MAX_BODY_BYTES + 1)
+
+        async def big_chunks():
+          yield big
+
+        return TunnelResponse(
+          200,
+          [("content-type", "application/json"), ("content-length", str(len(big)))],
+          big_chunks(),
+        )
+      if request.path == "/huge-headers":
+        medium = b"x" * 35_000
+
+        async def medium_chunks():
+          yield medium
+
+        return TunnelResponse(
+          200,
+          [
+            ("content-type", "application/json"),
+            ("content-length", str(len(medium))),
+            ("x-pad", "p" * 20_000),
+          ],
+          medium_chunks(),
+        )
+      body = b'{"status":"ok"}'
+
+      async def ok_chunks():
+        yield body
+
+      return TunnelResponse(
+        200,
+        [("content-type", "application/json"), ("content-length", str(len(body)))],
+        ok_chunks(),
+      )
+
+    edge = TunnelEndpoint(send=edge_send, handler=None, odd_ids=False)
+    runtime = TunnelEndpoint(send=runtime_send, handler=handler, odd_ids=True)
+
+    async def pump(queue: asyncio.Queue[str], endpoint: TunnelEndpoint) -> None:
+      while True:
+        await endpoint.feed(await queue.get())
+
+    pumps = [asyncio.create_task(pump(to_runtime, runtime)), asyncio.create_task(pump(to_edge, edge))]
+    try:
+      # Inert before negotiation: small JSON response uses head + data + end.
+      assert not runtime.single_frame_responses
+      resp0 = await edge.request("GET", "/api/health", [], b"")
+      assert b"".join([c async for c in resp0.body]) == b'{"status":"ok"}'
+      assert [f["t"] for f in runtime_frames] == ["head", "data", "end"]
+      runtime_frames.clear()
+
+      # Bootstrap control frame with tunnel_features: ["resp"] enables single-frame responses.
+      await edge.control("bootstrap", {"generation": 1, "tunnel_features": ["resp"]})
+      await asyncio.sleep(0)
+      assert runtime.single_frame_responses
+
+      # 100 back-to-back small JSON responses take 100 "resp" frames (no pacer sleep at 67).
+      loop = asyncio.get_running_loop()
+      started = loop.time()
+      for _ in range(100):
+        resp = await edge.request("GET", "/api/health", [], b"")
+        assert resp.status == 200
+        assert b"".join([c async for c in resp.body]) == b'{"status":"ok"}'
+      elapsed = loop.time() - started
+      assert [f["t"] for f in runtime_frames] == ["resp"] * 100
+      assert elapsed < 0.5
+      runtime_frames.clear()
+
+      # SSE, missing content-length, body > RESP_MAX_BODY_BYTES, and frame > MAX_FRAME_CHARS still stream.
+      for path, expected_len in (
+        ("/sse", len(b"data: hello\n\n")),
+        ("/no-length", len(b'{"ok":true}')),
+        ("/large", RESP_MAX_BODY_BYTES + 1),
+        ("/huge-headers", 35_000),
+      ):
+        resp = await edge.request("GET", path, [], b"")
+        body = b"".join([c async for c in resp.body])
+        assert len(body) == expected_len
+        types = [f["t"] for f in runtime_frames]
+        assert "resp" not in types
+        assert types[0] == "head" and types[-1] == "end"
+        runtime_frames.clear()
+    finally:
+      for task in pumps:
+        task.cancel()
   asyncio.run(scenario())

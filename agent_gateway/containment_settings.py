@@ -10,8 +10,9 @@ there.
 
 ``ContainmentSettings()`` is live: every attribute read resolves
 ``load_run_settings()`` (stamp-cached, one ``stat``), so a settings change is
-in force at the next read with no restart. A malformed operator file raises
-``RunSettingsError`` at that read. ``ContainmentSettings(**overrides)`` is
+in force at the next read with no restart. The file is observed, never refused:
+a malformed file, an unknown key or an out-of-range value is warned about and
+that setting's packaged default applies (``run_settings``). ``ContainmentSettings(**overrides)`` is
 pinned: the packaged defaults plus the overrides, resolved once, never reading
 the operator file (tests and callers that want a fixed bound use this form).
 

@@ -25,7 +25,7 @@ answers unbounded.
 
 The first two stages return a result; only the third ends the run. Threshold,
 final factor and grace come from ``ContainmentSettings`` (the run settings
-file, ``model_authority.run_settings``): the threshold is
+file, ``agent_gateway.run_settings``): the threshold is
 ``soft_turn_threshold(kind)``, keyed by run kind (``child_soft_turn_budget``
 for a ``run_agent``/skill child, ``fork_soft_turn_budget`` for a learning fork,
 ``writer_soft_turn_budget`` for the root writer session; nothing a run
