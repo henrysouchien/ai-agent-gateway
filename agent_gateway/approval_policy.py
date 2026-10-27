@@ -224,6 +224,7 @@ class RunContext:
   session_id: str | None = None
   run_id: str | None = None
   profile: str = "chat"
+  profile_name: str | None = None
   channel: str = "web"
   skill: str | None = None
   admitted_skill_execution_limits: SkillExecutionLimits | None = None

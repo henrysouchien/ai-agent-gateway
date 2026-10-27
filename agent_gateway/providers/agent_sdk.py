@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 from collections.abc import Set as AbstractSet
 
+from model_authority.registry import AdapterRouteSupport
 from .anthropic import AnthropicProvider
 from .base import CostEstimate
 from ..policy_imports import (
@@ -150,6 +151,19 @@ class AgentSDKConfig:
   request_id: str | None = None
 
 
+class AgentSDKProvider(AnthropicProvider):
+  """Installed capability adapter declaration for the Anthropic Agent SDK runner."""
+
+  @classmethod
+  def adapter_route_support(cls) -> AdapterRouteSupport:
+    return AdapterRouteSupport(
+      adapter="anthropic.agent_sdk",
+      provider="anthropic",
+      protocol_profiles=frozenset({"messages.standard", "messages.adaptive"}),
+      routes=frozenset({"anthropic.public"}),
+    )
+
+
 
 
 def _resolve_channel_tier(
@@ -212,6 +226,7 @@ def build_disallowed_tools(
   extra_blocked: set[str] | None = None,
   session: Any | None = None,
   available_tools: set[str] | None = None,
+  profile_name: Optional[str] = None,
 ) -> List[str]:
   tier = _resolve_channel_tier(channel, channel_tiers)
   allowed = set(SDK_SAFE_BUILTINS)
@@ -231,7 +246,10 @@ def build_disallowed_tools(
   if get_forbidden_tools_for_session is None or get_server_for_policy_tool is None:
     blocked.add("mcp__*")
   else:
-    for tool_name in get_forbidden_tools_for_session(session):
+    for tool_name in get_forbidden_tools_for_session(
+      session,
+      profile_name=profile_name,
+    ):
       server_name = get_server_for_policy_tool(tool_name)
       if server_name is None:
         blocked.add(tool_name)

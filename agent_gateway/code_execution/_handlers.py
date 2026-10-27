@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import tempfile
 import threading
@@ -22,11 +21,11 @@ from ..tool_dispatch_classification import (
 )
 from ..tool_dispatcher import ApprovalKeyQualifier, LocalToolHandler
 from ..tool_policy_registry import PreparedToolCall, ToolInputPreparationError
-from ._backends import DockerBackend, ExecutionBackend, SubprocessBackend
+from ._backends import DockerBackend, ExecutionBackend
 from ._backends._kernel import KernelBackend, KernelState
 from ._config import CodeExecutionConfig
 from ._frame_reader import (
-  ActivatableToolDefinitions, ActivateTool, CatalogMetadata, CodeCallable, FrameReader, SourceExtractor, SourceKey,
+  CatalogMetadata, CodeCallable, FrameReader, SourceExtractor, SourceKey,
 )
 from ._helpers import (
   _boolean_input, _host_wait_ms_input, _prepare_code_execute_env, _string_input, _timeout_ms_input, code_execute,
@@ -34,8 +33,6 @@ from ._helpers import (
 from ._hooks import strip_code_execute_base64_content, strip_code_execute_base64_hook
 from ._provenance import AGENT_CODE_EXECUTE_WORK_DIR_ENV, collect_native_computations
 from ._tool_defs import CODE_EXECUTE_TOOL_NAME, make_code_execute_tool_def
-
-log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -64,8 +61,6 @@ class CodeExecutionBundle:
     source_key: SourceKey | None = None,
     code_callable: CodeCallable | None = None,
     catalog_metadata: CatalogMetadata | None = None,
-    activatable_tool_definitions: ActivatableToolDefinitions | None = None,
-    activate_tool: ActivateTool | None = None,
   ) -> None:
     """Bind the dispatcher (and its tool catalog) that nested cell calls go through.
 
@@ -73,9 +68,6 @@ class CodeExecutionBundle:
     a cell keeps the binding it opened under.
     `tool_definitions` is the turn's grant and `code_callable(operation)` the
     product registration's decision for that exact route; a nested call needs both.
-    `activatable_tool_definitions` / `activate_tool` carry the product's
-    `load_tools`-activatable set and its activation mechanism for deferred
-    operations (see `FrameReader.bind_dispatcher`).
     `extract_sources(operation, result)` is the product's per-tool source-handle
     extractor; its handles for successful nested calls become the outer
     result's `sources`, alongside the canonical dispatch settlement's sources.
@@ -95,8 +87,6 @@ class CodeExecutionBundle:
       source_key=source_key,
       code_callable=code_callable,
       catalog_metadata=catalog_metadata,
-      activatable_tool_definitions=activatable_tool_definitions,
-      activate_tool=activate_tool,
       host_tools=host_tools,
     )
 
@@ -180,9 +170,10 @@ def build_code_execution(
 ) -> CodeExecutionBundle:
   """Create built-in code execution tools for a session.
 
-  `host=auto` prefers Docker, then a registered host kernel, then subprocess;
-  skipped backend reasons are logged and returned with the selected backend.
-  Reader, persistent interpreter states and work directory belong to the
+  The session runs one Python kernel, placed by `config.placement`: the local
+  kernel (`KernelBackend`) or the same kernel in a Docker container
+  (`DockerBackend`, with `config.readonly_mounts` mounted read-only).
+  Reader, persistent interpreter state and work directory belong to the
   session. Each bundle carries the current request's config.
 
   `job_runner()` answers the `AgentRunner` that owns this request's task
@@ -199,60 +190,20 @@ def build_code_execution(
       session.code_execution_kernels[name] = state
     return state
 
-  backends: Dict[str, ExecutionBackend] = {}
-  if cfg.register_subprocess:
-    backends["subprocess"] = SubprocessBackend(config=cfg)
-  if cfg.register_kernel:
-    backends["kernel"] = KernelBackend(config=cfg, state=_session_kernel("kernel"))
-  if cfg.register_docker:
-    backends["docker"] = DockerBackend(
-      image=cfg.docker_image or None, config=cfg, state=_session_kernel("docker"),
+  backend: ExecutionBackend
+  if cfg.placement == "docker":
+    backend = DockerBackend(
+      image=cfg.docker_image or None,
+      config=cfg,
+      state=_session_kernel("docker"),
+      readonly_mounts=cfg.readonly_mounts,
     )
+  else:
+    backend = KernelBackend(config=cfg, state=_session_kernel("kernel"))
 
-  # `host=auto` takes the first backend in this order that can run. Each walk
-  # records what it skipped and why, keyed by the backend it settled on, so the
-  # call that then runs there reports the degradation it was selected under
-  # (the handler receives only the resolved backend name).
-  auto_skipped: Dict[str, List[Dict[str, Any]]] = {}
-
-  def _get_backend(name: Optional[str] = None) -> ExecutionBackend:
-    if name:
-      backend = backends.get(name)
-      if backend is not None:
-        return backend
-      raise ValueError(f"Unknown backend: '{name}'. Available: {sorted(backends)}")
-    skipped: List[Dict[str, Any]] = []
-    for preferred in ("docker", "kernel", "subprocess"):
-      backend = backends.get(preferred)
-      if backend is None:
-        continue
-      reason = backend.unavailable_reason()
-      if reason is None:
-        if skipped:
-          log.warning(
-            "code_execute host=auto selected %s (sandboxed=%s); skipped %s",
-            backend.name,
-            backend.sandboxed,
-            "; ".join(f"{entry['backend']} (sandboxed={entry['sandboxed']}): {entry['reason']}" for entry in skipped),
-          )
-        auto_skipped[backend.name] = skipped
-        return backend
-      skipped.append({"backend": backend.name, "sandboxed": backend.sandboxed, "reason": reason})
-    raise RuntimeError(
-      "No execution backend available: "
-      + "; ".join(f"{entry['backend']}: {entry['reason']}" for entry in skipped)
-    )
-
-  def _backend_identity(host: str, backend: ExecutionBackend) -> Dict[str, Any]:
+  def _backend_identity() -> Dict[str, Any]:
     """What a code_execute result says about where it ran."""
-    return {
-      "backend": backend.name,
-      "sandboxed": backend.sandboxed,
-      "skipped_backends": list(auto_skipped.get(backend.name, ())) if host == "auto" else [],
-    }
-
-  def _get_registered_backend_names() -> list[str]:
-    return list(backends.keys())
+    return {"backend": backend.name, "sandboxed": backend.sandboxed}
 
   work_dir_lock = threading.Lock()
   if session.code_execution_frame_reader is None:
@@ -292,8 +243,8 @@ def build_code_execution(
     process = backend_data.get("process")
     return process is not None and getattr(process, "returncode", None) is not None
 
-  def _sandbox_work_dir_for_env(backend: ExecutionBackend, work_dir: str) -> str:
-    if backend.name == "docker":
+  def _sandbox_work_dir_for_env(work_dir: str) -> str:
+    if cfg.placement == "docker":
       return "/workspace"
     return work_dir
 
@@ -354,11 +305,10 @@ def build_code_execution(
   def _prepare_config_for_call(
     *,
     tool_ctx: Any | None,
-    backend: ExecutionBackend,
     work_dir: str,
   ) -> CodeExecutionConfig:
     telemetry_prepare_env = make_prepare_env_with_agent_telemetry(cfg.prepare_env, tool_ctx)
-    sandbox_work_dir = _sandbox_work_dir_for_env(backend, work_dir)
+    sandbox_work_dir = _sandbox_work_dir_for_env(work_dir)
 
     def _prepare_env(env: Dict[str, str]) -> Dict[str, str]:
       prepared = telemetry_prepare_env(env)
@@ -368,38 +318,25 @@ def build_code_execution(
     return replace(cfg, prepare_env=_prepare_env)
 
   async def _handle_code_execute(tool_input: Dict[str, Any], **kwargs: Any):
-    host, error = _string_input(tool_input, "host", default="auto")
-    if error is not None:
-      return None, error
-    assert host is not None
-    valid_hosts = {"auto"} | set(_get_registered_backend_names())
-    if host not in valid_hosts:
-      return None, {"code": "invalid_input", "message": f"Unknown host: '{host}'"}
-
     tool_ctx = kwargs.get("tool_ctx")
-    resolved_host = getattr(tool_ctx, "resolved_qualifier", "") if tool_ctx is not None else ""
-    if not resolved_host:
-      return None, {"code": "internal_error", "message": "Backend resolution failed"}
     # The outer call every nested `hank.call` of this cell is recorded under.
     outer_call_id = str(getattr(tool_ctx, "tool_call_id", "") or "")
 
     try:
-      backend = _get_backend(resolved_host)
       backend_available = backend.available()
-    except Exception:
+    except Exception as exc:
       return None, {
         "code": "backend_unavailable",
-        "message": f"Backend '{resolved_host}' unavailable",
+        "message": f"Backend '{backend.name}' unavailable: {type(exc).__name__}: {exc}; retry, or check the backend image/daemon",
       }
     if not backend_available:
-      return None, {"code": "backend_unavailable", "message": f"Backend '{resolved_host}' unavailable"}
+      return None, {
+        "code": "backend_unavailable",
+        "message": f"Backend '{backend.name}' unavailable; retry, or check the backend image/daemon",
+      }
 
     work_dir = _ensure_code_execution_work_dir()
-    per_call_config = _prepare_config_for_call(
-      tool_ctx=tool_ctx,
-      backend=backend,
-      work_dir=work_dir,
-    )
+    per_call_config = _prepare_config_for_call(tool_ctx=tool_ctx, work_dir=work_dir)
     background, error = _boolean_input(tool_input, "background", default=False)
     if error is not None:
       return None, error
@@ -425,11 +362,11 @@ def build_code_execution(
       if runner is None:
         return None, {
           "code": "code_execution_unavailable",
-          "message": "background cells need the session's job runner",
+          "message": "background cells need the session's job runner; none is bound here, so re-run this cell in the foreground with background=false",
         }
       env = _prepare_code_execute_env(per_call_config)
       task_id = f"ce_{os.urandom(4).hex()}"
-      identity = _backend_identity(host, backend)
+      identity = _backend_identity()
       job_redact = _output_redactor(tool_ctx)
       prepared_call = PreparedToolCall(dict(tool_input), backend.name)
       launched_at = time.time()
@@ -552,22 +489,13 @@ def build_code_execution(
     finally:
       await cell.aclose()
     if result is not None:
-      result.update(_backend_identity(host, backend))
+      result.update(_backend_identity())
       result.update(cell.summary())
       collect_native_computations(result)
     return _redact_execution_output(result, redact), error
 
   def _approval_qualifier(tool_name: str, tool_input: Dict[str, Any]) -> str:
-    if tool_name != "code_execute":
-      return ""
-    host, error = _string_input(tool_input, "host", default="auto")
-    if error is not None:
-      return ""
-    assert host is not None
-    try:
-      return _get_backend(host if host != "auto" else None).name
-    except (RuntimeError, ValueError):
-      return ""
+    return backend.name if tool_name == "code_execute" else ""
 
   def _prepare_call(raw_input: Dict[str, Any]) -> PreparedToolCall:
     if not isinstance(raw_input, dict):
@@ -576,16 +504,6 @@ def build_code_execution(
         "message": "code_execute input must be an object",
       })
     prepared = dict(raw_input)
-    host, error = _string_input(prepared, "host", default="auto")
-    if error is not None:
-      raise ToolInputPreparationError(error)
-    assert host is not None
-    valid_hosts = {"auto", *set(_get_registered_backend_names())}
-    if host not in valid_hosts:
-      raise ToolInputPreparationError({
-        "code": "invalid_input",
-        "message": f"Unknown host: '{host}'",
-      })
     _, error = _boolean_input(prepared, "background", default=False)
     if error is not None:
       raise ToolInputPreparationError(error)
@@ -603,38 +521,17 @@ def build_code_execution(
     _, error = _host_wait_ms_input(prepared, cfg)
     if error is not None:
       raise ToolInputPreparationError(error)
-    try:
-      backend = _get_backend(host if host != "auto" else None)
-    except Exception as exc:
-      raise ToolInputPreparationError({
-        "code": "invalid_input",
-        "message": "Code execution backend could not be resolved",
-      }) from exc
-    try:
-      backend_available = host == "auto" or backend.available()
-    except Exception as exc:
-      raise ToolInputPreparationError({
-        "code": "backend_unavailable",
-        "message": "Code execution backend availability could not be determined",
-      }) from exc
-    if not backend_available:
-      raise ToolInputPreparationError({
-        "code": "backend_unavailable",
-        "message": f"Backend '{backend.name}' unavailable",
-      })
     return PreparedToolCall(prepared, backend.name)
 
-  # No approval door on `code_execute` (it asked whenever the backend was
-  # unsandboxed): posture decides whether the subprocess backend is registered
-  # at all (`CodeExecutionConfig.register_subprocess`), so a registered
-  # backend runs without a card.
-  available_hosts = ("auto",) + tuple(_get_registered_backend_names())
+  # No approval door on `code_execute`: posture decides whether the local
+  # kernel or the Docker placement runs (`CodeExecutionConfig.placement`), so
+  # the session's one backend runs without a card.
   return CodeExecutionBundle(
     handlers={
       CODE_EXECUTE_TOOL_NAME: _handle_code_execute,
     },
     tool_definitions=[
-      make_code_execute_tool_def(cfg, available_hosts),
+      make_code_execute_tool_def(cfg),
     ],
     approval_qualifier=_approval_qualifier,
     sanitize_hook=strip_code_execute_base64_hook,

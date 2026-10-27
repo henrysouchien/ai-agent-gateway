@@ -475,6 +475,9 @@ def test_same_user_single_flight_and_different_users_isolate(monkeypatch):
 
 
 def test_spawn_env_contains_token_but_not_tier_one_key(monkeypatch):
+  from contextlib import asynccontextmanager
+  from mcp.types import ListToolsResult
+
   async def scenario():
     manager = _manager()
     captured = {}
@@ -483,19 +486,43 @@ def test_spawn_env_contains_token_but_not_tier_one_key(monkeypatch):
     async def mint(_user):
       return "tier-two", time.time() + 3600, "https://risk"
 
-    async def connect(_name, config):
-      captured.update(config["env"])
-      return _child("spawned")
+    @asynccontextmanager
+    async def stdio_client(server_params, errlog=None):
+      captured.update(server_params.env)
+      yield object(), object()
+
+    class Session:
+      def __init__(self, *_streams):
+        pass
+
+      async def __aenter__(self):
+        return self
+
+      async def __aexit__(self, *_exc):
+        return None
+
+      async def initialize(self):
+        return None
+
+      async def list_tools(self, *, params=None):
+        return ListToolsResult(tools=[])
 
     monkeypatch.setattr(manager, "_mint_gsheets_broker_session", mint)
-    monkeypatch.setattr(manager, "_connect_stdio_with_retries", connect)
-    await manager._spawn_per_user_server("gsheets-mcp", _subject())
-    assert captured["GSHEETS_BROKER_SESSION_TOKEN"] == "tier-two"
-    assert captured["GSHEETS_BROKER_URL"] == "https://risk"
-    assert "GATEWAY_GOOGLE_SHEETS_BROKER_HMAC_KEY" not in captured
+    monkeypatch.setattr(mcp_client_module, "stdio_client", stdio_client)
+    monkeypatch.setattr(mcp_client_module, "ClientSession", Session)
+    monkeypatch.setattr(
+      mcp_client_module, "_preflight_stdio_executable", lambda *_args: None,
+    )
+    state = await manager._spawn_per_user_server("gsheets-mcp", _subject())
+    try:
+      assert captured["GSHEETS_BROKER_SESSION_TOKEN"] == "tier-two"
+      assert captured["GSHEETS_BROKER_URL"] == "https://risk"
+      assert "GATEWAY_GOOGLE_SHEETS_BROKER_HMAC_KEY" not in captured
+    finally:
+      assert state.host is not None
+      await state.host.close()
 
   asyncio.run(scenario())
-
 
 def test_mint_failures_are_terminal_and_do_not_spawn(monkeypatch):
   async def scenario(code):

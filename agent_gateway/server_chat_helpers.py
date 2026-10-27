@@ -295,18 +295,20 @@ def _clear_active_turn(session: GatewaySession, active_turn: SessionStream) -> N
   if session.active_turn is not active_turn:
     return
   _cancel_active_turn_cleanup_handle(active_turn)
-  for subscriber in active_turn.subscribers.values():
-    pump_task = subscriber.pump_task
-    if pump_task is not None and not pump_task.done():
-      pump_task.cancel()
-  active_turn.subscribers.clear()
+  event_log = active_turn.event_log
+  if not log_has_terminal(event_log):
+    if not any(entry.event.get("type") == "interrupted" for entry in event_log.entries):
+      event_log.append({"type": "interrupted", "reason": "turn_cancelled"})
+    event_log.append({
+      "type": "stream_complete",
+      "terminal_disposition": "interrupted",
+      "reason": "turn_cancelled",
+    })
+  event_log.close()
   _release_turn_research_file_activity(active_turn, None)
   session.active_turn = None
   session.stream_active = False
-  # A subscriber that reconnects after this clear replays the finished
-  # turn's log rather than meeting 404 (R-ETN 2026-10-13); a turn that never
-  # published its terminal has nothing to replay and is not parked.
-  session.last_completed_turn = active_turn if log_has_terminal(active_turn.event_log) else None
+  session.last_completed_turn = active_turn
 
 
 def _active_turn_is_running(active_turn: SessionStream | None) -> bool:
@@ -486,31 +488,18 @@ def _stream_envelope(*, entry: Any, session_id: str, schema_version: int, event:
   )
 
 
-def _disconnect_stream_subscriber_for_backpressure(
-  subscriber: StreamSubscriber,
-  *,
-  done_marker: object = _STREAM_SUBSCRIBER_DONE,
-) -> None:
-  return _chat_stream_core.disconnect_stream_subscriber_for_backpressure(
-    subscriber,
-    done_marker=done_marker,
-  )
-
-
 async def _pump_stream_subscriber(
   active_turn: SessionStream,
   subscriber: StreamSubscriber,
   after_seq: int,
   *,
   done_marker: object = _STREAM_SUBSCRIBER_DONE,
-  disconnect_stream_subscriber_for_backpressure: Callable[[StreamSubscriber], None] = _disconnect_stream_subscriber_for_backpressure,
 ) -> None:
   await _chat_stream_core.pump_stream_subscriber(
     active_turn,
     subscriber,
     after_seq,
     done_marker=done_marker,
-    disconnect_stream_subscriber_for_backpressure=disconnect_stream_subscriber_for_backpressure,
   )
 
 
@@ -1716,6 +1705,7 @@ async def _dispatch_chat_turn_body(
             break
 
     async def run_agent() -> None:
+      cancelled = False
       try:
         await runner.run(
           messages=messages,
@@ -1727,6 +1717,7 @@ async def _dispatch_chat_turn_body(
             sid,
           )
       except asyncio.CancelledError:
+        cancelled = True
         raise
       except ApprovalPark as park:
         terminal = next(
@@ -1755,7 +1746,7 @@ async def _dispatch_chat_turn_body(
         )
         _emit_terminal({"type": "error", "error": error_text})
       finally:
-        if not log_has_terminal(event_log):
+        if not cancelled and not log_has_terminal(event_log):
           _emit_terminal({"type": "error", "error": "stream closed"})
 
     runner_task = asyncio.create_task(run_agent())
@@ -1799,7 +1790,14 @@ async def _dispatch_chat_turn_body(
     )
     if publish_lifecycle_events and _latest_chat_run_state(session, sid) != "cancelled":
       _record_event(_chat_run_state_event(sid, "cancelled"), sid)
-    _emit_terminal({"type": "error", "error": "stream closed"})
+    if not log_has_terminal(event_log):
+      if not any(entry.event.get("type") == "interrupted" for entry in event_log.entries):
+        event_log.append({"type": "interrupted", "reason": cause})
+      _emit_terminal({
+        "type": "stream_complete",
+        "terminal_disposition": "interrupted",
+        "reason": cause,
+      })
     raise
   except Exception as exc:
     session.stream_active = False

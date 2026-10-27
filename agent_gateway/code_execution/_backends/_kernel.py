@@ -23,7 +23,7 @@ from ...child_environment import CODE_EXECUTE_ENVIRONMENT, filter_child_environm
 
 from .._config import CodeExecutionConfig
 from .._frame_codec import CellBudget, MAX_CELL_BYTES, MAX_FRAME_BYTES, ProtocolError, decode_frame, encode_frame
-from .._frame_reader import CELL_TOKEN_ENV, REQUEST_FRAME_TYPES, _error_reply
+from .._frame_reader import REQUEST_FRAME_TYPES, _error_reply
 from .._helpers import (
   _collect_generated_images,
   _prepare_code_execute_env,
@@ -31,7 +31,7 @@ from .._helpers import (
   _remove_path,
   _remove_task_artifacts,
   _snapshot_image_mtimes,
-  _write_code_execute_script,
+  _write_cell_script,
 )
 from ._base import CellBridge, ExecutionBackend, ExecutionHandle, OnOutputChunk
 
@@ -46,6 +46,7 @@ def _runner_source() -> str:
   modules = (
     ("_hank_frame_codec", root / "_frame_codec.py"),
     ("_hank_bridge_client", root / "_bridge_client.py"),
+    ("_hank_prelude", root / "_hank_prelude.py"),
   )
   bootstrap = "import sys as _s, types as _t\n"
   for name, path in modules:
@@ -88,7 +89,7 @@ class _KernelProcess:
       cwd=self.work_dir,
       env=env,
       start_new_session=True,
-      limit=MAX_FRAME_BYTES,
+      limit=MAX_CELL_BYTES,
     ))
     try:
       process = await asyncio.shield(spawn)
@@ -178,6 +179,7 @@ class KernelState:
     self._close_lock = asyncio.Lock()
     self.runner: _KernelProcess | None = None
     self.cells: Dict[str, Dict[str, Any]] = {}
+    self.user_ns_locals: Dict[str, str] = {}
     self.closed = False
     self.holder: str | None = None  # task id of the cell holding `lock`
 
@@ -210,6 +212,7 @@ class KernelState:
         # A launch already in flight when close began installs then releases
         # its runner before its cell task settles.
         self.runner = None
+        self.user_ns_locals = {}
 
 
 class _OutputTail:
@@ -405,7 +408,7 @@ class KernelBackend(ExecutionBackend):
       data["container_id"] = getattr(runner, "container_id", None)
       if self._state.closed:
         await runner.aclose()
-      script = _write_code_execute_script(work_dir, code, self._config, task_id=data["task_id"])
+      script = _write_cell_script(work_dir, code, task_id=data["task_id"])
       data["script_path"] = script
       data["stdout_file"] = work_dir / f"_cell_{handle.handle_id}_stdout.log"
       data["stderr_file"] = work_dir / f"_cell_{handle.handle_id}_stderr.log"
@@ -413,11 +416,11 @@ class KernelBackend(ExecutionBackend):
       started_ns = time.time_ns()
       try:
         if bridge is not None:
-          bridge_child_env = bridge.child_env()
-          token = bridge_child_env.get(CELL_TOKEN_ENV)
-          cell_env.update(bridge_child_env)
+          # The token rides the control frame (`cell_token`); the runner
+          # exports it. Only the signed claim is env.
+          cell_env.update(bridge.capability_env())
           bridge.activate()
-          bridge.close_child_ends()
+          token = bridge.token
         else:
           token = None
         with data["stdout_file"].open("w", encoding="utf-8", buffering=1) as stdout_log, \
@@ -439,6 +442,8 @@ class KernelBackend(ExecutionBackend):
             handle, runner, {
               "type": "cell", "id": handle.handle_id, "script": self._script_name(script),
               "cell_token": token, "env": env_delta,
+              "prelude": self._config.preamble_suffix or "",
+              "plot_prefix": f"_plot_{data['task_id']}_" if data["task_id"] else "_plot_",
             },
             bridge=bridge, timeout_ms=timeout_ms, capture=capture,
           )
@@ -488,13 +493,17 @@ class KernelBackend(ExecutionBackend):
     displays: list[Dict[str, Any]] = []
     images: list[Dict[str, Any]] = []
     # Two clocks: `timeout_ms` bounds compute only. The runner brackets every
-    # bridge request made on the cell's own thread with host_wait_begin/
-    # host_wait_end (a spawned thread's call sends none, so it never pauses a
-    # computing interpreter); while any is open the compute deadline is paused,
-    # and the runner's `blocked_ms` sum is `host_wait_ms`. A host wait never
-    # times the cell out or interrupts it.
+    # bridge request made on the cell's own thread, and every `hank.acall`
+    # worker's, with host_wait_begin/host_wait_end (any other spawned thread's
+    # call sends none, so it never pauses a computing interpreter); while any is
+    # open the compute deadline is paused, including CPU the main thread spends
+    # on other coroutines meanwhile. `host_wait_ms` is the union of those
+    # intervals, measured here from the empty->nonempty to the nonempty->empty
+    # transition of `host_waits`, so overlapping concurrent waits are never
+    # summed. A host wait never times the cell out or interrupts it.
     host_waits: set[str] = set()
     host_wait_ms = 0
+    wait_started: float | None = None
     compute_s = 0.0
     resumed_at: float | None = None
     clock = asyncio.Event()
@@ -541,22 +550,45 @@ class KernelBackend(ExecutionBackend):
           images.append({"filename": name, "media_type": "image/png", "data_base64": png})
 
     async def dispatch_requests() -> None:
-      while True:
-        frame = await requests.get()
+      """One task per request frame; replies are serialized on `reply_lock`."""
+      reply_lock = asyncio.Lock()
+      answering: set[asyncio.Task[None]] = set()
+
+      async def answer(frame: Dict[str, Any]) -> None:
         try:
           if bridge is not None:
             reply = await bridge.handle_decoded_frame(frame)
           else:
-            reply = encode_frame(_error_reply(frame.get("type"), frame.get("call_id"), "bridge_unavailable", "no bridge for this cell"), budget)
-          stdin.write(reply)
-          await stdin.drain()
+            reply = encode_frame(_error_reply(frame.get("type"), frame.get("call_id"), "bridge_unavailable", "no bridge for this cell; re-run it via a bridged code_execute cell, or call the operation directly as a tool outside the cell"), budget)
+          async with reply_lock:
+            stdin.write(reply)
+            await stdin.drain()
         except ProtocolError as exc:
           fail_protocol(str(exc))
         except (BrokenPipeError, ConnectionResetError):
           raise _KernelLost("runner closed stdin") from None
 
+      getter = asyncio.create_task(requests.get())
+      try:
+        while True:
+          finished, _ = await asyncio.wait({getter, *answering}, return_when=asyncio.FIRST_COMPLETED)
+          if getter in finished:
+            frame = getter.result()
+            answering.add(asyncio.create_task(answer(frame)))
+            getter = asyncio.create_task(requests.get())
+          for task in finished & answering:
+            answering.discard(task)
+            task.result()
+      finally:
+        # A reply never lands after the cell's teardown: every answer still
+        # in flight is cancelled and awaited here.
+        pending = {getter, *answering}
+        for task in pending:
+          task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
     async def read_frames() -> Dict[str, Any]:
-      nonlocal host_wait_ms
+      nonlocal host_wait_ms, wait_started
       while True:
         try:
           line = await stdout.readline()
@@ -596,14 +628,16 @@ class KernelBackend(ExecutionBackend):
             fail_protocol(str(frame.get("protocol_error") or budget.error))
           return frame
         if kind == "host_wait_begin":
+          if not host_waits:
+            wait_started = time.monotonic()
           host_waits.add(str(frame.get("call_id")))
           pause_compute()
           continue
         if kind == "host_wait_end":
           host_waits.discard(str(frame.get("call_id")))
-          blocked_ms = frame.get("blocked_ms")
-          if isinstance(blocked_ms, int):
-            host_wait_ms += blocked_ms
+          if not host_waits and wait_started is not None:
+            host_wait_ms += int((time.monotonic() - wait_started) * 1000)
+            wait_started = None
           resume_compute()
           continue
         if protocol_error is not None:
@@ -679,6 +713,10 @@ class KernelBackend(ExecutionBackend):
       fault_task.cancel()
       reader_task.cancel()
       await asyncio.gather(dispatch_task, interrupt_task, fault_task, reader_task, return_exceptions=True)
+    if wait_started is not None:
+      # The cell ended with a wait open; it counts to the end of the cell.
+      host_wait_ms += int((time.monotonic() - wait_started) * 1000)
+      wait_started = None
 
     error = done.get("error") if done is not None else None
     if lost is not None:
@@ -687,6 +725,7 @@ class KernelBackend(ExecutionBackend):
       await runner.aclose()
       if self._state.runner is runner:
         self._state.runner = None
+        self._state.user_ns_locals = {}
       capture("stderr", f"[kernel lost: {lost}; earlier interpreter state is gone]\n")
       if diagnostics:
         capture("stderr", diagnostics + "\n")
@@ -706,6 +745,12 @@ class KernelBackend(ExecutionBackend):
     }
     if error is not None:
       result["error"] = error
+    if done is not None and isinstance(done.get("kernel_locals"), dict):
+      self._state.user_ns_locals = {
+        str(k): str(v) for k, v in done["kernel_locals"].items() if str(k).strip() and str(v).strip()
+      }
+      if self._state.user_ns_locals:
+        result["kernel_locals"] = dict(self._state.user_ns_locals)
     if protocol_error is not None:
       result["protocol_error"] = {"code": "protocol_error", "message": protocol_error}
       if error is None:

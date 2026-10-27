@@ -43,6 +43,7 @@ from agent_gateway.providers import StreamEvent  # noqa: E402
 from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402
 from agent_gateway.providers.anthropic_oauth import (  # noqa: E402
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
+  ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
   ANTHROPIC_USER_SCOPE_FIELD,
   AnthropicOAuthRecord,
   anthropic_credential_blocked_until,
@@ -188,6 +189,7 @@ def _blocked_until(
 ) -> float:
   """When the shared selection sidecar lets `token`'s account serve again."""
   credential = resolve_anthropic_credentials(
+    {ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True},
     environ=environ, user_scope=user_scope,
   ).by_token(token)
   assert credential is not None
@@ -214,6 +216,7 @@ def _rotated_material(
     "auth_token": credential.token,
     "credential_source": {**credential.source_metadata(), "automatic": True},
     "credential_prepared": True,
+    ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
   }
   if affinity_key is not None:
     material["credential_affinity_key"] = affinity_key
@@ -515,7 +518,7 @@ def test_usage_limited_credential_rotates_to_sibling_and_keeps_bound_model(
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
 
   provider = _PooledAnthropicProvider(limited_tokens=(_TOKEN_A,), reset_at=reset_at)
-  sources = resolve_anthropic_credentials()
+  sources = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True})
   member_a = sources.by_token(_TOKEN_A)
   member_b = sources.by_token(_TOKEN_B)
   assert member_a is not None and member_b is not None
@@ -534,6 +537,7 @@ def test_usage_limited_credential_rotates_to_sibling_and_keeps_bound_model(
         "auth_mode": "oauth",
         "auth_token": _TOKEN_A,
         "credential_source": member_a.source_metadata(),
+        ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
         "max_tokens": 512,
       },
     )
@@ -590,7 +594,7 @@ def _make_rotation_budget_runner(
   monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 3)
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
-  member = resolve_anthropic_credentials().by_token(tokens[0])
+  member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(tokens[0])
   assert member is not None
   event_log = EventLog()
   capability_execution = stub_bound_capability_execution(
@@ -602,6 +606,7 @@ def _make_rotation_budget_runner(
       "auth_mode": "oauth",
       "auth_token": tokens[0],
       "credential_source": member.source_metadata(),
+      ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
       "max_tokens": 512,
     },
   )
@@ -631,7 +636,7 @@ def test_five_credential_generations_reach_the_usable_member_beyond_retry_budget
     limited_tokens=tokens[:-1], reset_at=time.time() + 4 * 3600,
   )
   runner, event_log = _make_rotation_budget_runner(monkeypatch, tmp_path, provider, tokens)
-  member_five = resolve_anthropic_credentials().by_token(tokens[-1])
+  member_five = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(tokens[-1])
   assert member_five is not None
   retry_sleeps: list[float] = []
   retry_delay = 0.001
@@ -707,7 +712,7 @@ def test_rotations_to_tried_generations_consume_transient_retry_budget(
   runner, event_log = _make_rotation_budget_runner(
     monkeypatch, tmp_path, provider, (_TOKEN_A, _TOKEN_B),
   )
-  sources = resolve_anthropic_credentials()
+  sources = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True})
 
   def next_credential(
     config: Any, failure: ProviderCredentialFailure,
@@ -775,7 +780,7 @@ def test_cancellation_during_a_free_rotation_retry_cancels_the_turn(
 
   assert observed_delays == [0.0]
   assert provider.streamed_tokens == [_TOKEN_A]
-  member_b = resolve_anthropic_credentials().by_token(_TOKEN_B)
+  member_b = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(_TOKEN_B)
   assert member_b is not None
   assert runner.capability_execution.bind.credential_ref == member_b.source_metadata()["generation_ref"]
   events = [entry.event for entry in event_log.entries]
@@ -793,7 +798,7 @@ def test_learning_fork_rotates_runner_and_dispatcher_to_sibling(
   monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
   monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
   provider = _PooledAnthropicProvider(limited_tokens=(_TOKEN_A,), reset_at=reset_at)
-  sources = resolve_anthropic_credentials()
+  sources = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True})
   member_a = sources.by_token(_TOKEN_A)
   member_b = sources.by_token(_TOKEN_B)
   assert member_a is not None and member_b is not None
@@ -806,6 +811,7 @@ def test_learning_fork_rotates_runner_and_dispatcher_to_sibling(
       "auth_mode": "oauth",
       "auth_token": _TOKEN_A,
       "credential_source": member_a.source_metadata(),
+      ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
       "max_tokens": 512,
     },
   )
@@ -884,7 +890,7 @@ def test_single_credential_pool_is_never_withheld_from_a_run(
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKENS", raising=False)
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
   monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
-  sources = resolve_anthropic_credentials()
+  sources = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True})
 
   assert sources.tokens == (_TOKEN_A,)
   selected = select_anthropic_credential_source(sources)
@@ -939,11 +945,12 @@ def test_usage_limited_enrolled_account_rotates_to_the_next_enrolled_account(
       "auth_token": "sk-ant-oat01-primary@example.com",
       "credential_affinity_key": "affinity-primary",
       "credential_model_family": "opus",
+      ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
     },
     failure,
   )
 
-  sibling = resolve_anthropic_credentials().by_token("sk-ant-oat01-sibling@example.com")
+  sibling = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token("sk-ant-oat01-sibling@example.com")
   assert sibling is not None
   assert rotated == _rotated_material(
     sibling, affinity_key="affinity-primary", model_family="opus",
@@ -957,7 +964,7 @@ def test_usage_limited_enrolled_account_rotates_to_the_next_enrolled_account(
   assert _blocked_until("sk-ant-oat01-sibling@example.com") == 0.0
   # Every account limited: no sibling is handed back, so the run cannot circle.
   assert provider.next_credential(
-    {"auth_mode": "oauth", "auth_token": "sk-ant-oat01-sibling@example.com"},
+    {"auth_mode": "oauth", "auth_token": "sk-ant-oat01-sibling@example.com", ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True},
     failure,
   ) is None
 
@@ -987,6 +994,7 @@ def test_pool_of_one_ends_the_turn_with_the_reported_reset_window(
       auth_config={
         "auth_mode": "oauth",
         "auth_token": _TOKEN_A,
+        ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
         "max_tokens": 512,
       },
     )
@@ -1036,6 +1044,7 @@ def test_every_credential_limited_stops_rotating_instead_of_circling(
       auth_config={
         "auth_mode": "oauth",
         "auth_token": _TOKEN_A,
+        ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
         "max_tokens": 512,
       },
     )
@@ -1091,7 +1100,7 @@ def test_autonomous_child_rotates_on_the_pool_its_projection_carries(
 
   # The parent selects out of the pool it resolves, as it does for every run.
   selected = select_anthropic_credential_source(
-    resolve_anthropic_credentials(environ=gateway_environ),
+    resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, environ=gateway_environ),
   )
   assert selected is not None and selected.token == _TOKEN_A
   bound_token = selected.token
@@ -1117,6 +1126,7 @@ def test_autonomous_child_rotates_on_the_pool_its_projection_carries(
           "auth_mode": "oauth",
           "api_key": "",
           "auth_token": bound_token,
+          ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
           "max_tokens": 512,
         },
       ),
@@ -1211,17 +1221,18 @@ def test_a_users_turn_rotates_inside_that_users_pool_and_never_onto_another(
     "auth_mode": "oauth",
     "auth_token": primary,
     ANTHROPIC_USER_SCOPE_FIELD: "1",
+    ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
     "credential_affinity_key": "affinity-henry",
     "credential_model_family": "sonnet",
   }
 
   selected = select_anthropic_credential_source(
-    resolve_anthropic_credentials(environ=environ, user_scope=1)
+    resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, environ=environ, user_scope=1)
   )
   assert selected is not None and selected.token == primary
   def credential_of(token: str, user_scope: int) -> Any:
     credential = resolve_anthropic_credentials(
-      environ=environ, user_scope=user_scope,
+      {ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, environ=environ, user_scope=user_scope,
     ).by_token(token)
     assert credential is not None
     return credential
@@ -1236,19 +1247,23 @@ def test_a_users_turn_rotates_inside_that_users_pool_and_never_onto_another(
   )
   assert _blocked_until(primary, environ=environ, user_scope=1) == pytest.approx(reset_at, abs=2.0)
 
-  # Another user's turn is served the org credential and nothing of user 1's,
-  # even though user 1's accounts are the ones no limiter is holding.
-  theirs = resolve_anthropic_credentials(environ=environ, user_scope=2)
-  assert theirs.tokens == ("sk-ant-oat01-other@example.com", _TOKEN_A)
+  # Another user's turn is served only their own private account and nothing
+  # of user 1's, even though user 1's accounts are the ones no limiter is
+  # holding. SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: user 2 is a
+  # non-owner, so their stamp admits no operator seat.
+  theirs = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: False}, environ=environ, user_scope=2)
+  assert theirs.tokens == ("sk-ant-oat01-other@example.com",)
+  assert _TOKEN_A not in theirs.tokens
   assert primary not in theirs.tokens and sibling not in theirs.tokens
   assert provider.next_credential(
     {
       "auth_mode": "oauth",
       "auth_token": "sk-ant-oat01-other@example.com",
       ANTHROPIC_USER_SCOPE_FIELD: "2",
+      ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: False,
     },
     failure,
-  ) == _rotated_material(credential_of(_TOKEN_A, 2))
+  ) is None
 
 
 def test_autonomous_child_of_a_user_scoped_run_inherits_that_users_pool(
@@ -1360,7 +1375,7 @@ def test_rotated_credential_source_matches_prepared_provider_authentication(
   token_a = _enroll(store_path, "rotation-primary@example.com")
   token_b = _enroll(store_path, "rotation-sibling@example.com")
 
-  sources = resolve_anthropic_credentials()
+  sources = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True})
   selected = select_anthropic_credential_source(sources)
   assert selected is not None and selected.token == token_a
   replacement = next(source for source in sources.credentials if source.token == token_b)
@@ -1368,6 +1383,7 @@ def test_rotated_credential_source_matches_prepared_provider_authentication(
     "auth_mode": "oauth",
     "auth_token": selected.token,
     "credential_source": selected.source_metadata(),
+    ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
     "credential_affinity_key": "affinity-rotation",
     "credential_model_family": "opus",
   }
@@ -1490,7 +1506,7 @@ def test_stream_loop_rotates_on_superseded_source_error_like_a_401(
   events = [entry.event for entry in event_log.entries]
   assert len([event for event in events if event["type"] == "credential_refreshed"]) == 1
   assert not any(event["type"] == "error" for event in events)
-  member_b = resolve_anthropic_credentials().by_token(_TOKEN_B)
+  member_b = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(_TOKEN_B)
   assert member_b is not None
   assert runner.capability_execution.bind.credential_ref == (
     member_b.source_metadata()["generation_ref"]

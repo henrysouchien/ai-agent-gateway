@@ -5,6 +5,7 @@ import pickle
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -407,3 +408,119 @@ def test_runtime_guard_message_is_boundary_sanitized() -> None:
   assert secret not in json.dumps(projected)
   assert projected["guard"] == "unread_result_handle_nudge"
   assert "task bg-1" in projected["message"]
+
+
+def test_payg_bound_auth_config_preserves_public_credential_ref_in_skill_result_projection() -> None:
+  """A PAYG/pool-backed auth_config carries deployment_api_key_source = 'anthropic-generation-<sha256>'.
+
+  SecretBoundary must redact the raw api_key while preserving the public
+  generation ref and classification stamps so ToolDispatcher._append_event
+  does not redact CapabilityBind.credential_ref and break
+  SkillRunEventEmitter.project_result_captured's exact-match check.
+  """
+  from agent_gateway.event_log import EventLog
+  from model_authority.bind import CapabilityBind
+  from agent_gateway.providers.anthropic_oauth import (
+    ANTHROPIC_DEPLOYMENT_API_KEY_FIELD,
+    ANTHROPIC_USER_SCOPE_FIELD,
+    CREDENTIAL_AFFINITY_KEY_FIELD,
+    CREDENTIAL_PREPARED_FIELD,
+  )
+  from agent_gateway.sub_agent_skill_events import SkillRunEventEmitter
+  from agent_gateway.tool_dispatcher import ToolDispatcher
+
+  raw_api_key = "sk-ant-api03-TEST-SECRET-MATERIAL-735ddab23cdd9fb8"
+  public_gen_ref = "anthropic-generation-ee842ddf563c4624dceabf5fb78192d9d1c7dea06d3297969951728a3694ee08"
+  affinity_digest = "a" * 64
+  auth_config = {
+    "provider": "anthropic",
+    "placement": "local",
+    ANTHROPIC_DEPLOYMENT_API_KEY_FIELD: public_gen_ref,
+    "auth_mode": "api",
+    "auth_mechanism": "api_key",
+    "entitlement_kind": "org_commercial",
+    "ownership": "deployment:org_commercial",
+    "api_key": raw_api_key,
+    "auth_token": "",
+    "max_tokens": 16000,
+    ANTHROPIC_USER_SCOPE_FIELD: "13",
+    CREDENTIAL_AFFINITY_KEY_FIELD: affinity_digest,
+    CREDENTIAL_PREPARED_FIELD: True,
+    "workspace_id": "wrks_01TestWorkspace",
+    "account_identity": "api-key-735ddab23cdd9fb8",
+    "credential_source": {
+      "account_identity": "api-key-735ddab23cdd9fb8",
+      "generation_ref": public_gen_ref,
+      "automatic": True,
+    },
+  }
+  boundary = SecretBoundary.from_auth_config(auth_config)
+  assert boundary.sanitize(raw_api_key, sink="dispatcher_event") == REDACTED_SECRET
+  assert boundary.sanitize(public_gen_ref, sink="dispatcher_event") == public_gen_ref
+  assert boundary.sanitize("local", sink="dispatcher_event") == "local"
+  assert boundary.sanitize("api_key", sink="dispatcher_event") == "api_key"
+  assert boundary.sanitize("org_commercial", sink="dispatcher_event") == "org_commercial"
+  assert boundary.sanitize("wrks_01TestWorkspace", sink="dispatcher_event") == "wrks_01TestWorkspace"
+
+  bind_dict = {
+    "schema_version": "1.0",
+    "capability_id": "node.explore",
+    "model_key": "anthropic.claude-haiku-5-5",
+    "provider": "anthropic",
+    "upstream_model": "claude-haiku-5-5",
+    "adapter": "anthropic.messages",
+    "protocol_profile": "messages.adaptive",
+    "route": "anthropic.public",
+    "effort": "low",
+    "credential_principal": "service",
+    "credential_ref": public_gen_ref,
+    "run_mode": "interactive",
+    "registry_revision": "2026-10-15.5",
+    "policy_revision": "2026-10-15.5",
+    "selection_source": "internal_policy",
+  }
+  raw_log = EventLog()
+  dispatcher = ToolDispatcher(
+    cast(Any, None),
+    event_log=raw_log,
+    capability_bind=CapabilityBind.from_json(bind_dict),
+  )
+  dispatcher.bind_secret_boundary(boundary)
+  tool_ctx = SimpleNamespace(
+    event_log=dispatcher._boundary_event_log,
+    emit=None,
+  )
+
+  async def _noop_append(_ev):
+    return None
+
+  async def _noop_confirm(_ev):
+    return None
+
+  emitter = SkillRunEventEmitter(
+    skill_run_id="0ce3a19eb6e5578241b99b160c5e72b5",
+    skill_name="explore",
+    semantic_scope="portfolio",
+    context_ticker=None,
+    portfolio_id=None,
+    event_log_getter=lambda: tool_ctx.event_log,
+    tool_ctx=tool_ctx,
+    durable_appender=_noop_append,
+    durable_confirmer=_noop_confirm,
+  )
+  captured_event = {
+    "type": "skill_result_captured",
+    "skill_run_id": "0ce3a19eb6e5578241b99b160c5e72b5",
+    "skill": "explore",
+    "scope": "portfolio",
+    "ticker": None,
+    "portfolio_id": None,
+    "exit_code": 0,
+    "outcome": "success",
+    "status": "complete",
+    "capability_bind": bind_dict,
+  }
+
+  assert emitter.project_result_captured(captured_event) is True
+  assert len(raw_log.entries) == 1
+  assert raw_log.entries[0].event["capability_bind"]["credential_ref"] == public_gen_ref

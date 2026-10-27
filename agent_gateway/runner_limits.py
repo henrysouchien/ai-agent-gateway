@@ -45,6 +45,14 @@ class TokenEstimateSnapshot:
   message_count: int
   tool_count: int
 
+  @property
+  def est_static_floor_tokens(self) -> int:
+    return self.est_system_tokens + self.est_tools_tokens
+
+  @property
+  def est_compressible_tokens(self) -> int:
+    return self.est_messages_tokens
+
 
 @dataclass(frozen=True)
 class TokenBreakdownSnapshot:
@@ -55,6 +63,18 @@ class TokenBreakdownSnapshot:
   pct_system: int
   pct_tools: int
   pct_messages: int
+
+  @property
+  def est_static_floor_tokens(self) -> int:
+    return self.est_system_tokens + self.est_tools_tokens
+
+  @property
+  def est_compressible_tokens(self) -> int:
+    return self.est_messages_tokens
+
+
+def compressible_message_tokens(est_total_tokens: int, *, est_static_floor_tokens: int = 0) -> int:
+  return max(0, int(est_total_tokens) - max(0, int(est_static_floor_tokens)))
 
 
 def request_input_token_estimate(

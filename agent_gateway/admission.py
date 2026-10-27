@@ -439,6 +439,8 @@ class AdmissionOwners:
   # The launch edge's user facts for an autonomous child (``None``: the child
   # runs inside its parent's session identity).
   identity: AdmittedChildIdentity | None = None
+  # The run's profile name, so the role policy scopes denials to it.
+  profile_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -748,6 +750,7 @@ def _admit_spawn(
   role_denied = role_denied_tools_for_session(
     owners.session,
     role=parent.tenant.role if parent.tenant is not None else "invite",
+    profile_name=owners.profile_name,
   )
   granted: list[str] = []
   for tool_id in sorted(registration.route_ceiling):

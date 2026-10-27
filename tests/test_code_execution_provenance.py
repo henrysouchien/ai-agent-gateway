@@ -180,13 +180,13 @@ def _job_runner() -> AgentRunner:
   )
 
 
-def test_code_execute_sets_work_dir_env_for_foreground_and_background_subprocess() -> None:
+def test_code_execute_sets_work_dir_env_for_foreground_and_background_cells() -> None:
   async def _run_test() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     runner = _job_runner()
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(register_docker=False),
+      config=CodeExecutionConfig(),
       job_runner=lambda: runner,
     )
 
@@ -251,7 +251,7 @@ def test_code_execute_sets_work_dir_env_for_foreground_and_background_subprocess
 def test_foreground_ignores_legacy_sidecars() -> None:
   async def _run_test() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+    bundle = build_code_execution(session, config=CodeExecutionConfig())
     first = _entry("load_statements", "a" * 64)
     second = _entry("render_sourced_table", "b" * 64)
 
@@ -296,7 +296,7 @@ def test_sanitize_hook_strips_computations_from_result_entry_only_for_code_execu
       result_entry=result_entry,
     )
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+    bundle = build_code_execution(session, config=CodeExecutionConfig())
 
     bundle.sanitize_hook(ctx)
 

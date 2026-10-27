@@ -1,7 +1,7 @@
 """`code_execute` bridge: nested `hank.*` calls from a running cell.
 
-The cell reaches the session's tools through frames on the fd pair the
-subprocess backend hands it; the host frame reader dispatches an operation iff
+The cell reaches the session's tools through frames on the session kernel's
+stdio; the host frame reader dispatches an operation iff
 it is in the turn's grant (the bound catalog) and the bound code-callable
 registration, through the bound dispatcher under the outer call, records it in
 the outer result's `nested_calls`, and carries registered producer settlement
@@ -9,9 +9,9 @@ identities plus the bound extractor's richer handles in `sources`.
 """
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
-import errno
 import json
 import os
+import re
 import signal
 import sys
 import textwrap
@@ -22,17 +22,34 @@ from typing import Any
 import pytest
 
 PKG_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = PKG_DIR.parent.parent
+if str(REPO_ROOT / "api") not in sys.path:
+  sys.path.insert(0, str(REPO_ROOT / "api"))
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentRunner, SessionStore, ToolDispatcher
 from agent_gateway.approval_policy import RunContext
+from agent_gateway import claim_signing_authority
+from agent_gateway.claim_signing_authority import (
+  GATEWAY_CLAIM_SIGNING_AUTHORITY_ENV,
+  GatewayClaimSigningAuthority,
+  LEGACY_CLAIM_HMAC_KEY_ENV,
+  install_gateway_claim_signing_authority,
+)
+from agent_gateway.user_runtime_credentials import (
+  DeskReplica,
+  USER_RUNTIME_CREDENTIALS_FILE_ENV,
+  UserRuntimeIdentity,
+  mint_user_runtime_credentials,
+  write_user_runtime_credentials,
+)
 from agent_gateway.code_execution import (
   CodeExecutionConfig,
-  SubprocessBackend,
   build_code_execution,
   cleanup_code_execution,
 )
+from agent_gateway.code_execution._backends._kernel import KernelBackend
 from agent_gateway.code_execution._frame_codec import decode_frame
 from agent_gateway.event_log import EventLog
 from agent_gateway.mcp_client import McpClientManager
@@ -278,7 +295,7 @@ def _setup(
   session.active_turn = SessionStream(event_log=EventLog(), runner_task=None, runtime_owner=runner)
   bundle = build_code_execution(
     session,
-    config=CodeExecutionConfig(register_docker=False),
+    config=CodeExecutionConfig(),
     job_runner=lambda: runner,
   )
   mcp = _CaptureMcp(delay_s=delay_s, frame_reader=bundle.frame_reader)
@@ -293,38 +310,23 @@ def _code_job(session: Any, task_id: str) -> TaskEntry:
 
 def _record_started_handles(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
   handles: list[Any] = []
-  start_bridged = SubprocessBackend.start_bridged
+  start_bridged = KernelBackend.start_bridged
 
   async def _recording_start_bridged(self: Any, *args: Any, **kwargs: Any) -> Any:
     handle = await start_bridged(self, *args, **kwargs)
     handles.append(handle)
     return handle
 
-  monkeypatch.setattr(SubprocessBackend, "start_bridged", _recording_start_bridged)
+  monkeypatch.setattr(KernelBackend, "start_bridged", _recording_start_bridged)
   return handles
 
 
 async def _until(predicate: Any) -> None:
-  for _ in range(400):
+  for _ in range(1500):
     if predicate():
       return
     await asyncio.sleep(0.01)
   raise AssertionError("condition not reached")
-
-
-def _record_open_cells(bundle: Any) -> list[tuple[Any, dict[int, os.stat_result]]]:
-  opened: list[tuple[Any, dict[int, os.stat_result]]] = []
-  open_cell = bundle.frame_reader.open_cell
-
-  def _recording_open_cell(*args: Any, **kwargs: Any) -> Any:
-    cell = open_cell(*args, **kwargs)
-    # Capture identity at creation, before a child/kernel can release and reuse
-    # an integer slot. Cleanup owns these pipes, not the process's future fds.
-    opened.append((cell, {fd: os.fstat(fd) for fd in cell.fds()}))
-    return cell
-
-  bundle.frame_reader.open_cell = _recording_open_cell
-  return opened
 
 
 async def _collect_background(session: Any, task_id: str) -> Any:
@@ -339,7 +341,7 @@ async def _run_cell(dispatcher: ToolDispatcher, code: str, **extra: Any) -> tupl
   return await dispatcher.dispatch(
     OUTER_ID,
     "code_execute",
-    {"code": textwrap.dedent(code), "host": "subprocess", **extra},
+    {"code": textwrap.dedent(code), **extra},
   )
 
 
@@ -376,7 +378,6 @@ def test_nested_dispatch_inherits_enclosing_execution_context(
         OUTER_ID, "code_execute",
         {
           "code": 'print(hank.call("file_read"))',
-          "host": "subprocess",
           "background": background,
         },
         **dispatch_context,
@@ -398,37 +399,6 @@ def test_nested_dispatch_inherits_enclosing_execution_context(
       await cleanup_code_execution(session)
 
   asyncio.run(_run())
-
-
-def _fd_closed(fd: int, original: os.stat_result) -> bool:
-  try:
-    current = os.fstat(fd)
-  except OSError as exc:
-    if exc.errno != errno.EBADF:
-      raise
-    return True
-  return (current.st_dev, current.st_ino, current.st_mode) != (
-    original.st_dev, original.st_ino, original.st_mode,
-  )
-
-
-def test_fd_closure_observation_distinguishes_a_live_pipe_from_reused_descriptor() -> None:
-  read_fd, write_fd = os.pipe()
-  original = os.fstat(read_fd)
-  replacement = None
-  try:
-    assert not _fd_closed(read_fd, original)
-    os.close(read_fd)
-    replacement = os.open(os.devnull, os.O_RDONLY)
-    if replacement != read_fd:
-      os.dup2(replacement, read_fd)
-    assert os.fstat(read_fd) != original
-    assert _fd_closed(read_fd, original)
-  finally:
-    os.close(read_fd)
-    os.close(write_fd)
-    if replacement is not None and replacement != read_fd:
-      os.close(replacement)
 
 
 def test_two_reads_compose_in_one_cell() -> None:
@@ -493,27 +463,90 @@ def test_reader_refuses_ungranted_non_code_callable_and_unknown_operations() -> 
   asyncio.run(_run())
 
 
-def test_registration_is_call_scoped_and_wrong_token_is_refused() -> None:
+@pytest.mark.parametrize("load_fails", [False, True])
+def test_in_cell_load_tools_refreshes_the_grant_only_after_success(load_fails: bool) -> None:
+  async def _run() -> None:
+    session, bundle, mcp, _dispatcher = _setup()
+    definitions = _tool_definitions(bundle)
+    deferred = next(row for row in definitions if row["name"] == FRED_SERIES)
+    definitions.remove(deferred)
+    definitions.append({
+      "name": "load_tools",
+      "input_schema": {"type": "object", "additionalProperties": True},
+    })
+
+    async def _load_tools(tool_input: dict[str, Any], **_kwargs: Any) -> ToolResult:
+      assert tool_input == {"tool_names": [FRED_SERIES]}
+      definitions.append(deferred)
+      if load_fails:
+        return None, {"code": "load_failed", "message": "loader failed after changing the surface"}
+      return {"loaded": [FRED_SERIES]}, None
+
+    dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
+      mcp_client=mcp,
+      local_tool_handlers={**bundle.handlers, "load_tools": _load_tools},
+      role="owner",
+      needs_approval=lambda _name, _tool_input, _qualifier: False,
+      event_log=EventLog(),
+      approval_key_qualifier=bundle.approval_qualifier,
+      get_tool_definitions=lambda: definitions,
+    )
+    bundle.bind_dispatcher(
+      dispatcher,
+      tool_definitions=dispatcher.get_tool_definitions,
+      code_callable=lambda name: name == "load_tools" or _CODE_CALLABLE(name),
+    )
+    try:
+      before, error = await _run_cell(dispatcher, f"""
+        try:
+            hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")
+        except HankBridgeError as exc:
+            print(exc.code)
+      """)
+      assert error is None, error
+      assert before["return_code"] == 0, before["stderr"]
+      assert before["stdout"] == "not_granted\n"
+      assert mcp.calls == []
+      assert before["nested_calls"][0]["error_code"] == "not_granted"
+
+      result, error = await _run_cell(dispatcher, f"""
+        try:
+            hank.load_tools(tool_names=[{FRED_SERIES!r}])
+        except HankBridgeError as exc:
+            print(exc.code)
+        try:
+            series = hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")
+            print(series["series_id"])
+        except HankBridgeError as exc:
+            print(exc.code)
+      """)
+      assert error is None, error
+      assert result["return_code"] == 0, result["stderr"]
+      assert result["stdout"] == ("load_failed\nnot_granted\n" if load_fails else "CPIAUCSL\n")
+      assert mcp.calls == ([] if load_fails else [(FRED_SERIES, {"series_id": "CPIAUCSL"})])
+      assert [(entry["operation"], entry["ok"], entry["error_code"]) for entry in result["nested_calls"]] == [
+        ("load_tools", not load_fails, "load_failed" if load_fails else None),
+        (FRED_SERIES, not load_fails, "not_granted" if load_fails else None),
+      ]
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+def test_registration_is_call_scoped_to_the_running_cell() -> None:
   async def _run() -> None:
     session, bundle, mcp, dispatcher = _setup()
     try:
       result, error = await _run_cell(dispatcher, f"""
-        import json, os
-        out = os.fdopen(int(os.environ["AGENT_CODE_EXECUTE_BRIDGE_FD_OUT"]), "wb")
-        inp = os.fdopen(int(os.environ["AGENT_CODE_EXECUTE_BRIDGE_FD_IN"]), "rb")
-        frame = {{"type": "tool_call", "call_id": "x1", "parent_call_id": {OUTER_ID!r},
-                 "cell_token": "not-the-token", "operation": {FRED_SERIES!r},
-                 "input": {{"series_id": "CPIAUCSL"}}}}
-        out.write(json.dumps(frame).encode() + b"\\n")
-        out.flush()
-        reply = json.loads(inp.readline())
-        print(reply["call_id"], reply["ok"], reply["error"]["code"])
-        hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")
+        series = hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")
+        print(series["series_id"])
       """)
       assert error is None, error
       assert result["return_code"] == 0, result["stderr"]
-      assert result["stdout"] == "x1 False bad_cell_token\n"
-      # Only the real-token call reached MCP, while the cell was registered.
+      assert result["stdout"] == "CPIAUCSL\n"
+      # The call reached MCP while the cell was registered, and only then.
       assert mcp.calls == [(FRED_SERIES, {"series_id": "CPIAUCSL"})]
       assert mcp.active_during_call == [(OUTER_ID,)]
       assert bundle.frame_reader.active_cells() == ()
@@ -523,103 +556,24 @@ def test_registration_is_call_scoped_and_wrong_token_is_refused() -> None:
   asyncio.run(_run())
 
 
-def test_exited_cell_with_in_group_output_holder_is_not_timed_out(tmp_path: Path) -> None:
-  async def _run() -> None:
-    session, _bundle, _mcp, dispatcher = _setup()
-    pid_path = tmp_path / "holder.pid"
-    release_path = tmp_path / "exit-cell"
-    try:
-      started, error = await _run_cell(
-        dispatcher,
-        f"""
-        import subprocess
-        import sys
-        import time
-        from pathlib import Path
-        descendant = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
-        )
-        Path({str(pid_path)!r}).write_text(str(descendant.pid))
-        while not Path({str(release_path)!r}).exists():
-            time.sleep(0.01)
-        print("done", flush=True)
-        """,
-        background=True,
-        timeout_ms=3000,
-      )
-      assert error is None, error
-      for _ in range(200):
-        if pid_path.exists():
-          break
-        await asyncio.sleep(0.01)
-      assert pid_path.exists()
-      # The monitor is waiting while the cell is alive; only the cell exits
-      # when released, leaving its in-group descendant holding both pipes.
-      release_path.touch()
-      result = await asyncio.wait_for(
-        _collect_background(session, started["task_id"]), timeout=7,
-      )
-      assert result["return_code"] == 0
-      assert result["timed_out"] is False
-      assert result["stdout"] == "done\n"
-      assert result["stderr"] == ""
-    finally:
-      if pid_path.exists():
-        try:
-          os.kill(int(pid_path.read_text()), signal.SIGKILL)
-        except ProcessLookupError:
-          pass
-      await cleanup_code_execution(session)
-
-  asyncio.run(_run())
-
-
-def test_timeout_retains_stdout_and_stderr_written_during_sigterm_grace() -> None:
-  async def _run() -> None:
-    session, _bundle, _mcp, dispatcher = _setup()
-    try:
-      result, error = await asyncio.wait_for(
-        _run_cell(
-          dispatcher,
-          """
-          import signal
-          import sys
-          import time
-          def on_term(signum, frame):
-              time.sleep(0.1)
-              print("partial-result-on-term", flush=True)
-              print("termination-detail", file=sys.stderr, flush=True)
-              raise SystemExit(3)
-          signal.signal(signal.SIGTERM, on_term)
-          print("start", flush=True)
-          time.sleep(30)
-          """,
-          timeout_ms=1500,
-        ),
-        timeout=7,
-      )
-      assert error is None, error
-      assert result["timed_out"] is True
-      assert result["return_code"] == 3
-      assert result["stdout"] == "start\npartial-result-on-term\n"
-      assert result["stderr"] == "termination-detail\n"
-    finally:
-      await cleanup_code_execution(session)
-
-  asyncio.run(_run())
-
-
-def test_timeout_kills_child_cancels_nested_call_and_closes_channel() -> None:
+def test_timeout_interrupts_cell_cancels_nested_call_and_closes_channel() -> None:
   async def _run() -> None:
     session, bundle, mcp, dispatcher = _setup(delay_s=30.0)
-    opened = _record_open_cells(bundle)
     try:
-      tasks_before = {task for task in asyncio.all_tasks() if not task.done()}
+      # A host wait never times a cell out, so the nested call runs on a spawned
+      # thread: its wait is compute, and the cell's own thread hits the deadline.
+      warm, error = await _run_cell(dispatcher, "pass")
+      assert error is None and warm["return_code"] == 0, error
       result, error = await _run_cell(
         dispatcher,
         f"""
+        import threading, time
+        worker = threading.Thread(
+            target=lambda: hank.call({FRED_SERIES!r}, series_id="CPIAUCSL"), daemon=True,
+        )
+        worker.start()
         print("calling", flush=True)
-        hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")
+        time.sleep(30)
         print("unreachable")
         """,
         timeout_ms=1500,
@@ -632,17 +586,13 @@ def test_timeout_kills_child_cancels_nested_call_and_closes_channel() -> None:
       assert mcp.cancelled is True
       assert [(entry["ok"], entry["error_code"]) for entry in result["nested_calls"]] == [(False, "cancelled")]
       assert bundle.frame_reader.active_cells() == ()
-      [(cell, original_fds)] = opened
-      assert all(_fd_closed(fd, original) for fd, original in original_fds.items())
-      leaked = {task for task in asyncio.all_tasks() if not task.done()} - tasks_before
-      assert leaked == set()
     finally:
       await cleanup_code_execution(session)
 
   asyncio.run(_run())
 
 
-def test_child_env_carries_bridge_names_and_no_domain_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cell_env_carries_the_cell_token_and_no_domain_secrets_or_bridge_fds(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setenv("EDGAR_API_KEY", "edgar-secret")
   monkeypatch.setenv("FRED_API_KEY", "fred-secret")
 
@@ -655,12 +605,9 @@ def test_child_env_carries_bridge_names_and_no_domain_secrets(monkeypatch: pytes
       """)
       assert error is None, error
       names = set(result["stdout"].splitlines())
-      assert {
-        "AGENT_CODE_EXECUTE_CELL_TOKEN",
-        "AGENT_CODE_EXECUTE_BRIDGE_FD_IN",
-        "AGENT_CODE_EXECUTE_BRIDGE_FD_OUT",
-      } <= names
+      assert "AGENT_CODE_EXECUTE_CELL_TOKEN" in names
       assert "EDGAR_API_KEY" not in names
+      assert not {name for name in names if "BRIDGE_FD" in name}
       assert "FRED_API_KEY" not in names
       assert "edgar-secret" not in result["stdout"] and "fred-secret" not in result["stdout"]
     finally:
@@ -813,7 +760,92 @@ def test_bridge_call_forwards_tool_arguments_named_like_bridge_parameters() -> N
   assert describe_frames[0]["operation"] == "x"
 
 
-def test_deferred_tool_activates_through_bound_mechanism_and_dispatches() -> None:
+@pytest.mark.parametrize("error_code", ["not_granted", "type_error"])
+@pytest.mark.parametrize("next_call", [
+  pytest.param("load_tools", id="string"),
+  pytest.param(["load_tools"], id="list"),
+  pytest.param(
+    {"tool_name": "load_tools", "arguments": "not-an-object"},
+    id="non-object-arguments",
+  ),
+  pytest.param({}, id="empty-mapping"),
+])
+def test_bridge_error_rejects_malformed_next_call(next_call: Any, error_code: str) -> None:
+  from agent_gateway.code_execution._bridge_client import HankBridge, HankBridgeError
+  from agent_gateway.code_execution._frame_reader import _error_reply
+  from pydantic import ValidationError
+
+  class Transport:
+    def exchange(self, payload: dict[str, Any]) -> dict[str, Any]:
+      return {
+        "call_id": payload["call_id"], "ok": False,
+        "error": {"code": error_code, "message": "host error", "next_call": next_call},
+      }
+
+  with pytest.raises(HankBridgeError, match="malformed next_call") as exc:
+    HankBridge(Transport(), "token").call("x")
+  assert exc.value.code == "protocol_error"
+  if isinstance(next_call, dict):
+    assert (
+      "must be an object" if "arguments" in next_call else "needs 'tool_name'"
+    ) in exc.value.message
+  with pytest.raises(ValidationError, match="undeclared keys"):
+    _error_reply(
+      "tool_result",
+      "call-1",
+      error_code,
+      "host error",
+      {"tool_name": "load_tools", "arguments": {"pack": "x"}, "bogus": 1},
+    )
+
+@pytest.mark.parametrize("error_fields", [
+  pytest.param({}, id="absent"),
+  pytest.param({"next_call": None}, id="none"),
+  pytest.param(
+    {"next_call": {"tool_name": "load_tools", "arguments": {"pack": "x"}}},
+    id="valid-mapping",
+  ),
+  pytest.param(
+    {"next_call": types.MappingProxyType({"tool_name": "load_tools", "arguments": {"pack": "x"}})},
+    id="valid-nondict-mapping",
+  ),
+])
+def test_bridge_error_preserves_next_call(error_fields: dict[str, Any]) -> None:
+  from agent_gateway.code_execution._bridge_client import HankBridge, HankBridgeError
+
+  class Transport:
+    def exchange(self, payload: dict[str, Any]) -> dict[str, Any]:
+      return {
+        "call_id": payload["call_id"], "ok": False,
+        "error": {"code": "not_granted", "message": "host error", **error_fields},
+      }
+
+  with pytest.raises(HankBridgeError) as exc:
+    HankBridge(Transport(), "token").call("x")
+  assert exc.value.code == "not_granted"
+  assert exc.value.message == "host error"
+  assert exc.value.next_call is error_fields.get("next_call")
+
+
+def test_bridge_type_error_with_valid_next_call_remains_type_error() -> None:
+  from agent_gateway.code_execution._bridge_client import HankBridge
+
+  class Transport:
+    def exchange(self, payload: dict[str, Any]) -> dict[str, Any]:
+      return {
+        "call_id": payload["call_id"], "ok": False,
+        "error": {
+          "code": "type_error", "message": "invalid tool arguments",
+          "next_call": {"tool_name": "load_tools", "arguments": {"pack": "x"}},
+        },
+      }
+
+  with pytest.raises(TypeError, match="invalid tool arguments"):
+    HankBridge(Transport(), "token").call("x")
+
+
+@pytest.mark.parametrize("grant_pack", [None, "fms-research"])
+def test_unloaded_tool_is_refused_until_it_enters_the_active_grant(grant_pack: str | None) -> None:
   async def _run() -> None:
     session, bundle, mcp, dispatcher = _setup()
     try:
@@ -822,23 +854,73 @@ def test_deferred_tool_activates_through_bound_mechanism_and_dispatches() -> Non
         "name": SEARCH_FILINGS, "description": "Search SEC filings.", "input_schema": object_schema,
       }
       loaded = _tool_definitions(bundle)
-      activated: list[str] = []
+      loaded.append({"name": "load_tools", "input_schema": object_schema})
 
-      async def activate(operation: str) -> bool:
-        activated.append(operation)
+      async def _load_tools(tool_input: dict[str, Any], **_kwargs: Any) -> ToolResult:
+        assert tool_input == {"pack": grant_pack}
         loaded.append(search_definition)
-        return True
+        return {"loaded": [SEARCH_FILINGS]}, None
 
+      dispatcher = ToolDispatcher(
+        capability_bind=TEST_CAPABILITY_BIND,
+        mcp_client=mcp,
+        local_tool_handlers={**bundle.handlers, "load_tools": _load_tools},
+        role="owner",
+        needs_approval=lambda _name, _tool_input, _qualifier: False,
+        event_log=EventLog(),
+        approval_key_qualifier=bundle.approval_qualifier,
+        get_tool_definitions=lambda: loaded,
+      )
       bundle.bind_dispatcher(
         dispatcher,
         tool_definitions=lambda: loaded,
-        code_callable=_CODE_CALLABLE,
-        activatable_tool_definitions=lambda: [search_definition],
-        activate_tool=activate,
+        code_callable=lambda name: name == "load_tools" or _CODE_CALLABLE(name),
       )
+      bundle.frame_reader.bind_grant_hint(lambda name: grant_pack if name == SEARCH_FILINGS else None)
+      before, error = await _run_cell(dispatcher, f"""
+        import json
+        print(json.dumps(sorted(row["name"] for row in hank.search(""))))
+        try:
+            hank.call({SEARCH_FILINGS!r}, operation="inspect")
+        except HankBridgeError as exc:
+            print(exc.code)
+            print(exc.message)
+            print(json.dumps(exc.next_call))
+            if exc.next_call is not None:
+                print(json.dumps(hank.call(exc.next_call)))
+                print(hank.describe({SEARCH_FILINGS!r})["name"])
+      """)
+      assert error is None, error
+      assert before["return_code"] == 0, before["stderr"]
+      lines = before["stdout"].splitlines()
+      assert SEARCH_FILINGS not in json.loads(lines[0])
+      assert lines[1] == "not_granted"
+      expected_message = (
+        f'{SEARCH_FILINGS!r} is not granted to this turn; load its pack first: '
+        f'hank.call("load_tools", pack="{grant_pack}") (or call it directly as a tool)'
+        if grant_pack is not None else
+        f"{SEARCH_FILINGS!r} is not granted to this turn; load its pack with load_tools (or call it directly as a tool)"
+      )
+      assert lines[2] == expected_message
+      expected_next_call = (
+        {"tool_name": "load_tools", "arguments": {"pack": grant_pack}}
+        if grant_pack is not None else None
+      )
+      assert json.loads(lines[3]) == expected_next_call
+      if grant_pack is not None:
+        assert json.loads(lines[4]) == {"loaded": [SEARCH_FILINGS]}
+        assert lines[5] == SEARCH_FILINGS
+        assert before["nested_calls"][1]["operation"] == "load_tools"
+        assert before["nested_calls"][1]["ok"] is True
+      assert before["nested_calls"][0]["error_code"] == "not_granted"
+      assert mcp.calls == []
+
+      if grant_pack is None:
+        loaded.append(search_definition)
       result, error = await _run_cell(dispatcher, f"""
         import json
         print(json.dumps(sorted(row["name"] for row in hank.search(""))))
+        print(hank.describe({SEARCH_FILINGS!r})["name"])
         print(hank.call({SEARCH_FILINGS!r}, operation="inspect"))
         print(getattr(hank, {SEARCH_FILINGS!r})(operation="inspect"))
         for op in ({EXECUTE_TRADE!r}, "mcp__nowhere__nothing"):
@@ -851,7 +933,7 @@ def test_deferred_tool_activates_through_bound_mechanism_and_dispatches() -> Non
       assert result["return_code"] == 0, result["stderr"]
       lines = result["stdout"].splitlines()
       assert SEARCH_FILINGS in json.loads(lines[0])
-      assert activated == [SEARCH_FILINGS]
+      assert lines[1] == SEARCH_FILINGS
       assert mcp.calls == [
         (SEARCH_FILINGS, {"operation": "inspect"}),
         (SEARCH_FILINGS, {"operation": "inspect"}),
@@ -866,10 +948,363 @@ def test_deferred_tool_activates_through_bound_mechanism_and_dispatches() -> Non
   asyncio.run(_run())
 
 
+def test_dormant_research_door_with_grant_hint_refuses_as_not_granted_and_runs_after_load() -> None:
+  async def _run() -> None:
+    session, bundle, mcp, _ = _setup()
+    try:
+      door_name = "get_valuation_policy_context"
+      door_pack = "research-corpus-mcp"
+      door_def = {
+        "name": door_name,
+        "description": "Read ValuationPolicy authoring context",
+        "input_schema": {
+          "type": "object",
+          "properties": {"research_file_id": {"type": "integer"}},
+        },
+      }
+      load_def = {
+        "name": "load_tools",
+        "description": "Load deferred tools",
+        "input_schema": {
+          "type": "object",
+          "properties": {"pack": {"type": "string"}},
+        },
+      }
+      loaded: list[dict[str, Any]] = [*bundle.tool_definitions, load_def]
+      local_handlers: dict[str, Any] = dict(bundle.handlers)
+
+      async def _door_handler(tool_input: dict[str, Any], **_kw: Any):
+        return {"status": "ready", "research_file_id": tool_input.get("research_file_id")}, None
+
+      async def _load_tools(tool_input: dict[str, Any], **_kw: Any):
+        assert tool_input == {"pack": door_pack}
+        local_handlers[door_name] = _door_handler
+        loaded.append(door_def)
+        return {"loaded_servers": [door_pack], "new_tools": {door_pack: [door_name]}}, None
+
+      local_handlers["load_tools"] = _load_tools
+      dispatcher = ToolDispatcher(
+        capability_bind=TEST_CAPABILITY_BIND,
+        mcp_client=mcp,
+        local_tool_handlers=local_handlers,
+        role="owner",
+        needs_approval=lambda _name, _tool_input, _qualifier: False,
+        event_log=EventLog(),
+        approval_key_qualifier=bundle.approval_qualifier,
+        get_tool_definitions=lambda: loaded,
+      )
+      # Before load_tools runs, the dormant door is in neither _local nor _mcp:
+      assert dispatcher.route_origin_for_tool(door_name) is None
+      bundle.bind_dispatcher(
+        dispatcher,
+        tool_definitions=lambda: loaded,
+        code_callable=lambda name: name in {"load_tools", door_name},
+      )
+      bundle.frame_reader.bind_grant_hint(
+        lambda name: door_pack if name == door_name else None,
+      )
+      result, error = await _run_cell(dispatcher, f"""
+        import json
+        read_first = {{"tool_name": {door_name!r}, "arguments": {{"research_file_id": 1}}}}
+        try:
+            hank.call(read_first)
+        except HankBridgeError as exc:
+            print(exc.code)
+            print(json.dumps(exc.next_call))
+            hank.call(exc.next_call)
+            ctx = hank.call(read_first)
+            print(json.dumps(ctx))
+      """)
+      assert error is None, error
+      assert result["return_code"] == 0, result["stderr"]
+      lines = result["stdout"].splitlines()
+      assert lines[0] == "not_granted"
+      assert json.loads(lines[1]) == {"tool_name": "load_tools", "arguments": {"pack": door_pack}}
+      assert json.loads(lines[2]) == {"status": "ready", "research_file_id": 1}
+      assert [
+        (entry["operation"], entry["ok"], entry["error_code"])
+        for entry in result["nested_calls"]
+      ] == [
+        (door_name, False, "not_granted"),
+        ("load_tools", True, None),
+        (door_name, True, None),
+      ]
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+def test_grant_hint_respects_frozen_autonomous_ceiling_and_parent_tool_ids() -> None:
+  async def _run() -> None:
+    session, bundle, mcp, _ = _setup()
+    try:
+      from agent.interactive.runtime_tooling import bind_session_code_execution
+      from excel_mcp.relay import ChannelRegistry
+
+      door_name = "get_valuation_policy_context"
+      door_pack = "research-corpus-mcp"
+      local_handlers = dict(bundle.handlers)
+      local_handlers.pop(door_name, None)
+
+      async def _door_handler(tool_input: dict[str, Any], **_kw: Any):
+        return {"status": "ready", "research_file_id": tool_input.get("research_file_id")}, None
+
+      async def _load_tools(tool_input: dict[str, Any], **_kw: Any):
+        return {"loaded_servers": [door_pack]}, None
+
+      local_handlers["load_tools"] = _load_tools
+      session.autonomous_task_id = "job-ceiling"
+      session.admitted_job_context = types.SimpleNamespace(
+        tool_ids=frozenset({"load_tools"}),
+        withheld=frozenset(),
+      )
+      dispatcher = ToolDispatcher(
+        capability_bind=TEST_CAPABILITY_BIND,
+        mcp_client=mcp,
+        session=session,
+        local_tool_handlers=local_handlers,
+        role="owner",
+        needs_approval=lambda _name, _tool_input, _qualifier: False,
+        event_log=EventLog(),
+        run_context=RunContext(user_id="u", request_id="r", profile_name="analyst"),
+        get_tool_definitions=lambda: [],
+      )
+      session.research_door_grant_ceiling = frozenset()
+      bind_session_code_execution(
+        bundle,
+        dispatcher,
+        mcp_client_manager=mcp,
+        channel_registry=ChannelRegistry(),
+        tool_definitions=lambda: [],
+      )
+      cell = bundle.frame_reader.open_cell("outer_ceiling", abort_event=None, active=True)
+
+      # Parent authority alone does not widen the frozen local ceiling.
+      assert cell._refusal(dispatcher, door_name) == "unknown_operation"
+      session.admitted_job_context.tool_ids = frozenset({"load_tools", door_name})
+      assert cell._refusal(dispatcher, door_name) == "unknown_operation"
+
+      # Once the frozen ceiling includes the door, the refusal is followable.
+      local_handlers[door_name] = _door_handler
+      session.research_door_grant_ceiling = frozenset({door_name})
+      cell.close()
+      bind_session_code_execution(
+        bundle,
+        dispatcher,
+        mcp_client_manager=mcp,
+        channel_registry=ChannelRegistry(),
+        tool_definitions=lambda: [],
+      )
+      cell = bundle.frame_reader.open_cell("outer_ceiling_granted", abort_event=None, active=True)
+      assert cell._refusal(dispatcher, door_name) == "not_granted"
+      assert cell._grant_hint(door_name) == door_pack
+      cell.close()
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+def test_packless_autonomous_ceiling_does_not_hint_outside_frozen_handlers() -> None:
+  async def _run() -> None:
+    session, bundle, mcp, _ = _setup()
+    try:
+      from agent.interactive.runtime_tooling import bind_session_code_execution
+      from excel_mcp.relay import ChannelRegistry
+
+      door_name = "get_historical_foundation_context"
+      local_handlers = dict(bundle.handlers)
+      local_handlers["load_tools"] = lambda *_args, **_kwargs: ({"loaded": True}, None)
+      local_handlers.pop(door_name, None)
+      session.autonomous_task_id = "job-packless"
+      session.admitted_job_context = None
+      dispatcher = ToolDispatcher(
+        capability_bind=TEST_CAPABILITY_BIND,
+        mcp_client=mcp,
+        session=session,
+        local_tool_handlers=local_handlers,
+        role="owner",
+        needs_approval=lambda _name, _tool_input, _qualifier: False,
+        event_log=EventLog(),
+        run_context=RunContext(user_id="u", request_id="r", profile_name="community"),
+        get_tool_definitions=lambda: [],
+      )
+      session.research_door_grant_ceiling = frozenset()
+      bind_session_code_execution(
+        bundle,
+        dispatcher,
+        mcp_client_manager=mcp,
+        channel_registry=ChannelRegistry(),
+        tool_definitions=lambda: [],
+      )
+      cell = bundle.frame_reader.open_cell("outer_packless", abort_event=None, active=True)
+      assert cell._refusal(dispatcher, door_name) == "unknown_operation"
+
+      async def _door_handler(tool_input: dict[str, Any], **_kw: Any):
+        return {"status": "ready"}, None
+
+      local_handlers[door_name] = _door_handler
+      session.research_door_grant_ceiling = frozenset({door_name})
+      cell.close()
+      bind_session_code_execution(
+        bundle,
+        dispatcher,
+        mcp_client_manager=mcp,
+        channel_registry=ChannelRegistry(),
+        tool_definitions=lambda: [],
+      )
+      cell = bundle.frame_reader.open_cell("outer_packless_granted", abort_event=None, active=True)
+      assert cell._refusal(dispatcher, door_name) == "not_granted"
+      assert cell._grant_hint(door_name) == "research-corpus-mcp"
+      cell.close()
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+def test_grant_hint_follows_the_load_tools_owner_not_the_profile_defaults() -> None:
+  async def _run() -> None:
+    from agent.interactive.runtime_tooling import bind_session_code_execution
+    from excel_mcp.relay import ChannelRegistry
+
+    async def _bound(*, ceiling: frozenset[str] | None, load_tool_packs: dict[str, Any]):
+      session, bundle, mcp, _ = _setup()
+      local_handlers = dict(bundle.handlers)
+      local_handlers["load_tools"] = lambda *_args, **_kwargs: ({"loaded": True}, None)
+      session.autonomous_task_id = "job-load-tools-owner"
+      session.admitted_job_context = None
+      # The caller recorded exactly what it passed to make_load_tools_handler;
+      # these differ from load_profile("analyst").tool_packs and the profile ceiling.
+      session.load_tool_packs = load_tool_packs
+      session.research_door_grant_ceiling = ceiling
+      dispatcher = ToolDispatcher(
+        capability_bind=TEST_CAPABILITY_BIND,
+        mcp_client=mcp,
+        session=session,
+        local_tool_handlers=local_handlers,
+        role="owner",
+        needs_approval=lambda _name, _tool_input, _qualifier: False,
+        event_log=EventLog(),
+        run_context=RunContext(user_id="u", request_id="r", profile_name="analyst"),
+        get_tool_definitions=lambda: [],
+      )
+      bind_session_code_execution(
+        bundle,
+        dispatcher,
+        mcp_client_manager=mcp,
+        channel_registry=ChannelRegistry(),
+        tool_definitions=lambda: [],
+      )
+      return session, bundle, dispatcher
+
+    # 1. Packs the caller actually gave load_tools decide the hinted pack: with no
+    #    model-versions pack, load_tools grants compare_model_versions through the
+    #    research-corpus-mcp alias, not through the analyst profile's pack.
+    session, bundle, dispatcher = await _bound(ceiling=None, load_tool_packs={})
+    try:
+      cell = bundle.frame_reader.open_cell("outer_packs", abort_event=None, active=True)
+      assert cell._refusal(dispatcher, "compare_model_versions") == "not_granted"
+      assert cell._grant_hint("compare_model_versions") == "research-corpus-mcp"
+      cell.close()
+    finally:
+      await cleanup_code_execution(session)
+
+    # 2. A door outside the ceiling the caller gave load_tools is not grantable.
+    door_name = "get_valuation_policy_context"
+    session, bundle, dispatcher = await _bound(ceiling=frozenset(), load_tool_packs={})
+    try:
+      cell = bundle.frame_reader.open_cell("outer_empty_ceiling", abort_event=None, active=True)
+      assert cell._refusal(dispatcher, door_name) == "unknown_operation"
+      cell.close()
+    finally:
+      await cleanup_code_execution(session)
+
+    # 3. A door inside that ceiling is a followable load_tools refusal.
+    session, bundle, dispatcher = await _bound(
+      ceiling=frozenset({door_name}),
+      load_tool_packs={},
+    )
+    try:
+      cell = bundle.frame_reader.open_cell("outer_door_ceiling", abort_event=None, active=True)
+      assert cell._refusal(dispatcher, door_name) == "not_granted"
+      cell.close()
+      result = await cell._tool_call({
+        "type": "tool_call",
+        "call_id": "c-door-ceiling",
+        "next_call": {"tool_name": door_name, "arguments": {"research_file_id": 1}},
+      })
+      assert result["error"]["code"] == "not_granted"
+      assert result["error"]["next_call"] == {
+        "tool_name": "load_tools",
+        "arguments": {"pack": "research-corpus-mcp"},
+      }
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+def test_root_autonomous_context_keeps_research_door_grant_hint() -> None:
+  async def _run() -> None:
+    from agent.interactive.runtime_tooling import bind_session_code_execution
+    from agent_gateway.admission import root_context
+    from excel_mcp.relay import ChannelRegistry
+
+    session, bundle, mcp, _ = _setup()
+    try:
+      door_name = "get_valuation_policy_context"
+      local_handlers = dict(bundle.handlers)
+      local_handlers.pop(door_name, None)
+      local_handlers["load_tools"] = lambda *_args, **_kwargs: ({"loaded": True}, None)
+      session.autonomous_task_id = "job-root"
+      root_context(session, withheld_tools=frozenset(), research_file_id=None)
+      # A root with configured packs has no frozen local ceiling; its root
+      # context has tool_ids=None and must not narrow the admitted doors.
+      session.research_door_grant_ceiling = None
+      session.load_tool_packs = {}
+      dispatcher = ToolDispatcher(
+        capability_bind=TEST_CAPABILITY_BIND,
+        mcp_client=mcp,
+        session=session,
+        local_tool_handlers=local_handlers,
+        role="owner",
+        needs_approval=lambda _name, _tool_input, _qualifier: False,
+        event_log=EventLog(),
+        run_context=RunContext(user_id="u", request_id="r", profile_name="analyst"),
+        get_tool_definitions=lambda: [],
+      )
+      bind_session_code_execution(
+        bundle,
+        dispatcher,
+        mcp_client_manager=mcp,
+        channel_registry=ChannelRegistry(),
+        tool_definitions=lambda: [],
+      )
+      cell = bundle.frame_reader.open_cell("outer_root", abort_event=None, active=True)
+      assert cell._refusal(dispatcher, door_name) == "not_granted"
+      assert cell._grant_hint(door_name) == "research-corpus-mcp"
+      cell.close()
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+def test_load_tools_grant_state_is_declared_on_gateway_session() -> None:
+  from dataclasses import fields
+
+  from agent_gateway.session import GatewaySession
+
+  declared = {item.name for item in fields(GatewaySession)}
+  assert {"research_door_grant_ceiling", "load_tool_packs"} <= declared
+
+
 def test_hank_outside_a_bridged_cell_and_unbound_dispatcher_report_bridge_unavailable() -> None:
   async def _run() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+    bundle = build_code_execution(session, config=CodeExecutionConfig())
     dispatcher = ToolDispatcher(
       capability_bind=TEST_CAPABILITY_BIND,
       mcp_client=_CaptureMcp(),
@@ -912,7 +1347,10 @@ def test_background_cell_reports_its_nested_calls_on_collection() -> None:
       result = await _collect_background(session, task_id)
       assert result["stdout"] == "CPIAUCSL\n", result
       assert mcp.calls == [(FRED_SERIES, {"series_id": "CPIAUCSL"})]
-      assert [(entry["nested_call_id"], entry["ok"]) for entry in result["nested_calls"]] == [(f"{OUTER_ID}.1", True)]
+      assert "nested_calls" not in result and "sources" not in result
+      record = bundle.frame_reader.cell_record(task_id)
+      assert record == bundle.frame_reader.cell_record(OUTER_ID)
+      assert [(entry["nested_call_id"], entry["ok"]) for entry in record["nested_calls"]] == [(f"{OUTER_ID}.1", True)]
       assert bundle.frame_reader.active_cells() == ()
     finally:
       await cleanup_code_execution(session)
@@ -925,7 +1363,6 @@ def test_background_cell_is_a_code_job_whose_result_carries_its_bridge() -> None
 
   async def _run() -> None:
     session, bundle, mcp, dispatcher = _setup(extract_sources=_filings_extractor)
-    opened = _record_open_cells(bundle)
     try:
       started, error = await _run_cell(
         dispatcher,
@@ -939,7 +1376,7 @@ def test_background_cell_is_a_code_job_whose_result_carries_its_bridge() -> None
       task_id = started["task_id"]
       later_bundle = build_code_execution(
         session,
-        config=CodeExecutionConfig(register_docker=False),
+        config=CodeExecutionConfig(),
         job_runner=lambda: session.active_turn.runtime_owner,
       )
       _bind(later_bundle, mcp, extract_sources=_filings_extractor)
@@ -947,11 +1384,15 @@ def test_background_cell_is_a_code_job_whose_result_carries_its_bridge() -> None
       assert _code_job(session, task_id).state == TaskState.COMPLETED
       assert result["status"] == "completed"
       assert result["stdout"] == "10-K\n", result
-      assert [(entry["nested_call_id"], entry["ok"]) for entry in result["nested_calls"]] == [(f"{OUTER_ID}.1", True)]
-      assert result["sources"] == [{**handle, "produced_by_tool": "get_filings"} for handle in _FILING_HANDLES]
-      [(cell, original_fds)] = opened
-      assert all(_fd_closed(fd, original) for fd, original in original_fds.items())
+      assert "nested_calls" not in result and "sources" not in result
+      record = bundle.frame_reader.cell_record(task_id)
+      assert record == later_bundle.frame_reader.cell_record(OUTER_ID)
+      assert [(entry["nested_call_id"], entry["ok"]) for entry in record["nested_calls"]] == [(f"{OUTER_ID}.1", True)]
+      assert record["sources"] == [{**handle, "produced_by_tool": "get_filings"} for handle in _FILING_HANDLES]
       assert bundle.frame_reader.active_cells() == ()
+      await cleanup_code_execution(session)
+      assert session.code_execution_frame_reader is None
+      assert bundle.frame_reader.cell_record(task_id) == {}
     finally:
       await cleanup_code_execution(session)
 
@@ -962,7 +1403,6 @@ def test_registry_kill_cancels_a_running_background_cell_and_closes_it(monkeypat
   async def _run() -> None:
     handles = _record_started_handles(monkeypatch)
     session, bundle, mcp, dispatcher = _setup(delay_s=30.0)
-    opened = _record_open_cells(bundle)
     try:
       started, error = await _run_cell(
         dispatcher,
@@ -976,7 +1416,6 @@ def test_registry_kill_cancels_a_running_background_cell_and_closes_it(monkeypat
       entry = _code_job(session, started["task_id"])
       await _until(lambda: bool(mcp.calls))
       assert mcp.calls == [(FRED_SERIES, {"series_id": "CPIAUCSL"})]
-      [(cell, original_fds)] = opened
       assert bundle.frame_reader.active_cells() == (OUTER_ID,)
 
       assert session.active_turn.runtime_owner.cancel_background_task(entry.task_id) is True
@@ -988,9 +1427,8 @@ def test_registry_kill_cancels_a_running_background_cell_and_closes_it(monkeypat
       assert bundle.frame_reader._cells == {}
       assert mcp.cancelled is True
       [handle] = handles
-      assert handle._backend_data["process"].returncode is not None
+      assert handle._backend_data["completed"] is True
       assert handle._backend_data["reader_task"].done()
-      assert all(_fd_closed(fd, original) for fd, original in original_fds.items())
     finally:
       await cleanup_code_execution(session)
 
@@ -1001,7 +1439,6 @@ def test_session_cleanup_closes_a_running_background_cell(monkeypatch: pytest.Mo
   async def _run() -> None:
     handles = _record_started_handles(monkeypatch)
     session, bundle, mcp, dispatcher = _setup(delay_s=30.0)
-    opened = _record_open_cells(bundle)
     started, error = await _run_cell(
       dispatcher,
       f"""
@@ -1014,7 +1451,6 @@ def test_session_cleanup_closes_a_running_background_cell(monkeypatch: pytest.Mo
     entry = _code_job(session, started["task_id"])
     await _until(lambda: bool(mcp.calls))
     assert mcp.calls == [(FRED_SERIES, {"series_id": "CPIAUCSL"})]
-    [(cell, original_fds)] = opened
     assert bundle.frame_reader.active_cells() == (OUTER_ID,)
 
     await cleanup_code_execution(session)
@@ -1024,14 +1460,11 @@ def test_session_cleanup_closes_a_running_background_cell(monkeypatch: pytest.Mo
     assert mcp.cancelled is True
     [handle] = handles
     assert handle._backend_data["reader_task"].done()
-    assert all(_fd_closed(fd, original) for fd, original in original_fds.items())
 
   asyncio.run(_run())
 
 
-@pytest.mark.parametrize("termination", ["cleanup", "timeout"])
 def test_background_teardown_does_not_wait_for_detached_descendant_output(
-  termination: str,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   async def _run() -> None:
@@ -1053,7 +1486,6 @@ def test_background_teardown_does_not_wait_for_detached_descendant_output(
         hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")
         """,
         background=True,
-        timeout_ms=1000 if termination == "timeout" else 30000,
       )
       assert error is None, error
       entry = _code_job(session, started["task_id"])
@@ -1062,14 +1494,8 @@ def test_background_teardown_does_not_wait_for_detached_descendant_output(
       [handle] = handles
       descendant_pid = int((Path(handle.work_dir) / "detached.pid").read_text())
 
-      if termination == "cleanup":
-        await asyncio.wait_for(cleanup_code_execution(session), timeout=7)
-        assert entry.state == TaskState.KILLED
-      else:
-        result = await asyncio.wait_for(
-          _collect_background(session, started["task_id"]), timeout=7,
-        )
-        assert result["timed_out"] is True
+      await asyncio.wait_for(cleanup_code_execution(session), timeout=7)
+      assert entry.state == TaskState.KILLED
       assert handle._backend_data["reader_task"].done()
       assert mcp.cancelled is True
       assert bundle.frame_reader.active_cells() == ()
@@ -1351,7 +1777,6 @@ def test_reader_teardown_awaits_nested_dispatch_and_revokes_all_cells() -> None:
     session, bundle, mcp, _dispatcher = _setup(delay_s=30.0)
     reader = bundle.frame_reader
     cell = reader.open_cell("teardown", abort_event=None, active=True)
-    original_fds = {fd: os.fstat(fd) for fd in cell.fds()}
     task = asyncio.create_task(cell.handle_frame(encode_frame({
       "type": "tool_call", "call_id": "wait", "cell_token": cell.token,
       "parent_call_id": "teardown", "operation": FRED_SERIES,
@@ -1368,7 +1793,6 @@ def test_reader_teardown_awaits_nested_dispatch_and_revokes_all_cells() -> None:
       assert task.done() and task.cancelled()
       assert mcp.cancelled
       assert reader.active_cells() == ()
-      assert all(_fd_closed(fd, original) for fd, original in original_fds.items())
       with pytest.raises(RuntimeError, match="disposed"):
         reader.open_cell("after-session-end", abort_event=None, active=True)
     finally:
@@ -1379,8 +1803,8 @@ def test_reader_teardown_awaits_nested_dispatch_and_revokes_all_cells() -> None:
   asyncio.run(_run())
 
 
-def test_actual_oversized_dispatch_reply_is_protocol_error_and_next_cell_works(monkeypatch: Any) -> None:
-  from agent_gateway.code_execution._frame_codec import MAX_FRAME_BYTES, encode_frame
+def test_actual_over_limit_dispatch_reply_is_a_correlated_error_and_the_cell_continues(monkeypatch: Any) -> None:
+  from agent_gateway.code_execution._frame_codec import MAX_CELL_BYTES, encode_frame
 
   async def _run() -> None:
     session, bundle, mcp, _dispatcher = _setup()
@@ -1388,7 +1812,7 @@ def test_actual_oversized_dispatch_reply_is_protocol_error_and_next_cell_works(m
 
     async def oversized(name: str, value: Any, **kwargs: Any) -> ToolResult:
       if value.get("series_id") == "large":
-        return {"text": "x" * MAX_FRAME_BYTES}, None
+        return {"text": "x" * MAX_CELL_BYTES}, None
       return await call_tool(name, value, **kwargs)
 
     monkeypatch.setattr(mcp, "call_tool", oversized)
@@ -1401,10 +1825,20 @@ def test_actual_oversized_dispatch_reply_is_protocol_error_and_next_cell_works(m
         "input": {"series_id": "large"},
       })))
       assert reply["ok"] is False
+      assert reply["call_id"] == "large"
       assert reply["error"]["code"] == "protocol_error"
-      assert cell.budget.error is not None
+      # One over-limit reply is that call's error; it does not poison the cell.
+      assert cell.budget.error is None
       assert cell.summary()["nested_calls"][0]["ok"] is False
       assert cell.summary()["nested_calls"][0]["error_code"] == "protocol_error"
+      reply = decode_frame(await cell.handle_frame(encode_frame({
+        "type": "tool_call", "call_id": "small", "cell_token": cell.token,
+        "parent_call_id": cell.outer_call_id, "operation": FRED_SERIES,
+        "input": {"series_id": "CPIAUCSL"},
+      })))
+      assert reply["ok"] is True, reply
+      assert reply["result"]["series_id"] == "CPIAUCSL"
+      assert [entry["ok"] for entry in cell.summary()["nested_calls"]] == [False, True]
       cell.close()
       later = reader.open_cell("small-reply", abort_event=None, active=True)
       try:
@@ -1419,6 +1853,188 @@ def test_actual_oversized_dispatch_reply_is_protocol_error_and_next_cell_works(m
         later.close()
     finally:
       cell.close()
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+def test_tool_reply_above_two_mib_arrives_intact_in_the_cell(monkeypatch: Any) -> None:
+  import hashlib
+
+  size = 3 * 1024 * 1024 + 5
+  text = ("abcdefghijklmnopqrstuvwxyz0123456789" * (size // 36 + 1))[:size]
+  digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+  async def _run() -> None:
+    session, _bundle, mcp, dispatcher = _setup()
+    call_tool = mcp.call_tool
+
+    async def large(name: str, value: Any, **kwargs: Any) -> ToolResult:
+      if value.get("series_id") == "big":
+        return {"series_id": "big", "text": text}, None
+      return await call_tool(name, value, **kwargs)
+
+    monkeypatch.setattr(mcp, "call_tool", large)
+    try:
+      result, error = await _run_cell(dispatcher, f"""
+        import hashlib
+        reply = hank.call({FRED_SERIES!r}, series_id="big")
+        body = reply["text"]
+        print(len(body), hashlib.sha256(body.encode("utf-8")).hexdigest())
+        print(body[:36], body[-5:])
+      """)
+      assert error is None, error
+      assert result["return_code"] == 0, result["stderr"]
+      assert result["stdout"] == f"{size} {digest}\n{text[:36]} {text[-5:]}\n"
+      assert not result.get("protocol_error")
+      nested = result["nested_calls"]
+      assert [(entry["ok"], entry["error_code"]) for entry in nested] == [(True, None)]
+      assert nested[0]["result_bytes"] > size
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+@pytest.mark.parametrize("direction", ["request", "reply"])
+def test_over_limit_bridge_traffic_is_a_caught_error_that_keeps_stdout_and_exit_code(
+  monkeypatch: Any, direction: str,
+) -> None:
+  from agent_gateway.code_execution._frame_codec import MAX_CELL_BYTES
+
+  async def _run() -> None:
+    session, _bundle, mcp, dispatcher = _setup()
+    call_tool = mcp.call_tool
+
+    async def oversized(name: str, value: Any, **kwargs: Any) -> ToolResult:
+      if value.get("series_id") == "over":
+        return {"text": "x" * MAX_CELL_BYTES}, None
+      return await call_tool(name, value, **kwargs)
+
+    monkeypatch.setattr(mcp, "call_tool", oversized)
+    argument = f"'x' * {MAX_CELL_BYTES}" if direction == "request" else "'over'"
+    try:
+      result, error = await _run_cell(dispatcher, f"""
+        saved = 88
+        print("before", flush=True)
+        try:
+            hank.call({FRED_SERIES!r}, series_id={argument})
+        except HankBridgeError as exc:
+            print("caught", exc.code)
+        print("after", hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")["series_id"])
+      """)
+      assert error is None, error
+      assert result["return_code"] == 0, result
+      assert result["stdout"] == "before\ncaught protocol_error\nafter CPIAUCSL\n"
+      assert not result.get("protocol_error")
+      if direction == "reply":
+        assert [(entry["ok"], entry["error_code"]) for entry in result["nested_calls"]] == [
+          (False, "protocol_error"), (True, None),
+        ]
+      else:
+        assert [entry["ok"] for entry in result["nested_calls"]] == [True]
+      following, error = await _run_cell(dispatcher, "print(saved)")
+      assert error is None and following["return_code"] == 0
+      assert following["stdout"] == "88\n"
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+def test_concurrent_acall_gather_returns_every_result_in_gather_order(monkeypatch: Any) -> None:
+  async def _run() -> None:
+    session, _bundle, mcp, dispatcher = _setup()
+    arrived: list[str] = []
+    all_in = asyncio.Event()
+
+    async def gated(name: str, value: Any, **_kwargs: Any) -> ToolResult:
+      # Every call must be in flight at once before any is answered: a serialized
+      # bridge never reaches the third call and this wait times out.
+      arrived.append(str(value.get("ticker") or value.get("series_id")))
+      if len(arrived) == 3:
+        all_in.set()
+      await asyncio.wait_for(all_in.wait(), timeout=30)
+      if name == GET_FILINGS:
+        return {**_FILINGS_RESULT, "ticker": value["ticker"]}, None
+      return {**_FRED_RESULT, "series_id": value["series_id"]}, None
+
+    monkeypatch.setattr(mcp, "call_tool", gated)
+    try:
+      result, error = await _run_cell(dispatcher, f"""
+        import asyncio
+        results = await asyncio.gather(
+            hank.acall({GET_FILINGS!r}, ticker="AAA"),
+            hank.acall({FRED_SERIES!r}, series_id="BBB"),
+            hank.acall({GET_FILINGS!r}, ticker="CCC"),
+        )
+        print([row.get("ticker") or row["series_id"] for row in results])
+      """)
+      assert error is None, error
+      assert result["return_code"] == 0, result["stderr"]
+      assert result["stdout"] == "['AAA', 'BBB', 'CCC']\n"
+      assert sorted(arrived) == ["AAA", "BBB", "CCC"]
+      nested = result["nested_calls"]
+      assert sorted(entry["ordinal"] for entry in nested) == [1, 2, 3]
+      assert len({entry["nested_call_id"] for entry in nested}) == 3
+      assert all(entry["ok"] is True and entry["error_code"] is None for entry in nested)
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+def test_call_accepts_a_next_call_mapping_positionally_and_unpacked() -> None:
+  async def _run() -> None:
+    session, _bundle, mcp, dispatcher = _setup()
+    try:
+      result, error = await _run_cell(dispatcher, f"""
+        next_call = {{"tool_name": {FRED_SERIES!r}, "arguments": {{"series_id": "CPIAUCSL"}}}}
+        first = hank.call(next_call)
+        second = hank.call(**next_call)
+        third = hank.call(**{{"tool_name": {GET_FILINGS!r}, "arguments": {{"cik": "0000320193"}}}})
+        print(first["series_id"], second["series_id"], third["ticker"])
+        check_model_entry = {{
+            "tool_name": {FRED_SERIES!r},
+            "arguments": {{"series_id": "CPIAUCSL"}},
+            "repair_owner": "model_builder",
+            "finding_codes": ["missing_input"],
+            "missing_controls": [],
+            "note": "refetch the series",
+            "then": "check_model",
+        }}
+        fourth = hank.call(check_model_entry)
+        print(fourth["series_id"])
+        try:
+            hank.call({{"arguments": {{"series_id": "CPIAUCSL"}}, "note": "no operation"}})
+        except TypeError:
+            print("TypeError")
+        try:
+            hank.call({{"tool_name": {FRED_SERIES!r}, "argments": {{"series_id": "CPIAUCSL"}}, "arguments": {{"series_id": "CPIAUCSL"}}}})
+        except TypeError as exc:
+            print("TypeError", "argments" in str(exc), "undeclared keys" in str(exc), "repair_owner" in str(exc))
+        try:
+            hank.call({{"tool_name": {FRED_SERIES!r}, "arguments": {{"series_id": "CPIAUCSL"}}, "missing_controls": [{{"item_id": "x", "then": 42}}]}})
+        except TypeError as exc:
+            print("TypeError", str(exc))
+      """)
+      assert error is None, error
+      assert result["return_code"] == 0, result["stderr"]
+      assert result["stdout"] == (
+        "CPIAUCSL CPIAUCSL AAPL\n"
+        "CPIAUCSL\n"
+        "TypeError\n"
+        "TypeError True True True\n"
+        "TypeError next_call.missing_controls.0.then: Input should be a valid list\n"
+      )
+      assert mcp.calls == [
+        (FRED_SERIES, {"series_id": "CPIAUCSL"}),
+        (FRED_SERIES, {"series_id": "CPIAUCSL"}),
+        (GET_FILINGS, {"cik": "0000320193"}),
+        (FRED_SERIES, {"series_id": "CPIAUCSL"}),
+      ]
+      assert [entry["ok"] for entry in result["nested_calls"]] == [True, True, True, True]
+    finally:
       await cleanup_code_execution(session)
 
   asyncio.run(_run())
@@ -1544,7 +2160,7 @@ def test_native_nested_computation_sources_settle_without_filesystem_reader(monk
 
     monkeypatch.setattr("agent_gateway.code_execution._handlers.code_execute", execute)
     try:
-      result, error = await _run_cell(dispatcher, "pass", host="subprocess")
+      result, error = await _run_cell(dispatcher, "pass")
       assert error is None
       assert result["sources"] == [
         {**source, "produced_by_tool": "get_filings"} for source in sources
@@ -1603,88 +2219,6 @@ def test_native_settlement_retrieves_live_entry_without_repreparing_executed_inp
       assert summary["nested_calls"][0]["provenance"] == provenance
       assert any(source.get("document_id") == _FILING_HANDLES[0]["document_id"] for source in summary["sources"])
     finally:
-      await cleanup_code_execution(session)
-
-  asyncio.run(run())
-
-
-def test_exited_cell_revokes_token_while_descendant_holds_output_pipes(
-  tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  from agent_gateway.code_execution._frame_codec import encode_frame
-  from agent_gateway.code_execution._frame_reader import lookup_active_cell
-
-  async def run() -> None:
-    handles = _record_started_handles(monkeypatch)
-    session, bundle, _mcp, dispatcher = _setup()
-    pid_path = tmp_path / "holder.pid"
-    release_path = tmp_path / "release-cell"
-    try:
-      started, error = await _run_cell(
-        dispatcher,
-        f"""
-        import subprocess
-        import sys
-        import time
-        from pathlib import Path
-        descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        Path({str(pid_path)!r}).write_text(str(descendant.pid))
-        while not Path({str(release_path)!r}).exists():
-            time.sleep(0.01)
-        """,
-        background=True,
-        # The cell is deliberately held alive until the release file lands, so
-        # its wall-clock budget must never bind: 60 s is a reaping safety net,
-        # not the test's synchronization (a 3 s budget raced load-stretched
-        # polls and revoked the token mid-test — gate #20b-74b).
-        timeout_ms=60000,
-      )
-      assert error is None, error
-      # All readiness below is state-driven; the 60 s monotonic deadlines are
-      # hang guards matching the cell's reaping net, never the mechanism.
-      loop = asyncio.get_running_loop()
-      cell, = bundle.frame_reader._cells.values()
-      # Activation rides the background start task: wait for the token to
-      # become active rather than assuming the handshake completed when
-      # dispatch returned.
-      active_deadline = loop.time() + 60
-      while lookup_active_cell(cell.token) is None and loop.time() < active_deadline:
-        await asyncio.sleep(0.005)
-      assert lookup_active_cell(cell.token) is not None
-      pid_deadline = loop.time() + 60
-      while not pid_path.exists() and loop.time() < pid_deadline:
-        await asyncio.sleep(0.005)
-      assert pid_path.exists()
-      entry = _code_job(session, started["task_id"])
-      [handle] = handles
-      data = handle._backend_data
-      release_path.touch()
-      # Observe the leader's exit without Process.wait(), which also waits for
-      # the descendant's inherited stdout/stderr descriptors to reach EOF.
-      exit_deadline = loop.time() + 60
-      while data["process"].returncode is None and loop.time() < exit_deadline:
-        await asyncio.sleep(0.005)
-      assert data["process"].returncode == 0
-      # Let the backend's exit observer run, but stay inside its pending output
-      # drain. The child remains alive and still holds both inherited pipes.
-      revoke_deadline = loop.time() + 60
-      while lookup_active_cell(cell.token) is not None and loop.time() < revoke_deadline:
-        await asyncio.sleep(0.005)
-      os.kill(int(pid_path.read_text()), 0)
-      assert not data["reader_task"].done()
-      assert not entry.completed
-      assert lookup_active_cell(cell.token) is None
-      reply = decode_frame(await cell.handle_frame(encode_frame({
-        "type": "hello", "call_id": "after-exit", "cell_token": cell.token,
-      })))
-      assert reply["error"]["code"] == "bad_cell_token"
-    finally:
-      if pid_path.exists():
-        try:
-          os.kill(int(pid_path.read_text()), signal.SIGKILL)
-        except ProcessLookupError:
-          pass
       await cleanup_code_execution(session)
 
   asyncio.run(run())
@@ -1787,3 +2321,166 @@ def test_skills_as_code_bridge_read_path_exercises_library_and_reaches_approval_
       pass
 
   asyncio.run(_run())
+
+
+# --- call-scoped cell token: v2 native minted by the installed authority -------
+
+_V2_CELL_TOKEN = re.compile(r"v2_[1-9][0-9]*_[0-9a-f]{64}_[0-9a-f]{64}")
+_AUTHORITY_SECRET = b"cell-token-authority-test-key-at-least-32-bytes"
+
+
+def _install_authority(monkeypatch: pytest.MonkeyPatch) -> GatewayClaimSigningAuthority:
+  monkeypatch.setattr(claim_signing_authority, "_configured_authority", None)
+  monkeypatch.setenv(GATEWAY_CLAIM_SIGNING_AUTHORITY_ENV, "stale")
+  monkeypatch.setenv(LEGACY_CLAIM_HMAC_KEY_ENV, "scrubbed-on-install")
+  authority = GatewayClaimSigningAuthority(_AUTHORITY_SECRET)
+  install_gateway_claim_signing_authority(authority)
+  return authority
+
+
+def _place_bundle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, storage_id: str) -> None:
+  bundle = mint_user_runtime_credentials(
+    org_claim_key="cell-token-org-authority-at-least-32-bytes",
+    identity=UserRuntimeIdentity(
+      key="alice-private-api-key", channel="excel", slug="alice",
+      email="alice@example.test", risk_user_id=17, role="analyst", capabilities=(),
+    ),
+    storage_id=storage_id,
+    desk=DeskReplica(
+      url="https://desk.example.test", aws_access_key_id=None, aws_secret_access_key=None,
+      aws_session_token=None, expires_at=None,
+    ),
+  )
+  path = tmp_path / "bundle.json"
+  write_user_runtime_credentials(bundle, path)
+  monkeypatch.setenv(USER_RUNTIME_CREDENTIALS_FILE_ENV, str(path))
+
+
+def test_agentcore_shaped_boot_mints_v2_token_for_the_placed_bundle_storage(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  from agent_gateway.code_execution._frame_reader import lookup_active_cell
+
+  authority = _install_authority(monkeypatch)
+  _place_bundle(monkeypatch, tmp_path, "4242")
+
+  async def run() -> None:
+    session, bundle, _mcp, _dispatcher = _setup()
+    cell = bundle.frame_reader.open_cell("placed", abort_event=None, active=True)
+    try:
+      assert _V2_CELL_TOKEN.fullmatch(cell.token)
+      assert claim_signing_authority.native_cell_token_storage(cell.token) == "4242"
+      assert authority.verify_native_cell_token(cell.token) == "4242"
+      active = lookup_active_cell(cell.token)
+      assert active is not None and active.outer_call_id == "placed"
+      cell.close()
+      assert lookup_active_cell(cell.token) is None
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(run())
+
+
+def test_zero_risk_session_inside_a_placed_bundle_mints_for_the_bundle_storage(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  from agent_gateway.code_execution._frame_reader import FrameReader
+
+  authority = _install_authority(monkeypatch)
+  _place_bundle(monkeypatch, tmp_path, "4242")
+
+  async def run() -> None:
+    reader = FrameReader(principal={"user_id": "alice-slug", "risk_user_id": 0})
+    cell = reader.open_cell("zero-risk", abort_event=None, active=True)
+    try:
+      assert authority.verify_native_cell_token(cell.token) == "4242"
+    finally:
+      await reader.aclose()
+
+  asyncio.run(run())
+
+
+def test_cell_token_without_a_bundle_mints_for_the_positive_risk_user_id(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.code_execution._frame_reader import FrameReader
+
+  authority = _install_authority(monkeypatch)
+  monkeypatch.delenv(USER_RUNTIME_CREDENTIALS_FILE_ENV, raising=False)
+
+  async def run() -> None:
+    reader = FrameReader(principal={"user_id": "alice-slug", "risk_user_id": 17})
+    cell = reader.open_cell("risk-id", abort_event=None, active=True)
+    try:
+      assert authority.verify_native_cell_token(cell.token) == "17"
+    finally:
+      await reader.aclose()
+
+  asyncio.run(run())
+
+
+def test_cell_token_without_a_bundle_or_positive_risk_id_is_the_plain_nonce(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.code_execution._frame_reader import FrameReader, lookup_active_cell
+
+  _install_authority(monkeypatch)
+  monkeypatch.delenv(USER_RUNTIME_CREDENTIALS_FILE_ENV, raising=False)
+
+  async def run() -> None:
+    reader = FrameReader(principal={"user_id": "alice-slug", "risk_user_id": 0})
+    cell = reader.open_cell("direct", abort_event=None, active=True)
+    try:
+      assert not _V2_CELL_TOKEN.fullmatch(cell.token)
+      assert claim_signing_authority.native_cell_token_storage(cell.token) is None
+      assert lookup_active_cell(cell.token) is not None
+    finally:
+      await reader.aclose()
+
+  asyncio.run(run())
+
+
+def test_v2_cell_token_verifies_only_for_its_minted_storage_and_authority(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  from agent_gateway.code_execution._frame_reader import FrameReader
+
+  authority = _install_authority(monkeypatch)
+  _place_bundle(monkeypatch, tmp_path, "4242")
+
+  async def run() -> None:
+    reader = FrameReader(principal={"risk_user_id": 17})
+    cell = reader.open_cell("wrong-storage", abort_event=None, active=True)
+    try:
+      version, storage, nonce, mac = cell.token.split("_")
+      assert (version, storage) == ("v2", "4242")
+      other_storage = "_".join((version, "17", nonce, mac))
+      assert claim_signing_authority.native_cell_token_storage(other_storage) == "17"
+      assert authority.verify_native_cell_token(other_storage) is None
+      foreign = GatewayClaimSigningAuthority(b"another-authority-key-at-least-32-bytes!!")
+      assert foreign.verify_native_cell_token(cell.token) is None
+    finally:
+      await reader.aclose()
+
+  asyncio.run(run())
+
+
+def test_cell_token_without_an_authority_is_the_plain_nonce(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  from agent_gateway.code_execution._frame_reader import FrameReader, lookup_active_cell
+
+  monkeypatch.setattr(claim_signing_authority, "_configured_authority", None)
+  _place_bundle(monkeypatch, tmp_path, "4242")
+
+  async def run() -> None:
+    reader = FrameReader(principal={"risk_user_id": 17})
+    cell = reader.open_cell("plain", abort_event=None, active=True)
+    try:
+      assert not _V2_CELL_TOKEN.fullmatch(cell.token)
+      assert claim_signing_authority.native_cell_token_storage(cell.token) is None
+      assert lookup_active_cell(cell.token) is not None
+    finally:
+      await reader.aclose()
+
+  asyncio.run(run())

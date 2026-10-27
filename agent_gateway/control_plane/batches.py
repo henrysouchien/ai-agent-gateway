@@ -11,9 +11,10 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Annotated, Any, Callable, Protocol
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request
+from pydantic import Field
 
 from agent_gateway.approval_route import (
   DurableLocalApprovalRoute,
@@ -53,12 +54,15 @@ from agent_gateway.session import AuthManager, GatewaySession
 
 from agent_gateway.admission import AdmittedContext, ParentContext, Refusal, SpawnRequest, root_context
 from agent_workflow_contracts import OperationUnavailable, ResolvedAuthority
+from agent_workflow_contracts.research_file_contract import MAX_RESEARCH_FILE_ID, is_research_file_id
 from .corpus_readiness import (
   CORPUS_REQUIREMENTS_FIELD,
   CorpusReadinessGateError,
   require_corpus_readiness,
 )
 from .runs import _require_bearer_session, _require_control_session, _session_owner_user_id
+
+SqliteInt64Id = Annotated[int, Field(ge=1, le=MAX_RESEARCH_FILE_ID)]
 
 _TERMINAL_BATCH_STATUSES = frozenset({
   "completed",
@@ -562,10 +566,9 @@ class BatchTaskRegistry:
   @staticmethod
   def _key(owner_user_id: str, batch_id: int) -> tuple[str, int]:
     owner = str(owner_user_id or "").strip()
-    normalized_batch_id = int(batch_id)
-    if not owner or normalized_batch_id < 1:
+    if not owner or not is_research_file_id(batch_id):
       raise ValueError("batch task owner and positive batch_id are required")
-    return owner, normalized_batch_id
+    return owner, batch_id
 
   def _release_live_session(self, key: tuple[str, int]) -> None:
     session = self._live_sessions.pop(key, None)
@@ -614,7 +617,7 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
   @router.get("/{batch_id}")
   async def get_batch(
     request: Request,
-    batch_id: int,
+    batch_id: SqliteInt64Id,
     top_n: int = Query(default=10, ge=1, le=100),
   ) -> dict[str, Any]:
     authenticated = _require_bearer_session(request, auth)
@@ -627,7 +630,7 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
     )
 
   @router.delete("/{batch_id}")
-  async def cancel_batch(request: Request, batch_id: int) -> dict[str, Any]:
+  async def cancel_batch(request: Request, batch_id: SqliteInt64Id) -> dict[str, Any]:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     owner_user_id = _session_owner_user_id(authenticated)
@@ -747,7 +750,7 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
       registry.close()
 
   @router.post("/{batch_id}/retry-failed")
-  async def retry_failed_batch(request: Request, batch_id: int) -> dict[str, Any]:
+  async def retry_failed_batch(request: Request, batch_id: SqliteInt64Id) -> dict[str, Any]:
     authenticated = _require_bearer_session(request, auth)
     _require_control_session(authenticated)
     owner_user_id = _session_owner_user_id(authenticated)

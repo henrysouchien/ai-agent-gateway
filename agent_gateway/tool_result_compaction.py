@@ -5,6 +5,7 @@ import os
 import uuid
 from typing import Any, Callable, Dict
 
+from agent_workflow_contracts.context_refs import project_persist_envelope_delta
 from .autonomous_event_channel import autonomous_event_fits_frame
 from .tool_result_spill import SpillPublication, SpillSink, normalize_spill_sink, write_spill_set
 from .tool_result_semantics import status_error_has_detail
@@ -14,8 +15,6 @@ MODEL_TOOL_RESULT_MAX_CHARS = 60_000
 MODEL_TOOL_RESULT_MAX_CHARS_ENV = "AGENT_GATEWAY_MAX_MODEL_TOOL_RESULT_CHARS"
 MODEL_TOOL_RESULT_MIN_CHARS = 4_000
 SPILL_TRUNCATED_TOOL_RESULTS_ENV = "AGENT_GATEWAY_SPILL_TRUNCATED_TOOL_RESULTS"
-_BUSINESS_MODEL_TERMINAL_TOOL = "fms_persist_business_model"
-_ERROR_STATUSES = frozenset({"error", "failed", "failure"})
 
 
 def model_tool_result_max_chars() -> int:
@@ -296,240 +295,6 @@ def _fit_content_projection(
   return None
 
 
-def _bounded_projection_text(value: Any, *, limit: int) -> str | None:
-  if not isinstance(value, str) or not value.strip():
-    return None
-  normalized = value.strip()
-  return normalized if len(normalized) <= limit else normalized[:limit] + "...<truncated>"
-
-
-def _business_model_data_gaps(value: Any) -> list[Any]:
-  if not isinstance(value, list):
-    return []
-  projected: list[Any] = []
-  for gap in value[:20]:
-    if isinstance(gap, str):
-      text = _bounded_projection_text(gap, limit=1_000)
-      if text is not None:
-        projected.append(text)
-      continue
-    if not isinstance(gap, dict):
-      continue
-    row: dict[str, Any] = {}
-    for field, limit in (("key", 256), ("text", 1_000)):
-      text = _bounded_projection_text(gap.get(field), limit=limit)
-      if text is not None:
-        row[field] = text
-    claim_keys = gap.get("claim_keys")
-    if isinstance(claim_keys, list):
-      bounded_claims = [
-        text
-        for item in claim_keys[:20]
-        if (text := _bounded_projection_text(item, limit=256)) is not None
-      ]
-      if bounded_claims:
-        row["claim_keys"] = bounded_claims
-    if row:
-      projected.append(row)
-  return projected
-
-
-_PROJECTION_DROPPED = object()
-
-
-def _bounded_projection_node(value: Any, *, depth: int = 0) -> Any:
-  """Bound a nested receipt value with the projection's existing caps.
-
-  Strings use ``_bounded_projection_text`` at the artifact_ref cap; lists and
-  dicts stop at the same 20-item cap as data gaps. A separate depth-cut sentinel
-  keeps explicit nulls and empty containers intact inside retained values.
-  """
-
-  if isinstance(value, str):
-    return _bounded_projection_text(value, limit=2_000) if value.strip() else value[:2_000]
-  if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
-    return value
-  if depth >= _PROJECTION_MAX_DEPTH:
-    return _PROJECTION_DROPPED
-  if isinstance(value, list):
-    items = [
-      projected
-      for item in value[:20]
-      if (projected := _bounded_projection_node(item, depth=depth + 1)) is not _PROJECTION_DROPPED
-    ]
-    return items
-  if isinstance(value, dict):
-    row: dict[str, Any] = {}
-    for key, item in list(value.items())[:20]:
-      projected = _bounded_projection_node(item, depth=depth + 1)
-      if projected is not _PROJECTION_DROPPED:
-        row[key] = projected
-    return row
-  return _bounded_projection_text(str(value), limit=2_000)
-
-
-def _business_model_findings(value: Any) -> list[Any]:
-  if not isinstance(value, list):
-    return []
-  projected: list[Any] = []
-  for item in value[:20]:
-    if not isinstance(item, dict):
-      continue
-    row: dict[str, Any] = {}
-    if "index" in item:
-      index = item.get("index")
-      if isinstance(index, bool):
-        pass
-      elif isinstance(index, (int, float)):
-        row["index"] = index
-      else:
-        text = _bounded_projection_text(index, limit=128)
-        if text is not None:
-          row["index"] = text
-    for field, limit in (("field", 256), ("code", 128), ("message", 2_000)):
-      text = _bounded_projection_text(item.get(field), limit=limit)
-      if text is not None:
-        row[field] = text
-    if "next_call" in item:
-      call = item.get("next_call")
-      if call is None:
-        row["next_call"] = None
-      else:
-        bounded_call = _bounded_projection_node(call)
-        if bounded_call is not _PROJECTION_DROPPED:
-          row["next_call"] = bounded_call
-    if "change_template" in item:
-      template = _bounded_projection_node(item.get("change_template"))
-      if template is not _PROJECTION_DROPPED:
-        row["change_template"] = template
-    if row:
-      projected.append(row)
-  return projected
-
-
-def _business_model_warnings(value: Any) -> list[Any]:
-  if not isinstance(value, list):
-    return []
-  projected: list[Any] = []
-  for item in value[:20]:
-    if isinstance(item, str):
-      text = _bounded_projection_text(item, limit=2_000)
-      if text is not None:
-        projected.append(text)
-      continue
-    if not isinstance(item, dict):
-      continue
-    row = _bounded_projection_node(item)
-    if isinstance(row, dict) and row:
-      projected.append(row)
-  return projected
-
-
-
-def _business_model_terminal_success_projection(
-  content: str,
-  *,
-  tool_name: str,
-) -> str | None:
-  """Return the bounded model-facing receipt for an accepted BM terminal call.
-
-  The runner's tool-complete event retains the original result separately —
-  always in the durable record, and in the streamed copy too whenever the
-  channel frame can carry it (``project_tool_call_complete_for_stream``).  This
-  projection therefore removes materialized BusinessModel/readback payloads only
-  from the provider conversation, where they add no value after persistence.
-  """
-
-  if tool_name != _BUSINESS_MODEL_TERMINAL_TOOL:
-    return None
-  try:
-    result = json.loads(content)
-  except Exception:
-    return None
-  if not isinstance(result, dict) or bool(result.get("error")):
-    return None
-  status = _bounded_projection_text(result.get("status"), limit=128)
-  if status is None or status.lower() in _ERROR_STATUSES:
-    return None
-
-  readback_value = result.get("readback")
-  readback = readback_value if isinstance(readback_value, dict) else {}
-  verdict_candidates = (
-    result.get("verdict"),
-    result.get("verdict_echo"),
-    readback.get("verdict"),
-  )
-  verdict_payload = next(
-    (
-      candidate
-      for candidate in verdict_candidates
-      if isinstance(candidate, dict)
-      and _bounded_projection_text(candidate.get("verdict"), limit=128) is not None
-    ),
-    {},
-  )
-  verdict = _bounded_projection_text(verdict_payload.get("verdict"), limit=128)
-  if verdict is None:
-    return None
-
-  typed_outputs_value = readback.get("typed_outputs")
-  typed_outputs = (
-    typed_outputs_value
-    if isinstance(typed_outputs_value, dict)
-    else {}
-  )
-  stage_receipt_value = typed_outputs.get("business_model_stage_receipt")
-  stage_receipt = (
-    stage_receipt_value
-    if isinstance(stage_receipt_value, dict)
-    else {}
-  )
-  data_gaps = next(
-    (
-      candidate.get("data_gaps")
-      for candidate in verdict_candidates
-      if isinstance(candidate, dict) and isinstance(candidate.get("data_gaps"), list)
-    ),
-    [],
-  )
-  recommended_next_action = next(
-    (
-      candidate.get("recommended_next_action")
-      for candidate in verdict_candidates
-      if isinstance(candidate, dict)
-      and isinstance(candidate.get("recommended_next_action"), str)
-    ),
-    None,
-  )
-
-  projection: dict[str, Any] = {
-    "status": status,
-    "gate_code": _bounded_projection_text(result.get("gate_code"), limit=128),
-    "artifact_ref": _bounded_projection_text(result.get("artifact_ref"), limit=2_000),
-    "proposal_id": _bounded_projection_text(result.get("proposal_id"), limit=256),
-    "verdict": verdict,
-    "confidence": _bounded_projection_text(verdict_payload.get("confidence"), limit=128),
-    "revision": _bounded_projection_text(verdict_payload.get("revision"), limit=256),
-    "stage_receipt_status": _bounded_projection_text(stage_receipt.get("status"), limit=128),
-    "data_gaps": _business_model_data_gaps(data_gaps),
-    "recommended_next_action": _bounded_projection_text(recommended_next_action, limit=2_000),
-  }
-  # A structural noop or review-required verdict carries its reason only in
-  # the selected verdict's findings and the envelope warnings. An accepted
-  # BM_CONSTRUCTED receipt stays the receipt above, unchanged.
-  if status == "noop" or not verdict.upper().startswith("BM_CONSTRUCTED"):
-    findings = _business_model_findings(verdict_payload.get("findings"))
-    if findings:
-      projection["findings"] = findings
-    warnings = _business_model_warnings(result.get("warnings"))
-    if warnings:
-      projection["warnings"] = warnings
-    if isinstance(result.get("argument_skeleton"), dict):
-      projection["argument_skeleton"] = result["argument_skeleton"]
-    if isinstance(result.get("next_call"), dict):
-      projection["next_call"] = result["next_call"]
-  return json.dumps(projection, default=str)
-
 
 def annotate_result(result: Any, tool_name: str = "") -> Any:
   """Add _runner_warning to generic results with detectable anomalies."""
@@ -715,14 +480,16 @@ def compact_model_tool_result_entry(
   if not isinstance(content, str):
     return result_entry, result_entry
 
-  terminal_projection = (
-    None
-    if is_error_tool_result_entry(result_entry, content)
-    else _business_model_terminal_success_projection(
-      content,
-      tool_name=tool_name,
-    )
-  )
+  terminal_projection: str | None = None
+  if tool_name.startswith("fms_persist_") and not is_error_tool_result_entry(result_entry, content):
+    try:
+      parsed_dict = json.loads(content)
+    except (TypeError, ValueError):
+      parsed_dict = None
+    if isinstance(parsed_dict, dict):
+      delta = project_persist_envelope_delta(parsed_dict)
+      if delta is not None:
+        terminal_projection = json.dumps(delta, default=str)
   if terminal_projection is not None:
     projected_entry = dict(result_entry)
     projected_entry["content"] = terminal_projection

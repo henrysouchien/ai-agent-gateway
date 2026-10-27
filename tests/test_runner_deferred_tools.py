@@ -51,6 +51,10 @@ class _Dispatcher:
   def redact_prepared_tool_input(self, tool_name: str, prepared_call: Any) -> dict[str, Any]:
     return prepared_call.materialize_input()
 
+  def redact_raw_tool_input_for_history(self, tool_name: str, tool_input: Any) -> dict[str, Any]:
+    _ = tool_name
+    return dict(tool_input)
+
   def settle_tool_result(self, tool_name, dispatch_entry, result, error, semantic_error=None, *, prepared_call):
     return settle_catalogless_tool_result(
       entry=dispatch_entry, result=result, error=error, semantic_error=semantic_error,

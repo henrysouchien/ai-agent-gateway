@@ -19,20 +19,29 @@ def _load_result_payload(content: Any) -> Dict[str, Any] | None:
 def strip_code_execute_base64_content(content: str) -> str:
   """The model-visible form of one serialized `code_execute` result.
 
-  Image bytes become `[image: <name>]` placeholders and native `computations`
-  are dropped; content that is not a result object is returned unchanged.
-  A foreground cell's result entry and a background cell's job result both
-  pass through here.
+  Image bytes become `[image: <name>]` placeholders. Native `computations`,
+  `sources`, `nested_calls` and the `stdout_tail`/`stderr_tail` duplicates of
+  the single stdout/stderr copy are dropped, as are empty `displays`/`images`,
+  and a null `error`; `spill` refs are kept. Content that
+  is not a result object is returned unchanged. A foreground cell's result
+  entry and a background cell's job result both pass through here.
   """
   result = _load_result_payload(content)
   if result is None:
     return content
 
   updated = False
-  for key in ("computations",):
+  for key in ("computations", "sources", "nested_calls", "stdout_tail", "stderr_tail", "kernel_locals"):
     if key in result:
       result.pop(key, None)
       updated = True
+  for key in ("displays", "images"):
+    if key in result and result[key] == []:
+      result.pop(key, None)
+      updated = True
+  if "error" in result and result["error"] is None:
+    result.pop("error", None)
+    updated = True
   displays = result.get("displays")
   if isinstance(displays, list):
     for index, bundle in enumerate(displays):

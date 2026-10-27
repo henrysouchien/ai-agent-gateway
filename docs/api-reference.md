@@ -585,9 +585,8 @@ Inject built-in code execution tools into a runtime.
 
 Behavior:
 
-- `host=auto` prefers Docker when available
-- falls back to a registered host kernel, then subprocess; skipped-backend reasons are logged at `WARNING`
-- every `code_execute` result names where it ran: `backend`, `sandboxed`, and `skipped_backends` (`[{backend, sandboxed, reason}]`, empty unless `host=auto` skipped one)
+- `CodeExecutionConfig.placement` chooses the one backend: `"local"` (default) builds a `KernelBackend`, `"docker"` builds a `DockerBackend` with `docker_image` and `readonly_mounts`; there is no per-call host selector and no fallback between placements
+- every `code_execute` result names where it ran: `backend` (`"kernel"` or `"docker"`) and `sandboxed`
 - stores reader, interpreter states and work directory on the session
 - `job_runner()` answers the `AgentRunner` that owns the request's task registry, or `None`, at call time; a `background=true` cell registers there as a `code` job and is inspected, waited on and killed through the registry, and with no runner it returns `code_execution_unavailable`
 
@@ -603,20 +602,19 @@ completion or interruption does not dispose a persistent interpreter.
 
 Read-only availability probe for the Docker backend `config` names: returns that `DockerBackend`'s `unavailable_reason()` (`None` when it can run). The answer is memoised per image name for `ttl_s` seconds; `clear_docker_availability_cache()` forgets it. A runtime that must offer `code_execute` only under the sandboxed backend calls this before `build_code_execution()`.
 
-### `DockerBackend`, `KernelBackend` and `SubprocessBackend`
+### `DockerBackend` and `KernelBackend`
 
-Concrete execution backends of `ExecutionBackend`.
+Concrete execution backends of `ExecutionBackend`; both are persistent session interpreters sharing the same runner and codec.
 
-- `DockerBackend` is treated as sandboxed
-- `KernelBackend` is an unsandboxed persistent host interpreter, registered by default (`CodeExecutionConfig.register_kernel=True`); sandboxed-only deployments must set `register_kernel=False`
-- `SubprocessBackend` is treated as unsandboxed
+- `DockerBackend` is treated as sandboxed; `readonly_mounts` lists host directories bind-mounted into the container read-only at the same path (only existing directories are mounted)
+- `KernelBackend` is an unsandboxed persistent host interpreter
 - `unavailable_reason()` returns why a backend cannot run now, or `None`; `available()` derives from it, so a custom backend overrides `unavailable_reason()` only
 
-Subprocess carries the bridge over inherited pipes. Docker and the host kernel
-run the same dependency-free `_kernel_runner.py` with the shared client and
-codec shipped as source. The container receives cell tokens over stdin, not a
-new environment allowlist or socket mount; its direct networking remains
-disabled and domain reads execute through the gateway dispatcher.
+Docker and the host kernel run the same dependency-free `_kernel_runner.py` with
+the shared client and codec shipped as source. The container receives cell tokens
+over stdin, not a new environment allowlist or socket mount; its direct
+networking remains disabled and domain reads execute through the gateway
+dispatcher.
 
 Every placement uses the same 2 MiB wire-frame and 64 MiB executing-cell
 aggregate bounds. Oversize requests, replies and aggregate overflow report
@@ -644,7 +642,10 @@ bound so a descendant holding a writer cannot stall teardown.
 
 ### `make_code_execute_tool_def()`
 
-Factory for the public `code_execute` tool schema exposed to the model. A
+`make_code_execute_tool_def(config)` is the factory for the public `code_execute`
+tool schema exposed to the model; it takes only the `CodeExecutionConfig`, and
+the schema carries no host or backend selector — `config.placement` alone
+chooses where cells run. A
 `background=true` cell runs as a `code` job on the task registry of the runner
 `build_code_execution(..., job_runner=...)` answers; its result is delivered as
 any background task result.

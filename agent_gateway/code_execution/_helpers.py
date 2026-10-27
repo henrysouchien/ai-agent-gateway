@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import errno
-import functools
 import os
 import stat as stat_module
 import tempfile
@@ -161,107 +160,6 @@ def _build_subprocess_env(extra_env: Optional[Dict[str, str]] = None) -> Dict[st
     else:
       env[key] = text_value
   return env
-
-
-def _default_code_execute_preamble(task_id: str = "") -> str:
-  plot_prefix = f"_plot_{task_id}_" if task_id else "_plot_"
-  return f"""\
-import importlib.abc as _importlib_abc
-import os as _os
-import sys as _sys
-
-_WORK_DIR = _os.getcwd()
-_PLOT_PREFIX = {plot_prefix!r}
-_PLOT_COUNTER = [0]
-_os.environ.setdefault("MPLBACKEND", "Agg")
-
-
-def _code_execute_patch_pyplot(_plt):
-    if getattr(_plt, "_code_execute_show_patched", False):
-        return
-
-    def _patched_show(*args, **kwargs):
-        for _fig_num in _plt.get_fignums():
-            _fig = _plt.figure(_fig_num)
-            _PLOT_COUNTER[0] += 1
-            _fig.savefig(
-                _os.path.join(_WORK_DIR, f"{{_PLOT_PREFIX}}{{_PLOT_COUNTER[0]}}.png"),
-                dpi=150, bbox_inches="tight",
-            )
-        _plt.close("all")
-
-    _plt.show = _patched_show
-    _plt._code_execute_show_patched = True
-
-
-class _CodeExecutePyplotLoader(_importlib_abc.Loader):
-    def __init__(self, loader):
-        self._loader = loader
-
-    def create_module(self, spec):
-        create_module = getattr(self._loader, "create_module", None)
-        if create_module is None:
-            return None
-        return create_module(spec)
-
-    def exec_module(self, module):
-        self._loader.exec_module(module)
-        _code_execute_patch_pyplot(module)
-
-
-class _CodeExecutePyplotFinder(_importlib_abc.MetaPathFinder):
-    def find_spec(self, fullname, path, target=None):
-        if fullname != "matplotlib.pyplot":
-            return None
-        for finder in list(_sys.meta_path):
-            if finder is self:
-                continue
-            find_spec = getattr(finder, "find_spec", None)
-            if find_spec is None:
-                continue
-            spec = find_spec(fullname, path, target)
-            if spec is None:
-                continue
-            if spec.loader is not None:
-                spec.loader = _CodeExecutePyplotLoader(spec.loader)
-            return spec
-        return None
-
-
-if "_code_execute_pyplot_finder" not in globals():
-    _code_execute_pyplot_finder = _CodeExecutePyplotFinder()
-    _sys.meta_path.insert(0, _code_execute_pyplot_finder)
-if "matplotlib.pyplot" in _sys.modules:
-    _code_execute_patch_pyplot(_sys.modules["matplotlib.pyplot"])
-"""
-
-
-@functools.cache
-def _bridge_client_source() -> str:
-  """Ship the one shared codec and client without importing the gateway."""
-  root = Path(__file__).parent
-  codec = (root / "_frame_codec.py").read_text(encoding="utf-8")
-  client = (root / "_bridge_client.py").read_text(encoding="utf-8")
-  return (
-    "import sys as _hank_sys, types as _hank_types\n"
-    "if '_hank_frame_codec' not in _hank_sys.modules:\n"
-    "    _hank_codec_module = _hank_types.ModuleType('_hank_frame_codec')\n"
-    "    _hank_sys.modules['_hank_frame_codec'] = _hank_codec_module\n"
-    f"    exec(compile({codec!r}, '_frame_codec.py', 'exec'), _hank_codec_module.__dict__)\n"
-    + client
-  )
-
-
-def _build_code_execute_preamble(config: CodeExecutionConfig, task_id: str = "") -> str:
-  if config.build_preamble is not None:
-    return config.build_preamble(task_id)
-
-  preamble = _default_code_execute_preamble(task_id).rstrip()
-  preamble = f"{preamble}\n\n{_bridge_client_source().strip()}"
-  suffix = (config.preamble_suffix or "").strip("\n")
-  if suffix:
-    preamble = f"{preamble}\n\n{suffix}"
-  return preamble + "\n"
 
 
 def _prepare_code_execute_env(config: CodeExecutionConfig) -> Dict[str, str]:
@@ -482,28 +380,11 @@ def _collect_generated_images(
   return images
 
 
-def _task_script_path(work_dir: Path, task_id: str) -> Path:
-  return work_dir / f"_task_{task_id}.py"
-
-
-def _task_stdout_path(work_dir: Path, task_id: str) -> Path:
-  return work_dir / f"_task_{task_id}_stdout.log"
-
-
-def _task_stderr_path(work_dir: Path, task_id: str) -> Path:
-  return work_dir / f"_task_{task_id}_stderr.log"
-
-
-def _write_code_execute_script(
-  work_dir: Path,
-  code: str,
-  config: CodeExecutionConfig,
-  *,
-  task_id: str = "",
-) -> Path:
+def _write_cell_script(work_dir: Path, code: str, *, task_id: str = "") -> Path:
+  """Write only the user's code; the kernel runner supplies every preamble."""
   if task_id:
-    script_path = _task_script_path(work_dir, task_id)
-    script_path.write_text(_build_code_execute_preamble(config, task_id) + "\n" + code, encoding="utf-8")
+    script_path = work_dir / f"_task_{task_id}.py"
+    script_path.write_text(code, encoding="utf-8")
     return script_path
 
   with tempfile.NamedTemporaryFile(
@@ -514,8 +395,6 @@ def _write_code_execute_script(
     dir=str(work_dir),
     delete=False,
   ) as handle:
-    handle.write(_build_code_execute_preamble(config))
-    handle.write("\n")
     handle.write(code)
     return Path(handle.name)
 
@@ -541,17 +420,6 @@ def _remove_task_artifacts(work_dir: Path, task_id: str) -> None:
   for pattern in patterns:
     for candidate in work_dir.glob(pattern):
       _remove_path(candidate)
-
-
-def _tail_file(path_value: str | Path, n: int = 20) -> str:
-  path = Path(path_value)
-  if not path.exists():
-    return ""
-  try:
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines(True)
-  except OSError:
-    return ""
-  return "".join(lines[-n:])
 
 
 def _read_truncated(path_value: str | Path, max_bytes: int) -> Tuple[str, bool]:

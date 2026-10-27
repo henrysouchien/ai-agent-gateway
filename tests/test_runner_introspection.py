@@ -14,6 +14,7 @@ from agent_gateway.runner_introspection import (  # noqa: E402
   derive_sub_agent_id,
   detect_user_id_param,
   format_exc,
+  root_session_id,
 )
 from agent_gateway.sdk_runner import _detect_user_id_param as sdk_detect_user_id_param  # noqa: E402
 from agent_gateway.sub_agent import _derive_sub_agent_id as sub_agent_derive_sub_agent_id  # noqa: E402
@@ -32,6 +33,15 @@ def test_derive_sub_agent_id_accepts_session_objects_and_plain_ids() -> None:
   assert derive_sub_agent_id("raw-parent", 4) == "sub4:raw-parent"
   assert derive_sub_agent_id(SimpleNamespace(session_id=""), 0) == "sub0:"
 
+
+
+def test_root_session_id_strips_nested_sub_agent_layers_and_preserves_root() -> None:
+  assert root_session_id("sess_266f165bda194216af5fd5038a147591") == "sess_266f165bda194216af5fd5038a147591"
+  assert root_session_id("sub0:sess_266f165bda194216af5fd5038a147591") == "sess_266f165bda194216af5fd5038a147591"
+  assert root_session_id("sub2:sub0:sess_parent") == "sess_parent"
+  assert root_session_id("sub0:") == "sub0:"
+  assert root_session_id("sub_custom:session") == "sub_custom:session"
+  assert root_session_id(None) == ""
 
 def test_format_exc_includes_cause_chain_once() -> None:
   try:

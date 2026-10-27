@@ -1,30 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict
+from typing import Callable, Dict, Literal
 
 
 @dataclass
 class CodeExecutionConfig:
   """Configuration for built-in code execution.
 
-  Fields are grouped into backend selection, script preamble generation,
+  Fields are grouped into kernel placement, script preamble generation,
   environment preparation, working-directory management, output limits, and tool
   description customization.
   """
 
-  # Backend. The session kernel is registered by default so a bundle keeps
-  # locals across cells; a placement that may only run sandboxed code (a
-  # production-hosted gateway) turns it off at its own registration owner
-  # (`build_session_code_execution`), not here.
+  # Placement of the session's one Python kernel: "local" runs it on the host,
+  # "docker" runs the same kernel in a container. `readonly_mounts` are host
+  # directories mounted read-only at the same absolute path in the container.
+  placement: Literal["local", "docker"] = "local"
   docker_image: str = ""
-  register_docker: bool = True
-  register_subprocess: bool = True
-  register_kernel: bool = True
+  readonly_mounts: tuple[str, ...] = ()
 
   # Preamble
   preamble_suffix: str = ""
-  build_preamble: Callable[[str], str] | None = None
 
   # Environment
   extra_env: Dict[str, str] | None = None

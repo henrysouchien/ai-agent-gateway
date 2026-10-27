@@ -5,6 +5,7 @@ from typing import Dict, Mapping
 from .agent_session_log_layout import SESSION_LOG_LAYOUT_ENV
 from .gateway_address import GATEWAY_BASE_URL_ENV
 from .run_settings import SETTINGS_PATH_ENV
+from .user_runtime_credentials import USER_STORAGE_ID_ENV
 
 
 RUN_BASH_ENVIRONMENT = "run_bash"
@@ -89,6 +90,7 @@ _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES = frozenset({
   "HANK_SPEND_INSTANCE_ID",
   "HANK_SPEND_GIT_SHA",
   "USER_DATA_DIR",
+  USER_STORAGE_ID_ENV,
   "CORPUS_LOG_DIR",
   "CORPUS_STATE_DIR",
   "LOG_DIR",
@@ -145,6 +147,7 @@ _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES = frozenset({
   "MODEL_ENGINE_OVERRIDES_DIR",
   "GATEWAY_SURFACE_CONTENT_CAPTURE_ENABLED",
   "GATEWAY_SURFACE_CONTENT_PATH",
+  "AUTONOMOUS_GATEWAY_READY_TIMEOUT_SECONDS",
   # The operator file the child's live ``ContainmentSettings`` reads.
   SETTINGS_PATH_ENV,
 })

@@ -152,6 +152,7 @@ def build_runs_router(
         user_email=authenticated.user_email,
         risk_user_id=authenticated.risk_user_id,
         role=authenticated.role,
+        capabilities=authenticated.capabilities,
         kind="chat",
         auth_config=authenticated.auth_config,
         model_entitled_capabilities=authenticated.model_entitled_capabilities,

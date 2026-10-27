@@ -67,9 +67,10 @@ async def _docker_exec(*args: str, check: bool = True) -> tuple[int, str, str]:
 
 
 class _DockerProcess(_KernelProcess):
-  def __init__(self, work_dir: str, image: str) -> None:
+  def __init__(self, work_dir: str, image: str, readonly_mounts: tuple[str, ...] = ()) -> None:
     super().__init__(work_dir)
     self.image = image
+    self.readonly_mounts = readonly_mounts
     self.container_id: str | None = None
     self.container_name = f"code-execute-{uuid.uuid4().hex}"
     self._removed = False
@@ -84,6 +85,10 @@ class _DockerProcess(_KernelProcess):
       await asyncio.shield(self.aclose())
       raise
 
+  def _readonly_mount_paths(self) -> list[Path]:
+    paths = (Path(mount).expanduser().resolve() for mount in self.readonly_mounts)
+    return [path for path in paths if path.is_dir()]
+
   async def _launch(self, env: Dict[str, str]) -> asyncio.subprocess.Process:
     self.spawn_env = dict(env)
     work_dir = Path(self.work_dir)
@@ -94,6 +99,7 @@ class _DockerProcess(_KernelProcess):
       "create", "-i", "--init", "--name", self.container_name,
       "--network", "none", "--memory", "512m", "--cpus", "1.0", "--pids-limit", "128",
       "-v", f"{work_dir.resolve()}:/workspace:rw", "-w", "/workspace",
+      *(arg for mount in self._readonly_mount_paths() for arg in ("-v", f"{mount}:{mount}:ro")),
       "-e", "PYTHONUNBUFFERED=1",
       "-e", "MPLCONFIGDIR=/workspace/.code_execute_cache/mplconfig",
       "-e", "XDG_CACHE_HOME=/workspace/.code_execute_cache/xdg",
@@ -113,7 +119,7 @@ class _DockerProcess(_KernelProcess):
       stdin=asyncio.subprocess.PIPE,
       stdout=asyncio.subprocess.PIPE,
       stderr=asyncio.subprocess.PIPE,
-      limit=MAX_FRAME_BYTES,
+      limit=MAX_CELL_BYTES,
     ))
     try:
       process = await asyncio.shield(spawn)
@@ -158,10 +164,11 @@ class DockerBackend(KernelBackend):
 
   def __init__(
     self, image: Optional[str] = None, config: CodeExecutionConfig | None = None,
-    *, state: KernelState | None = None,
+    *, state: KernelState | None = None, readonly_mounts: tuple[str, ...] = (),
   ) -> None:
     super().__init__(config=config, state=state)
     self._image = image or os.getenv("CODE_EXECUTE_DOCKER_IMAGE", "ai-excel-addin-code-exec:latest")
+    self._readonly_mounts = readonly_mounts
 
   @property
   def name(self) -> str:
@@ -188,7 +195,7 @@ class DockerBackend(KernelBackend):
     return None
 
   def _make_runner(self, work_dir: str) -> _KernelProcess:
-    return _DockerProcess(work_dir, self._image)
+    return _DockerProcess(work_dir, self._image, self._readonly_mounts)
 
   def _script_name(self, path: Path) -> str:
     return f"/workspace/{path.name}"

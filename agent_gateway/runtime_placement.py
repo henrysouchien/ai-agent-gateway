@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Iterator, Literal, Mapping, Protocol
+from typing import Any, Iterator, Literal, Mapping, Protocol
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -23,6 +23,7 @@ from hank_contracts.user_claims import derive_user_claim_key
 from .user_runtime_credentials import (
   DeskReplica,
   USER_RUNTIME_CREDENTIALS_FILE_ENV,
+  USER_STORAGE_ID_ENV,
   UserRuntimeCredentials,
   UserRuntimeIdentity,
   load_user_runtime_credentials,
@@ -31,6 +32,16 @@ from .user_runtime_credentials import (
 )
 
 RuntimeState = Literal["starting", "ready", "stopped", "replaced"]
+
+# How long a caller waits after SIGTERM to a placement's desk_sync process group
+# before SIGKILL. A stop is graceful only if this covers everything desk_sync does
+# after the signal: the gateway drains up to its uvicorn graceful-shutdown bound
+# (30 s: the `timeout_graceful_shutdown` default in gateway_server.py, which
+# user_runtime_boot.py leaves unset), then desk_sync runs its final file pass
+# (allowance below) and stops Litestream with SIGTERM, waiting up to
+# LITESTREAM_STOP_TIMEOUT (10 s, deploy/user-runtime/desk_sync.py). 30 + 20 + 10.
+# The AgentCore adapter's stop_product imports this one constant.
+PLACEMENT_STOP_GRACE_SECONDS = 30 + 20 + 10
 
 # The runtime's writable state layout, relative to its placement root (the
 # parent of USER_DATA_DIR). The product pins the approval stores under
@@ -44,16 +55,110 @@ _RUNTIME_STATE_PATHS: Mapping[str, str] = {
   "GATEWAY_LOG_DIR": "logs/gateway",
   "TOOL_TIMING_DB_PATH": "logs/gateway/cost.db",
   "GATEWAY_CHAT_LOG_DIR": "logs/chat",
-  "AGENT_SESSION_LOG_BASE_DIR": "logs/sessions",
   "LOG_DIR": "logs/service",
   "MCP_CONFIG_TMP_DIR": "tmp/mcp",
   "MODEL_ENGINE_OVERRIDES_DIR": "model-engine-overrides",
   "GATEWAY_SURFACE_CONTENT_PATH": "telemetry/surface_content.jsonl",
 }
 
+# The user's own data, relative to the desk root: what deploy/user-runtime/
+# desk_sync.py replicates and restores. Investment private state is the desk's
+# ``investment-tools`` directory: the placement sets INVESTMENT_TOOLS_STATE_DIR to
+# it as a locator (investment_state_dir) but never creates it, since a fresh state
+# root must be absent for investment_tools state_paths to initialise it.
+_DESK_STATE_PATHS: Mapping[str, str] = {
+  "AGENT_SESSION_LOG_BASE_DIR": "agent-sessions",
+}
+
+
+def desk_root(user_data_dir: Path, storage_id: str) -> Path:
+  """The one directory a user's desk replicates: ``USER_DATA_DIR/users/<storage_id>``."""
+  return user_data_dir / "users" / storage_id
+
+
+def investment_state_dir(user_data_dir: Path, storage_id: str) -> Path:
+  """The desk's Investment private-state root, ``<desk root>/investment-tools``.
+
+  The placement owns this layout and hands it to the runtime and its children as an
+  explicit ``INVESTMENT_TOOLS_STATE_DIR``. It is a locator only: nothing here creates it.
+  """
+  return desk_root(user_data_dir, storage_id) / "investment-tools"
+
+
+def runtime_state_environment(user_data_dir: Path, storage_id: str) -> dict[str, str]:
+  """Every writable state root of one placed runtime, created and as env values.
+
+  Everything is the runtime's own: an inherited shared-tier path would put two
+  users' logs, approvals or telemetry in one place. User data (session
+  journals) sits under the desk root, the rest under the placement root, the
+  parent of ``user_data_dir``. The storage id is exported too, and the
+  Investment private-state root as ``INVESTMENT_TOOLS_STATE_DIR`` (the desk's
+  ``investment-tools``, see ``investment_state_dir``): that locator is the only
+  way investment_tools places its state, in this runtime and in every child
+  that inherits it. Investment state is the one root not created here;
+  investment_tools initialises it on first use.
+  """
+  runtime_root = user_data_dir.parent
+  paths = {name: runtime_root / relative for name, relative in _RUNTIME_STATE_PATHS.items()}
+  desk = desk_root(user_data_dir, storage_id)
+  paths.update({name: desk / relative for name, relative in _DESK_STATE_PATHS.items()})
+  environ: dict[str, str] = {
+    USER_STORAGE_ID_ENV: storage_id,
+    "INVESTMENT_TOOLS_STATE_DIR": str(investment_state_dir(user_data_dir, storage_id)),
+  }
+  for name, path in paths.items():
+    (path if name.endswith("_DIR") else path.parent).mkdir(parents=True, exist_ok=True, mode=0o700)
+    environ[name] = str(path)
+  return environ
+
 
 def _now() -> float:
   return time.time()
+
+
+def parse_positive_pid(raw: object) -> int:
+  """The one pid shape the system signals or records: a positive int32."""
+  if type(raw) is int and 0 < raw <= 0x7FFFFFFF:
+    return raw
+  raise ValueError(f"pid must be a positive 32-bit integer, got {raw!r}")
+
+
+def _linux_proc_stat_birth_token(raw: str) -> str:
+  """Return Linux ``/proc/<pid>/stat`` field 22, or an empty token."""
+
+  if not isinstance(raw, str):
+    return ""
+  comm_end = raw.rfind(")")
+  if comm_end < 0:
+    return ""
+  fields_from_state = raw[comm_end + 1 :].split()
+  if len(fields_from_state) <= 19:
+    return ""
+  token = fields_from_state[19]
+  return token if token.isdecimal() else ""
+
+
+def pid_birth_token(
+  pid: int, *, platform: str | None = None, run_ps: Any = None, path_cls: Any = Path,
+) -> str:
+  """Process-birth identity; empty string when unavailable or pid is not a positive int32."""
+
+  if type(pid) is not int or not (0 < pid <= 0x7FFFFFFF):
+    return ""
+  if (sys.platform if platform is None else platform) == "linux":
+    try:
+      raw = path_cls(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+      return ""
+    return _linux_proc_stat_birth_token(raw)
+  try:
+    out = (subprocess.run if run_ps is None else run_ps)(
+      ["ps", "-p", str(pid), "-o", "lstart="],
+      capture_output=True, text=True, timeout=5,
+    )
+  except (OSError, subprocess.SubprocessError):
+    return ""
+  return out.stdout.strip()
 
 
 @dataclass(frozen=True)
@@ -67,6 +172,7 @@ class RuntimePlacement:
   generation: int
   started_at: float
   updated_at: float
+  handle_birth: str | None = None
 
 
 class RuntimePlacementStore:
@@ -81,10 +187,16 @@ class RuntimePlacementStore:
         CREATE TABLE IF NOT EXISTS runtime_placements (
           storage_id TEXT PRIMARY KEY, url TEXT NOT NULL, state TEXT NOT NULL,
           backend TEXT NOT NULL, handle TEXT, bundle_path TEXT NOT NULL,
-          generation INTEGER NOT NULL, started_at REAL NOT NULL, updated_at REAL NOT NULL
+          generation INTEGER NOT NULL, started_at REAL NOT NULL, updated_at REAL NOT NULL,
+          handle_birth TEXT
         )
       """)
-
+      columns = {row[1] for row in connection.execute("PRAGMA table_info(runtime_placements)").fetchall()}
+      if "handle_birth" not in columns:
+        # One-time migration: pre-existing rows have no recorded spawn birth
+        # token (and under rule 7 a deploy drains live work before restart),
+        # so their handle_birth stays NULL (unverified) and stop never signals them.
+        connection.execute("ALTER TABLE runtime_placements ADD COLUMN handle_birth TEXT")
   @contextmanager
   def _connection(self) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(self.path, timeout=30)
@@ -105,16 +217,19 @@ class RuntimePlacementStore:
   def upsert(self, placement: RuntimePlacement) -> RuntimePlacement:
     with self._connection() as connection:
       connection.execute("""
-        INSERT INTO runtime_placements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO runtime_placements (
+          storage_id, url, state, backend, handle, bundle_path, generation,
+          started_at, updated_at, handle_birth
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(storage_id) DO UPDATE SET
           url=excluded.url, state=excluded.state, backend=excluded.backend,
           handle=excluded.handle, bundle_path=excluded.bundle_path,
           generation=excluded.generation, started_at=excluded.started_at,
-          updated_at=excluded.updated_at
+          updated_at=excluded.updated_at, handle_birth=excluded.handle_birth
       """, (
         placement.storage_id, placement.url, placement.state, placement.backend,
         placement.handle, placement.bundle_path, placement.generation,
-        placement.started_at, placement.updated_at,
+        placement.started_at, placement.updated_at, placement.handle_birth,
       ))
     return placement
 
@@ -213,6 +328,7 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
     self, *, placement_root: str | os.PathLike[str], org_claim_key: str,
     app: str = "api.main:app", python: str | os.PathLike[str] = sys.executable,
     extra_env: Mapping[str, str] | None = None, litestream_bin: str | None = None,
+    stop_grace: float = PLACEMENT_STOP_GRACE_SECONDS,
   ) -> None:
     super().__init__(placement_root=placement_root, org_claim_key=org_claim_key)
     self._app = app
@@ -223,25 +339,20 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
     self._checkout = Path(__file__).resolve().parents[3]
     self._scripts = self._checkout / "deploy" / "user-runtime"
     self._processes: dict[str, subprocess.Popen[bytes]] = {}
+    self._stop_grace = stop_grace
 
   def __repr__(self) -> str:
     return "LocalProcessRuntimeBackend(credentials=<redacted>)"
 
 
-  def _environment(self, user_data_dir: Path) -> dict[str, str]:
+  def _environment(self, user_data_dir: Path, storage_id: str) -> dict[str, str]:
     environ = dict(self._extra_env)
     for name in (
       "AGENT_API_USER_CLAIM_HMAC_KEY", "GATEWAY_USER_KEYS", "GATEWAY_API_KEY_WEB",
     ):
       environ.pop(name, None)
     environ["USER_DATA_DIR"] = str(user_data_dir)
-    # Every writable state root is the runtime's own: an inherited shared-tier
-    # path would put two users' logs, approvals or telemetry in one place.
-    runtime_root = user_data_dir.parent
-    for name, relative in _RUNTIME_STATE_PATHS.items():
-      path = runtime_root / relative
-      (path if name.endswith("_DIR") else path.parent).mkdir(parents=True, exist_ok=True, mode=0o700)
-      environ[name] = str(path)
+    environ.update(runtime_state_environment(user_data_dir, storage_id))
     return environ
 
   @staticmethod
@@ -283,9 +394,9 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
       user_root = self.placement_root / storage_id
       user_root.mkdir(parents=True, exist_ok=True, mode=0o700)
       user_data_dir = user_root / "user-data"
-      (user_data_dir / "users" / storage_id).mkdir(parents=True, exist_ok=True, mode=0o700)
+      desk_root(user_data_dir, storage_id).mkdir(parents=True, exist_ok=True, mode=0o700)
       bundle_path = self._mint_bundle(storage_id, identity, desk)
-      environ = self._environment(user_data_dir)
+      environ = self._environment(user_data_dir, storage_id)
       environ[USER_RUNTIME_CREDENTIALS_FILE_ENV] = str(bundle_path)
       if desk.aws_access_key_id is not None:
         # The user's own session credentials for its desk prefix (ruling 2);
@@ -337,7 +448,8 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
           ]
         process = self._spawn(boot_command, environ)
         self._processes[storage_id] = process
-        placement = replace(placement, handle=str(process.pid), updated_at=_now())
+        birth = pid_birth_token(process.pid) or None
+        placement = replace(placement, handle=str(process.pid), handle_birth=birth, updated_at=_now())
         self.store.upsert(placement)
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
@@ -349,7 +461,9 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
         raise RuntimeError("user runtime did not become ready within 60 seconds")
       except BaseException:
         self.stop(placement)
-        self.store.upsert(replace(placement, state="stopped", handle=None, updated_at=_now()))
+        self.store.upsert(
+          replace(placement, state="stopped", handle=None, handle_birth=None, updated_at=_now()),
+        )
         raise
 
   def _spawn(self, command: list[str], environ: Mapping[str, str]) -> subprocess.Popen[bytes]:
@@ -365,8 +479,7 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
     finally:
       os.close(descriptor)
 
-  @staticmethod
-  def _terminate(pid: int, process: subprocess.Popen[bytes] | None = None) -> None:
+  def _terminate(self, pid: int, process: subprocess.Popen[bytes] | None = None) -> None:
     if process is not None and process.poll() is not None:
       return
     try:
@@ -377,7 +490,7 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
       return
     if process is not None:
       try:
-        process.wait(timeout=10)
+        process.wait(timeout=self._stop_grace)
         return
       except subprocess.TimeoutExpired:
         os.killpg(pid, signal.SIGKILL)
@@ -385,7 +498,7 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
         return
     # A reloaded backend has only persisted pids. Reap if this is still our child,
     # otherwise wait for the process to disappear before another desk writer starts.
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + self._stop_grace
     while time.monotonic() < deadline:
       try:
         waited, _ = os.waitpid(pid, os.WNOHANG)
@@ -413,13 +526,27 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
       stored = self.store.get(storage_id)
       if stored and (stored.generation != placement.generation or stored.handle != placement.handle):
         # A stale caller does not own the replacement's process or routing row.
-        return replace(placement, state="stopped", handle=None, updated_at=_now())
+        return replace(placement, state="stopped", handle=None, handle_birth=None, updated_at=_now())
       process = self._processes.pop(storage_id, None)
       if process is not None:
         self._terminate(process.pid, process)
-      elif placement.state in ("ready", "starting") and placement.handle:
-        self._terminate(int(placement.handle))
-      return self.store.upsert(replace(placement, state="stopped", handle=None, updated_at=_now()))
+      else:
+        # A reloaded backend holds only a persisted pid; the OS may have reused
+        # it, so the group is signalled only while the pid is still the
+        # process whose birth token was recorded at spawn.
+        target = stored if stored is not None else placement
+        expected_birth = target.handle_birth
+        if (
+          target.state in ("ready", "starting") and target.handle
+          and target.handle.isascii() and target.handle.isdigit()
+          and expected_birth
+        ):
+          pid = int(target.handle)
+          if pid_birth_token(pid) == expected_birth:
+            self._terminate(pid)
+      return self.store.upsert(
+        replace(placement, state="stopped", handle=None, handle_birth=None, updated_at=_now()),
+      )
 
   def replace(self, placement: RuntimePlacement) -> RuntimePlacement:
     storage_id = placement.storage_id

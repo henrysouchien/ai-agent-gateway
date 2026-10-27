@@ -679,6 +679,48 @@ def test_private_tier_precedes_org_and_org_is_a_fallback() -> None:
   assert only_org.reason == quota.REASON_ORDERED and only_org.tier == "org"
 
 
+@pytest.mark.parametrize("seed", [None, "", "seed-1", "seed-2"])
+@pytest.mark.parametrize(
+  "windows,reason",
+  [
+    ((), quota.REASON_QUOTA_UNAVAILABLE),
+    ((five(0.87, reset_in=HOUR), week(0.4, reset_in=HOUR)), quota.REASON_SHORT_WINDOW_HOT),
+    ((week(0.95, reset_in=HOUR),), quota.REASON_RESERVE),
+  ],
+  ids=["unmeasured", "hot", "in_reserve"],
+)
+def test_org_tier_precedes_payg_until_every_private_and_org_candidate_is_blocked(
+  seed: str | None, windows: tuple[QuotaWindow, ...], reason: str,
+) -> None:
+  org = cand("O", tier="org", windows=windows)
+  other_org = cand("Q", tier="org", windows=windows)
+  payg = cand("K", tier="payg", windows=(week(0.1, reset_in=HOUR),))
+  decision = rank([payg, other_org, org], seed=seed)
+  assert set(names(decision)) == {"O", "Q"}
+  assert decision.tier == "org"
+  assert decision.reason == reason
+
+  private = cand("A")
+  assert names(rank([payg, org, private, other_org], seed=seed)) == ["A"]
+  private_blocked = cand("A", cooldowns=(Cooldown("shared", NOW + 60, "auth"),))
+  org_fallback = rank([payg, org, private_blocked, other_org], seed=seed)
+  assert set(names(org_fallback)) == {"O", "Q"}
+  assert org_fallback.tier == "org"
+
+  org_blocked = cand("O", tier="org", cooldowns=(Cooldown("shared", NOW + 120, "quota"),))
+  still_org = rank([payg, org_blocked, private_blocked, other_org], seed=seed)
+  assert names(still_org) == ["Q"] and still_org.tier == "org"
+
+  other_org_blocked = cand("Q", tier="org", cooldowns=(Cooldown("shared", NOW + 180, "quota"),))
+  payg_fallback = rank([payg, org_blocked, private_blocked, other_org_blocked], seed=seed)
+  assert (names(payg_fallback), payg_fallback.tier, payg_fallback.reason) == (
+    ["K"], "payg", quota.REASON_ORG_FALLBACK,
+  )
+  assert payg_fallback.blocked == (
+    (private_blocked, NOW + 60), (org_blocked, NOW + 120), (other_org_blocked, NOW + 180),
+  )
+
+
 def test_all_blocked_sets_earliest_reset_fallback_with_stable_ties() -> None:
   soon = cand("B", cooldowns=(Cooldown("shared", NOW + 100, "quota"),))
   later = cand("A", tier="org", cooldowns=(Cooldown("shared", NOW + 900, "quota"),))

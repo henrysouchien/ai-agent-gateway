@@ -7365,12 +7365,18 @@ def test_resume_uses_frozen_anthropic_generation_not_current_selection(
   from agent_gateway.providers.anthropic_oauth import register_anthropic_static_credential
 
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "credentials"))
+  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: the frozen generation is this owner's account.
+  monkeypatch.setenv(
+    "GATEWAY_USER_KEYS",
+    json.dumps([{"slug": "alice", "risk_user_id": 1, "role": "owner"}]),
+  )
   frozen = register_anthropic_static_credential(
-    "frozen-key", source="request:anthropic:api_key",
+    "frozen-key", source="request:anthropic:api_key", user_scope=1,
   )
   current = register_anthropic_static_credential(
     "current-key",
     source=("request:anthropic:api_key" if retired else "request:other:api_key"),
+    user_scope=1,
   )
   assert frozen is not None
   assert current is not None
@@ -7394,10 +7400,21 @@ def test_resume_uses_frozen_anthropic_generation_not_current_selection(
       ), None
 
     runner.resume_sub_agent = _resume_sub_agent
+    parent_session = GatewaySession(
+      session_id="sess-parent",
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="alice",
+      risk_user_id=1,
+      role="owner",
+    )
+    root_context(parent_session, withheld_tools=frozenset(), research_file_id=None)
     resolver = stub_capability_execution_resolver()
     handler = make_resume_handler(
       [runner], mcp_client=_NullMcpClient(),
       operation_resume_bindings=None,
+      parent_session=parent_session,
       excluded_tools_resolver=frozenset, capability_execution_resolver=resolver,
     )
     result, error = await handler({"task_id": "bg_generation"})
@@ -7889,8 +7906,13 @@ def test_supplied_workflow_successor_executes_frozen_admission_and_fanout(
   from agent_gateway.providers.anthropic_oauth import register_anthropic_static_credential
 
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "credentials"))
+  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: the frozen generation is this owner's account.
+  monkeypatch.setenv(
+    "GATEWAY_USER_KEYS",
+    json.dumps([{"slug": "alice", "risk_user_id": 1, "role": "owner"}]),
+  )
   frozen = register_anthropic_static_credential(
-    "frozen-workflow-key", source="request:anthropic:api_key",
+    "frozen-workflow-key", source="request:anthropic:api_key", user_scope=1,
   )
   assert frozen is not None
   receipt = _bind_receipt()
@@ -7913,6 +7935,16 @@ def test_supplied_workflow_successor_executes_frozen_admission_and_fanout(
   async def _case() -> None:
     runner, source, successor = await _trusted_workflow_resume_setup(
       tmp_path, parked_state=state, receipt=receipt, research_file_id=37,
+      session=GatewaySession(
+        session_id="workflow-host",
+        api_key_hash="hash",
+        created_at=10,
+        expires_at=20,
+        user_id="alice",
+        tenant_id="tenant-test",
+        risk_user_id=1,
+        role="owner",
+      ),
     )
     captured: dict[str, Any] = {}
     finished = asyncio.Event()

@@ -22,7 +22,6 @@ from agent_gateway.session import GatewaySession, SessionStream, StreamSubscribe
 
 def test_streaming_parent_aliases_are_available() -> None:
   assert gateway_server._server_streaming is server_streaming
-  assert callable(gateway_server._disconnect_stream_subscriber_for_backpressure)
   assert callable(gateway_server._pump_stream_subscriber)
   assert callable(gateway_server._register_stream_subscriber)
   assert callable(gateway_server._cleanup_stream_subscriber)
@@ -259,5 +258,142 @@ def test_stream_keepalive_tracks_wire_idle_during_filtered_traffic(
     assert subscriber.last_sent_seq == 34
     assert not arrivals
     assert active_turn.subscribers == {}
+
+  asyncio.run(run())
+
+
+def test_stream_subscriber_sse_emits_terminal_when_pump_ends_abnormally() -> None:
+  def build_turn() -> tuple[GatewaySession, SessionStream, StreamSubscriber, EventLog]:
+    session = GatewaySession(
+      session_id="session-1",
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="user-1",
+    )
+    event_log = EventLog(session_id=session.session_id)
+    active_turn = SessionStream(event_log=event_log, runner_task=None)
+    subscriber = StreamSubscriber(
+      subscriber_id="subscriber-1",
+      connected_at=0.0,
+      last_sent_seq=0,
+      queue=asyncio.Queue(),
+    )
+    active_turn.subscribers[subscriber.subscriber_id] = subscriber
+    return session, active_turn, subscriber, event_log
+
+  async def wire_events(
+    session: GatewaySession,
+    active_turn: SessionStream,
+    subscriber: StreamSubscriber,
+  ) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+
+    async def consume() -> None:
+      async for chunk in server_chat_helpers._stream_subscriber_sse(
+        session=session,
+        active_turn=active_turn,
+        subscriber=subscriber,
+        transcript_dir=None,
+        channel=None,
+        write_transcript=False,
+        log=logging.getLogger("test.server_chat_helpers"),
+        keepalive_seconds=0.05,
+      ):
+        if chunk.startswith(b"data: "):
+          events.append(json.loads(chunk[len(b"data: "):])["event"])
+
+    # A stream that loops on `:keepalive` instead of ending trips this timeout.
+    await asyncio.wait_for(consume(), timeout=5.0)
+    return events
+
+  async def pump_raises_after_first_delta() -> None:
+    session, active_turn, subscriber, event_log = build_turn()
+    first = event_log.append({"type": "text_delta", "text": "hello"})
+    assert first is not None
+
+    async def failing_pump() -> None:
+      await subscriber.queue.put(first)
+      raise RuntimeError("pump boom")
+
+    subscriber.pump_task = asyncio.create_task(failing_pump())
+
+    events = await wire_events(session, active_turn, subscriber)
+
+    assert [event["type"] for event in events] == ["text_delta", "error"]
+    assert events[-1]["error"] == "pump boom"
+    assert active_turn.subscribers == {}
+
+  async def pump_cancelled_after_interrupted_terminal() -> None:
+    session, active_turn, subscriber, event_log = build_turn()
+    first = event_log.append({"type": "text_delta", "text": "hello"})
+    assert first is not None
+    event_log.append({"type": "interrupted", "reason": "turn_cancelled"})
+    event_log.append({
+      "type": "stream_complete",
+      "terminal_disposition": "interrupted",
+      "reason": "turn_cancelled",
+    })
+    subscriber.queue.put_nowait(first)
+    pump_task = asyncio.create_task(asyncio.Event().wait())
+    subscriber.pump_task = pump_task
+    pump_task.cancel()
+    await asyncio.gather(pump_task, return_exceptions=True)
+    assert pump_task.cancelled()
+
+    events = await wire_events(session, active_turn, subscriber)
+
+    assert [event["type"] for event in events][-2:] == ["interrupted", "stream_complete"]
+    assert events[0]["type"] == "text_delta"
+    assert events[-1]["terminal_disposition"] == "interrupted"
+    assert active_turn.subscribers == {}
+
+  async def run() -> None:
+    await pump_raises_after_first_delta()
+    await pump_cancelled_after_interrupted_terminal()
+
+  asyncio.run(run())
+
+
+def test_lingering_subscriber_on_cleared_turn_never_settles_next_turn_pending_client_tool(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(server_chat_helpers, "_ACTIVE_TURN_GRACE_SECONDS", 0.02)
+  monkeypatch.setattr(server_chat_stream_core.server_models, "_ACTIVE_TURN_GRACE_SECONDS", 0.02)
+
+  async def run() -> None:
+    session = GatewaySession(
+      session_id="session-1",
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="user-1",
+      result_queue=asyncio.Queue(),
+    )
+    turn_a_log = EventLog(session_id=session.session_id)
+    turn_a_log.append({"type": "text_delta", "text": "a"})
+    turn_a_log.append({"type": "stream_complete", "terminal_disposition": "completed"})
+    turn_a_log.close()
+    turn_a = SessionStream(event_log=turn_a_log, runner_task=None, session=session)
+    session.active_turn = turn_a
+    sub_a = StreamSubscriber(
+      subscriber_id="sub-a",
+      connected_at=0.0,
+      last_sent_seq=0,
+      queue=asyncio.Queue(),
+    )
+    turn_a.subscribers[sub_a.subscriber_id] = sub_a
+
+    # Turn A clears to last_completed_turn while sub_a is still attached; Turn B starts with a pending client tool.
+    server_chat_helpers._clear_active_turn(session, turn_a)
+    turn_b = SessionStream(event_log=EventLog(session_id=session.session_id), runner_task=None, session=session)
+    session.active_turn = turn_b
+    session.pending_tools["call-b"] = {"status": "pending"}
+
+    await server_chat_helpers._cleanup_stream_subscriber(turn_a, sub_a.subscriber_id)
+    assert turn_a.client_disconnect_handle is None
+    await asyncio.sleep(0.05)
+    assert session.pending_tools == {"call-b": {"status": "pending"}}
+    assert session.result_queue is not None and session.result_queue.empty()
 
   asyncio.run(run())

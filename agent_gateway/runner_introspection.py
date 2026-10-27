@@ -51,6 +51,17 @@ def is_sub_agent_session_id(session_id: str) -> bool:
   return sid.startswith("sub") and ":" in sid
 
 
+
+def root_session_id(session_id: str | None) -> str:
+  """Strip every ``derive_sub_agent_id`` ``sub<N>:`` layer, returning the root session id."""
+  sid = str(session_id or "").strip()
+  while is_sub_agent_session_id(sid):
+    prefix, _, remainder = sid.partition(":")
+    if not prefix[3:].isdigit() or not remainder:
+      break
+    sid = remainder
+  return sid
+
 def format_exc(exc: BaseException) -> str:
   parts = [f"{type(exc).__name__}: {repr(exc)}"]
   seen = {id(exc)}

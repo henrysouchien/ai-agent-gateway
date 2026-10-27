@@ -39,6 +39,7 @@ from agent_gateway.providers import anthropic_oauth, anthropic_quota
 from agent_gateway.providers.anthropic_oauth import (
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
   ANTHROPIC_DEPLOYMENT_API_KEY_FIELD,
+  ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
   CREDENTIAL_AFFINITY_KEY_FIELD,
   CREDENTIAL_PREPARED_FIELD,
   AnthropicRequestBinding,
@@ -1695,10 +1696,10 @@ def test_org_refusing_oauth_parks_that_member_and_rotates_to_the_next(
   failure = provider.classify_credential_failure(exc_info.value)
 
   assert failure is not None and failure.kind == "auth"
-  refused_member = resolve_anthropic_credentials().by_token(refused)
-  serving_member = resolve_anthropic_credentials().by_token(serving)
+  refused_member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(refused)
+  serving_member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(serving)
   assert refused_member is not None and serving_member is not None
-  rotated = provider.next_credential({"auth_mode": "oauth", "auth_token": refused}, failure)
+  rotated = provider.next_credential({"auth_mode": "oauth", "auth_token": refused, ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, failure)
   assert rotated is not None
   assert rotated["auth_mode"] == "oauth"
   assert rotated["api_key"] == ""
@@ -1953,6 +1954,7 @@ def test_quota_429_with_a_family_claim_parks_only_that_model_family(
       "auth_token": refused,
       CREDENTIAL_AFFINITY_KEY_FIELD: "aff-key",
       CREDENTIAL_MODEL_FAMILY_FIELD: family,
+      ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
     },
     failure,
   )
@@ -1961,7 +1963,7 @@ def test_quota_429_with_a_family_claim_parks_only_that_model_family(
   assert rotated[CREDENTIAL_PREPARED_FIELD] is True
   assert rotated[CREDENTIAL_AFFINITY_KEY_FIELD] == "aff-key"
   assert rotated[CREDENTIAL_MODEL_FAMILY_FIELD] == family
-  refused_member = resolve_anthropic_credentials().by_token(refused)
+  refused_member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(refused)
   assert refused_member is not None
   assert anthropic_credential_blocked_until(refused_member, model=model) > time.time()
   for healthy_family in ("opus", "sonnet", "fable", "mythos"):
@@ -1995,12 +1997,11 @@ def test_an_arbitrary_403_keeps_the_generic_mapping_and_parks_no_quota(
   # Not a quota signal: the generic mapping, so no scope and no quota verdict.
   assert failure is not None
   assert (failure.kind, failure.status_code, failure.limit_scope) == ("billing", 403, None)
-  # An API key's billing denial still rotates to its seats (Henry 2026-10-13)...
+  # An unscoped call gets only the deployment API key (never an operator seat),
+  # and the API key's billing denial parks the key in its sidecar...
   config = credentials.get_anthropic_config()
   assert config["auth_mode"] == "api"
-  rotated = provider.next_credential(config, failure)
-  assert rotated is not None
-  assert (rotated["auth_mode"], rotated["auth_token"]) == ("oauth", seat)
+  assert provider.next_credential(config, failure) is None
   key = resolve_anthropic_credentials(
     {ANTHROPIC_DEPLOYMENT_API_KEY_FIELD: config[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD]},
   ).credentials[0]
@@ -2050,7 +2051,7 @@ def pool_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[str, s
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
   # Ranking breaks ties by a session-seeded digest, so resolver order alone does not decide
   # the winner; a higher policy priority makes `first` the explicit choice.
-  preferred = resolve_anthropic_credentials().by_token(tokens[0])
+  preferred = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(tokens[0])
   assert preferred is not None
   anthropic_quota.set_account_policy(preferred.sidecar_store_path, preferred.locator, priority=1)
   return tokens
@@ -2071,12 +2072,12 @@ def usage_probes(monkeypatch: pytest.MonkeyPatch) -> list[list[anthropic_quota.P
 
 
 def _pool_config(token: str, *, automatic: bool, **extra: object) -> dict[str, object]:
-  member = resolve_anthropic_credentials().by_token(token)
+  member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(token)
   assert member is not None
   source = {key: value for key, value in member.source_metadata().items() if key != "automatic"}
   if automatic:
     source["automatic"] = True
-  return {"auth_mode": "oauth", "auth_token": token, "credential_source": source, **extra}
+  return {"auth_mode": "oauth", "auth_token": token, "credential_source": source, ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True, **extra}
 
 
 def _prepare(config: dict[str, object], session_id: str | None = "session-1") -> dict[str, object] | None:
@@ -2106,7 +2107,7 @@ def test_prepare_credential_keeps_an_exact_source_and_ranks_the_pool_for_an_auto
   assert stateless is not None and stateless[CREDENTIAL_AFFINITY_KEY_FIELD] is None
 
   # The selection reads the shared sidecar: a cooled account yields to its sibling.
-  member = resolve_anthropic_credentials().by_token(first)
+  member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(first)
   assert member is not None
   anthropic_quota.record_cooldown(
     member.sidecar_store_path,
@@ -2151,7 +2152,7 @@ def test_prepare_fallback_refreshes_a_recovered_oauth_grant_on_the_first_client_
     }
 
   monkeypatch.setattr(anthropic_oauth, "_post_token_endpoint", post)
-  sources = resolve_anthropic_credentials()
+  sources = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True})
   fallback = anthropic_oauth.select_anthropic_credential_source(sources)
   assert fallback is not None and fallback.token == stale_token
   [cooldown] = anthropic_quota.load_selection_state(store).cooldowns[fallback.locator.id]
@@ -2220,7 +2221,7 @@ def test_prepare_credential_probes_stale_subscription_accounts_on_the_direct_rou
   assert _prepare(_pool_config(first, automatic=True)) is not None
 
   assert len(usage_probes) == 1
-  members = [resolve_anthropic_credentials().by_token(token) for token in (first, second)]
+  members = [resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(token) for token in (first, second)]
   assert all(member is not None for member in members)
   assert {target.locator.id for target in usage_probes[0]} == {
     member.locator.id for member in members if member is not None
@@ -2238,7 +2239,7 @@ def test_concurrent_prepare_credential_claims_one_usage_probe_without_waiting(
 ) -> None:
   first, _second = pool_tokens
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([first]))
-  member = resolve_anthropic_credentials().by_token(first)
+  member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(first)
   assert member is not None
   config = _pool_config(first, automatic=True)
   real_probe = anthropic_quota.probe_usage_batch
@@ -2305,7 +2306,7 @@ def test_prepare_credential_probes_after_an_in_progress_marker_expires(
 ) -> None:
   first, _second = pool_tokens
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([first]))
-  member = resolve_anthropic_credentials().by_token(first)
+  member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(first)
   assert member is not None
   anthropic_quota.record_probe_state(
     member.sidecar_store_path,
@@ -2340,7 +2341,7 @@ def test_usage_probe_claim_in_another_process_honors_a_live_marker_without_waiti
   pool_tokens: tuple[str, str],
 ) -> None:
   first, _second = pool_tokens
-  member = resolve_anthropic_credentials().by_token(first)
+  member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(first)
   assert member is not None
   now = time.time()
   assert anthropic_quota.claim_usage_probe(
@@ -2416,7 +2417,7 @@ def test_prepare_credential_still_selects_when_the_usage_probe_is_forbidden(
 
   assert material is not None and material["auth_token"] == first
   assert requested == ["api.anthropic.com", "api.anthropic.com"]
-  member = resolve_anthropic_credentials().by_token(first)
+  member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(first)
   assert member is not None
   probe = anthropic_quota.load_selection_state(member.sidecar_store_path).observations[
     member.locator.id

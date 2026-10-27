@@ -12,26 +12,22 @@ OnOutputChunk = Callable[[str, str], None]
 class CellBridge(Protocol):
   """One cell's frame channel to the host (`_frame_reader.CellChannel`).
 
-  Subprocess hands `child_fds()` to the child with `child_env()` and runs
-  `serve()` on its inherited pipes. Docker initializes its container runner
-  over stdin and routes decoded bridge requests through `handle_decoded_frame()`.
-  The channel's `decode_frame()` charges inbound data/request frames once;
-  its answer path charges bridge replies. Both close registration at cell end.
+  The kernel runner's persistent stdin/stdout pipe is the only transport. The
+  backend sends `token` in the cell control frame, applies `capability_env()`
+  to the cell env delta, and routes each decoded bridge request through
+  `handle_decoded_frame()`. The channel's `decode_frame()` charges inbound
+  data/request frames once; its answer path charges bridge replies. Both close
+  registration at cell end.
   """
 
   budget: CellBudget
+  token: str
+
+  def capability_env(self) -> Dict[str, str]: ...
 
   def activate(self) -> None: ...
 
   def deactivate(self) -> None: ...
-
-  def child_env(self) -> Dict[str, str]: ...
-
-  def child_fds(self) -> tuple[int, ...]: ...
-
-  def close_child_ends(self) -> None: ...
-
-  async def serve(self) -> None: ...
 
   def decode_frame(self, line: bytes) -> Dict[str, Any]: ...
 
@@ -129,8 +125,8 @@ class ExecutionBackend:
   def unavailable_reason(self) -> Optional[str]:
     """Why this backend cannot run code right now, or None when it can.
 
-    The one availability probe: `available()` derives from it, so a backend
-    that `host=auto` skips always has a cause to log and to report.
+    The one availability probe: `available()` derives from it, so an
+    unavailable backend always has a cause to report.
     """
     return None
 

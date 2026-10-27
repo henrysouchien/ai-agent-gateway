@@ -12,6 +12,7 @@ import uuid
 
 from .fork_ledger import ForkLedger, ReceiptClaim
 from .fork_task_registry import ForkLaunchDecision, ForkTaskRegistry
+from .session_capabilities import is_shared_community_session
 from .task_registry import TaskNotification
 
 
@@ -145,17 +146,20 @@ def _cohort_factors(
   execution = getattr(runner, "_capability_execution", None)
   bind = getattr(execution, "bind", None)
   run_context = getattr(getattr(runner, "_dispatcher", None), "run_context", None)
-  role_owner = getattr(session, "role", None) == "owner"
+  individual_subject = session is not None and not is_shared_community_session(session)
   billing_not_byok = getattr(runner, "_billing_mode", None) != "byok"
   credential_principal_service = (
     getattr(bind, "credential_principal", None) == "service"
   )
   run_mode_interactive = getattr(bind, "run_mode", None) == "interactive"
-  profile: str | None = getattr(run_context, "profile", None)
+  profile: str | None = (
+    getattr(run_context, "profile_name", None)
+    or getattr(run_context, "profile", None)
+  )
   profile_analyst = profile == "analyst"
   not_fork_mode = not bool(getattr(runner, "_fork_mode", False))
   factors = {
-    "role_owner": role_owner,
+    "individual_subject": individual_subject,
     "billing_not_byok": billing_not_byok,
     "credential_principal_service": credential_principal_service,
     "run_mode_interactive": run_mode_interactive,
@@ -166,7 +170,7 @@ def _cohort_factors(
 
 
 def owner_operated_interactive_analyst(runner: Any, session: Any) -> bool:
-  """Default-on cohort; non-owner and BYOK sessions are excluded."""
+  """Default-on cohort; shared-community and BYOK sessions are excluded."""
 
   factors, _, _ = _cohort_factors(runner, session)
   return all(factors.values())
@@ -383,7 +387,7 @@ def submit_learning_fork_after_turn(
       extra={
         "data": {
           "event": "learning_fork_decision",
-          "role_owner": factors["role_owner"],
+          "individual_subject": factors["individual_subject"],
           "billing_not_byok": factors["billing_not_byok"],
           "credential_principal_service": factors["credential_principal_service"],
           "run_mode_interactive": factors["run_mode_interactive"],

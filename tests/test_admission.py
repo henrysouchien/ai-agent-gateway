@@ -1957,7 +1957,7 @@ def test_interactive_root_turn_records_before_tools_in_dispatchers_store(
         selection_snapshot=None, selection_provenance=None,
       ),
       channel="cli", auth_manager=None,
-      channel_registry=SimpleNamespace(get_channel_for_tool=lambda _name: None),
+      channel_registry=SimpleNamespace(get_channel_for_tool=lambda _name, *, user_id=None: None),
       mcp_client_manager=deps.mcp_client, mcp_relay=None, sdk_config=None, risk_preamble="",
       clear_source_pack_session_fn=lambda _session: None,
       session_storage_user_id_fn=lambda _session, **_kwargs: session.owner_user_id,

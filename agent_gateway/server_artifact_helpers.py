@@ -12,8 +12,11 @@ from typing import Any, Dict, Mapping
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from hank_contracts.agent_api import canonical_agent_api_claim_bytes
+
 from .auth import ChannelMismatchError, CredentialsTimeoutError, CrossUserReuseError, MissingUserIdError, NoCredentialError
 from .session import AuthManager
+from .user_runtime_credentials import bundle_storage_id, load_user_runtime_credentials
 from .claim_signing_authority import GatewayClaimSigningAuthority
 from .server_models import (
   _AGENT_API_CLAIM_AUDIENCE,
@@ -130,7 +133,13 @@ def _artifact_auth_dependency(request: Request) -> str:
     return session.user_id
 
   claim = _verify_signed_user_claim(request)
-  return str(claim["user_id"])
+  bundle = load_user_runtime_credentials(os.environ)
+  if bundle is None:
+    return str(claim["user_id"])
+  storage_id = bundle_storage_id(bundle, claim["user_id"], claim["user_email"])
+  if storage_id is None:
+    raise HTTPException(status_code=401, detail="Invalid signed user claim")
+  return storage_id
 
 
 def _extract_agent_claim_headers(headers: Mapping[str, Any]) -> dict[str, str] | None:
@@ -176,9 +185,19 @@ def _verify_agent_claim_headers(
   except ValueError:
     return None
 
-  canonical = f"{_AGENT_API_CLAIM_AUDIENCE}\n{issued_at}\n{expiry}\n{user_id}\n{user_email}\n{nonce}".encode("utf-8")
+  canonical = canonical_agent_api_claim_bytes(
+    audience=_AGENT_API_CLAIM_AUDIENCE,
+    issued_at=issued_at,
+    expiry=expiry,
+    user_id=user_id,
+    user_email=user_email,
+    nonce=nonce,
+  )
   expected = hmac.new(hmac_key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
-  if not hmac.compare_digest(expected, signature):
+  if not hmac.compare_digest(
+    expected.encode("ascii"),
+    signature.encode("utf-8", "surrogatepass"),
+  ):
     return None
   return {
     **dict(claim_headers),

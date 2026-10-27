@@ -15,7 +15,7 @@ from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 from anyio import EndOfStream
 from mcp.types import PaginatedRequestParams
 
-from .mcp_client_config import iter_exception_tree
+from .mcp_client_config import expand_http_template, iter_exception_tree
 from .mcp_client_oauth_storage import oauth_token_cache_path
 
 
@@ -161,11 +161,11 @@ class McpConnectionRuntime:
   stdio_connect_retry_delay: Callable[[int], float]
   stdio_connect_stabilize_delay: Callable[[], float]
   is_retryable_stdio_startup_error: Callable[[BaseException], bool]
-  build_mcp_env: Callable[[dict[str, Any] | None], dict[str, str]]
+  build_mcp_env: Callable[..., dict[str, str]]
   # Raises when the configured stdio executable decisively cannot exist in the
   # spawn env; a no-op for anything it cannot decisively resolve.
   preflight_stdio_executable: Callable[[str, Sequence[str], Mapping[str, str]], None]
-  build_http_headers: Callable[[dict[str, Any] | None], dict[str, str]]
+  build_http_headers: Callable[..., dict[str, str]]
   parse_allowed_tools: Callable[[Any], tuple[str, ...] | None]
   safe_cache_name: Callable[[str], str]
   close_contexts: Callable[[list[Any]], Any]
@@ -338,7 +338,15 @@ async def connect(
 ) -> Any:
   server_type = str(config.get("type", "stdio")).strip().lower()
   if server_type in runtime.streamable_http_types:
-    return await manager._connect_streamable_http(name, config)
+    # A per-user server's startup connection only lists its catalog; the
+    # per-user connections that serve a user's calls are made per user.
+    return await manager._connect_streamable_http(
+      name,
+      config,
+      user_claim_auth=(
+        manager._catalog_claim_auth() if config.get("per_user") is True else None
+      ),
+    )
   if server_type == "stdio":
     return await manager._connect_stdio_with_retries(name, config)
   raise ValueError(f"unsupported type {server_type}")
@@ -423,9 +431,16 @@ class _TransportHost:
     try:
       opened.set_result(await opener(exit_contexts))
     except BaseException as exc:
-      await self._close_contexts(exit_contexts)
+      unwound = await self._close_contexts(exit_contexts)
       if isinstance(exc, asyncio.CancelledError):
-        opened.cancel()
+        # A transport's task group cancels the task that entered it when its
+        # own task fails (a refused connection), and reports that failure only
+        # when the group is exited. A cancellation whose exit surfaced a
+        # failure is that failure, not a caller's cancel.
+        if unwound is None:
+          opened.cancel()
+        else:
+          opened.set_exception(unwound)
       else:
         opened.set_exception(exc)
       return
@@ -468,7 +483,19 @@ async def connect_stdio(
     args = [str(arg) for arg in args_raw] if isinstance(args_raw, list) else []
 
     env_raw = config.get("env")
-    env = runtime.build_mcp_env(env_raw if isinstance(env_raw, dict) else None)
+    projected_raw = config.get("_projected_env")
+    projected = projected_raw if isinstance(projected_raw, Mapping) else None
+    scoped_env = manager._scoped_server_env(
+      name,
+      config,
+      deployment_environ=runtime.environ,
+      projected_env=projected,
+    )
+    env = runtime.build_mcp_env(
+      env_raw if isinstance(env_raw, dict) else None,
+      environ=scoped_env,
+      base_environ=runtime.environ,
+    )
     runtime.preflight_stdio_executable(command, args, env)
 
     cwd = config.get("cwd")
@@ -499,7 +526,7 @@ async def connect_stdio(
       allowed_tools=runtime.parse_allowed_tools(config.get("allowed_tools")),
     )
     await manager._verify_stdio_session_stable(session)
-    state.config = dict(config)
+    state.config = {k: v for k, v in config.items() if k != "_projected_env"}
     state.stdio_eof = read_stream.eof
     state.stdio_receive_done = read_stream.receive_done
     stderr.failed = False
@@ -513,16 +540,36 @@ async def connect_streamable_http(
   name: str,
   config: dict[str, Any],
   runtime: McpConnectionRuntime,
+  *,
+  user_claim_auth: Any | None = None,
 ) -> Any:
+  """Connect one streamable-HTTP server.
+
+  `user_claim_auth` is the per-request user-claim `httpx.Auth` of a per-user
+  connection; it is the connection's only authentication (a per-user entry
+  cannot also configure OAuth).
+  """
   host = _TransportHost(runtime.close_contexts)
 
   async def open_streamable_http(exit_contexts: list[Any]) -> Any:
-    url = str(config.get("url") or "").strip()
-    if not url:
+    configured_url = str(config.get("url") or "").strip()
+    if not configured_url:
       raise ValueError("missing url")
 
     headers_raw = config.get("headers")
-    headers = runtime.build_http_headers(headers_raw if isinstance(headers_raw, dict) else None)
+    projected_raw = config.get("_projected_env")
+    projected = projected_raw if isinstance(projected_raw, Mapping) else None
+    scoped_env = manager._scoped_server_env(
+      name,
+      config,
+      deployment_environ=runtime.environ,
+      projected_env=projected,
+    )
+    url = expand_http_template(configured_url, environ=scoped_env)
+    headers = runtime.build_http_headers(
+      headers_raw if isinstance(headers_raw, dict) else None,
+      environ=scoped_env,
+    )
     timeout_seconds = float(config.get("timeout", manager._startup_timeout))
     # GP19/GA-N2: no clock may end an in-flight call, transport included; the
     # configured seconds are an expectation logged once when exceeded, and the
@@ -531,7 +578,11 @@ async def connect_streamable_http(
     sse_read_expected_seconds = float(config.get("sse_read_timeout", 300))
     terminate_on_close = bool(config.get("terminate_on_close", True))
     tool_prefix = str(config.get("tool_prefix", "") or "").strip()
-    auth = manager._build_http_auth(name, url, config)
+    auth = (
+      user_claim_auth
+      if user_claim_auth is not None
+      else manager._build_http_auth(name, url, config)
+    )
 
     log.info(
       "streamable-http for %s: no socket-read deadline; read expectation %gs",
@@ -558,13 +609,15 @@ async def connect_streamable_http(
     await session.__aenter__()
     exit_contexts.append(session)
 
-    return await manager._initialize_session_state(
+    state = await manager._initialize_session_state(
       name=name,
       session=session,
       exit_contexts=[host],
       tool_prefix=tool_prefix,
       allowed_tools=runtime.parse_allowed_tools(config.get("allowed_tools")),
     )
+    state.config = dict(config)
+    return state
 
   return await host.open(open_streamable_http)
 

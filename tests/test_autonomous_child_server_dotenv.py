@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -44,7 +45,13 @@ def test_cron_templates_render_declared_tls_setting_without_missing_env(
   template = json.loads((_ROOT / "deploy" / template_name).read_text(encoding="utf-8"))
   # Keep the deployed server/env declarations; rebase only their application
   # cwd so the parent reads fixture dotfiles, never host credentials.
-  for config in template["mcpServers"].values():
+  for name, config in template["mcpServers"].items():
+    if any(
+      str(arg).endswith("/scripts/local_gateway_python_child.py")
+      for arg in config.get("args", [])
+    ):
+      assert "cwd" not in config, f"{name}: snapshot launcher owns the child cwd"
+      continue
     config["cwd"] = str(tmp_path / Path(config["cwd"]).name)
   template_path = tmp_path / "template.json"
   template_path.write_text(json.dumps(template), encoding="utf-8")
@@ -70,6 +77,9 @@ def test_cron_templates_render_declared_tls_setting_without_missing_env(
     "USER_DATA_DIR": str(tmp_path / "data"),
     "ENVIRONMENT": "production",
     "GATEWAY_BASE_URL": "https://gateway.example.test",
+    "LOCAL_GATEWAY_PYTHON": sys.executable,
+    "LOCAL_GATEWAY_RUNTIME_ROOT": str(tmp_path / "runtime"),
+    "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT": str(tmp_path / "runtime" / "version"),
   }
   if gateway_verify is not None:
     parent_env["GATEWAY_SSL_VERIFY"] = gateway_verify
@@ -82,6 +92,7 @@ def test_cron_templates_render_declared_tls_setting_without_missing_env(
   # The parent-selected identity normally supplies these at materialization;
   # no authority value below may be recovered from a sibling's dotenv.
   monkeypatch.setattr(os, "environ", child_env)
+  child_env["AUTONOMOUS_USER_ID"] = "1"
   monkeypatch.setattr(mcp_config.user_identity, "resolve_storage_user_id", lambda *_: "1")
   monkeypatch.setattr(mcp_config, "_resolve_gateway_api_key", lambda *_: "selected-mcp-key")
   monkeypatch.setattr(mcp_config, "_PRIVATE_TMP", tmp_path / "rendered")
@@ -129,7 +140,7 @@ def test_local_topology_keeps_authenticated_child_on_its_selected_gateway(
     name for name, config in template["mcpServers"].items()
     if "GATEWAY_URL" in config.get("env", {})
   }
-  assert "portfolio-producers-mcp" in gateway_consumers
+  assert "fmp-mcp" in gateway_consumers
   risk_root = tmp_path / "risk_module"
   risk_root.mkdir()
   sibling_origin = "https://wrong-gateway.example.test"

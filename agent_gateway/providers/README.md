@@ -80,6 +80,11 @@ generation metadata under the store lock. Old
 writers cannot safely share an upgraded store: isolate their store paths
 operationally rather than relying on mixed-version writes.
 
+An org OAuth/setup-token record resolves only when the config carries
+`operator_seats_admitted=True`, or carries no stamp and its effective user scope
+is in `deployment_owner_scopes`; otherwise the exact lookup reports
+`unobservable` and the pool omits org seats.
+
 `resolve_anthropic_credentials()` with `credential_source` metadata reads the
 exact original bearer record for the bound pool member, without replacement
 enrollment; selection can refresh that original grant. The lookup is a pure

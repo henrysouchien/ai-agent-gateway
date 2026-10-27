@@ -70,6 +70,7 @@ from .autonomous_runner_state import (
   _TASK_MANIFEST_VERSION as _TASK_MANIFEST_VERSION,
   AutonomousRegistryStateMixin,
   AutonomousTask,
+  release_claim_broker,
   is_root_run_event,
   is_root_terminal_event,
 )
@@ -1284,15 +1285,12 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         task.cancel()
     if observer_tasks:
       await asyncio.gather(*observer_tasks, return_exceptions=True)
-    if record.claim_broker is not None:
-      try:
-        record.claim_broker.close()
-      except Exception:
-        _LOGGER.exception(
-          "Autonomous claim broker close failed after reaper crash"
-        )
-      finally:
-        record.claim_broker = None
+    try:
+      release_claim_broker(record)
+    except Exception:
+      _LOGGER.exception(
+        "Autonomous claim broker close failed after reaper crash"
+      )
     await self._expire_autonomous_gateway_session(record)
     if record.exit_code is None and record.proc is not None:
       observed_returncode = record.proc.returncode
@@ -1544,14 +1542,11 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     await asyncio.gather(*wait_tasks, return_exceptions=True)
     harvest({task for task in wait_tasks if task.done()})
 
-    if record.claim_broker is not None:
-      try:
-        record.claim_broker.close()
-      except Exception as exc:
-        if cleanup_error is None:
-          cleanup_error = exc
-      finally:
-        record.claim_broker = None
+    try:
+      release_claim_broker(record)
+    except Exception as exc:
+      if cleanup_error is None:
+        cleanup_error = exc
 
     await self._expire_autonomous_gateway_session(record)
 

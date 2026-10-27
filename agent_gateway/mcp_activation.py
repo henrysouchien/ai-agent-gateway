@@ -544,6 +544,18 @@ class SessionToolSurface:
     self._defers_mcp_tools = bool(defers_mcp_tools)
     self._fold = activation_fold
 
+
+  @property
+  def profile(self) -> Any:
+    if self._profile is None:
+      raise ValueError("SessionToolSurface requires a bound profile")
+    return self._profile
+
+  @property
+  def denied_mcp_servers(self) -> frozenset[str] | None:
+    if self._denied_mcp_servers is None:
+      return None
+    return frozenset(self._denied_mcp_servers)
   @property
   def defers_mcp_tools(self) -> bool:
     """Whether this surface holds tools back behind ``load_tools``."""

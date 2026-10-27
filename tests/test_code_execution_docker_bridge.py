@@ -3,9 +3,15 @@
 Only an unavailable Docker daemon/CLI or execution image skips these tests.
 The MCP fixture is deterministic; every Python cell and container lifecycle is
 real, with mounts in the Docker-shared home state directory.
+
+Collection needs the repo-root ``pytest.ini`` (``-c <repo>/pytest.ini
+--rootdir=<repo>``): ``tests.host_timing_test_support`` resolves only with the
+root config's ``pythonpath``, so a bare node-id run from this package
+collects nothing.
 """
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
 import sys
@@ -26,7 +32,7 @@ from agent_gateway import SessionStore
 from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution
 from agent_gateway.code_execution._backends._docker import DockerBackend
 from agent_gateway.code_execution._backends._kernel import KernelState
-from agent_gateway.code_execution._frame_codec import MAX_FRAME_BYTES
+from agent_gateway.code_execution._frame_codec import MAX_CELL_BYTES, MAX_FRAME_BYTES
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 from test_code_execution_bridge import (
   FRED_SERIES,
@@ -39,11 +45,9 @@ from test_code_execution_bridge import (
   _FILING_HANDLES,
   _bind,
   _code_job,
-  _fd_closed,
   _filings_extractor,
   _job_runner,
   _policy,
-  _record_open_cells,
 )
 from agent_gateway.session import SessionStream
 from agent_gateway.event_log import EventLog
@@ -84,7 +88,7 @@ def docker_runtime(docker_image: str, monkeypatch: pytest.MonkeyPatch, _policy: 
   with tempfile.TemporaryDirectory(prefix="docker-bridge-test-", dir=state_root) as root:
     yield CodeExecutionConfig(
       docker_image=docker_image,
-      register_subprocess=False,
+      placement="docker",
       work_dir_root=root,
       max_output_bytes=4 * 1024 * 1024,
     ), handles
@@ -112,6 +116,19 @@ class _BlockedMcp(_CaptureMcp):
       self.finished.set()
 
 
+def _record_open_cells(bundle: Any) -> list[Any]:
+  opened: list[Any] = []
+  open_cell = bundle.frame_reader.open_cell
+
+  def _recording_open_cell(*args: Any, **kwargs: Any) -> Any:
+    cell = open_cell(*args, **kwargs)
+    opened.append(cell)
+    return cell
+
+  bundle.frame_reader.open_cell = _recording_open_cell
+  return opened
+
+
 def _setup(config: CodeExecutionConfig, *, blocked: bool = False) -> tuple[Any, ...]:
   session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
   runner = _job_runner()
@@ -126,7 +143,7 @@ async def _run_cell(dispatcher: Any, code: str, **extra: Any) -> tuple[Any, Any]
   return await dispatcher.dispatch(
     OUTER_ID,
     "code_execute",
-    {"code": textwrap.dedent(code), "host": "docker", **extra},
+    {"code": textwrap.dedent(code), **extra},
   )
 
 
@@ -141,16 +158,10 @@ async def _collect_background(session: Any, task_id: str) -> Any:
 
 async def _assert_cell_finished(
   bundle: Any,
-  opened: list[tuple[Any, dict[int, os.stat_result]]],
+  opened: list[Any],
   handles: list[Any],
 ) -> None:
   assert bundle.frame_reader.active_cells() == ()
-  for cell, original_fds in opened:
-    assert all(_fd_closed(fd, original) for fd, original in original_fds.items())
-    assert cell._raw_fds == set()
-    assert cell._pipe_files == []
-    assert cell._read_transport is None
-    assert cell._write_transport is None
   assert len(handles) == len(opened)
   for _backend, handle in handles:
     assert handle._backend_data["reader_task"].done()
@@ -188,7 +199,9 @@ async def _teardown(session: Any, bundle: Any, opened: list[Any], handles: list[
 
 @contextlib.asynccontextmanager
 async def _backend(config: CodeExecutionConfig, *, state: KernelState | None = None) -> AsyncIterator[DockerBackend]:
-  backend = DockerBackend(image=config.docker_image, config=config, state=state)
+  backend = DockerBackend(
+    image=config.docker_image, config=config, state=state, readonly_mounts=config.readonly_mounts,
+  )
   try:
     yield backend
   finally:
@@ -229,6 +242,13 @@ def test_docker_nested_results_compose_and_preserve_ledger_sources(docker_runtim
       if background:
         task_id = result["task_id"]
         result = await _collect_background(session, task_id)
+        assert "nested_calls" not in result and "sources" not in result
+        record = bundle.frame_reader.cell_record(task_id)
+        assert record == bundle.frame_reader.cell_record(OUTER_ID)
+      else:
+        record = bundle.frame_reader.cell_record(OUTER_ID)
+        assert record["nested_calls"] == result["nested_calls"]
+        assert record["sources"] == result["sources"]
       assert result["return_code"] == 0, result
       assert result["stdout"] == "160.7\n"
       assert result["stderr"] == ""
@@ -237,7 +257,7 @@ def test_docker_nested_results_compose_and_preserve_ledger_sources(docker_runtim
         (FRED_SERIES, {"series_id": "CPIAUCSL"}),
       ]
       assert mcp.active_during_call == [(OUTER_ID,), (OUTER_ID,)]
-      nested = result["nested_calls"]
+      nested = record["nested_calls"]
       assert [entry["nested_call_id"] for entry in nested] == [f"{OUTER_ID}.1", f"{OUTER_ID}.2"]
       assert [entry["ordinal"] for entry in nested] == [1, 2]
       assert all(entry["parent_call_id"] == OUTER_ID for entry in nested)
@@ -245,7 +265,7 @@ def test_docker_nested_results_compose_and_preserve_ledger_sources(docker_runtim
       assert [entry["server"] for entry in nested] == ["edgar-parser-mcp", "fred-mcp"]
       assert all(entry["ok"] is True and entry["error_code"] is None for entry in nested)
       assert all(entry["result_bytes"] > 0 and entry["duration_ms"] >= 0 for entry in nested)
-      assert result["sources"] == [{**handle, "produced_by_tool": "get_filings"} for handle in _FILING_HANDLES]
+      assert record["sources"] == [{**handle, "produced_by_tool": "get_filings"} for handle in _FILING_HANDLES]
       assert "321.4" not in json.dumps(result)
       state = session.code_execution_kernels["docker"]
       container_id = state.container_id
@@ -356,8 +376,11 @@ def test_docker_blocked_nested_dispatch_is_host_wait_not_compute_timeout(docker_
     config, handles = docker_runtime
     session, bundle, mcp, dispatcher, opened = _setup(config, blocked=True)
     before = {task for task in asyncio.all_tasks() if not task.done()}
+    # Warm-up absorbs container/interpreter cold start so the 1000 ms compute bound measures cell compute, not startup under load.
+    warmed, error = await asyncio.wait_for(_run_cell(dispatcher, "saved = 71", timeout_ms=30_000), timeout=_docker_wait(60))
+    assert error is None, error
+    assert warmed["return_code"] == 0, warmed["stderr"]
     running = asyncio.create_task(_run_cell(dispatcher, f"""
-      saved = 71
       print("calling", flush=True)
       print(hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")["series_id"])
     """, background=background, timeout_ms=1000))
@@ -370,13 +393,15 @@ def test_docker_blocked_nested_dispatch_is_host_wait_not_compute_timeout(docker_
       assert error is None, error
       if background:
         result = await _collect_background(session, result["task_id"])
+        assert "nested_calls" not in result
       assert result["timed_out"] is False, result
       assert result["return_code"] == 0, result["stderr"]
       assert result["stdout"] == "calling\nCPIAUCSL\n"
       assert result["host_wait_ms"] >= 2500
       assert result["compute_ms"] < 1000
       assert mcp.cancelled is False and mcp.finished.is_set()
-      assert [(entry["ok"], entry["error_code"]) for entry in result["nested_calls"]] == [(True, None)]
+      record = bundle.frame_reader.cell_record(OUTER_ID)
+      assert [(entry["ok"], entry["error_code"]) for entry in record["nested_calls"]] == [(True, None)]
       following, error = await _run_cell(dispatcher, "print(saved)")
       assert error is None and following["return_code"] == 0 and following["stdout"] == "71\n"
       await _assert_runtime_running(handles)
@@ -426,7 +451,7 @@ def test_docker_cancel_during_nested_dispatch_releases_every_owner(docker_runtim
         assert job.state == TaskState.KILLED
       assert mcp.cancelled is True and mcp.finished.is_set()
       assert mcp.calls == [(FRED_SERIES, {"series_id": "CPIAUCSL"})]
-      [(cell, _original_fds)] = opened
+      [cell] = opened
       assert [(entry["ok"], entry["error_code"]) for entry in cell.summary()["nested_calls"]] == [(False, "cancelled")]
       if termination != "session_cleanup":
         following, error = await _run_cell(dispatcher, "print(saved)")
@@ -468,11 +493,13 @@ def test_docker_cell_done_cancels_pending_dispatch_without_blocking_output(docke
       assert error is None, error
       if background:
         result = await _collect_background(session, result["task_id"])
+        assert "nested_calls" not in result
       assert mcp.entered.is_set()
       assert result["stdout"] == "done\n"
       assert result["return_code"] == 0 and result["timed_out"] is False, result
       assert mcp.cancelled and mcp.finished.is_set()
-      assert [(entry["ok"], entry["error_code"]) for entry in result["nested_calls"]] == [(False, "cancelled")]
+      record = bundle.frame_reader.cell_record(OUTER_ID)
+      assert [(entry["ok"], entry["error_code"]) for entry in record["nested_calls"]] == [(False, "cancelled")]
       await _assert_runtime_running(handles)
       await _assert_cell_finished(bundle, opened, handles)
       _assert_no_new_tasks(before, handles)
@@ -529,29 +556,93 @@ def test_docker_descendant_pipe_does_not_mask_cell_exit(docker_runtime: Any) -> 
   asyncio.run(run())
 
 
+def test_docker_readonly_mount_artifact_is_readable_and_not_writable(docker_runtime: Any) -> None:
+  async def run() -> None:
+    config, handles = docker_runtime
+    artifacts = (Path(config.work_dir_root) / "artifacts").resolve()
+    artifacts.mkdir()
+    (artifacts / "nvda.txt").write_text("artifact-bytes", encoding="utf-8")
+    config = dataclasses.replace(config, readonly_mounts=(str(artifacts),))
+    session, bundle, _mcp, dispatcher, opened = _setup(config)
+    try:
+      result, error = await _run_cell(dispatcher, f"""
+        print(open({str(artifacts / "nvda.txt")!r}, encoding="utf-8").read())
+        try:
+            open({str(artifacts / "new.txt")!r}, "w")
+        except OSError:
+            print("denied")
+      """)
+      assert error is None, error
+      assert result["backend"] == "docker" and result["sandboxed"] is True
+      assert result["return_code"] == 0, result
+      assert result["stdout"].splitlines() == ["artifact-bytes", "denied"]
+      assert not (artifacts / "new.txt").exists()
+    finally:
+      await _teardown(session, bundle, opened, handles)
+
+  asyncio.run(run())
+
+
+def test_docker_tool_reply_above_two_mib_succeeds_under_the_cell_budget(docker_runtime: Any) -> None:
+  async def run() -> None:
+    config, handles = docker_runtime
+    session, bundle, mcp, dispatcher, opened = _setup(config)
+    size = 3 * 1024 * 1024 + 5
+    text = "abcdefghij" * (size // 10 + 1)
+    text = text[:size]
+
+    async def large_result(*args: Any, **kwargs: Any) -> ToolResult:
+      await _CaptureMcp.call_tool(mcp, *args, **kwargs)
+      return {"series_id": "big", "text": text}, None
+
+    mcp.call_tool = large_result
+    try:
+      result, error = await _run_cell(dispatcher, f"""
+        reply = hank.call({FRED_SERIES!r}, series_id="big")
+        body = reply["text"]
+        print(len(body), body[:10], body[-5:])
+      """)
+      assert error is None, error
+      assert result["backend"] == "docker" and result["return_code"] == 0, result
+      assert result["stdout"] == f"{size} {text[:10]} {text[-5:]}\n"
+      assert not result.get("protocol_error")
+      assert [(entry["ok"], entry["error_code"]) for entry in result["nested_calls"]] == [(True, None)]
+      assert len(mcp.calls) == 1
+      await _assert_runtime_running(handles)
+      await _assert_cell_finished(bundle, opened, handles)
+    finally:
+      await _teardown(session, bundle, opened, handles)
+
+  asyncio.run(run())
+
+
 @pytest.mark.parametrize("direction", ["request", "reply"])
-def test_docker_frame_bounds_fail_only_cell_and_keep_interpreter(docker_runtime: Any, direction: str) -> None:
+def test_docker_over_limit_frame_is_a_caught_error_and_keeps_cell_and_interpreter(docker_runtime: Any, direction: str) -> None:
   async def run() -> None:
     config, handles = docker_runtime
     session, bundle, mcp, dispatcher, opened = _setup(config)
 
     async def large_result(*args: Any, **kwargs: Any) -> ToolResult:
       await _CaptureMcp.call_tool(mcp, *args, **kwargs)
-      return {"payload": "x" * MAX_FRAME_BYTES}, None
+      return {"payload": "x" * MAX_CELL_BYTES}, None
 
     if direction == "reply":
       mcp.call_tool = large_result
-    argument = "'x' * 2097152" if direction == "request" else "'CPIAUCSL'"
+    argument = f"'x' * {MAX_CELL_BYTES}" if direction == "request" else "'CPIAUCSL'"
     try:
       result, error = await _run_cell(dispatcher, f"""
         saved = 88
+        print("before", flush=True)
         try:
             hank.call({FRED_SERIES!r}, series_id={argument})
-        except HankBridgeError:
-            pass
+        except HankBridgeError as exc:
+            print("caught", exc.code)
+        print("after")
       """)
       assert error is None, error
-      assert result["return_code"] == 1 and result["protocol_error"]["code"] == "protocol_error", result
+      assert result["return_code"] == 0, result
+      assert result["stdout"] == "before\ncaught protocol_error\nafter\n"
+      assert not result.get("protocol_error")
       assert len(mcp.calls) == (1 if direction == "reply" else 0)
       if direction == "reply":
         assert [(entry["ok"], entry["error_code"]) for entry in result["nested_calls"]] == [(False, "protocol_error")]

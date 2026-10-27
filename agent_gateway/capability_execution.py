@@ -490,6 +490,7 @@ class CapabilityExecutionResolver:
       select_anthropic_credential_source,
     )
     from .providers.credential_pool import (
+      USER_SCOPE_FIELD,
       PoolAccountCandidate,
       ProviderCredentialPool,
       get_provider_credential_pool,
@@ -512,6 +513,7 @@ class CapabilityExecutionResolver:
           candidate = select_pool_candidate(
             candidates, pool=provider_pool, refresh_fn=refresh_fn,
             placement=placement, route=route,
+            user_scope=pool_config.get(USER_SCOPE_FIELD),
           )
           if candidate is None:
             raise _PlacementIneligible
@@ -573,6 +575,7 @@ class CapabilityExecutionResolver:
     if select_pool_candidate(
       [candidate], pool=ProviderCredentialPool(),
       placement=placement, route=route or execution.bind.route,
+      user_scope=execution.auth_config.get(USER_SCOPE_FIELD),
     ) is None:
       raise _PlacementIneligible
     return execution

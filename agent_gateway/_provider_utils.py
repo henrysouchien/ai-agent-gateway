@@ -44,6 +44,7 @@ def resolve_auth_config(
   infer_mode_from_prefix: bool = False,
   read_env: bool = True,
   raise_on_missing: bool = False,
+  user_scope: Any = None,
 ) -> dict[str, Any]:
   """Resolve provider auth config from args, config dict, and env vars.
 
@@ -80,7 +81,14 @@ def resolve_auth_config(
     if read_env and auth_config is None and provider_name in {"openai", "xai"}:
       prefix = provider_name.upper()
       resolved_key = resolved_key or os.environ.get(f"{prefix}_API_KEY", "").strip()
-      resolved_token = resolved_token or os.environ.get(f"{prefix}_AUTH_TOKEN", "").strip()
+      env_token = os.environ.get(f"{prefix}_AUTH_TOKEN", "").strip()
+      if env_token and not resolved_token:
+        # An env OAuth token is deployment operator-seat material: ambient
+        # resolution admits it only for the deployment owner's runs.
+        from .providers.credential_pool import scope_admits_operator_seats
+
+        if scope_admits_operator_seats(user_scope):
+          resolved_token = env_token
 
     explicit_mode = str(result.get("auth_mode", "")).strip().lower()
 
@@ -116,13 +124,20 @@ def resolve_auth_config(
 
   if use_pool and not resolved_key and not resolved_token:
     from .providers.anthropic_oauth import (
+      ANTHROPIC_USER_SCOPE_FIELD,
+      anthropic_user_scope,
       resolve_anthropic_credentials,
       select_anthropic_credential_source,
     )
 
-    sources = resolve_anthropic_credentials()
+    sources = resolve_anthropic_credentials(
+      call_class="agent", user_scope=user_scope,
+    )
     selected = select_anthropic_credential_source(sources)
     if selected is not None:
+      normalized_scope = anthropic_user_scope(user_scope)
+      if normalized_scope:
+        result[ANTHROPIC_USER_SCOPE_FIELD] = normalized_scope
       if selected.record is not None and selected.record.credential_kind == "api_key":
         resolved_key = selected.token
       else:
@@ -187,6 +202,7 @@ def _resolve_provider(
   *,
   auth_config: dict[str, Any] | None = None,
   max_tokens: int = 16_000,
+  user_scope: Any = None,
 ) -> tuple[ModelProvider, str, dict[str, Any]]:
   provider_name: str
   normalized_model = str(model or "").strip()
@@ -222,32 +238,38 @@ def _resolve_provider(
       provider="anthropic",
       api_key=api_key,
       auth_token=auth_token,
+      user_scope=user_scope,
     )
   elif auth_config is None:
     resolved_auth_config = resolve_auth_config(
       provider=provider_name,
       api_key=api_key,
       auth_token=auth_token,
+      user_scope=user_scope,
     )
   elif isinstance(provider_instance, AnthropicProvider):
     resolved_auth_config = resolve_auth_config(
       provider="anthropic",
       auth_config=auth_config,
+      user_scope=user_scope,
     )
   elif isinstance(provider_instance, OpenAIProvider):
     resolved_auth_config = resolve_auth_config(
       provider="openai",
       auth_config=auth_config,
+      user_scope=user_scope,
     )
   elif isinstance(provider_instance, CodexProvider):
     resolved_auth_config = resolve_auth_config(
       provider="codex",
       auth_config=auth_config,
+      user_scope=user_scope,
     )
   elif isinstance(provider_instance, XAIProvider):
     resolved_auth_config = resolve_auth_config(
       provider="xai",
       auth_config=auth_config,
+      user_scope=user_scope,
     )
   else:
     resolved_auth_config = dict(auth_config or {})

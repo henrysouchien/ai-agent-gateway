@@ -5,7 +5,7 @@ from time import monotonic
 from typing import Any, AsyncIterator, Callable
 
 from .event_adapter import adapt_event
-from .event_log import EventLog
+from .event_log import EventLog, LogEntry, TERMINAL_EVENT_TYPES, log_has_terminal
 from .events import DEFAULT_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS
 from .product_config import gateway_product_id
 from .server_artifact_helpers import _json_dumps
@@ -42,11 +42,13 @@ def schedule_client_disconnect(active_turn: SessionStream) -> None:
     not active_turn.subscribers
     and active_turn.client_disconnect_handle is None
     and session is not None
+    and session.active_turn is active_turn
     and any(pending.get("status") == "pending" for pending in session.pending_tools.values())
   ):
     def settle_disconnected_client() -> None:
       active_turn.client_disconnect_handle = None
-      settle_pending_client_tools(session, "pane_disconnected")
+      if session.active_turn is active_turn:
+        settle_pending_client_tools(session, "pane_disconnected")
 
     active_turn.client_disconnect_handle = asyncio.get_running_loop().call_later(
       server_models._ACTIVE_TURN_GRACE_SECONDS, settle_disconnected_client,
@@ -99,45 +101,20 @@ def stream_envelope(*, entry: Any, session_id: str, schema_version: int, event: 
   }
 
 
-def disconnect_stream_subscriber_for_backpressure(
-  subscriber: StreamSubscriber,
-  *,
-  done_marker: object,
-) -> None:
-  subscriber.disconnect_reason = "backpressure"
-  while True:
-    try:
-      subscriber.queue.get_nowait()
-    except asyncio.QueueEmpty:
-      break
-  try:
-    subscriber.queue.put_nowait(done_marker)
-  except asyncio.QueueFull:
-    pass
-
-
 async def pump_stream_subscriber(
   active_turn: SessionStream,
   subscriber: StreamSubscriber,
   after_seq: int,
   *,
   done_marker: object,
-  disconnect_stream_subscriber_for_backpressure: Callable[[StreamSubscriber], None],
 ) -> None:
   try:
     async for entry in active_turn.event_log.iter_from(after_seq):
-      try:
-        subscriber.queue.put_nowait(entry)
-      except asyncio.QueueFull:
-        disconnect_stream_subscriber_for_backpressure(subscriber)
-        return
+      await subscriber.queue.put(entry)
   except asyncio.CancelledError:
     raise
   else:
-    try:
-      subscriber.queue.put_nowait(done_marker)
-    except asyncio.QueueFull:
-      disconnect_stream_subscriber_for_backpressure(subscriber)
+    await subscriber.queue.put(done_marker)
 
 
 def register_stream_subscriber(
@@ -207,6 +184,111 @@ async def stream_subscriber_sse(
   monotonic_fn: Callable[[], float] = monotonic,
 ) -> AsyncIterator[bytes]:
   event_log = active_turn.event_log
+  terminal_sent = False
+
+  def render(entry: Any) -> tuple[bytes | None, str | None, bool]:
+    """Return (chunk, adapted event type, fatal) for one log entry."""
+    subscriber.last_sent_seq = int(entry.seq)
+    event = event_for_wire_fn(entry, event_log)
+    if write_transcript:
+      write_turn_transcript_entry_fn(
+        active_turn,
+        int(entry.seq),
+        event,
+        transcript_dir=transcript_dir,
+        session_id=session.session_id,
+        user_id=session.user_id,
+        channel=channel,
+      )
+
+    try:
+      adapted_event = adapt_event_fn(event, session.schema_version)
+    except ValueError as adapter_exc:
+      log.error(
+        "SSE adapter failed for session=%s schema_version=%s event_type=%s: %s",
+        session.session_id,
+        session.schema_version,
+        event.get("type"),
+        adapter_exc,
+        exc_info=True,
+      )
+      error_event = {"type": "stream_error", "error": str(adapter_exc)}
+      adapted_event = adapt_event_fn(error_event, default_schema_version)
+    if adapted_event is None:
+      return None, None, False
+
+    envelope = stream_envelope_fn(
+      entry=entry,
+      session_id=session.session_id,
+      schema_version=session.schema_version,
+      event=adapted_event,
+    )
+    try:
+      chunk = f"data: {json_dumps_fn(envelope)}\n\n".encode("utf-8")
+      return chunk, adapted_event.get("type"), False
+    except Exception as ser_exc:
+      log.error(
+        "SSE serialization failed for event type=%s: %s",
+        event.get("type"),
+        ser_exc,
+        exc_info=True,
+      )
+      try:
+        error_event = {"type": "stream_error", "error": f"SSE serialization failed: {ser_exc}"}
+        error_envelope = {
+          "seq": subscriber.last_sent_seq,
+          "session_id": session.session_id,
+          "schema_version": session.schema_version,
+          "event": adapt_event_fn(error_event, session.schema_version) or error_event,
+        }
+        return f"data: {json_dumps_fn(error_envelope)}\n\n".encode("utf-8"), None, True
+      except Exception:
+        return None, None, True
+
+  async def emit_terminal_tail() -> AsyncIterator[bytes]:
+    """Never close the stream without the turn's terminal event."""
+    nonlocal terminal_sent
+    pump_task = subscriber.pump_task
+    pump_exc: BaseException | None = None
+    if pump_task is not None and pump_task.done() and not pump_task.cancelled():
+      pump_exc = pump_task.exception()
+      if pump_exc is not None and not log_has_terminal(event_log):
+        event_log.close(str(pump_exc) or type(pump_exc).__name__)
+
+    for entry in (entry for entry in event_log.entries if int(entry.seq) > subscriber.last_sent_seq):
+      chunk, event_type, fatal = render(entry)
+      if chunk is not None:
+        yield chunk
+      if fatal:
+        terminal_sent = True
+        return
+      if event_type in TERMINAL_EVENT_TYPES:
+        terminal_sent = True
+    if terminal_sent:
+      return
+
+    if pump_task is not None and pump_task.cancelled():
+      synthesized = [
+        {"type": "interrupted", "reason": "stream_cancelled"},
+        {
+          "type": "stream_complete",
+          "terminal_disposition": "interrupted",
+          "reason": "stream_cancelled",
+        },
+      ]
+    else:
+      reason = (str(pump_exc) or type(pump_exc).__name__) if pump_exc is not None else "stream closed"
+      synthesized = [{"type": "error", "error": reason}]
+    for event in synthesized:
+      entry = LogEntry(seq=subscriber.last_sent_seq + 1, timestamp=0.0, event=event)
+      chunk, event_type, fatal = render(entry)
+      if chunk is not None:
+        yield chunk
+      if fatal:
+        return
+      if event_type in TERMINAL_EVENT_TYPES:
+        terminal_sent = True
+
   # Filtered log entries do not count as wire activity.
   keepalive_deadline = monotonic_fn() + keepalive_seconds
   try:
@@ -218,7 +300,9 @@ async def stream_subscriber_sse(
         )
       except timeout_error:
         pump_task = subscriber.pump_task
-        if pump_task is not None and pump_task.done() and subscriber.disconnect_reason:
+        if pump_task is not None and pump_task.done() and subscriber.queue.empty():
+          async for chunk in emit_terminal_tail():
+            yield chunk
           return
         keepalive_deadline = monotonic_fn() + keepalive_seconds
         yield b":keepalive\n\n"
@@ -227,72 +311,20 @@ async def stream_subscriber_sse(
       if item is done_marker:
         return
 
-      entry = item
-      subscriber.last_sent_seq = int(entry.seq)
-      event = event_for_wire_fn(entry, event_log)
-      if write_transcript:
-        write_turn_transcript_entry_fn(
-          active_turn,
-          int(entry.seq),
-          event,
-          transcript_dir=transcript_dir,
-          session_id=session.session_id,
-          user_id=session.user_id,
-          channel=channel,
-        )
-
-      try:
-        adapted_event = adapt_event_fn(event, session.schema_version)
-      except ValueError as adapter_exc:
-        log.error(
-          "SSE adapter failed for session=%s schema_version=%s event_type=%s: %s",
-          session.session_id,
-          session.schema_version,
-          event.get("type"),
-          adapter_exc,
-          exc_info=True,
-        )
-        error_event = {"type": "stream_error", "error": str(adapter_exc)}
-        adapted_event = adapt_event_fn(error_event, default_schema_version)
-      if adapted_event is None:
-        continue
-
-      envelope = stream_envelope_fn(
-        entry=entry,
-        session_id=session.session_id,
-        schema_version=session.schema_version,
-        event=adapted_event,
-      )
-      try:
-        chunk = f"data: {json_dumps_fn(envelope)}\n\n".encode("utf-8")
+      chunk, event_type, fatal = render(item)
+      if chunk is not None:
         keepalive_deadline = monotonic_fn() + keepalive_seconds
         yield chunk
-      except Exception as ser_exc:
-        log.error(
-          "SSE serialization failed for event type=%s: %s",
-          event.get("type"),
-          ser_exc,
-          exc_info=True,
-        )
-        try:
-          error_event = {"type": "stream_error", "error": f"SSE serialization failed: {ser_exc}"}
-          error_envelope = {
-            "seq": subscriber.last_sent_seq,
-            "session_id": session.session_id,
-            "schema_version": session.schema_version,
-            "event": adapt_event_fn(error_event, session.schema_version) or error_event,
-          }
-          yield f"data: {json_dumps_fn(error_envelope)}\n\n".encode("utf-8")
-        except Exception:
-          pass
+      if fatal:
         return
+      if event_type in TERMINAL_EVENT_TYPES:
+        terminal_sent = True
   finally:
     await cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
 
 
 __all__ = [
   "cleanup_stream_subscriber",
-  "disconnect_stream_subscriber_for_backpressure",
   "event_for_wire",
   "pump_stream_subscriber",
   "register_stream_subscriber",

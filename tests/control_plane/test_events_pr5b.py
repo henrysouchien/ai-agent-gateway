@@ -381,6 +381,86 @@ def test_control_event_serialization_failure_logs_traceback(
   assert records[0].exc_info[0] is RuntimeError
 
 
+@pytest.mark.parametrize("schema_version", [None, "1"])
+def test_control_events_reject_nonfinite_float_with_stream_error(
+  monkeypatch,
+  tmp_path: Path,
+  caplog,
+  schema_version: str | None,
+) -> None:
+  nonfinite_event = {"type": "stream_complete", "usage": {"cost": float("nan")}}
+
+  class _NonFiniteBus:
+    def subscribe(self, _user_id: str, *, control_run_id: str | None = None):
+      _ = control_run_id
+
+      async def subscription():
+        yield nonfinite_event
+
+      return subscription()
+
+    async def subscribe_entries(
+      self,
+      _user_id: str,
+      *,
+      control_run_id: str | None = None,
+      after_seq: int = 0,
+    ):
+      _ = (control_run_id, after_seq)
+
+      async def subscription():
+        yield SimpleNamespace(
+          event=nonfinite_event,
+          seq=7,
+          control_run_id=None,
+        )
+
+      return subscription()
+
+    async def shutdown(self) -> None:
+      return None
+
+  caplog.set_level(
+    logging.WARNING,
+    logger="agent_gateway.control_plane.events",
+  )
+  app = _make_app(monkeypatch, tmp_path, [])
+
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    app.state.user_event_bus = _NonFiniteBus()
+
+    response = client.get(
+      "/api/control/events",
+      headers=_headers(control),
+      params={"schema_version": schema_version} if schema_version else None,
+    )
+    assert response.status_code == 200
+    body = response.content
+
+  assert b"NaN" not in body
+  payload = _decode_sse_chunk(body)
+  if schema_version == "1":
+    assert payload["run_id"] is None
+    assert payload["seq"] == 7
+    event = payload["event"]
+  else:
+    event = payload
+  assert event["type"] == "stream_error"
+  assert event["error"].startswith(
+    "SSE serialization failed: Out of range float values are not JSON compliant"
+  )
+  records = [
+    record
+    for record in caplog.records
+    if record.name == "agent_gateway.control_plane.events"
+    and "SSE serialization failed" in record.getMessage()
+  ]
+  assert len(records) == 1
+  assert records[0].exc_info
+  assert records[0].exc_info[0] is ValueError
+
+
 def test_control_events_cancelled_aclose_does_not_leave_pending_close_task() -> None:
   class _SlowClose:
     def __init__(self) -> None:

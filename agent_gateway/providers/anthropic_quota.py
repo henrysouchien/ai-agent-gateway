@@ -126,6 +126,7 @@ REASON_QUOTA_UNAVAILABLE = "quota_unavailable"
 REASON_ALL_BLOCKED_PROBE = "all_blocked_probe"
 REASON_ORDERED = "ordered"
 
+_TIER_RANK: dict[str, int] = {"private": 0, "org": 1, "payg": 2}
 _SHARED = "shared"
 _FIVE_HOUR = "five_hour"
 _SEVEN_DAY = "seven_day"
@@ -1261,7 +1262,10 @@ def rank_candidates(
       ordered=(), blocked=blocked, tier=None, reason=REASON_ALL_BLOCKED_PROBE, fallback=fallback
     )
 
-  tier = min({e.candidate.tier for e in usable}, key=lambda name: (name != "private", name))
+  tier = min(
+    {e.candidate.tier for e in usable},
+    key=lambda name: (_TIER_RANK.get(name, 99), name),
+  )
   in_tier = sorted((e for e in usable if e.candidate.tier == tier), key=lambda e: e.key)
 
   ordered = in_tier
@@ -1277,10 +1281,12 @@ def rank_candidates(
         ordered = [kept, *(e for e in in_tier if e is not kept)]
 
   top = ordered[0]
-  has_private = any(c.tier == "private" for c in candidates)
+  has_higher_tier = any(
+    _TIER_RANK.get(c.tier, 99) < _TIER_RANK.get(tier, 99) for c in candidates
+  )
   if warm:
     reason = REASON_WARM
-  elif tier != "private" and has_private:
+  elif has_higher_tier:
     reason = REASON_ORG_FALLBACK
   elif top.in_reserve:
     reason = REASON_RESERVE

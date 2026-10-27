@@ -470,6 +470,17 @@ def adapt_control_event(event: dict, schema_version: int) -> dict | None:
   return adapter.transform(event)
 
 
+def split_control_attribution(event: dict) -> tuple[dict, dict]:
+  """Split an event into (attribution, payload) on `CONTROL_V1_ATTRIBUTION_FIELDS`.
+
+  Payload keeps every remaining key, declared or not, so a strict consumer still sees
+  undeclared keys.
+  """
+  attribution = {key: value for key, value in event.items() if key in CONTROL_V1_ATTRIBUTION_FIELDS}
+  payload = {key: value for key, value in event.items() if key not in CONTROL_V1_ATTRIBUTION_FIELDS}
+  return attribution, payload
+
+
 __all__ = [
   "ADAPTERS",
   "CONTROL_ADAPTERS",
@@ -485,4 +496,5 @@ __all__ = [
   "V1_WIRE_EVENT_TYPES",
   "adapt_control_event",
   "adapt_event",
+  "split_control_attribution",
 ]

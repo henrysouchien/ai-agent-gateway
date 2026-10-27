@@ -3,13 +3,14 @@ from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_
 
 import asyncio
 import json
+import logging
 import socket
 import sys
 import threading
 import time
 import types
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, AsyncIterator, Mapping
 
 import httpx
 import pytest
@@ -18,7 +19,7 @@ import agent_gateway.runner as gateway_runner
 import agent_gateway.server as gateway_server
 import agent_gateway.server_chat_helpers as chat_helpers
 import agent_gateway.server_models as server_models
-from agent_gateway.event_log import EventLog
+from agent_gateway.event_log import EventLog, LogEntry
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers import AnthropicProvider, OpenAIProvider
 from agent_gateway.providers.agent_sdk import AgentSDKConfig, SDK_PINNED_VERSION
@@ -27,7 +28,7 @@ from agent_gateway.runner import AgentRunner
 from agent_gateway.runner_auth import merge_refreshed_auth_config
 from agent_gateway.sdk_runner import AgentSDKRunner
 from agent_gateway.server import ChatRuntime
-from agent_gateway.session import SessionStream
+from agent_gateway.session import GatewaySession, SessionStream, StreamSubscriber
 from agent_gateway.tool_dispatcher import ToolDispatcher, _SpawningTurn
 from agent_gateway.runner_tool_audit import redact_tool_input_for_event
 from agent_gateway.tool_dispatch_classification import (
@@ -521,6 +522,13 @@ class _HangingDispatcher:
       tool_name,
       prepared_call.materialize_input(),
     )
+
+  @staticmethod
+  def redact_raw_tool_input_for_history(
+    tool_name: str,
+    tool_input: Mapping[str, Any],
+  ) -> dict[str, Any]:
+    return redact_tool_input_for_event(tool_name, dict(tool_input))
 
   @staticmethod
   def settle_tool_result(
@@ -1613,12 +1621,13 @@ def test_subscribe_live_fanout_keeps_post_and_subscriber_connected(make_test_app
   _run(case())
 
 
-def test_slow_subscriber_disconnects_on_backpressure(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_slow_subscriber_pump_is_flow_controlled_through_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
     monkeypatch.setattr(gateway_server, "_STREAM_SUBSCRIBER_QUEUE_MAX", 1)
     event_log = EventLog(session_id="sess-slow")
     event_log.append({"type": "text_delta", "text": "one"})
     event_log.append({"type": "text_delta", "text": "two"})
+    event_log.append({"type": "stream_complete", "terminal_disposition": "completed"})
     active_turn = SessionStream(event_log=event_log, runner_task=None)
 
     subscriber = gateway_server._register_stream_subscriber(
@@ -1627,11 +1636,521 @@ def test_slow_subscriber_disconnects_on_backpressure(monkeypatch: pytest.MonkeyP
       client_label="slow",
     )
 
-    await _wait_for(lambda: subscriber.disconnect_reason == "backpressure", timeout=1.0)
-    assert subscriber.queue.get_nowait() is gateway_server._STREAM_SUBSCRIBER_DONE
+    # The pump waits on the full queue instead of dropping the subscriber.
+    await asyncio.sleep(0.05)
+    assert subscriber.pump_task is not None and not subscriber.pump_task.done()
+
+    first = await asyncio.wait_for(subscriber.queue.get(), timeout=1.0)
+    assert (first.seq, first.event["text"]) == (1, "one")
+    second = await asyncio.wait_for(subscriber.queue.get(), timeout=1.0)
+    assert (second.seq, second.event["text"]) == (2, "two")
+    third = await asyncio.wait_for(subscriber.queue.get(), timeout=1.0)
+    assert (third.seq, third.event["type"]) == (3, "stream_complete")
+    assert await asyncio.wait_for(subscriber.queue.get(), timeout=1.0) is gateway_server._STREAM_SUBSCRIBER_DONE
+
+    await asyncio.wait_for(subscriber.pump_task, timeout=1.0)
     await gateway_server._cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
 
   _run(case())
+
+
+_NVDA_SESSION_ID = "sess_0fe7f8faf35648baaade82d44984381e"
+_NVDA_JOURNAL = (
+  Path.home()
+  / ".local/state/hank/evidence/isolated-gateways/20261024T111109Z-p8485-ai79db99836665"
+  / f"state/logs/chat/{_NVDA_SESSION_ID}.jsonl"
+)
+_NVDA_TOTAL_ENTRIES = 646_255
+_NVDA_AFTER_SEQ = 187_720
+
+
+def _nvda_event_log() -> EventLog:
+  """The NVDA B turn's log: seq == journal line number, 646,255 entries ending in `stream_complete`.
+
+  The 257th entry past the cursor (seq 187,977) and the tail are the journal's own
+  lines when it is on disk; every other entry is a light placeholder, which the
+  subscriber pump treats identically. Without the journal the same shape is synthesised.
+  """
+  boundary_seqs = {
+    _NVDA_AFTER_SEQ + 1,
+    _NVDA_AFTER_SEQ + 256,
+    _NVDA_AFTER_SEQ + 257,
+    *range(_NVDA_TOTAL_ENTRIES - 10, _NVDA_TOTAL_ENTRIES + 1),
+  }
+  real_events: dict[int, dict[str, Any]] = {}
+  if _NVDA_JOURNAL.is_file():
+    line_count = 0
+    with _NVDA_JOURNAL.open(encoding="utf-8") as journal:
+      for line_count, line in enumerate(journal, start=1):
+        if line_count in boundary_seqs:
+          event = json.loads(line)
+          event.pop("seq", None)
+          real_events[line_count] = event
+    assert line_count == _NVDA_TOTAL_ENTRIES
+  else:
+    real_events[_NVDA_TOTAL_ENTRIES] = {"type": "stream_complete", "terminal_disposition": "completed"}
+  interior = {"type": "thinking_delta", "text": "x"}
+  event_log = EventLog(session_id=_NVDA_SESSION_ID)
+  event_log._entries = [
+    LogEntry(seq=seq, timestamp=0.0, event=real_events.get(seq, interior))
+    for seq in range(1, _NVDA_TOTAL_ENTRIES + 1)
+  ]
+  event_log._next_seq = _NVDA_TOTAL_ENTRIES + 1
+  event_log._has_terminal = True
+  event_log._closed = True
+  return event_log
+
+
+def test_nvda_journal_late_subscriber_after_seq_187720_replays_backlog_to_stream_complete() -> None:
+  async def case() -> None:
+    active_turn = SessionStream(event_log=_nvda_event_log(), runner_task=None)
+    subscriber = gateway_server._register_stream_subscriber(
+      active_turn,
+      after_seq=_NVDA_AFTER_SEQ,
+      client_label="late-reconnect",
+    )
+    assert subscriber.queue.maxsize == 256
+
+    async def drain() -> list[LogEntry]:
+      edges: list[LogEntry] = []
+      delivered = 0
+      while True:
+        item = await subscriber.queue.get()
+        if item is gateway_server._STREAM_SUBSCRIBER_DONE:
+          return edges
+        delivered += 1
+        assert item.seq == _NVDA_AFTER_SEQ + delivered
+        if delivered <= 3 or item.seq >= _NVDA_TOTAL_ENTRIES - 10:
+          edges.append(item)
+        elif item.seq in (_NVDA_AFTER_SEQ + 256, _NVDA_AFTER_SEQ + 257):
+          edges.append(item)
+
+    edges = await asyncio.wait_for(drain(), timeout=120.0)
+    assert subscriber.pump_task is not None
+    await asyncio.wait_for(subscriber.pump_task, timeout=5.0)
+    await gateway_server._cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
+
+    assert edges[0].seq == _NVDA_AFTER_SEQ + 1
+    assert {entry.seq for entry in edges} >= {_NVDA_AFTER_SEQ + 256, _NVDA_AFTER_SEQ + 257}
+    last = edges[-1]
+    assert last.seq == _NVDA_TOTAL_ENTRIES
+    assert last.event["type"] == "stream_complete"
+    assert last.event["terminal_disposition"] == "completed"
+    assert last.seq - _NVDA_AFTER_SEQ == 458_535
+
+  _run(case())
+
+
+def test_clear_active_turn_during_backlog_drain_preserves_inflight_subscriber_through_stream_complete(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def case() -> None:
+    monkeypatch.setattr(gateway_server, "_STREAM_SUBSCRIBER_QUEUE_MAX", 2)
+    event_log = EventLog(session_id="sess-grace")
+    for index in range(6):
+      event_log.append({"type": "text_delta", "text": f"t{index + 1}"})
+    event_log.append({"type": "stream_complete", "terminal_disposition": "completed"})
+    event_log.close()
+    active_turn = SessionStream(event_log=event_log, runner_task=None)
+    session = GatewaySession(
+      session_id="sess-grace",
+      api_key_hash="hash",
+      created_at=1,
+      expires_at=2,
+      user_id="alice",
+    )
+    session.active_turn = active_turn
+
+    subscriber = gateway_server._register_stream_subscriber(
+      active_turn,
+      after_seq=0,
+      client_label="mid-drain",
+    )
+    assert subscriber.queue.maxsize == 2
+
+    first = await asyncio.wait_for(subscriber.queue.get(), timeout=1.0)
+    second = await asyncio.wait_for(subscriber.queue.get(), timeout=1.0)
+    assert (first.seq, second.seq) == (1, 2)
+    # The pump is parked on the full queue, mid-backlog, when the grace timer fires.
+    await asyncio.sleep(0.05)
+    assert subscriber.pump_task is not None and not subscriber.pump_task.done()
+
+    chat_helpers._clear_active_turn(session, active_turn)
+
+    assert session.active_turn is None
+    assert session.last_completed_turn is active_turn
+    assert not subscriber.pump_task.done()
+
+    drained: list[LogEntry] = []
+    while True:
+      item = await asyncio.wait_for(subscriber.queue.get(), timeout=1.0)
+      if item is gateway_server._STREAM_SUBSCRIBER_DONE:
+        break
+      drained.append(item)
+
+    assert [entry.seq for entry in drained] == [3, 4, 5, 6, 7]
+    assert [entry.event["type"] for entry in drained[:-1]] == ["text_delta"] * 4
+    assert drained[-1].event["type"] == "stream_complete"
+    await asyncio.wait_for(subscriber.pump_task, timeout=1.0)
+    await gateway_server._cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
+
+  _run(case())
+
+
+async def _next_sse_payload(lines: AsyncIterator[str]) -> dict[str, Any]:
+  async for line in lines:
+    if line.startswith("data: "):
+      return json.loads(line[6:])
+  raise AssertionError("Expected at least one SSE payload")
+
+
+async def _drain_sse_payloads(lines: AsyncIterator[str]) -> list[dict[str, Any]]:
+  return [json.loads(line[6:]) async for line in lines if line.startswith("data: ")]
+
+
+async def _subscribe_payloads(
+  client: httpx.AsyncClient,
+  headers: Mapping[str, str],
+  session_id: str,
+  after_seq: int,
+) -> list[dict[str, Any]]:
+  async with client.stream(
+    "GET",
+    f"/api/chat/subscribe?session_id={session_id}&after_seq={after_seq}",
+    headers=headers,
+  ) as response:
+    assert response.status_code == 200
+    # A stream that loops on `:keepalive` instead of ending trips this timeout.
+    return await asyncio.wait_for(_drain_sse_payloads(response.aiter_lines()), timeout=5.0)
+
+
+def _assert_interrupted_terminal(payloads: list[dict[str, Any]]) -> None:
+  types = [payload["event"]["type"] for payload in payloads]
+  assert "interrupted" in types
+  assert types[-1] == "stream_complete"
+  assert payloads[-1]["event"]["terminal_disposition"] == "interrupted"
+  seqs = [payload["seq"] for payload in payloads]
+  assert seqs == sorted(set(seqs))
+
+
+def test_explicit_cancel_delivers_terminal_to_attached_and_late_subscribers(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_HangingProvider(), runner_class=_ObservedAgentRunner)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+      headers = {"Authorization": f"Bearer {session_info['session_token']}"}
+
+      async with client.stream("POST", "/api/chat", headers=headers, json=_chat_payload()) as response:
+        assert response.status_code == 200
+        lines = response.aiter_lines()
+        first = await _next_sse_payload(lines)
+        assert (first["seq"], first["event"]["type"]) == (1, "text_delta")
+        active_turn = session.active_turn
+        assert active_turn is not None
+
+        cancel_response = await client.post(
+          "/api/chat/cancel",
+          headers=headers,
+          json={"session_id": session_info["session_id"]},
+        )
+        assert cancel_response.status_code == 200
+        attached = await asyncio.wait_for(_drain_sse_payloads(lines), timeout=5.0)
+
+      assert session.active_turn is None
+      assert session.last_completed_turn is active_turn
+      _assert_interrupted_terminal(attached)
+
+      late = await _subscribe_payloads(client, headers, session_info["session_id"], 1)
+      _assert_interrupted_terminal(late)
+      assert late[-1]["seq"] == attached[-1]["seq"]
+      await app.state.user_event_bus.shutdown()
+
+  _run(case())
+
+
+def test_session_expiry_delivers_terminal_to_attached_and_late_subscribers(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_HangingProvider(), runner_class=_ObservedAgentRunner)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+      headers = {"Authorization": f"Bearer {session_info['session_token']}"}
+
+      async with client.stream("POST", "/api/chat", headers=headers, json=_chat_payload()) as response:
+        assert response.status_code == 200
+        lines = response.aiter_lines()
+        first = await _next_sse_payload(lines)
+        assert (first["seq"], first["event"]["type"]) == (1, "text_delta")
+        active_turn = session.active_turn
+        assert active_turn is not None
+
+        await chat_helpers._cleanup_active_turn_on_expiry(session)
+        attached = await asyncio.wait_for(_drain_sse_payloads(lines), timeout=5.0)
+
+      assert session.active_turn is None
+      assert session.last_completed_turn is active_turn
+      _assert_interrupted_terminal(attached)
+
+      subscriber = gateway_server._register_stream_subscriber(
+        active_turn,
+        after_seq=1,
+        client_label="late",
+      )
+      chunks: list[bytes] = []
+
+      async def consume_late() -> None:
+        async for chunk in gateway_server._stream_subscriber_sse(
+          session=session,
+          active_turn=active_turn,
+          subscriber=subscriber,
+          transcript_dir=None,
+          channel=None,
+          write_transcript=False,
+          log=logging.getLogger("test.stream_lifecycle"),
+        ):
+          chunks.append(chunk)
+
+      await asyncio.wait_for(consume_late(), timeout=5.0)
+      late = [json.loads(chunk[len(b"data: "):]) for chunk in chunks if chunk.startswith(b"data: ")]
+      _assert_interrupted_terminal(late)
+      assert late[-1]["seq"] == attached[-1]["seq"]
+      assert active_turn.subscribers == {}
+      await app.state.user_event_bus.shutdown()
+
+  _run(case())
+
+
+def test_pump_exception_delivers_terminal_error_to_attached_and_late_subscribers(
+  make_test_app, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setattr(gateway_server, "_STREAM_SUBSCRIBER_KEEPALIVE_SECONDS", 0.05)
+  real_pump = chat_helpers._pump_stream_subscriber
+  pump_after_seqs: list[int] = []
+
+  async def failing_first_pump(
+    active_turn: SessionStream,
+    subscriber: StreamSubscriber,
+    after_seq: int,
+    **kwargs: Any,
+  ) -> None:
+    pump_after_seqs.append(after_seq)
+    if len(pump_after_seqs) > 1:
+      await real_pump(active_turn, subscriber, after_seq, **kwargs)
+      return
+    async for entry in active_turn.event_log.iter_from(after_seq):
+      await subscriber.queue.put(entry)
+      if entry.seq == 1:
+        raise RuntimeError("pump failure after seq 1")
+
+  monkeypatch.setattr(chat_helpers, "_pump_stream_subscriber", failing_first_pump)
+
+  async def case() -> None:
+    app = make_test_app(provider=_HangingProvider(), runner_class=_ObservedAgentRunner)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+      headers = {"Authorization": f"Bearer {session_info['session_token']}"}
+
+      async with client.stream("POST", "/api/chat", headers=headers, json=_chat_payload()) as response:
+        assert response.status_code == 200
+        attached = await asyncio.wait_for(_drain_sse_payloads(response.aiter_lines()), timeout=5.0)
+
+      active_turn = session.active_turn
+      assert active_turn is not None
+      assert [payload["event"]["type"] for payload in attached] == ["text_delta", "error"]
+      assert attached[-1]["event"]["error"] == "pump failure after seq 1"
+      assert active_turn.event_log.closed
+      assert active_turn.event_log.entries[-1].event == {
+        "type": "error",
+        "error": "pump failure after seq 1",
+      }
+
+      late = await _subscribe_payloads(client, headers, session_info["session_id"], 1)
+      assert [payload["event"]["type"] for payload in late] == ["error"]
+      assert late[-1]["event"]["error"] == "pump failure after seq 1"
+      assert late[-1]["seq"] == attached[-1]["seq"]
+      assert pump_after_seqs == [0, 1]
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
+
+  _run(case())
+
+
+class _BacklogProvider(_CompletingProvider):
+  name = "backlog"
+
+  def __init__(self, *, deltas: int = 700) -> None:
+    super().__init__()
+    self.deltas = deltas
+
+  async def stream(self, client: Any, params: dict[str, Any]):
+    _ = client, params
+    yield StreamEvent(type="message_start", input_tokens=1)
+    for index in range(self.deltas):
+      yield StreamEvent(type="text_delta", text=f"d{index} ")
+    yield StreamEvent(type="text_end", raw_block={"type": "text", "text": "backlog"})
+    yield StreamEvent(type="usage_update", output_tokens=1)
+    yield StreamEvent(type="message_end", stop_reason="end_turn")
+
+
+def test_subscribe_after_seq_replays_backlog_over_two_queues_to_stream_complete(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_BacklogProvider())
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      session = app.state.auth.session_store.get_session(session_info["session_id"])
+      assert session is not None
+      headers = {"Authorization": f"Bearer {session_info['session_token']}"}
+
+      async with client.stream("POST", "/api/chat", headers=headers, json=_chat_payload()) as response:
+        assert response.status_code == 200
+        seen_seqs: list[int] = []
+        async for line in response.aiter_lines():
+          if line.startswith("data: "):
+            seen_seqs.append(json.loads(line[6:])["seq"])
+          if len(seen_seqs) == 2:
+            break
+      assert seen_seqs == [1, 2]
+
+      await _wait_for(
+        lambda: session.active_turn is None or session.active_turn.event_log.has_terminal,
+        timeout=10.0,
+      )
+      async with client.stream(
+        "GET",
+        f"/api/chat/subscribe?session_id={session_info['session_id']}&after_seq=2",
+        headers=headers,
+      ) as subscriber_response:
+        assert subscriber_response.status_code == 200
+        replayed = [
+          json.loads(line[6:])
+          async for line in subscriber_response.aiter_lines()
+          if line.startswith("data: ")
+        ]
+
+      seqs = [payload["seq"] for payload in replayed]
+      delta_seqs = [payload["seq"] for payload in replayed if payload["event"]["type"] == "text_delta"]
+      assert len(seqs) > 2 * gateway_server._STREAM_SUBSCRIBER_QUEUE_MAX
+      assert delta_seqs == list(range(3, 701))
+      assert seqs == sorted(set(seqs))
+      assert replayed[-1]["event"]["type"] == "stream_complete"
+      await _expire_session_and_shutdown_bus(app, session_info["session_id"])
+
+  _run(case())
+
+
+class _CutAfterFrames(httpx.SyncByteStream):
+  """A POST /chat body that ends in a read error after `frames` SSE data frames."""
+
+  def __init__(self, inner: httpx.SyncByteStream, frames: int) -> None:
+    self._inner = inner
+    self._frames = frames
+
+  def __iter__(self):
+    buffer = b""
+    delivered = 0
+    for chunk in self._inner:
+      buffer += chunk
+      while b"\n\n" in buffer:
+        frame, buffer = buffer.split(b"\n\n", 1)
+        yield frame + b"\n\n"
+        if frame.startswith(b"data: "):
+          delivered += 1
+        if delivered == self._frames:
+          raise httpx.ReadError("stream cut for the test")
+
+  def close(self) -> None:
+    self._inner.close()
+
+
+class _CuttingTransport(httpx.BaseTransport):
+  def __init__(self, frames: int) -> None:
+    self._inner = httpx.HTTPTransport()
+    self._frames = frames
+    self.subscribe_after_seqs: list[str] = []
+
+  def handle_request(self, request: httpx.Request) -> httpx.Response:
+    if request.url.path.endswith("/chat/subscribe"):
+      self.subscribe_after_seqs.append(request.url.params["after_seq"])
+    response = self._inner.handle_request(request)
+    if request.method == "POST" and request.url.path.endswith("/chat"):
+      assert isinstance(response.stream, httpx.SyncByteStream)
+      return httpx.Response(
+        response.status_code,
+        headers=response.headers,
+        stream=_CutAfterFrames(response.stream, self._frames),
+        extensions=response.extensions,
+      )
+    return response
+
+  def close(self) -> None:
+    self._inner.close()
+
+
+def test_gateway_transport_reconnect_after_seq_2_receives_backlog_to_stream_complete(make_test_app) -> None:
+  from agent_gateway_cli.transport import GatewayEndpoint, GatewayTransport, MemorySessionHolder
+
+  uvicorn = pytest.importorskip("uvicorn")
+  app = make_test_app(provider=_BacklogProvider())
+  try:
+    port = _find_free_port()
+  except PermissionError as exc:
+    pytest.skip(f"loopback sockets are unavailable in this environment: {exc}")
+  server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", access_log=False))
+  server.install_signal_handlers = lambda: None
+  thread = threading.Thread(target=server.run, daemon=True)
+  thread.start()
+
+  try:
+    deadline = time.perf_counter() + 5.0
+    while not server.started:
+      assert time.perf_counter() < deadline, "uvicorn did not start"
+      time.sleep(0.01)
+
+    cutting = _CuttingTransport(frames=2)
+    endpoint = GatewayEndpoint(
+      base_url=f"http://127.0.0.1:{port}", api_key="gateway-key", channel=None, user_id="alice",
+    )
+    transport = GatewayTransport(
+      endpoint=endpoint,
+      http_transport=cutting,
+      sleep_fn=lambda _seconds: None,
+      reconnect_delays=(0.0,),
+    )
+    try:
+      envelopes = [
+        envelope
+        for envelope in transport.stream_turn(MemorySessionHolder(), message="hello")
+        if envelope.seq is not None
+      ]
+    finally:
+      transport.close()
+
+    seqs = [envelope.seq for envelope in envelopes if envelope.seq is not None]
+    delta_seqs = [
+      envelope.seq
+      for envelope in envelopes
+      if envelope.seq is not None and envelope.event["type"] == "text_delta"
+    ]
+    assert cutting.subscribe_after_seqs == ["2"]
+    assert len(seqs) - 2 > 2 * gateway_server._STREAM_SUBSCRIBER_QUEUE_MAX
+    assert delta_seqs == list(range(1, 701))
+    assert seqs == sorted(set(seqs))
+    assert envelopes[-1].event["type"] == "stream_complete"
+  finally:
+    server.should_exit = True
+    thread.join(timeout=5.0)
+    if thread.is_alive():
+      server.force_exit = True
+      thread.join(timeout=5.0)
+    assert not thread.is_alive()
 
 
 def test_subscribe_resume_cursor_replays_tail_through_terminal(make_test_app) -> None:

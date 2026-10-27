@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,16 +13,15 @@ from .capability_execution import BoundCapabilityExecution
 from .child_result_trust import UNTRUSTED_CHILD_RESULTS_POLICY
 from .provider_summarize import provider_summarize
 from .providers.base import ModelProvider
-from .runner_limits import estimate_tokens
+from .runner_limits import compressible_message_tokens, estimate_tokens
 from model_authority.thinking import ThinkingLevel, parse_effort
 
 
 LOGGER = logging.getLogger("agent_gateway.server_compaction")
 
-KEEP_ROUNDS = 0
 TAIL_TOKEN_BUDGET = 24_000
-MIN_COMPACT_GAIN_TOKENS = 20_000
-SUMMARY_MAX_TOKENS = 4_096
+MIN_COMPACT_GAIN_TOKENS = 60_000
+SUMMARY_MAX_TOKENS = 8_192
 RENDER_CHAR_BUDGET = 600_000
 MIN_SUMMARY_CHARS = 200
 CONTINUATION_NUDGE = "[History was compacted into the summary above. Continue the task from that summary.]"
@@ -31,8 +31,7 @@ DEFAULT_SERVER_COMPACTION_INSTRUCTIONS = """You are compacting a long tool-using
 
 Do not call tools. Do not ask follow-up questions. Return text only.
 
-First write a brief private <analysis> scratchpad (at most a few bullet points) so the summary fits within the output budget.
-Then write the durable summary inside a <summary>...</summary> block.
+Write the durable summary inside a <summary>...</summary> block.
 
 The summary must preserve:
 - the original root user deliverable on the very first line (never narrow the overall task deliverable to an in-flight invoke_skill stage's local output format such as a '## Skill Summary' receipt; an inline skill is one step inside the root deliverable)
@@ -102,6 +101,8 @@ def _json_chars(value: Any) -> int:
 
 
 def _estimate_messages(messages: list[dict[str, Any]]) -> int:
+  if not messages:
+    return 0
   return estimate_tokens(json.dumps(messages, ensure_ascii=False, default=str))
 
 
@@ -116,6 +117,7 @@ def should_portable_compact(
   last_compact_turn: int | None = None,
   last_compact_failed_turn: int | None = None,
   force: bool = False,
+  est_static_floor_tokens: int = 0,
 ) -> tuple[bool, str]:
   if not portable_compaction_enabled():
     return False, "disabled_by_env"
@@ -123,15 +125,31 @@ def should_portable_compact(
     return False, "native_model"
   if trigger is None or trigger <= 0:
     return False, "disabled"
-  if not force and est_total_tokens < trigger:
+  floor_tokens = max(0, int(est_static_floor_tokens))
+  compressible_tokens = compressible_message_tokens(est_total_tokens, est_static_floor_tokens=floor_tokens)
+  min_gain = (
+    min(MIN_COMPACT_GAIN_TOKENS, max(1, int(trigger) // 2))
+    if trigger is not None and 1_000 <= int(trigger) < MIN_COMPACT_GAIN_TOKENS
+    else MIN_COMPACT_GAIN_TOKENS
+  )
+  effective_trigger = (
+    max(min_gain + TAIL_TOKEN_BUDGET, int(trigger) - floor_tokens)
+    if floor_tokens > 0 and trigger is not None and int(trigger) >= MIN_COMPACT_GAIN_TOKENS
+    else (max(1, int(trigger) - floor_tokens) if floor_tokens > 0 and trigger is not None else trigger)
+  )
+  if not force and effective_trigger is not None and compressible_tokens < effective_trigger:
     return False, "below_trigger"
   if not force and turn_count is not None and last_compact_failed_turn == turn_count:
     return False, "failed_cooldown"
-  if not force and failed_est_at is not None and est_total_tokens < failed_est_at + MIN_COMPACT_GAIN_TOKENS:
+  if (
+    not force
+    and failed_est_at is not None
+    and compressible_tokens < max(0, int(failed_est_at) - floor_tokens) + min_gain
+  ):
     return False, "failed_cooldown"
   if not force and turn_count is not None and last_compact_turn == turn_count:
     return False, "already_compacted_turn"
-  if est_summarize_tokens < MIN_COMPACT_GAIN_TOKENS:
+  if est_summarize_tokens < min_gain:
     return False, "insufficient_gain"
   return True, "force" if force else "triggered"
 
@@ -249,7 +267,7 @@ def build_summary_prompt(rendered: str, instructions: str | None) -> str:
     "<conversation>\n"
     f"{rendered.strip()}\n"
     "</conversation>\n\n"
-    "Return text only. Use <analysis> for private scratchpad and <summary> for the durable summary."
+    "Return text only. Write the durable summary inside <summary>...</summary> tags."
   ).strip()
 
 
@@ -275,47 +293,103 @@ def _tool_result_ids(message: dict[str, Any]) -> set[str]:
   }
 
 
+def _call_batch_start(messages: list[dict[str, Any]], index: int) -> int:
+  """Index of the earliest assistant message whose tool calls the result
+  message at `index` answers (its own index when no call is found)."""
+  remaining = set(_tool_result_ids(messages[index]))
+  start = index
+  for call_index in range(index - 1, -1, -1):
+    matched = _tool_use_ids(messages[call_index]) & remaining
+    if matched:
+      start = call_index
+      remaining -= matched
+      if not remaining:
+        break
+  return start
+
+
 def split_messages_for_compact(
   messages: list[dict[str, Any]],
   *,
-  keep_rounds: int = KEEP_ROUNDS,
   tail_token_budget: int = TAIL_TOKEN_BUDGET,
   preserve_tool_result_ids: frozenset[str] | set[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-  # Required delivery is a chronological suffix, not an optional round. Keep
-  # the whole calling batch, including companion results and later continuations.
-  required_start = len(messages)
-  for index, message in enumerate(messages):
-    if _tool_result_ids(message) & preserve_tool_result_ids:
-      required_start = min(required_start, index)
-      result_ids = _tool_result_ids(message)
-      for call_index in range(index - 1, -1, -1):
-        if _tool_use_ids(messages[call_index]) & result_ids:
-          required_start = min(required_start, call_index)
-          result_ids -= _tool_use_ids(messages[call_index])
-        if not result_ids:
-          break
-
-  selected_units: list[tuple[int, list[dict[str, Any]]]] = []
+  # The verbatim tail is a chronological suffix of complete units (a tool_use
+  # message with its tool_result message, or one standalone message), bounded by
+  # `tail_token_budget`. A unit that carries an undelivered result takes the
+  # whole calling batch and every later continuation with it.
+  tail_start = len(messages)
+  preserve_start = len(messages)
+  tail_messages: list[dict[str, Any]] | None = None
   used_tokens = 0
-  index = len(messages) - 1
-  rounds = 0
-  while index >= 0 and rounds < keep_rounds:
+  if preserve_tool_result_ids:
+    preserve_start = min(
+      (
+        _call_batch_start(messages, idx)
+        for idx, msg in enumerate(messages)
+        if _tool_result_ids(msg) & preserve_tool_result_ids
+      ),
+      default=len(messages),
+    )
+    if preserve_start < len(messages):
+      tail_start = preserve_start
+      tail_messages = copy.deepcopy(messages[tail_start:])
+      preserve_tokens = _estimate_messages(tail_messages)
+      if preserve_tokens > tail_token_budget:
+        from .tool_result_compaction import (
+          MODEL_TOOL_RESULT_MIN_CHARS,
+          truncate_model_tool_result_content,
+        )
+
+        result_blocks = [
+          block
+          for msg in tail_messages
+          if isinstance(msg.get("content"), list)
+          for block in msg["content"]
+          if isinstance(block, dict)
+          and block.get("type") == "tool_result"
+          and isinstance(block.get("content"), str)
+        ]
+        if result_blocks:
+          # Subtract the exact non-result framing tokens of `tail_messages` and
+          # floor per-block projection at `MODEL_TOOL_RESULT_MIN_CHARS` (4,000 chars,
+          # `tool_result_compaction.py:17`) so undelivered results within the minimum
+          # projection floor stay verbatim while oversized blocks are compacted in
+          # place to fit `tail_token_budget` (`docs/design/harness-context-and-kernel-pass-through-2026-10-24.md:249`).
+          result_tokens = sum(estimate_tokens(block["content"]) for block in result_blocks)
+          non_result_tokens = max(0, preserve_tokens - result_tokens)
+          available_result_tokens = max(0, tail_token_budget - non_result_tokens)
+          per_block_max_chars = max(
+            MODEL_TOOL_RESULT_MIN_CHARS,
+            (available_result_tokens * 4) // len(result_blocks),
+          )
+          original_contents = [block["content"] for block in result_blocks]
+          for _ in range(2):
+            for block, raw_content in zip(result_blocks, original_contents):
+              if len(raw_content) > per_block_max_chars:
+                compacted_text, _ = truncate_model_tool_result_content(
+                  raw_content,
+                  tool_name="tool_result",
+                  max_chars=per_block_max_chars,
+                )
+                block["content"] = compacted_text
+            preserve_tokens = _estimate_messages(tail_messages)
+            if preserve_tokens <= tail_token_budget or per_block_max_chars <= MODEL_TOOL_RESULT_MIN_CHARS:
+              break
+            excess_chars = ((preserve_tokens - tail_token_budget) * 4) // len(result_blocks) + 4
+            per_block_max_chars = max(MODEL_TOOL_RESULT_MIN_CHARS, per_block_max_chars - excess_chars)
+      used_tokens = preserve_tokens
+  index = tail_start - 1
+  while index >= 0:
     message = messages[index]
     result_ids = _tool_result_ids(message)
-    use_ids = _tool_use_ids(message)
     if result_ids:
-      if index <= 0:
+      if index <= 0 or not result_ids <= _tool_use_ids(messages[index - 1]):
         index -= 1
         continue
-      previous = messages[index - 1]
-      previous_use_ids = _tool_use_ids(previous)
-      if not result_ids <= previous_use_ids:
-        index -= 1
-        continue
-      unit = [dict(previous), dict(message)]
+      unit = [dict(messages[index - 1]), dict(message)]
       start = index - 1
-    elif use_ids:
+    elif _tool_use_ids(message):
       index -= 1
       continue
     else:
@@ -325,17 +399,21 @@ def split_messages_for_compact(
     unit_tokens = _estimate_messages(unit)
     if used_tokens + unit_tokens > tail_token_budget:
       break
-    selected_units.append((start, unit))
+    if start <= 0 or _estimate_messages(messages[:start]) < max(MIN_COMPACT_GAIN_TOKENS, tail_token_budget):
+      break
+    tail_start = start
     used_tokens += unit_tokens
-    rounds += 1
     index = start - 1
 
-  first_tail_index = min(
-    [required_start, *(start for start, _unit in selected_units)]
-  )
+  if tail_messages is not None and tail_start < preserve_start:
+    final_tail = [dict(message) for message in messages[tail_start:preserve_start]] + tail_messages
+  elif tail_messages is not None:
+    final_tail = tail_messages
+  else:
+    final_tail = [dict(message) for message in messages[tail_start:]]
   return (
-    [dict(message) for message in messages[:first_tail_index]],
-    [dict(message) for message in messages[first_tail_index:]],
+    [dict(message) for message in messages[:tail_start]],
+    final_tail,
   )
 
 
@@ -553,10 +631,214 @@ def _extract_root_deliverable(messages: list[dict[str, Any]]) -> str | None:
   return None
 
 
-def _ensure_root_deliverable_header(summary: str, messages: list[dict[str, Any]]) -> str:
-  cleaned = str(summary or "").strip()
-  if not cleaned:
-    return cleaned
+def _tool_payload_dicts(content: Any) -> list[dict[str, Any]]:
+  if isinstance(content, dict):
+    return [content]
+  if isinstance(content, str):
+    candidates = [content]
+  elif isinstance(content, list):
+    candidates = [
+      str(item.get("text") or "") if isinstance(item, dict) else str(item)
+      for item in content
+      if not isinstance(item, dict) or item.get("type") == "text"
+    ]
+  else:
+    return []
+  payloads: list[dict[str, Any]] = []
+  for candidate in candidates:
+    try:
+      parsed = json.loads(candidate)
+    except (TypeError, ValueError):
+      continue
+    if isinstance(parsed, dict):
+      payloads.append(parsed)
+  return payloads
+
+
+_STATE_MAP_LIST_LIMIT = 40
+_STATE_MAP_ID_CHARS = 200
+_STATE_MAP_DESCRIPTION_CHARS = 80
+_ROOT_CAUSE_LIST_KEYS = ("root_causes", "findings", "failed_checks")
+_ROOT_CAUSE_CODE_KEYS = ("code", "check_id")
+_ROOT_CAUSE_TOOLS = frozenset({"check_model", "build_model"})
+
+
+def _state_map_id(value: Any) -> str | None:
+  if isinstance(value, bool) or not isinstance(value, (str, int)):
+    return None
+  text = str(value).strip()
+  return text if text and len(text) <= _STATE_MAP_ID_CHARS else None
+
+
+def _payload_item_ids(source: dict[str, Any]) -> list[str]:
+  found: list[str] = []
+  value = _state_map_id(source.get("item_id"))
+  if value is not None:
+    found.append(value)
+  item_ids = source.get("item_ids")
+  if isinstance(item_ids, list):
+    found.extend(text for text in (_state_map_id(item) for item in item_ids) if text is not None)
+  ops = source.get("ops")
+  if isinstance(ops, list):
+    for op in ops:
+      if isinstance(op, dict):
+        value = _state_map_id(op.get("item_id"))
+        if value is not None:
+          found.append(value)
+  return found
+
+
+def _payload_root_cause_codes(source: dict[str, Any]) -> list[str]:
+  found: list[str] = []
+  containers: list[dict[str, Any]] = [source]
+  for nested_key in ("evaluated_view", "validation"):
+    nested = source.get(nested_key)
+    if isinstance(nested, dict):
+      containers.append(nested)
+  for container in containers:
+    for key in _ROOT_CAUSE_LIST_KEYS:
+      entries = container.get(key)
+      if not isinstance(entries, list):
+        continue
+      for entry in entries:
+        if isinstance(entry, dict):
+          matched_code = False
+          for code_key in _ROOT_CAUSE_CODE_KEYS:
+            value = _state_map_id(entry.get(code_key))
+            if value is not None:
+              found.append(value)
+              matched_code = True
+          if not matched_code:
+            root_item = _state_map_id(entry.get("root_item_id"))
+            reason = _state_map_id(entry.get("reason"))
+            if root_item is not None:
+              found.append(f"{root_item}:{reason}" if reason is not None else root_item)
+        else:
+          value = _state_map_id(entry)
+          if value is not None:
+            found.append(value)
+  return found
+
+
+def _describe_kernel_local(value: Any) -> str:
+  if isinstance(value, dict):
+    kind = value.get("type")
+    text = str(kind).strip() if isinstance(kind, str) and kind.strip() else "?"
+    shape = value.get("shape")
+    if shape is not None:
+      text += shape if isinstance(shape, str) else json.dumps(shape, separators=(",", ":"), default=str)
+    return text[:_STATE_MAP_DESCRIPTION_CHARS]
+  return str(value).strip()[:_STATE_MAP_DESCRIPTION_CHARS]
+
+
+def _payload_kernel_locals(source: dict[str, Any]) -> dict[str, str]:
+  value = source.get("kernel_locals")
+  found: dict[str, str] = {}
+  if isinstance(value, dict):
+    for name, description in value.items():
+      text = _describe_kernel_local(description)
+      if str(name).strip() and text:
+        found[str(name).strip()] = text
+  elif isinstance(value, list):
+    for entry in value:
+      if isinstance(entry, dict) and str(entry.get("name") or "").strip():
+        text = _describe_kernel_local({key: item for key, item in entry.items() if key != "name"})
+        found[str(entry["name"]).strip()] = text
+      elif isinstance(entry, str):
+        name, _, description = entry.partition(":")
+        if name.strip():
+          found[name.strip()] = description.strip()[:_STATE_MAP_DESCRIPTION_CHARS] or "?"
+  return found
+
+
+def _state_map_list(label: str, values: list[str]) -> str:
+  return f"{label}=[{', '.join(values[-_STATE_MAP_LIST_LIMIT:])}]"
+
+
+def _extract_deterministic_state_map(
+  messages: list[dict[str, Any]],
+  *,
+  kernel_locals: Mapping[str, Any] | None = None,
+) -> str | None:
+  """One `[STATE MAP]` line of the identifiers a model cannot re-derive after
+  compaction, read from the current turn's tool calls and results and the
+  kernel's live `user_ns` variable map. None when the turn carries none."""
+  research_file_id: int | str | None = None
+  context_ref: str | None = None
+  revision: int | str | None = None
+  inspected_items: dict[str, None] = {}
+  open_root_causes: dict[str, None] | None = None
+  live_locals: dict[str, str] = {}
+  if isinstance(kernel_locals, Mapping):
+    for name, description in kernel_locals.items():
+      text = _describe_kernel_local(description)
+      if str(name).strip() and text:
+        live_locals[str(name).strip()] = text
+  tool_names: dict[str, str] = {}
+  for message in _current_turn_messages(messages):
+    content = message.get("content")
+    if not isinstance(content, list):
+      continue
+    for block in content:
+      if not isinstance(block, dict):
+        continue
+      block_type = block.get("type")
+      if block_type == "tool_use":
+        name = str(block.get("name") or "")
+        tool_names[str(block.get("id") or "")] = name
+        block_input = block.get("input")
+        sources = [block_input] if isinstance(block_input, dict) else []
+        is_model_document = name == "model_document"
+        is_root_cause_tool = False
+      elif block_type == "tool_result":
+        name = tool_names.get(str(block.get("tool_use_id") or ""), "")
+        sources = _tool_payload_dicts(block.get("content"))
+        is_model_document = name == "model_document"
+        is_root_cause_tool = name in _ROOT_CAUSE_TOOLS
+      else:
+        continue
+      if is_root_cause_tool:
+        open_root_causes = {}
+      for source in sources:
+        value = source.get("research_file_id")
+        if isinstance(value, (int, str)) and not isinstance(value, bool) and str(value).strip():
+          research_file_id = value
+        value = source.get("context_ref")
+        if isinstance(value, str) and value.strip():
+          context_ref = value.strip()
+        value = source.get("revision")
+        if is_model_document and isinstance(value, (int, str)) and not isinstance(value, bool) and str(value).strip():
+          revision = value
+        if is_model_document:
+          for item_id in _payload_item_ids(source):
+            inspected_items.pop(item_id, None)
+            inspected_items[item_id] = None
+        if is_root_cause_tool and open_root_causes is not None:
+          for code in _payload_root_cause_codes(source):
+            open_root_causes[code] = None
+        if block_type == "tool_result":
+          for local_name, description in _payload_kernel_locals(source).items():
+            if description:
+              live_locals[local_name] = description
+  parts: list[str] = []
+  if research_file_id is not None:
+    parts.append(f"research_file_id={research_file_id}")
+  if context_ref is not None:
+    parts.append(f"context_ref={context_ref}")
+  if revision is not None:
+    parts.append(f"model_document_revision={revision}")
+  if inspected_items:
+    parts.append(_state_map_list("inspected_items", list(inspected_items)))
+  if open_root_causes is not None:
+    parts.append(_state_map_list("open_root_causes", list(open_root_causes)))
+  if live_locals:
+    parts.append(_state_map_list("kernel_locals", [f"{name}:{kind}" for name, kind in live_locals.items()]))
+  if not parts:
+    return None
+  return "[STATE MAP] " + " | ".join(parts)
+
+
+def _with_root_deliverable_line(cleaned: str, messages: list[dict[str, Any]]) -> str:
   if not _message_has_inline_skill_or_stage_narrowing(messages, cleaned):
     return cleaned
   root_deliverable = _extract_root_deliverable(messages)
@@ -568,6 +850,28 @@ def _ensure_root_deliverable_header(summary: str, messages: list[dict[str, Any]]
     lines[0] = f"{_ROOT_DELIVERABLE_LINE_PREFIX}{root_deliverable}"
     return "\n".join(lines).strip()
   return f"{_ROOT_DELIVERABLE_LINE_PREFIX}{root_deliverable}\n\n{cleaned}"
+
+
+def _ensure_root_deliverable_header(
+  summary: str,
+  messages: list[dict[str, Any]],
+  *,
+  kernel_locals: Mapping[str, Any] | None = None,
+) -> str:
+  cleaned = str(summary or "").strip()
+  if not cleaned:
+    return cleaned
+  cleaned = _with_root_deliverable_line(cleaned, messages)
+  state_map = _extract_deterministic_state_map(messages, kernel_locals=kernel_locals)
+  if state_map is None:
+    return cleaned
+  cleaned = re.sub(r"(?m)^\[STATE MAP\][^\n]*\n*", "", cleaned).strip()
+  lines = cleaned.splitlines()
+  for position, line in enumerate(lines):
+    if line.startswith(_ROOT_DELIVERABLE_LINE_PREFIX):
+      return "\n".join([*lines[:position + 1], state_map, *lines[position + 1:]]).strip()
+  return f"{state_map}\n\n{cleaned}".strip()
+
 
 def _summary_tools(provider: ModelProvider, tools: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
   if tools and getattr(provider, "supports_tool_choice_none", False) is True:
@@ -623,6 +927,7 @@ async def summarize_messages(
   tools: list[dict[str, Any]] | None = None,
   on_event: Callable[[dict[str, Any]], object] | None = None,
   session_id: str | None = None,
+  kernel_locals: Mapping[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError(
@@ -657,7 +962,7 @@ async def summarize_messages(
     )
     if result.saw_tool_use:
       raise SummaryResponseRejected("Summary generation returned tool_use", usage=result.usage)
-    return _ensure_root_deliverable_header(_strip_analysis_and_extract_summary(_summary_response_text(result)), messages), result.usage
+    return _ensure_root_deliverable_header(_strip_analysis_and_extract_summary(_summary_response_text(result)), messages, kernel_locals=kernel_locals), result.usage
 
   async def _summarize_rendered() -> tuple[str, dict[str, Any]]:
     rendered = render_messages_for_summary(messages)
@@ -673,7 +978,7 @@ async def summarize_messages(
     )
     if result.saw_tool_use:
       raise SummaryResponseRejected("Summary generation returned tool_use", usage=result.usage)
-    return _ensure_root_deliverable_header(_strip_analysis_and_extract_summary(_summary_response_text(result)), messages), result.usage
+    return _ensure_root_deliverable_header(_strip_analysis_and_extract_summary(_summary_response_text(result)), messages, kernel_locals=kernel_locals), result.usage
 
   if _json_chars(messages) <= RENDER_CHAR_BUDGET:
     try:
@@ -696,13 +1001,14 @@ async def maybe_compact_current_messages(
   last_compact_turn: int | None = None,
   last_compact_failed_turn: int | None = None,
   failed_est_at: int | None = None,
-  keep_rounds: int = KEEP_ROUNDS,
+  est_static_floor_tokens: int = 0,
   tail_token_budget: int = TAIL_TOKEN_BUDGET,
   preserve_tool_result_ids: frozenset[str] | set[str] = frozenset(),
   tools: list[dict[str, Any]] | None = None,
   force: bool = False,
   on_event: Callable[[dict[str, Any]], object] | None = None,
   session_id: str | None = None,
+  kernel_locals: Mapping[str, Any] | None = None,
 ) -> CompactResult:
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError(
@@ -715,7 +1021,6 @@ async def maybe_compact_current_messages(
   original_messages = [dict(message) for message in messages]
   to_summarize, tail = split_messages_for_compact(
     messages,
-    keep_rounds=keep_rounds,
     tail_token_budget=tail_token_budget,
     preserve_tool_result_ids=preserve_tool_result_ids,
   )
@@ -733,6 +1038,7 @@ async def maybe_compact_current_messages(
   est_summarize_tokens = _estimate_messages(to_summarize)
   should_compact, reason = should_portable_compact(
     est_total_tokens=est_total_tokens,
+    est_static_floor_tokens=est_static_floor_tokens,
     est_summarize_tokens=est_summarize_tokens,
     trigger=trigger,
     native_compaction=model_info.supports_native_compaction,
@@ -761,6 +1067,7 @@ async def maybe_compact_current_messages(
     tools=tools,
     on_event=on_event,
     session_id=session_id,
+    kernel_locals=kernel_locals,
   )
   summary = summary.strip()
   summary_chars = len(summary)
@@ -783,7 +1090,12 @@ async def maybe_compact_current_messages(
     model=model,
   )
   anchor_block = dict(compacted_messages[0]["content"][0])
-  est_after = max(0, est_total_tokens - _estimate_messages(messages)) + _estimate_messages(compacted_messages)
+  floor_tokens = (
+    max(0, int(est_static_floor_tokens))
+    if est_static_floor_tokens > 0
+    else max(0, int(est_total_tokens) - (est_summarize_tokens + _estimate_messages(tail)))
+  )
+  est_after = floor_tokens + _estimate_messages(compacted_messages)
   return CompactResult(
     applied=True,
     messages=compacted_messages,
@@ -796,7 +1108,6 @@ async def maybe_compact_current_messages(
   )
 
 __all__ = [
-  "KEEP_ROUNDS",
   "TAIL_TOKEN_BUDGET",
   "MIN_COMPACT_GAIN_TOKENS",
   "SUMMARY_MAX_TOKENS",

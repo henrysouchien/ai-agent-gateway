@@ -282,16 +282,30 @@ def resolve_contained_path(
 
 
 @contextlib.contextmanager
-def sweep_lock(lock_path: Path, *, blocking: bool = False):
+def sweep_lock(
+  lock_path: Path,
+  *,
+  blocking: bool = False,
+  create: bool = True,
+):
   """Take the one process-wide lock shared by CLI and server entry points."""
 
-  # A state-root directory lock avoids creating a third dry-run artifact.  A
-  # caller may still supply a regular lock pathname when write purity is not a
-  # concern.
+  # A state-root directory lock avoids creating a lock artifact inside the
+  # target tree.  When create=False (dry_run), a nonexistent lock_path takes no
+  # lock and creates nothing, while an existing root or file is opened
+  # read-only.
   if lock_path.is_dir():
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
       flags |= os.O_DIRECTORY
+    fd = os.open(lock_path, flags)
+  elif not create:
+    if not lock_path.exists():
+      yield
+      return
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+      flags |= os.O_NOFOLLOW
     fd = os.open(lock_path, flags)
   else:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -409,7 +423,7 @@ class RetentionSweeper:
       raise ValueError("retention sweep clock must have an explicit UTC offset")
     lock_path = self.catalog.state_root
     reports: list[RetentionSweepReport] = []
-    with sweep_lock(lock_path, blocking=blocking_lock):
+    with sweep_lock(lock_path, blocking=blocking_lock, create=mode == "enforce"):
       for entry in self.catalog.entries:
         started = datetime.now(timezone.utc).isoformat()
         effective_mode: SweepMode = mode

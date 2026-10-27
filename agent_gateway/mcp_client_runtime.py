@@ -170,9 +170,16 @@ async def close_contexts(
   logger: logging.Logger,
   suppress_warnings: Callable[[], Any],
   wait_for: Callable[..., Any],
-) -> None:
+) -> Exception | None:
+  """Exit every context, best effort; return the first failure an exit raised.
+
+  A transport's task group reports the failure that ended it only when it is
+  exited, so a caller closing a connection that died under it reads the cause
+  here. Nothing is raised: a close that fails must not stop the others.
+  """
   pending_contexts = list(contexts)
   contexts.clear()
+  failure: Exception | None = None
   for ctx in reversed(pending_contexts):
     try:
       with suppress_warnings():
@@ -189,6 +196,8 @@ async def close_contexts(
       logger.debug("MCP context close cancelled during cleanup: %s", exc)
     except Exception as exc:
       logger.debug("MCP context close failed: %s", exc)
+      failure = failure or exc
+  return failure
 
 
 def read_claude_config(

@@ -133,6 +133,29 @@ def _candidates() -> list[PoolAccountCandidate]:
     ]
   ]
 
+_OWNER_SCOPE = "1"
+_OWNER_ROSTER = json.dumps([
+  {"slug": "operator", "risk_user_id": 1, "role": "owner"},
+])
+_OWNER_ENVIRON = {"GATEWAY_USER_KEYS": _OWNER_ROSTER}
+
+
+def _owner_kwargs() -> dict[str, Any]:
+  return {"user_scope": _OWNER_SCOPE, "environ": _OWNER_ENVIRON}
+
+
+def _payg_candidate() -> PoolAccountCandidate:
+  return PoolAccountCandidate(
+    provider="google_antigravity", key="payg",
+    record={"identity": "payg", "api_key": "payg-key"},
+    auth_mode="api", entitlement_kind="org_commercial",
+  )
+
+
+def _admit_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.delenv("HANK_USER_RUNTIME_CREDENTIALS_FILE", raising=False)
+  monkeypatch.setenv("GATEWAY_USER_KEYS", _OWNER_ROSTER)
+
 
 def test_pool_parks_accounts_until_cooldown_and_never_shortens_block() -> None:
   pool = ProviderCredentialPool()
@@ -151,19 +174,27 @@ def test_pool_parks_accounts_until_cooldown_and_never_shortens_block() -> None:
 def test_select_and_rotate_keep_token_and_project_of_unblocked_seat() -> None:
   first, second = _candidates()
   pool = ProviderCredentialPool()
-  assert select_pool_candidate([first, second], pool=pool, now=100) is first
+  assert select_pool_candidate(
+    [first, second], pool=pool, now=100, **_owner_kwargs(),
+  ) is first
   selected = rotate_pool_candidate(
     [first, second], current_key=first.token, until=200, pool=pool, now=100,
+    **_owner_kwargs(),
   )
   assert selected is not None
   assert selected is second
   assert selected.record["project_id"] == "project-second"
   assert pool.blocked_until(first.key) == 200
-  assert select_pool_candidate([first, second], pool=pool, now=100) is second
+  assert select_pool_candidate(
+    [first, second], pool=pool, now=100, **_owner_kwargs(),
+  ) is second
   assert rotate_pool_candidate(
     [first, second], current_key=second.account_identity, until=200, pool=pool, now=100,
+    **_owner_kwargs(),
   ) is None
-  assert select_pool_candidate([first, second], pool=pool, now=200) is first
+  assert select_pool_candidate(
+    [first, second], pool=pool, now=200, **_owner_kwargs(),
+  ) is first
 
 
 def test_selection_refresh_failure_parks_first_and_serves_second() -> None:
@@ -177,7 +208,9 @@ def test_selection_refresh_failure_parks_first_and_serves_second() -> None:
       raise RuntimeError("refresh revoked")
     return candidate
 
-  selected = select_pool_candidate([first, second], pool=pool, refresh_fn=refresh, now=100)
+  selected = select_pool_candidate(
+    [first, second], pool=pool, refresh_fn=refresh, now=100, **_owner_kwargs(),
+  )
   assert selected is not None
   assert selected is second
   assert refreshed == [first.key, second.key]
@@ -200,11 +233,83 @@ def test_rotation_refresh_failure_parks_sibling_and_serves_next() -> None:
 
   selected = rotate_pool_candidate(
     [first, second, third], current_key=first.key, until=200,
-    pool=pool, refresh_fn=refresh, now=100,
+    pool=pool, refresh_fn=refresh, now=100, **_owner_kwargs(),
   )
   assert selected is third
   assert pool.blocked_until(first.key) == 200
   assert pool.blocked_until(second.key) == 100 + REFRESH_FAILURE_BLOCK_SECONDS
+
+
+def test_owner_scope_selects_the_operator_seat() -> None:
+  first, _second = _candidates()
+  selected = select_pool_candidate(
+    [first], pool=ProviderCredentialPool(), now=100, **_owner_kwargs(),
+  )
+  assert selected is not None
+  assert selected.token == "token-first"
+
+
+def test_non_owner_and_unscoped_select_skip_operator_seats() -> None:
+  first, second = _candidates()
+  payg = _payg_candidate()
+  pool = ProviderCredentialPool()
+  invite = {"GATEWAY_USER_KEYS": json.dumps([
+    {"slug": "operator", "risk_user_id": 1, "role": "owner"},
+    {"slug": "invite", "risk_user_id": 2, "role": "invite"},
+  ])}
+  for scope, environ in (("2", invite), (None, _OWNER_ENVIRON), ("", _OWNER_ENVIRON)):
+    selected = select_pool_candidate(
+      [first, second, payg], pool=pool, now=100, user_scope=scope, environ=environ,
+    )
+    assert selected is not None
+    assert selected.token == "payg-key"
+    assert select_pool_candidate(
+      [first, second], pool=pool, now=100, user_scope=scope, environ=environ,
+    ) is None
+
+
+def test_non_owner_all_blocked_fallback_never_returns_a_seat() -> None:
+  first, _second = _candidates()
+  payg = _payg_candidate()
+  pool = ProviderCredentialPool()
+  pool.block(first.key, until=500)
+  pool.block(payg.key, until=500)
+  selected = select_pool_candidate(
+    [first, payg], pool=pool, now=100, user_scope="2", environ=_OWNER_ENVIRON,
+  )
+  assert selected is not None
+  assert selected.token == "payg-key"
+  assert select_pool_candidate(
+    [first], pool=pool, now=100, user_scope="2", environ=_OWNER_ENVIRON,
+  ) is None
+
+
+def test_rotate_cannot_land_on_a_seat_for_a_non_owner() -> None:
+  first, second = _candidates()
+  payg = _payg_candidate()
+  pool = ProviderCredentialPool()
+  assert rotate_pool_candidate(
+    [payg, first, second], current_key=payg.token, until=200, pool=pool, now=100,
+    user_scope="2", environ=_OWNER_ENVIRON,
+  ) is None
+  assert rotate_pool_candidate(
+    [first, second], current_key=first.token, until=200,
+    pool=ProviderCredentialPool(), now=100, user_scope="2", environ=_OWNER_ENVIRON,
+  ) is None
+
+
+def test_api_key_only_selection_ignores_a_malformed_roster() -> None:
+  payg = _payg_candidate()
+  selected = select_pool_candidate(
+    [payg],
+    pool=ProviderCredentialPool(),
+    now=100,
+    user_scope="13",
+    environ={"GATEWAY_USER_KEYS": "{not-json"},
+  )
+  assert selected is not None
+  assert selected is payg
+  assert selected.token == "payg-key"
 
 
 @pytest.fixture
@@ -212,6 +317,7 @@ def gemini_pool(
   monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> Iterator[tuple[ProviderCredentialPool, Path]]:
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  _admit_owner(monkeypatch)
   for name in (
     "GOOGLE_ANTIGRAVITY_AUTH_STORE_PATH", "GOOGLE_ANTIGRAVITY_AUTH_TOKEN",
     "GOOGLE_ANTIGRAVITY_PROJECT_ID", "GEMINI_AUTH_TOKEN", "GOOGLE_AUTH_TOKEN",
@@ -267,6 +373,7 @@ def _gemini_config(store: Path) -> dict[str, Any]:
     "provider": "google_antigravity", "auth_mode": "oauth", "auth_token": "token-first",
     "api_key": "", "project_id": "project-first", "account_identity": "first@example.com",
     "auth_store_path": str(store), "max_tokens": 4096,
+    "auth_user_scope": _OWNER_SCOPE,
   }
 
 
@@ -744,6 +851,7 @@ def test_xai_refresh_lock_serializes_with_pool_removal(tmp_path: Path) -> None:
 
 def test_bound_credential_without_pool_is_never_parked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  _admit_owner(monkeypatch)
   for name in ("GOOGLE_ANTIGRAVITY_AUTH_STORE_PATH", "GOOGLE_AUTH_STORE_PATH", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_AUTH_TOKEN", "GEMINI_AUTH_TOKEN"):
     monkeypatch.delenv(name, raising=False)
   execution = stub_bound_capability_execution(
@@ -752,12 +860,16 @@ def test_bound_credential_without_pool_is_never_parked(tmp_path: Path, monkeypat
       "provider": "google_antigravity", "auth_mode": "oauth",
       "auth_token": "request-scoped-token", "api_key": "",
       "project_id": "request-project", "max_tokens": 4096,
+      "auth_user_scope": _OWNER_SCOPE,
     },
   )
   assert CapabilityExecutionResolver._rebind_unparked_account(execution) is execution
 
 
-def test_explicit_custom_store_rotation_stays_within_its_own_accounts(tmp_path: Path) -> None:
+def test_explicit_custom_store_rotation_stays_within_its_own_accounts(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _admit_owner(monkeypatch)
   custom = tmp_path / "google_antigravity" / "custom.json"
   canonical = tmp_path / "google_antigravity" / "oauth.json"
   for seat, path in (("first@example.com", custom), ("second@example.com", custom)):
@@ -775,6 +887,7 @@ def test_explicit_custom_store_rotation_stays_within_its_own_accounts(tmp_path: 
       "auth_token": "token-first", "api_key": "",
       "project_id": "project-first", "account_identity": "first@example.com",
       "auth_store_path": str(custom), "max_tokens": 4096,
+      "auth_user_scope": _OWNER_SCOPE,
     },
     failure_kind="rate_limit", reset_at=time.time() + 600,
   )

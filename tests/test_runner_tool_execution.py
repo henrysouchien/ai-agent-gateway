@@ -51,7 +51,7 @@ from agent_gateway.runner_background_tasks import (  # noqa: E402
 )
 from agent_gateway.runner_tool_execution import RunnerToolExecutionMixin  # noqa: E402
 from agent_gateway.runner_tool_audit import redact_tool_input_for_event  # noqa: E402
-from agent_gateway.tool_policy_registry import PreparedToolCall  # noqa: E402
+from agent_gateway.tool_policy_registry import PreparedToolCall, ToolInputPreparationError  # noqa: E402
 from agent_gateway.tool_dispatch_classification import (  # noqa: E402
   ToolResultSettlement,
   settle_catalogless_tool_result,
@@ -104,6 +104,13 @@ class _Dispatcher:
       tool_name,
       prepared_call.materialize_input(),
     )
+
+  def redact_raw_tool_input_for_history(
+    self,
+    tool_name: str,
+    tool_input: dict[str, Any],
+  ) -> dict[str, Any]:
+    return redact_tool_input_for_event(tool_name, dict(tool_input))
 
   def settle_tool_result(
     self,
@@ -1929,12 +1936,13 @@ class _FailingPreparationDispatcher(_Dispatcher):
     self.dispatch_calls += 1
     raise AssertionError("failed preparation must not dispatch")
 
-  def redact_prepared_tool_input(
+  def redact_raw_tool_input_for_history(
     self,
     tool_name: str,
-    prepared_call: PreparedToolCall,
+    tool_input: dict[str, Any],
   ) -> dict[str, Any]:
-    raise AssertionError("failed preparation must not emit a tool start")
+    _ = tool_name
+    return {key: "[REDACTED]" for key in tool_input}
 
   @staticmethod
   def route_origin_for_tool(_tool_name: str) -> str:
@@ -2001,7 +2009,14 @@ def test_pane_remediation_reaches_model_through_real_addin_dispatch(
     if with_code:
       pane_error["code"] = "focus_lost"
     result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    session = SimpleNamespace(session_id="pane-errors", pending_tools={})
+    # Mirrors /api/mcp/events registration in api/main_mcp.py:438-448 paired
+    # with interactive chat ToolDispatcher(session=...) in
+    # api/agent/interactive/runtime_chat_builder.py:727-745.
+    session = SimpleNamespace(
+      session_id="pane-errors",
+      user_id="alice",
+      pending_tools={},
+    )
     event_log = EventLog()
     execute_addin = addin_execution._make_execute_addin(
       SimpleNamespace(session=session, result_queue=result_queue, event_log=event_log),
@@ -2010,12 +2025,26 @@ def test_pane_remediation_reaches_model_through_real_addin_dispatch(
       resolve_display_fn=lambda _name, _value: None,
     )
     channels = ChannelRegistry()
-    await channels.register(Channel("excel", ChannelType.EXCEL, {"read_cells"}))
+    await channels.register(
+      Channel(
+        "excel:pane-errors",
+        ChannelType.EXCEL,
+        {"read_cells"},
+        metadata={
+          "client_id": "client-1",
+          "workbook_session": "wb-1",
+          "workbook": "Model.xlsx",
+          "user_id": "alice",
+          "model_stamp": None,
+        },
+      )
+    )
     dispatcher = ExcelToolDispatcher(
       base=ToolDispatcher(
         capability_bind=TEST_CAPABILITY_BIND,
         mcp_client=McpClientManager(config_path=None),
         local_tool_handlers={},
+        session=session,
       ),
       channel_registry=channels,
       execute_addin=execute_addin,
@@ -2634,8 +2663,90 @@ def test_preparation_failure_returns_typed_error_without_dispatch() -> None:
     for entry in runner._log.entries
     if entry.event.get("type") == "tool_call_start"
   ]
-  assert start_events == []
+  assert len(start_events) == 1
+  assert start_events[0]["tool_input"] == {"secret": "[REDACTED]"}
   assert contexts[0].redacted_tool_input is None
+  assert contexts[0].tool_input == {}
+
+
+class _RejectingCodeExecuteDispatcher(_FailingPreparationDispatcher):
+  def prepare_tool_call(
+    self,
+    _tool_name: str,
+    _tool_input: dict[str, Any],
+  ) -> PreparedToolCall:
+    raise ToolInputPreparationError({
+      "code": "invalid_input",
+      "message": "code is required",
+    })
+
+  @staticmethod
+  def route_origin_for_tool(_tool_name: str) -> str:
+    return "local"
+
+
+_NVDA_8485_JOURNAL = (
+  Path.home()
+  / ".local/state/hank/evidence/isolated-gateways"
+  / "20261024T111109Z-p8485-ai79db99836665/state/logs/chat"
+  / "sess_0fe7f8faf35648baaade82d44984381e.jsonl"
+)
+
+
+def test_preparation_rejected_code_execute_emits_tool_call_start_and_grades_hand_bridged_pass() -> None:
+  if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+  from scripts.model_build_journey_measure import hand_bridge_section, measure_journal
+
+  call_id = "call_kszj1nr4"
+  runner = _dispatch_runner(_RejectingCodeExecuteDispatcher())
+
+  _run(runner._execute_single_tool(call_id, "code_execute", {}, {"tools": []}))
+
+  events = [entry.event for entry in runner._log.entries]
+  assert [event["type"] for event in events] == ["tool_call_start", "tool_call_complete"]
+  start, complete = events
+  assert start["tool_call_id"] == call_id
+  assert start["tool_name"] == "code_execute"
+  assert start["tool_input"] == {}
+  assert complete["error"] == {"code": "invalid_input", "message": "code is required"}
+  assert complete["is_error"] is True
+
+  chat_request = {"type": "chat_request"}
+  stream_complete = {"type": "stream_complete"}
+
+  def grade(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return hand_bridge_section(rows, measure_journal(rows), [])
+
+  orphan_rows = [chat_request, complete, stream_complete]
+  before = grade(orphan_rows)
+  assert before["status"] == "unknown"
+  assert before["detail"]["missing_arguments"] == [call_id]
+
+  after = grade([chat_request, *events, stream_complete])
+  assert after["status"] == "pass"
+  assert after["detail"]["missing_arguments"] == []
+
+  if not _NVDA_8485_JOURNAL.is_file():
+    return
+  rows = [
+    json.loads(line)
+    for line in _NVDA_8485_JOURNAL.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+  ]
+  raw = grade(rows)
+  assert raw["status"] == "unknown"
+  assert raw["detail"]["missing_arguments"] == [call_id]
+  complete_index = next(
+    index
+    for index, row in enumerate(rows)
+    if row.get("type") == "tool_call_complete" and row.get("tool_call_id") == call_id
+  )
+  rows.insert(complete_index, start)
+  fixed = grade(rows)
+  assert fixed["status"] == "pass"
+  assert fixed["detail"]["missing_arguments"] == []
+  assert fixed["detail"]["calls_examined"] == 482
 
 
 def test_retries_stop_at_two_and_emit_retries_exhausted(
@@ -2772,3 +2883,45 @@ def test_a_set_abort_event_stops_retrying_between_attempts(
 
   assert dispatcher.calls == 1
   assert _complete_event(runner)["dispatch"]["attempts"] == 1
+
+
+@pytest.mark.parametrize(
+  ("decider_role", "expected_irreversible"),
+  [
+    ("owner", True),
+    (" OWNER ", True),
+    ("invite", False),
+    ("INVITE", False),
+    (None, False),
+    ("", False),
+    ("   ", False),
+    ("admin", False),
+  ],
+)
+def test_single_user_approval_policy_role_authorized_for_class_enforces_money_boundary(
+  decider_role: str | None,
+  expected_irreversible: bool,
+) -> None:
+  policy = SingleUserApprovalPolicy()
+  assert (
+    policy.role_authorized_for_class(
+      decider_role=decider_role,
+      tool_class="irreversible",
+    )
+    is expected_irreversible
+  )
+  for non_money_class in (
+    "read",
+    "pure_transform",
+    "artifact_write",
+    "state_write",
+    "external_write",
+    "portfolio_config",
+  ):
+    assert (
+      policy.role_authorized_for_class(
+        decider_role=decider_role,
+        tool_class=non_money_class,
+      )
+      is True
+    )

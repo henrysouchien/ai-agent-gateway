@@ -343,13 +343,17 @@ dispatcher supplies the request's control-run identity as for direct calls.
 
 A docker or kernel cell's `timeout_ms` bounds its compute only. The interpreter
 runner brackets each `hank` request made on the cell's own (main interpreter)
-thread with `host_wait_begin`/`host_wait_end` frames; `_run_cell` pauses the
-compute deadline while one is open, so a blocked host call never times the cell
-out or interrupts it. A `hank` call from a cell-spawned thread still works but
-sends no frames and does not pause the clock, since the cell thread may still be
-computing. Each result carries `compute_ms` (unpaused time the deadline counted)
-and `host_wait_ms` (the cell thread's summed blocked time; spawned threads' waits
-are not counted). The optional `host_wait_ms` operand
+thread, and each `await hank.acall(...)` worker's, with
+`host_wait_begin`/`host_wait_end` frames; `_run_cell` pauses the compute
+deadline while one is open, so a blocked host call never times the cell out or
+interrupts it. CPU the main thread spends on other coroutines while an `acall`
+wait is open also escapes the deadline. A `hank` call from any other
+cell-spawned thread (`threading.Thread`) still works but sends no frames and
+does not pause the clock, since the cell thread may still be computing. Each
+result carries `compute_ms` (unpaused time the deadline counted) and
+`host_wait_ms` (the union of the intervals during which at least one host wait
+was open, so overlapping concurrent waits are not summed). The optional
+`host_wait_ms` operand
 (`CodeExecutionConfig.default_host_wait_ms`) is recorded and echoed as
 `requested_host_wait_ms`, never armed as a wait. The subprocess backend still
 bounds the whole process wall time.

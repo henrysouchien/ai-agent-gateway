@@ -8,6 +8,7 @@ from agent_gateway.event_adapter import (
   V1_WIRE_EVENT_TYPES,
   V1Adapter,
   adapt_event,
+  split_control_attribution,
 )
 from agent_gateway.runner_session_events import REFUSAL_GUIDANCE, build_refusal_event
 
@@ -633,3 +634,38 @@ def test_dispatch_record_is_session_log_only_and_never_reaches_the_wire() -> Non
   assert adapted is not None
   assert "dispatch" not in adapted
   assert adapted["is_error"] is False
+
+
+def test_split_control_attribution_separates_declared_keys_and_keeps_undeclared_payload() -> None:
+  event = {
+    "type": "run_state_changed",
+    "run_id": "run-1",
+    "state": "running",
+    "control_run_id": "ctl-1",
+    "undeclared": "kept",
+    "sub_agent_id": "sub-1",
+  }
+
+  attribution, payload = split_control_attribution(event)
+
+  assert attribution == {"run_id": "run-1", "control_run_id": "ctl-1", "sub_agent_id": "sub-1"}
+  assert list(attribution) == ["run_id", "control_run_id", "sub_agent_id"]
+  assert payload == {"type": "run_state_changed", "state": "running", "undeclared": "kept"}
+  assert list(payload) == ["type", "state", "undeclared"]
+
+
+def test_split_control_attribution_without_attribution_keys_returns_event_payload() -> None:
+  event = {"type": "text_delta", "text": "hello"}
+
+  attribution, payload = split_control_attribution(event)
+
+  assert attribution == {}
+  assert payload == event
+
+
+def test_split_control_attribution_does_not_mutate_input() -> None:
+  event = {"type": "text_delta", "run_id": "run-1", "text": "hello"}
+
+  split_control_attribution(event)
+
+  assert event == {"type": "text_delta", "run_id": "run-1", "text": "hello"}

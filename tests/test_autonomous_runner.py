@@ -2810,6 +2810,46 @@ def test_autonomous_v7_manifest_rejects_missing_role(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
+  ("present", "claims_served", "expected"),
+  [
+    (True, 7, 7),
+    (True, None, None),
+    (False, None, None),
+  ],
+  ids=["count", "null", "absent"],
+)
+def test_rehydrated_manifest_carries_claims_served(
+  tmp_path,
+  present,
+  claims_served,
+  expected,
+) -> None:
+  if present:
+    written = _write_manifest(tmp_path, claims_served=claims_served)
+    assert written["claims_served"] == claims_served
+  else:
+    written = _write_manifest(tmp_path)
+    assert "claims_served" not in written
+
+  record = _registry(tmp_path)._tasks["bg_0"]
+  assert record.claims_served == expected
+
+
+@pytest.mark.parametrize(
+  "claims_served",
+  ["many", True, -5, {"x": 1}, 1.5],
+  ids=["string", "bool", "negative", "object", "float"],
+)
+def test_rehydration_skips_a_manifest_whose_claims_served_is_not_a_count(
+  tmp_path,
+  claims_served,
+) -> None:
+  _write_manifest(tmp_path, claims_served=claims_served)
+
+  assert "bg_0" not in _registry(tmp_path)._tasks
+
+
+@pytest.mark.parametrize(
   ("field_name", "field_value"),
   [
     ("pack", "unexpected-pack"),
@@ -3730,6 +3770,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "autonomous_in_flight_at_start",
         "owner_run_limit",
         "credential_handoff_bytes",
+        "claims_served",
         "dispatch_scope",
         "containment_expectation",
         "cmd",

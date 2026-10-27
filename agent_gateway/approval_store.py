@@ -3646,7 +3646,7 @@ class SQLiteApprovalStore:
           raise RuntimeError("approval request state_version changed")
         decided_at = utc_now() if state in TERMINAL_STATES else current.decided_at
         terminal_decision = decision
-        if terminal_decision is None and state in {"approved", "denied", "auto_approved", "auto_denied", "expired"}:
+        if terminal_decision is None and state in TERMINAL_STATES:
           terminal_decision = state
         updated = replace(
           current,
@@ -3673,7 +3673,8 @@ class SQLiteApprovalStore:
   ) -> sqlite3.Cursor:
     """The only write of approval_requests.state, decision, and the decider columns.
 
-    Other callers match approval_id only. Cancellation passes cancellation_compare
+    Terminal target writes match approval_id only. Non-terminal target writes
+    fence out TERMINAL_STATES in WHERE; cancellation passes cancellation_compare
     so the identity compare-and-set is this statement's WHERE, not a second write.
     """
     predicate = ""
@@ -3689,7 +3690,15 @@ class SQLiteApprovalStore:
         AND session_id = :expected_session_id
         AND LOWER(TRIM(channel)) = :expected_channel"""
       params = {**params, **cancellation_compare}
-    return conn.execute(
+    elif updated.state not in TERMINAL_STATES:
+      terminal_params = {
+        f"terminal_state_{idx}": terminal_state
+        for idx, terminal_state in enumerate(sorted(TERMINAL_STATES))
+      }
+      placeholders = ", ".join(f":{key}" for key in terminal_params)
+      predicate = f"\n        AND state NOT IN ({placeholders})"
+      params = {**params, **terminal_params}
+    cursor = conn.execute(
       f"""
       UPDATE approval_requests SET
         state = :state,
@@ -3704,6 +3713,11 @@ class SQLiteApprovalStore:
       """,
       params,
     )
+    if cancellation_compare is None and updated.state not in TERMINAL_STATES and cursor.rowcount != 1:
+      raise ValueError(
+        f"cannot transition terminal approval request {updated.approval_id} to {updated.state}"
+      )
+    return cursor
 
   async def terminalize_pending_for_cancellation(
     self,

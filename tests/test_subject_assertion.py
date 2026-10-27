@@ -85,7 +85,6 @@ def test_verifier_derives_subject_and_consumes_assertion_once() -> None:
     payload_email=" USER@example.com ",
     payload_request_id=request_id,
     claimed_channel="web",
-    now=current,
   )
 
   assert subject.user_id == "101"
@@ -98,7 +97,6 @@ def test_verifier_derives_subject_and_consumes_assertion_once() -> None:
       payload_email="user@example.com",
       payload_request_id=request_id,
       claimed_channel="web",
-      now=current,
     )
 
 
@@ -129,7 +127,6 @@ def test_verifier_rejects_payload_authority_mismatch(
     "payload_email": "user@example.com",
     "payload_request_id": request_id,
     "claimed_channel": "web",
-    "now": current,
     **override,
   }
 
@@ -164,9 +161,75 @@ def test_verifier_rejects_wrong_audience_and_expired_assertion() -> None:
         payload_email="user@example.com",
         payload_request_id=request_id,
         claimed_channel="web",
-        now=current,
       )
 
+  future_token = _token(
+    private_key,
+    request_id=request_id,
+    issued_at=current + 60,
+    expires_at=current + 90,
+  )
+  nbf_token = jwt.encode(
+    {
+      "schema_version": 1,
+      "iss": SUBJECT_ASSERTION_ISSUER,
+      "aud": SUBJECT_ASSERTION_AUDIENCE,
+      "sub": "101",
+      "email": "user@example.com",
+      "channel": "web",
+      "request_id": request_id,
+      "iat": current,
+      "nbf": current + 60,
+      "exp": current + 90,
+      "jti": str(uuid4()),
+    },
+    private_key,
+    algorithm="EdDSA",
+    headers={"kid": "risk-web-v1", "typ": "JWT"},
+  )
+  non_scalar_iat_token = jwt.encode(
+    {
+      "schema_version": 1,
+      "iss": SUBJECT_ASSERTION_ISSUER,
+      "aud": SUBJECT_ASSERTION_AUDIENCE,
+      "sub": "101",
+      "email": "user@example.com",
+      "channel": "web",
+      "request_id": request_id,
+      "iat": [],
+      "exp": current + 60,
+      "jti": str(uuid4()),
+    },
+    private_key,
+    algorithm="EdDSA",
+    headers={"kid": "risk-web-v1", "typ": "JWT"},
+  )
+  inf_iat_token = jwt.encode(
+    {
+      "schema_version": 1,
+      "iss": SUBJECT_ASSERTION_ISSUER,
+      "aud": SUBJECT_ASSERTION_AUDIENCE,
+      "sub": "101",
+      "email": "user@example.com",
+      "channel": "web",
+      "request_id": request_id,
+      "iat": float("inf"),
+      "exp": current + 60,
+      "jti": str(uuid4()),
+    },
+    private_key,
+    algorithm="EdDSA",
+    headers={"kid": "risk-web-v1", "typ": "JWT"},
+  )
+  for rejected_token in (future_token, nbf_token, non_scalar_iat_token, inf_iat_token):
+    with pytest.raises(SubjectAssertionError, match="verification_failed"):
+      verifier.verify(
+        rejected_token,
+        payload_user_id="101",
+        payload_email="user@example.com",
+        payload_request_id=request_id,
+        claimed_channel="web",
+      )
 
 def test_replay_cache_fails_closed_instead_of_evicting_live_jti() -> None:
   private_key, verifier = _authority(replay_cache_size=1)
@@ -187,7 +250,6 @@ def test_replay_cache_fails_closed_instead_of_evicting_live_jti() -> None:
     payload_email="user@example.com",
     payload_request_id=request_ids[0],
     claimed_channel="web",
-    now=current,
   )
 
   with pytest.raises(SubjectAssertionError, match="replay_cache_saturated"):
@@ -197,7 +259,6 @@ def test_replay_cache_fails_closed_instead_of_evicting_live_jti() -> None:
       payload_email="user@example.com",
       payload_request_id=request_ids[1],
       claimed_channel="web",
-      now=current,
     )
   with pytest.raises(SubjectAssertionError, match="replayed"):
     verifier.verify(
@@ -206,5 +267,4 @@ def test_replay_cache_fails_closed_instead_of_evicting_live_jti() -> None:
       payload_email="user@example.com",
       payload_request_id=request_ids[0],
       claimed_channel="web",
-      now=current,
     )

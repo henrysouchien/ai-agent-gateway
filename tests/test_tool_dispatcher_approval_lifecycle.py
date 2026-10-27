@@ -1792,7 +1792,7 @@ def test_native_parks_before_and_after_rotation_capture_their_original_generatio
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   from agent_gateway.providers.anthropic import AnthropicProvider
-  from agent_gateway.providers.anthropic_oauth import resolve_anthropic_credentials
+  from agent_gateway.providers.anthropic_oauth import ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD, resolve_anthropic_credentials
   from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 
   token_a = "sk-ant-oat01-capture-member-A"
@@ -1801,7 +1801,7 @@ def test_native_parks_before_and_after_rotation_capture_their_original_generatio
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([token_a, token_b]))
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
   monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "oauth.json"))
-  sources = resolve_anthropic_credentials()
+  sources = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True})
   member_a = sources.by_token(token_a)
   member_b = sources.by_token(token_b)
   assert member_a is not None and member_b is not None
@@ -1843,6 +1843,7 @@ def test_native_parks_before_and_after_rotation_capture_their_original_generatio
       auth_config={
         "auth_mode": "oauth", "auth_token": token_a, "max_tokens": 1024,
         "credential_source": member_a.source_metadata(),
+        ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
       },
     )
     dispatcher.replace_capability_bind(execution.bind)

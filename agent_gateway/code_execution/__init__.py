@@ -1,4 +1,4 @@
-from ._backends import DockerBackend, ExecutionBackend, ExecutionHandle, OnOutputChunk, SubprocessBackend
+from ._backends import DockerBackend, ExecutionBackend, ExecutionHandle, OnOutputChunk
 from ._cleanup import cleanup_code_execution
 from ._config import CodeExecutionConfig
 from ._frame_reader import CellChannel, FrameReader
@@ -26,7 +26,6 @@ __all__ = [
   "ExecutionHandle",
   "FrameReader",
   "OnOutputChunk",
-  "SubprocessBackend",
   "build_code_execution",
   "cleanup_code_execution",
   "clear_docker_availability_cache",

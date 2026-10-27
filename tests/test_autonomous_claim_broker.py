@@ -29,6 +29,11 @@ from agent_gateway.autonomous_claim_broker import (
   AutonomousClaimBrokerError,
   AutonomousClaimSigner,
 )
+from agent_gateway.autonomous_runner import AutonomousRegistry
+from agent_gateway.autonomous_runner_state import (
+  AutonomousTask,
+  release_claim_broker,
+)
 from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )
@@ -70,7 +75,6 @@ class _BrokerRuntime:
 
 def _broker_runtime(
   *,
-  broker_max_requests: int = broker_module.AUTONOMOUS_CLAIM_BROKER_MAX_REQUESTS,
   broker_max_ttl_seconds: int = 600,
   ttl_resolver: TtlResolver | None = None,
   session_ttl_seconds: int = 600,
@@ -115,7 +119,6 @@ def _broker_runtime(
     broker = AutonomousClaimBroker(
       GatewayClaimSigningAuthority(_SECRET, ttl_resolver=ttl_resolver),
       envelope_json,
-      max_requests=broker_max_requests,
       max_ttl_seconds=broker_max_ttl_seconds,
     )
     resources.callback(broker.close)
@@ -153,6 +156,89 @@ def test_broker_signer_is_fixed_to_admitted_identity() -> None:
   finally:
     runtime.close()
 
+
+def test_broker_serves_past_the_retired_request_ceiling() -> None:
+  served = 513
+  runtime = _broker_runtime()
+  try:
+    for _index in range(served):
+      claim = runtime.claim_signer.sign_claim(ttl_seconds=1)
+      assert _verify_agent_claim_headers(
+        _SECRET,
+        _claim_headers(claim),
+      ) is not None
+    assert runtime.claim_broker.claims_served == served
+  finally:
+    runtime.close()
+
+
+def test_served_count_reaches_task_manifest_when_broker_closes(
+  tmp_path: Path,
+) -> None:
+  served = 3
+  runtime = _broker_runtime()
+  try:
+    for _index in range(served):
+      runtime.claim_signer.sign_claim(ttl_seconds=1)
+    inbox = tmp_path / "inbox"
+    ledger = tmp_path / "ledger"
+    record = AutonomousTask(
+      task_id="bg_7",
+      control_run_id="run-7",
+      session_id="bg_7",
+      channel_id="ab" * 32,
+      user_id="42",
+      user_email="owner@example.test",
+      role="owner",
+      profile="analyst",
+      mode="task",
+      task="sign claims",
+      skill=None,
+      pack=None,
+      deliver=True,
+      skill_resume_allowed=False,
+      admitted_skill_execution_limits=None,
+      context=None,
+      ticker=None,
+      channel="tui",
+      dev_mode=False,
+      dispatch_scope=None,
+      cmd=["python", "-m", "job"],
+      log_path=tmp_path / "bg_7.log",
+      operator_inbox_path=inbox,
+      approval_decisions_path=None,
+      control_authority=AutonomousControlAuthority(
+        control_mode="file",
+        admission_ledger_path=str(ledger),
+        admission_ledger_device=1,
+        admission_ledger_inode=2,
+        operator_inbox_path=str(inbox),
+        operator_inbox_device=1,
+        operator_inbox_inode=3,
+      ),
+      owner_lease_path=tmp_path / "lease",
+      owner_lease_device=1,
+      owner_lease_inode=2,
+      started_at=100.0,
+      capability_bind=_bind(),
+      claim_broker=runtime.claim_broker,
+    )
+    release_claim_broker(record)
+    registry = AutonomousRegistry(
+      api_dir=tmp_path / "api",
+      log_dir=tmp_path / "autonomous",
+    )
+    assert registry._commit_terminal_manifest_or_fence(record) is True
+    manifest = json.loads(
+      (tmp_path / "autonomous" / "bg_7.task.json").read_text(
+        encoding="utf-8",
+      )
+    )
+    assert manifest["claims_served"] == served
+    assert record.claims_served == served
+    assert record.claim_broker is None
+  finally:
+    runtime.close()
 
 def test_broker_enforces_ttl_and_closes_after_rejection() -> None:
   runtime = _broker_runtime(
@@ -281,19 +367,6 @@ def test_signer_binds_claim_to_exact_resolved_ttl_response(
     runtime.close()
 
 
-def test_broker_enforces_request_count_and_closes() -> None:
-  runtime = _broker_runtime(
-    broker_max_requests=1,
-  )
-  try:
-    runtime.claim_signer.sign_claim(ttl_seconds=30)
-    with pytest.raises(AutonomousClaimBrokerError):
-      runtime.claim_signer.sign_claim(ttl_seconds=30)
-    with pytest.raises(AutonomousClaimBrokerError, match="closed"):
-      runtime.claim_signer.sign_claim(ttl_seconds=30)
-  finally:
-    runtime.close()
-
 
 def test_broker_rejects_any_envelope_other_than_exact_launch() -> None:
   runtime = _broker_runtime()
@@ -416,21 +489,6 @@ def test_broker_parent_closure_fails_child_signing() -> None:
   finally:
     runtime.close()
 
-
-def test_broker_rejects_unbounded_request_configuration() -> None:
-  runtime = _broker_runtime()
-  try:
-    with pytest.raises(ValueError, match="max_requests"):
-      AutonomousClaimBroker(
-        GatewayClaimSigningAuthority(_SECRET),
-        runtime.envelope_json,
-        max_requests=(
-          broker_module.AUTONOMOUS_CLAIM_BROKER_MAX_REQUESTS
-          + 1
-        ),
-      )
-  finally:
-    runtime.close()
 
 
 def _broker_with_controlled_clock(

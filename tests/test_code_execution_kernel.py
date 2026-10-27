@@ -22,12 +22,24 @@ from agent_gateway.code_execution._frame_codec import MAX_FRAME_BYTES, decode_fr
 from agent_gateway.code_execution._kernel_runner import _implicit_mime_bundle
 from agent_gateway.event_log import EventLog
 from agent_gateway.session import SessionStream
-from test_code_execution_bridge import FRED_SERIES, GET_FILINGS, _CODE_CALLABLE, _CaptureMcp, _bind, _filings_extractor, _job_runner, _policy
+from agent_gateway.tool_dispatcher_helpers import ToolResult
+from agent_gateway.tool_policy_registry import PreparedToolCall
+from test_code_execution_bridge import (
+  FRED_SERIES,
+  GET_FILINGS,
+  _CODE_CALLABLE,
+  _FRED_RESULT,
+  _CaptureMcp,
+  _bind,
+  _filings_extractor,
+  _job_runner,
+  _policy,
+)
 
 
 @contextlib.asynccontextmanager
 async def _kernel(config: CodeExecutionConfig | None = None) -> AsyncIterator[KernelBackend]:
-  backend = KernelBackend(config=config or CodeExecutionConfig(register_docker=False))
+  backend = KernelBackend(config=config or CodeExecutionConfig())
   try:
     yield backend
   finally:
@@ -290,16 +302,16 @@ def test_timeout_keeps_locals_and_each_cell_gets_a_fresh_budget(tmp_path: Path) 
 def test_host_wait_longer_than_timeout_does_not_interrupt_the_cell(tmp_path: Path, _policy: Any) -> None:
   async def run() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    config = CodeExecutionConfig(register_kernel=True, register_docker=False, register_subprocess=False, work_dir_root=str(tmp_path))
+    config = CodeExecutionConfig(work_dir_root=str(tmp_path))
     bundle = build_code_execution(session, config=config)
     mcp = _CaptureMcp(delay_s=1.6, frame_reader=bundle.frame_reader)
     dispatcher = _bind(bundle, mcp)
     try:
       # A warm interpreter keeps cold boot out of the 1000 ms compute window.
-      warm, error = await dispatcher.dispatch("cell-warm", "code_execute", {"host": "kernel", "code": "pass"})
+      warm, error = await dispatcher.dispatch("cell-warm", "code_execute", {"code": "pass"})
       assert error is None and warm is not None and warm["return_code"] == 0, error
       result, error = await dispatcher.dispatch("cell-wait", "code_execute", {
-        "host": "kernel", "timeout_ms": 1000, "host_wait_ms": 2000,
+        "timeout_ms": 1000, "host_wait_ms": 2000,
         "code": f"saved = 61\nfilings = hank.call({GET_FILINGS!r}, cik='0000320193')\nprint(filings['filings'][0]['form'])",
       })
       assert error is None and result is not None, error
@@ -310,7 +322,7 @@ def test_host_wait_longer_than_timeout_does_not_interrupt_the_cell(tmp_path: Pat
       assert result["requested_host_wait_ms"] == 2000
       state = session.code_execution_kernels["kernel"]
       pid = state.pid
-      following, error = await dispatcher.dispatch("cell-after", "code_execute", {"host": "kernel", "code": "print(saved)"})
+      following, error = await dispatcher.dispatch("cell-after", "code_execute", {"code": "print(saved)"})
       assert error is None and following is not None and following["stdout"] == "61\n"
       assert following["host_wait_ms"] == 0 and "requested_host_wait_ms" not in following
       assert state.pid == pid
@@ -327,12 +339,11 @@ def test_kernel_cell_bridge_operation_is_answered(tmp_path: Path, _policy: Any) 
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     runner = _job_runner()
     session.active_turn = SessionStream(event_log=EventLog(), runner_task=None, runtime_owner=runner)
-    config = CodeExecutionConfig(register_kernel=True, register_docker=False, register_subprocess=False, work_dir_root=str(tmp_path))
+    config = CodeExecutionConfig(work_dir_root=str(tmp_path))
     bundle = build_code_execution(session, config=config, job_runner=lambda: runner)
     dispatcher = _bind(bundle, _CaptureMcp(frame_reader=bundle.frame_reader))
     try:
       result, error = await asyncio.wait_for(dispatcher.dispatch("cell-wait-op", "code_execute", {
-        "host": "kernel",
         "code": "import json\nprint(json.dumps(hank.wait(['bg_9'], timeout=0)))",
       }), timeout=30)
       assert error is None and result is not None, error
@@ -347,7 +358,7 @@ def test_kernel_cell_bridge_operation_is_answered(tmp_path: Path, _policy: Any) 
 def test_spawned_thread_host_call_does_not_pause_the_compute_deadline(tmp_path: Path, _policy: Any) -> None:
   async def run() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    config = CodeExecutionConfig(register_kernel=True, register_docker=False, register_subprocess=False, work_dir_root=str(tmp_path))
+    config = CodeExecutionConfig(work_dir_root=str(tmp_path))
     bundle = build_code_execution(session, config=config)
     mcp = _CaptureMcp(delay_s=2.0, frame_reader=bundle.frame_reader)
     dispatcher = _bind(bundle, mcp)
@@ -358,10 +369,10 @@ def test_spawned_thread_host_call_does_not_pause_the_compute_deadline(tmp_path: 
     )
     try:
       # A warm interpreter keeps cold boot out of the 1000 ms compute window.
-      warm, error = await dispatcher.dispatch("cell-warm", "code_execute", {"host": "kernel", "code": "pass"})
+      warm, error = await dispatcher.dispatch("cell-warm", "code_execute", {"code": "pass"})
       assert error is None and warm is not None and warm["return_code"] == 0, error
       result, error = await dispatcher.dispatch("cell-spin", "code_execute", {
-        "host": "kernel", "timeout_ms": 1000,
+        "timeout_ms": 1000,
         "code": thread_call + "end = time.monotonic() + 1.5\nwhile time.monotonic() < end:\n    pass\nworker.join()\nprint('finished')",
       })
       assert error is None and result is not None, error
@@ -372,7 +383,7 @@ def test_spawned_thread_host_call_does_not_pause_the_compute_deadline(tmp_path: 
       assert mcp.calls == [(GET_FILINGS, {"cik": "0000320193"})]
       # Reply routing for a spawned thread is unchanged; its wait is compute.
       following, error = await dispatcher.dispatch("cell-join", "code_execute", {
-        "host": "kernel", "timeout_ms": 30_000,
+        "timeout_ms": 30_000,
         "code": thread_call + "worker.join()\nprint(box['filings']['filings'][0]['form'])",
       })
       assert error is None and following is not None, error
@@ -437,8 +448,8 @@ def test_explicit_display_and_trailing_expression_bundles(tmp_path: Path) -> Non
       assert len(result["displays"]) == 3
       assert result["displays"][0]["application/json"] == {"a": 1}
       assert result["displays"][1]["text/plain"] == "42"
-      assert result["displays"][2]["application/json"] == {"private": "last expression"}
-      assert result["displays"][2]["text/plain"] == "{'private': 'last expression'}"
+      assert result["displays"][2] == {"text/plain": "{'private': 'last expression'}"}
+      assert "application/json" not in result["displays"][2]
       # A trailing display(...) call returns None, so it adds no bundle.
       none_result = await backend.execute("display(1)\nprint('side')", str(tmp_path))
       assert none_result["return_code"] == 0
@@ -450,7 +461,8 @@ def test_explicit_display_and_trailing_expression_bundles(tmp_path: Path) -> Non
 
 def test_implicit_result_json_projection_stays_within_text_budget() -> None:
   within = _implicit_mime_bundle({"rows": ["x" * 100] * 100})
-  assert within["application/json"] == {"rows": ["x" * 100] * 100}
+  assert "application/json" not in within
+  assert within["text/plain"].startswith("{'rows':")
   over = _implicit_mime_bundle({"rows": ["x" * 100] * 200})
   assert len(over["text/plain"].encode("utf-8")) <= 16 * 1024
   assert "truncated" in over["text/plain"]
@@ -524,7 +536,7 @@ def test_display_over_frame_bound_is_not_success_and_kernel_survives(tmp_path: P
       pid = backend.runtime.pid
       result = await backend.execute(f"display('x' * {MAX_FRAME_BYTES})", str(tmp_path))
       assert result["return_code"] == 1
-      assert result["protocol_error"]["code"] == "protocol_error"
+      assert "2 MiB" in result["error"]["evalue"]
       assert result["displays"] == []
       following = await backend.execute("print(saved)", str(tmp_path))
       assert following["return_code"] == 0 and following["stdout"] == "37\n"
@@ -563,16 +575,204 @@ def test_error_and_unbridged_call_do_not_destroy_kernel(tmp_path: Path) -> None:
   asyncio.run(run())
 
 
+def test_top_level_await_cell_runs_and_its_coroutines_persist_across_cells(tmp_path: Path) -> None:
+  async def run() -> None:
+    async with _kernel() as backend:
+      first = await backend.execute(
+        "import asyncio\n"
+        "async def double(value):\n"
+        "    await asyncio.sleep(0)\n"
+        "    return value * 2\n"
+        "total = await double(21)\n"
+        "print(total)",
+        str(tmp_path),
+      )
+      assert first["return_code"] == 0, first["stderr"]
+      assert first["stdout"] == "42\n"
+      pid = backend.runtime.pid
+      second = await backend.execute("print(total, await double(4))\nawait double(5)", str(tmp_path))
+      assert second["return_code"] == 0, second["stderr"]
+      assert second["stdout"] == "42 8\n"
+      assert second["displays"] == [{"text/plain": "10"}]
+      failed = await backend.execute("await double('x')\nawait asyncio.sleep(0)\nraise_later = undefined_name", str(tmp_path))
+      assert failed["return_code"] == 1 and failed["error"]["ename"] == "NameError"
+      following = await backend.execute("print(total, await double(1))", str(tmp_path))
+      assert following["stdout"] == "42 2\n" and following["return_code"] == 0
+      assert backend.runtime.pid == pid
+
+  asyncio.run(run())
+
+
+def test_create_task_in_body_with_await_only_in_the_trailing_expression_runs_on_the_loop(tmp_path: Path) -> None:
+  async def run() -> None:
+    async with _kernel() as backend:
+      gathered = await backend.execute(
+        "import asyncio\n"
+        "async def work(n):\n"
+        "    await asyncio.sleep(0)\n"
+        "    return n * 2\n"
+        "tasks = [asyncio.create_task(work(n)) for n in range(3)]\n"
+        "await asyncio.gather(*tasks)",
+        str(tmp_path),
+      )
+      assert gathered["return_code"] == 0, gathered["stderr"]
+      assert [bundle["text/plain"] for bundle in gathered["displays"]] == ["[0, 2, 4]"]
+      awaited = await backend.execute(
+        "single = asyncio.create_task(work(21))\nawait single", str(tmp_path),
+      )
+      assert awaited["return_code"] == 0, awaited["stderr"]
+      assert [bundle["text/plain"] for bundle in awaited["displays"]] == ["42"]
+      # A cell without top-level await still runs with no loop driving it.
+      plain = await backend.execute(
+        "try:\n    asyncio.get_running_loop()\nexcept RuntimeError:\n    print('no loop')\n", str(tmp_path),
+      )
+      assert plain["return_code"] == 0 and plain["stdout"] == "no loop\n"
+
+  asyncio.run(run())
+
+
+def test_task_that_swallows_cancellation_cannot_hang_the_cell_or_lose_the_namespace(tmp_path: Path) -> None:
+  async def run() -> None:
+    async with _kernel() as backend:
+      assert (await backend.execute("pass", str(tmp_path)))["return_code"] == 0
+      pid = backend.runtime.pid
+      # The task ignores cancellation for 8 s (and for a bounded iteration
+      # count, so it ends by itself either way). Cell cleanup runs with SIGINT
+      # ignored, so an unbounded wait for it outlives the 3 s timeout and its
+      # grace, and the interpreter is lost.
+      stubborn = await backend.execute(
+        "import asyncio, time\n"
+        "saved = 83\n"
+        "async def stubborn():\n"
+        "    end = time.monotonic() + 8\n"
+        "    for _ in range(5_000_000):\n"
+        "        if time.monotonic() > end:\n"
+        "            return\n"
+        "        try:\n"
+        "            await asyncio.sleep(0)\n"
+        "        except asyncio.CancelledError:\n"
+        "            pass\n"
+        "stubborn_task = asyncio.create_task(stubborn())\n"
+        "await asyncio.sleep(0)",
+        str(tmp_path), timeout_ms=3_000,
+      )
+      assert stubborn["return_code"] == 0 and not stubborn["timed_out"], stubborn["stderr"]
+      following = await backend.execute(
+        "import asyncio\nawait asyncio.sleep(0)\nprint(saved, stubborn_task.done())", str(tmp_path),
+      )
+      assert following["return_code"] == 0, following["stderr"]
+      assert following["stdout"] == "83 False\n"
+      assert backend.runtime.pid == pid
+
+  asyncio.run(run())
+
+
+def test_acall_wait_pauses_the_compute_deadline(tmp_path: Path, _policy: Any) -> None:
+  async def run() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    config = CodeExecutionConfig(work_dir_root=str(tmp_path))
+    bundle = build_code_execution(session, config=config)
+    mcp = _CaptureMcp(delay_s=1.4, frame_reader=bundle.frame_reader)
+    dispatcher = _bind(bundle, mcp)
+    try:
+      # A warm interpreter keeps cold boot out of the 1000 ms compute window.
+      warm, error = await dispatcher.dispatch("cell-warm", "code_execute", {"code": "pass"})
+      assert error is None and warm is not None and warm["return_code"] == 0, error
+      result, error = await dispatcher.dispatch("cell-acall", "code_execute", {
+        "timeout_ms": 1000,
+        "code": (
+          f"filings = await hank.acall({GET_FILINGS!r}, cik='0000320193')\n"
+          "print(filings['filings'][0]['form'])"
+        ),
+      })
+      assert error is None and result is not None, error
+      assert result["timed_out"] is False and result["return_code"] == 0, result["stderr"]
+      assert result["stdout"] == "10-K\n"
+      assert result["host_wait_ms"] >= 1200
+      assert result["compute_ms"] < 1000
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(run())
+
+
+def test_acall_gather_runs_concurrent_nested_calls_and_plain_hank_ops_stay_sync(tmp_path: Path, _policy: Any) -> None:
+  async def run() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    runner = _job_runner()
+    session.active_turn = SessionStream(event_log=EventLog(), runner_task=None, runtime_owner=runner)
+    config = CodeExecutionConfig(work_dir_root=str(tmp_path))
+    bundle = build_code_execution(session, config=config, job_runner=lambda: runner)
+    mcp = _CaptureMcp(frame_reader=bundle.frame_reader)
+    dispatcher = _bind(bundle, mcp)
+    arrived: list[str] = []
+    all_in = asyncio.Event()
+
+    async def gated(
+      name: str,
+      tool_input: dict[str, Any] | PreparedToolCall,
+      meta: object | None = None,
+      abort_event: asyncio.Event | None = None,
+      gateway_session: object | None = None,
+      allow_uncertain_replay: bool = True,
+      trusted_dispatch_scope: object | None = None,
+    ) -> ToolResult:
+      _ = (name, meta, abort_event, gateway_session, allow_uncertain_replay, trusted_dispatch_scope)
+      assert isinstance(tool_input, dict)
+      # All three calls must be in flight together before any is answered; a
+      # serialized bridge never reaches the third and this wait times out.
+      arrived.append(tool_input["series_id"])
+      if len(arrived) == 3:
+        all_in.set()
+      await asyncio.wait_for(all_in.wait(), timeout=30)
+      return {**_FRED_RESULT, "series_id": tool_input["series_id"]}, None
+
+    mcp.call_tool = gated
+    try:
+      result, error = await asyncio.wait_for(dispatcher.dispatch("cell-gather", "code_execute", {
+        "code": (
+          "import asyncio\n"
+          f"results = await asyncio.gather(*(hank.acall({FRED_SERIES!r}, series_id=name) for name in ('A', 'B', 'C')))\n"
+          "print([row['series_id'] for row in results])\n"
+          "waited = await hank.acall('wait', ['bg_9'], timeout=0)\n"
+          "print(waited['unknown'])"
+        ),
+      }), timeout=60)
+      assert error is None and result is not None, error
+      assert result["return_code"] == 0, result["stderr"]
+      assert result["stdout"] == "['A', 'B', 'C']\n['bg_9']\n"
+      assert sorted(arrived) == ["A", "B", "C"]
+      assert [entry["operation"] for entry in result["nested_calls"]].count(FRED_SERIES) == 3
+      # An operation called without `acall` stays synchronous and returns a plain dict.
+      del mcp.call_tool
+      sync, error = await asyncio.wait_for(dispatcher.dispatch("cell-sync", "code_execute", {
+        "code": (
+          "import inspect\n"
+          "waited = hank.wait(['bg_9'], timeout=0)\n"
+          f"row = getattr(hank, {FRED_SERIES!r})(series_id='CPIAUCSL')\n"
+          "print(type(waited) is dict, inspect.isawaitable(waited), waited['unknown'])\n"
+          "print(type(row) is dict, inspect.isawaitable(row), row['series_id'])"
+        ),
+      }), timeout=60)
+      assert error is None and sync is not None, error
+      assert sync["return_code"] == 0, sync["stderr"]
+      assert sync["stdout"] == "True False ['bg_9']\nTrue False CPIAUCSL\n"
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(run())
+
+
 def test_real_nested_dispatch_reuses_locals_but_rebinds_cell_grant(tmp_path: Path, _policy: Any) -> None:
   async def run() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-    config = CodeExecutionConfig(register_kernel=True, register_docker=False, register_subprocess=False, work_dir_root=str(tmp_path))
+    config = CodeExecutionConfig(work_dir_root=str(tmp_path))
     first = build_code_execution(session, config=config)
     mcp = _CaptureMcp(frame_reader=first.frame_reader)
     dispatcher = _bind(first, mcp, extract_sources=_filings_extractor)
     try:
       result, error = await dispatcher.dispatch("cell-first", "code_execute", {
-        "host": "kernel", "code": f"filings = hank.call({GET_FILINGS!r}, cik='0000320193')\nprint(len(hank.search('')))",
+        "code": f"filings = hank.call({GET_FILINGS!r}, cik='0000320193')\nprint(len(hank.search('')))",
       })
       assert error is None and result is not None and result["return_code"] == 0
       assert result["stdout"] == "2\n"
@@ -586,7 +786,7 @@ def test_real_nested_dispatch_reuses_locals_but_rebinds_cell_grant(tmp_path: Pat
         code_callable=_CODE_CALLABLE,
       )
       following, error = await later_dispatcher.dispatch("cell-next", "code_execute", {
-        "host": "kernel", "code": f"print(filings['filings'][0]['form'])\nprint([row['name'] for row in hank.search('')])\n"
+        "code": f"print(filings['filings'][0]['form'])\nprint([row['name'] for row in hank.search('')])\n"
         f"try:\n    hank.call({FRED_SERIES!r}, series_id='CPIAUCSL')\nexcept HankBridgeError as exc:\n    print(exc.code)",
       })
       assert error is None and following is not None and following["return_code"] == 0
@@ -627,6 +827,209 @@ def test_new_wrapper_refreshes_call_identity_in_the_same_interpreter(tmp_path: P
   asyncio.run(run())
 
 
+def test_kernel_reuses_one_hank_bridge_instance_across_cells_without_hello(tmp_path: Path) -> None:
+  async def run() -> None:
+    async with _kernel() as backend:
+      first = await backend.execute(
+        "hank_id = id(hank)\nprint(not hasattr(hank, 'carry') and not hasattr(hank, 'input'))", str(tmp_path),
+      )
+      second = await backend.execute(
+        "print(id(hank) == hank_id)\nprint(not hasattr(hank, 'carry') and not hasattr(hank, 'input'))", str(tmp_path),
+      )
+      assert first["return_code"] == 0, first["stderr"]
+      assert second["return_code"] == 0, second["stderr"]
+      assert first["stdout"] == "True\n"
+      assert second["stdout"].splitlines() == ["True", "True"]
+      assert backend.runtime.user_ns_locals == {"hank_id": "int"}
+
+  asyncio.run(run())
+
+
+_RISK_STYLE_PREAMBLE = (
+  "from abc import ABCMeta\n"
+  "from typing import Protocol\n\n"
+  "class DomainBridge(Protocol):\n"
+  "  def call(self, operation: str) -> object: ...\n\n"
+  "class DomainRouteError(LookupError):\n"
+  "  pass\n\n"
+  "class HankDomainTransport:\n"
+  "  def __init__(self, get_bridge):\n"
+  "    self._get_bridge = get_bridge\n\n"
+  "_risk = HankDomainTransport(lambda: hank)\n"
+)
+
+
+def test_cell_traceback_line_numbers_are_one_indexed_with_a_long_preamble(tmp_path: Path) -> None:
+  async def run() -> None:
+    config = CodeExecutionConfig(preamble_suffix=_RISK_STYLE_PREAMBLE + "configured = 1\n" * 40)
+    async with _kernel(config) as backend:
+      result = await backend.execute("x = 1\ny = 2\nraise ValueError('line three')", str(tmp_path))
+      assert result["return_code"] == 1
+      assert result["error"]["ename"] == "ValueError"
+      assert 'File "<cell>", line 3, in <module>' in result["stderr"]
+      assert 'File "<cell>", line 1,' not in result["stderr"]
+      assert any('File "<cell>", line 3, in <module>' in line for line in result["error"]["traceback"])
+      assert result["stderr"].count('File "<cell>"') == 1
+
+  asyncio.run(run())
+
+
+def test_import_hank_works_and_yields_the_injected_bridge(tmp_path: Path) -> None:
+  async def run() -> None:
+    async with _kernel() as backend:
+      first = await backend.execute(
+        "import sys\n_injected = hank\nimport hank\nprint(hank is _injected)\nprint(sys.modules['hank'] is _injected)",
+        str(tmp_path),
+      )
+      assert first["return_code"] == 0, first["stderr"]
+      assert first["stdout"] == "True\nTrue\n"
+      second = await backend.execute("import hank as other\nprint(other is hank)", str(tmp_path))
+      assert second["return_code"] == 0, second["stderr"]
+      assert second["stdout"] == "True\n"
+
+  asyncio.run(run())
+
+
+def test_risk_style_preamble_binds_clients_without_leaking_helper_names(tmp_path: Path) -> None:
+  async def run() -> None:
+    async with _kernel(CodeExecutionConfig(preamble_suffix=_RISK_STYLE_PREAMBLE)) as backend:
+      result = await backend.execute(
+        "leaked = [n for n in ('ABCMeta', 'Protocol', 'DomainBridge', 'DomainRouteError', 'HankDomainTransport')"
+        " if n in globals()]\n"
+        "print(leaked)\n"
+        "print(type(_risk).__name__)\n"
+        "print(_risk._get_bridge() is hank)",
+        str(tmp_path),
+      )
+      assert result["return_code"] == 0, result["stderr"]
+      assert result["stdout"] == "[]\nHankDomainTransport\nTrue\n"
+
+  asyncio.run(run())
+
+
+def test_percent_load_executes_helper_into_cell_namespace_and_keeps_line_numbers(tmp_path: Path) -> None:
+  helper = tmp_path / "helper_module.py"
+  helper.write_text("def double(value):\n  return value * 2\n\nloaded = double(21)\n", encoding="utf-8")
+
+  async def run() -> None:
+    async with _kernel() as backend:
+      result = await backend.execute(
+        f"%load {helper}\nprint(loaded, double(2))\nraise ValueError('after load')", str(tmp_path),
+      )
+      assert result["return_code"] == 1
+      assert result["stdout"] == "42 4\n"
+      assert result["error"]["ename"] == "ValueError"
+      assert 'File "<cell>", line 3, in <module>' in result["stderr"]
+      assert result["stderr"].count('File "<cell>"') == 1
+      # The helper's names persist in the session namespace for later cells.
+      following = await backend.execute("print(double(loaded))", str(tmp_path))
+      assert following["stdout"] == "84\n"
+
+  asyncio.run(run())
+
+
+async def _dispatch_bridged_cells(tmp_path: Path, cells: list[str]) -> list[dict[str, Any]]:
+  session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+  runner = _job_runner()
+  session.active_turn = SessionStream(event_log=EventLog(), runner_task=None, runtime_owner=runner)
+  config = CodeExecutionConfig(work_dir_root=str(tmp_path))
+  bundle = build_code_execution(session, config=config, job_runner=lambda: runner)
+  dispatcher = _bind(bundle, _CaptureMcp(frame_reader=bundle.frame_reader))
+  results: list[dict[str, Any]] = []
+  try:
+    for index, code in enumerate(cells):
+      result, error = await asyncio.wait_for(
+        dispatcher.dispatch(f"cell-footer-{index}", "code_execute", {"code": code}), timeout=30,
+      )
+      assert error is None and result is not None, error
+      assert result["return_code"] == 0, result["stderr"]
+      results.append(result)
+  finally:
+    await cleanup_code_execution(session)
+  return results
+
+
+def test_silent_assignment_after_a_hank_call_reports_what_it_bound(tmp_path: Path, _policy: Any) -> None:
+  [result] = asyncio.run(_dispatch_bridged_cells(tmp_path, ["st = hank.wait(['bg_9'], timeout=0)"]))
+  assert result["stdout"].startswith("[bound in kernel: st = dict[")
+  assert result["stdout"].endswith("]\n")
+  assert result["stdout"].count("\n") == 1
+
+
+def test_silent_assignment_without_a_hank_call_prints_nothing(tmp_path: Path) -> None:
+  async def run() -> None:
+    async with _kernel() as backend:
+      result = await backend.execute("st = {'a': 1, 'b': 2}", str(tmp_path))
+      assert result["return_code"] == 0, result["stderr"]
+      assert result["stdout"] == ""
+      assert backend.runtime.user_ns_locals["st"].startswith("dict[2]")
+
+  asyncio.run(run())
+
+
+def test_cell_that_prints_gets_no_bound_footer(tmp_path: Path, _policy: Any) -> None:
+  [result] = asyncio.run(_dispatch_bridged_cells(
+    tmp_path, ["st = hank.wait(['bg_9'], timeout=0)\nprint('done')"],
+  ))
+  assert result["stdout"] == "done\n"
+
+
+def test_hank_call_cell_that_displays_or_rebinds_nothing_gets_no_bound_footer(tmp_path: Path, _policy: Any) -> None:
+  first, displayed, unchanged = asyncio.run(_dispatch_bridged_cells(tmp_path, [
+    "st = hank.wait(['bg_9'], timeout=0)",
+    "other = hank.wait(['bg_9'], timeout=0)\ndisplay(1)",
+    "hank.wait(['bg_9'], timeout=0)",
+  ]))
+  assert first["stdout"].startswith("[bound in kernel: st = dict[")
+  assert displayed["stdout"] == ""
+  assert len(displayed["displays"]) == 1 and displayed["displays"][0]["text/plain"] == "1"
+  assert unchanged["stdout"] == ""
+
+
+def test_kernel_locals_summary_survives_hostile_values_and_clears_deleted_names(tmp_path: Path) -> None:
+  async def run() -> None:
+    async with _kernel() as backend:
+      setup = (
+        "import threading\n"
+        "hank_id = id(hank)\n"
+        "class Bad:\n"
+        "    @property\n"
+        "    def shape(self):\n"
+        "        raise ValueError('shape exploded')\n"
+        "bad = Bad()\n"
+        "big = {'k' * 100_000: 1}\n"
+        "keep = 41\n"
+        "_stop = threading.Event()\n"
+        "def _churn():\n"
+        "    i = 0\n"
+        "    while not _stop.is_set():\n"
+        "        globals()['churn_' + str(i % 50)] = i\n"
+        "        globals().pop('churn_' + str((i + 25) % 50), None)\n"
+        "        i += 1\n"
+        "    for name in [n for n in list(globals()) if n.startswith('churn_')]:\n"
+        "        globals().pop(name, None)\n"
+        "_thread = threading.Thread(target=_churn, daemon=True)\n"
+        "_thread.start()\n"
+      )
+      first = await backend.execute(setup, str(tmp_path))
+      assert first["return_code"] == 0, first["stderr"]
+      pid = backend.runtime.pid
+      assert pid is not None
+      second = await backend.execute("print(keep)", str(tmp_path))
+      assert second["return_code"] == 0, second["stderr"]
+      assert second["stdout"] == "41\n"
+      assert backend.runtime.pid == pid
+      assert backend.runtime.user_ns_locals["keep"] == "int"
+      assert backend.runtime.user_ns_locals["bad"] == "Bad"
+      assert all(len(name) <= 48 and len(summary) <= 256 for name, summary in backend.runtime.user_ns_locals.items())
+      cleared = await backend.execute("_stop.set()\n_thread.join()\ndel hank_id, big, bad, keep", str(tmp_path))
+      assert cleared["return_code"] == 0, cleared["stderr"]
+      assert backend.runtime.pid == pid
+      assert backend.runtime.user_ns_locals == {}
+
+  asyncio.run(run())
+
+
 def test_kernel_token_tracks_slot_and_environment_lifetime(tmp_path: Path) -> None:
   from agent_gateway.code_execution._frame_codec import encode_frame
   from agent_gateway.code_execution._frame_reader import CELL_TOKEN_ENV, lookup_active_cell
@@ -644,7 +1047,7 @@ def test_kernel_token_tracks_slot_and_environment_lifetime(tmp_path: Path) -> No
         await asyncio.sleep(0)
         assert lookup_active_cell(cell.token) is None
         denied = decode_frame(await cell.handle_frame(encode_frame({
-          "type": "hello", "call_id": "before", "cell_token": cell.token,
+          "type": "catalog", "request": "search", "query": "", "call_id": "before", "cell_token": cell.token,
         })))
         assert denied["error"]["code"] == "bad_cell_token"
         backend.runtime.lock.release()

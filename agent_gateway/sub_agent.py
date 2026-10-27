@@ -16,6 +16,7 @@ from collections.abc import Collection, Sequence, Set as AbstractSet
 
 from pydantic import JsonValue, ValidationError
 
+from agent_workflow_contracts.next_call import next_call as build_next_call
 from agent_workflow_contracts import (
   AgentCompletionEnvelope,
   AdmittedDataRef,
@@ -283,10 +284,10 @@ def _child_run_context(
     ),
     session_id=session_id or getattr(parent_session, "session_id", None),
     run_id=skill_run_id,
-    # A child runs inside its parent's profile partition: the authority owner
-    # (server_policies.authority_denies_tool) reads this as a profile name.
-    # The skill name rides `skill`.
+    # A child runs inside its parent's product profile partition (`profile_name`);
+    # `profile` carries the telemetry/approval run label.
     profile=str(getattr(tool_ctx, "profile", None) or skill_name or "sub_agent"),
+    profile_name=getattr(tool_ctx, "profile_name", None),
     channel=str(getattr(parent_session, "channel", None) or "web"),
     skill=skill_name,
     admitted_skill_execution_limits=admitted_skill_execution_limits,
@@ -363,7 +364,7 @@ def _durable_skill_event_persistence_error() -> dict[str, str]:
 log = logging.getLogger("agent_gateway.sub_agent")
 
 _CODE_EXECUTION_TOOL_NAMES = frozenset({
-  make_code_execute_tool_def(CodeExecutionConfig(), ())["name"],
+  make_code_execute_tool_def(CodeExecutionConfig())["name"],
 })
 
 
@@ -810,16 +811,16 @@ def _required_context_next_call(
   if key in _CURRENT_MODEL_REF_KEYS:
     if research_file_id is None:
       return None
-    return {
-      "tool_name": "get_current_model",
-      "arguments": {"research_file_id": research_file_id},
-    }
+    return build_next_call(
+      "get_current_model",
+      {"research_file_id": research_file_id},
+    )
   if ticker is None or not key.endswith("_ref"):
     return None
-  return {
-    "tool_name": "get_skill_artifact",
-    "arguments": {"ticker": ticker, "skill": key.removesuffix("_ref").replace("_", "-")},
-  }
+  return build_next_call(
+    "get_skill_artifact",
+    {"ticker": ticker, "skill": key.removesuffix("_ref").replace("_", "-")},
+  )
 
 
 def _operation_unavailable_error(
@@ -844,7 +845,7 @@ def _operation_unavailable_error(
         for item in unavailable.unsatisfied
       ],
     },
-    "next_call": {"tool_name": "list_skills", "arguments": {}},
+    "next_call": build_next_call("list_skills", {}),
   }
 
 
@@ -855,10 +856,10 @@ def _ticker_refusal(
   refusal: dict[str, Any] = {
     "code": code,
     "message": message,
-    "next_call": {
-      "tool_name": "run_agent",
-      "arguments": {key: value for key, value in tool_input.items() if key != "ticker"},
-    },
+    "next_call": build_next_call(
+      "run_agent",
+      {key: value for key, value in tool_input.items() if key != "ticker"},
+    ),
   }
   if required:
     refusal["missing_keys"] = ["ticker"]
@@ -1995,14 +1996,14 @@ def make_run_agent_handler(
           "unknown run_agent input fields: "
           + ", ".join(unknown_input_keys)
         ),
-        "next_call": {
-          "tool_name": "run_agent",
-          "arguments": {
+        "next_call": build_next_call(
+          "run_agent",
+          {
             key: value
             for key, value in tool_input.items()
             if key in allowed_input_keys
           },
-        },
+        ),
       }
     controls = [key for key in ("resume", "interrupt") if key in tool_input]
     if controls:
@@ -2012,12 +2013,12 @@ def make_run_agent_handler(
         return None, {
           "code": "invalid_input",
           "message": "Use interrupt or resume alone, without spawn or model overrides",
-          "next_call": {
-            "tool_name": "run_agent",
-            "arguments": {
+          "next_call": build_next_call(
+            "run_agent",
+            {
               key: value for key, value in tool_input.items() if key in control_fields
             },
-          },
+          ),
         }
       if control == "resume":
         handler = next(
@@ -2718,6 +2719,16 @@ def make_run_agent_handler(
     spawn_resolver = cast(
       CapabilityExecutionResolver, runner.capability_execution.resolver,
     )
+    raw_profile = (
+      getattr(tool_ctx, "profile_name", None)
+      if getattr(tool_ctx, "profile_name", None) is not None
+      else getattr(
+        getattr(runner, "_run_context", None)
+        or getattr(getattr(runner, "_dispatcher", None), "run_context", None),
+        "profile_name",
+        None,
+      )
+    )
     try:
       admission = admit(
         SpawnRequest(
@@ -2758,6 +2769,7 @@ def make_run_agent_handler(
           resolve_tool_authority=_resolve_tool_authority,
           containment=runner._containment,
           outputs=outputs,
+          profile_name=raw_profile,
         ),
       )
     except CapabilityResolutionError as exc:
@@ -2777,13 +2789,13 @@ def make_run_agent_handler(
             "research_file_id must match the verified active research turn "
             f"({root.research_binding.research_file_id})"
           ),
-          "next_call": {
-            "tool_name": "run_agent",
-            "arguments": {
+          "next_call": build_next_call(
+            "run_agent",
+            {
               **tool_input,
               "research_file_id": root.research_binding.research_file_id,
             },
-          },
+          ),
         }
       error = {
         "code": admission.reason,

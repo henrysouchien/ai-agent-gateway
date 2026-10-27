@@ -592,6 +592,9 @@ class AutonomousTask:
   # The signed pre-authorized call this launch carries. The parent holds it in
   # memory only; it is never persisted to the manifest.
   launch_approval_continuation: dict[str, Any] | None = None
+  # Claims this broker served. Written into the task manifest when the
+  # broker closes; unset until that close.
+  claims_served: int | None = None
 
   def __post_init__(self) -> None:
     if self.mode not in {"once", "task", "skill", "pack"}:
@@ -750,6 +753,18 @@ class AutonomousTask:
   def elapsed_sec(self) -> int:
     end_time = self.completed_at if self.completed_at is not None else _time_time()
     return max(0, int(end_time - self.started_at))
+
+
+def release_claim_broker(record: AutonomousTask) -> None:
+  """Close the run's claim broker and keep its served count on the record."""
+  broker = record.claim_broker
+  if broker is None:
+    return
+  try:
+    broker.close()
+  finally:
+    record.claims_served = broker.claims_served
+    record.claim_broker = None
 
 
 def _positive_int(value: Any) -> int | None:
@@ -1219,6 +1234,7 @@ class AutonomousRegistryStateMixin:
       "autonomous_in_flight_at_start": record.autonomous_in_flight_at_start,
       "owner_run_limit": record.owner_run_limit,
       "credential_handoff_bytes": record.credential_handoff_bytes,
+      "claims_served": record.claims_served,
       "dispatch_scope": _normalize_dispatch_scope(record.dispatch_scope),
       "containment_expectation": {
         "platform": sys.platform,
@@ -2136,6 +2152,19 @@ class AutonomousRegistryStateMixin:
     record_credential_handoff_bytes = _positive_int(
       manifest.get("credential_handoff_bytes")
     )
+    # Parsed here, at the manifest's entry: null until the broker closes
+    # (absent on manifests written before the field existed), otherwise the
+    # non-negative count the broker served. Any other value is a corrupt
+    # manifest, skipped like the other malformed fields above.
+    record_claims_served = manifest.get("claims_served")
+    if record_claims_served is not None and (
+      type(record_claims_served) is not int or record_claims_served < 0
+    ):
+      self._warn_once(
+        manifest_path,
+        "Skipping autonomous manifest with invalid claims_served: %s",
+      )
+      return None
     record_terminal_manifest_committed = (
       not was_interrupted
       and raw_state in terminal_states
@@ -2210,6 +2239,7 @@ class AutonomousRegistryStateMixin:
         autonomous_in_flight_at_start=record_autonomous_in_flight_at_start,
         owner_run_limit=record_owner_run_limit,
         credential_handoff_bytes=record_credential_handoff_bytes,
+        claims_served=record_claims_served,
         state=raw_state,
         exit_code=exit_code,
         error=error,

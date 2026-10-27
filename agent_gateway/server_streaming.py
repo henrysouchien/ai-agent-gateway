@@ -13,7 +13,6 @@ class StreamingDeps:
   done_marker: object
   queue_max: int
   keepalive_seconds: float
-  disconnect_stream_subscriber_for_backpressure: Callable[[StreamSubscriber], None]
   pump_stream_subscriber: Callable[..., Any]
   cleanup_stream_subscriber: Callable[..., Any]
 
@@ -24,27 +23,17 @@ def _deps(namespace: Mapping[str, Any]) -> StreamingDeps:
     done_marker=namespace["_STREAM_SUBSCRIBER_DONE"],
     queue_max=namespace["_STREAM_SUBSCRIBER_QUEUE_MAX"],
     keepalive_seconds=namespace["_STREAM_SUBSCRIBER_KEEPALIVE_SECONDS"],
-    disconnect_stream_subscriber_for_backpressure=namespace[
-      "_disconnect_stream_subscriber_for_backpressure"
-    ],
     pump_stream_subscriber=namespace["_pump_stream_subscriber"],
     cleanup_stream_subscriber=namespace["_cleanup_stream_subscriber"],
   )
 
 
 def bind_streaming_helpers(namespace: Callable[[], Mapping[str, Any]]) -> tuple[
-  Callable[[StreamSubscriber], None],
   Callable[[Any, StreamSubscriber, int], Any],
   Callable[..., StreamSubscriber],
   Callable[[Any, str], Any],
   Callable[..., AsyncIterator[Any]],
 ]:
-  def disconnect(subscriber: StreamSubscriber) -> None:
-    return disconnect_stream_subscriber_for_backpressure(
-      subscriber,
-      deps=_deps(namespace()),
-    )
-
   async def pump(active_turn: Any, subscriber: StreamSubscriber, after_seq: int) -> None:
     await pump_stream_subscriber(
       active_turn,
@@ -77,7 +66,6 @@ def bind_streaming_helpers(namespace: Callable[[], Mapping[str, Any]]) -> tuple[
 
   module_name = str(namespace().get("__name__", __name__))
   for func, name in (
-    (disconnect, "_disconnect_stream_subscriber_for_backpressure"),
     (pump, "_pump_stream_subscriber"),
     (register, "_register_stream_subscriber"),
     (cleanup, "_cleanup_stream_subscriber"),
@@ -87,18 +75,7 @@ def bind_streaming_helpers(namespace: Callable[[], Mapping[str, Any]]) -> tuple[
     func.__qualname__ = name
     func.__module__ = module_name
 
-  return disconnect, pump, register, cleanup, sse
-
-
-def disconnect_stream_subscriber_for_backpressure(
-  subscriber: StreamSubscriber,
-  *,
-  deps: StreamingDeps,
-) -> None:
-  return deps.chat_helpers._disconnect_stream_subscriber_for_backpressure(
-    subscriber,
-    done_marker=deps.done_marker,
-  )
+  return pump, register, cleanup, sse
 
 
 async def pump_stream_subscriber(
@@ -113,7 +90,6 @@ async def pump_stream_subscriber(
     subscriber,
     after_seq,
     done_marker=deps.done_marker,
-    disconnect_stream_subscriber_for_backpressure=deps.disconnect_stream_subscriber_for_backpressure,
   )
 
 

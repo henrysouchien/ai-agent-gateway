@@ -18,7 +18,7 @@ import hashlib
 import json
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import secrets
 import time
 from typing import Any, Callable, Generator, Mapping, Sequence
@@ -30,12 +30,22 @@ from ..auth import (
   derive_auth_mechanism_and_entitlement,
   evaluate_placement_eligibility,
 )
+from ..user_runtime_credentials import deployment_owner_scopes
 
 LOGGER = logging.getLogger(__name__)
 
 CREDENTIAL_POOL_STORE_VERSION = 1
 USER_SCOPE_FIELD = "auth_user_scope"
+USER_CREDENTIAL_STORE_FILENAMES = frozenset({"oauth.json", "credentials.json"})
 ACCOUNT_IDENTITY_FIELD = "account_identity"
+POOL_PUBLIC_AUTH_CONFIG_FIELDS: frozenset[str] = frozenset({
+  USER_SCOPE_FIELD,
+  ACCOUNT_IDENTITY_FIELD,
+  "api_key_store_path",
+  "auth_store_path",
+  "project_id",
+  "token_expires_at",
+})
 UNDECLARED_LIMIT_BLOCK_SECONDS = 300.0
 REFRESH_FAILURE_BLOCK_SECONDS = 300.0
 _HOSTED_EXTERNAL_PLACEMENT: Placement = "hosted_external"
@@ -55,11 +65,38 @@ def normalize_user_scope(value: Any) -> str:
   return str(scope) if scope > 0 else ""
 
 
+def scope_admits_operator_seats(
+  user_scope: Any,
+  *,
+  environ: Mapping[str, str] | None = None,
+) -> bool:
+  """True when `user_scope` is a non-empty deployment owner scope."""
+  scope = normalize_user_scope(user_scope)
+  return bool(scope) and scope in deployment_owner_scopes(
+    os.environ if environ is None else environ
+  )
+
+
 def store_base_dir(environ: Mapping[str, str] | None = None) -> Path:
   """The root directory for provider credential stores (`$USER_DATA_DIR` or `~/.agent_gateway`)."""
   env = os.environ if environ is None else environ
   user_data = str(env.get("USER_DATA_DIR") or "").strip()
   return Path(user_data).expanduser() if user_data else Path.home() / ".agent_gateway"
+
+
+def is_user_credential_store_path(relative: str | PurePosixPath) -> bool:
+  """Recognize stores and sidecars relative to `users/<storage_id>/`.
+
+  Derived from the `<family>/<filename>` envelope this module mints; also
+  covers anthropic_oauth.resolve_anthropic_auth_store_path's independent
+  scoped minter by shape, without requiring a store file to exist.
+  """
+  path = PurePosixPath(relative)
+  name = path.name.removeprefix(".").removesuffix(".lock")
+  return len(path.parts) == 2 and any(
+    name == filename or name.startswith(f"{filename}.")
+    for filename in USER_CREDENTIAL_STORE_FILENAMES
+  )
 
 
 def resolve_provider_store_path(
@@ -80,6 +117,11 @@ def resolve_provider_store_path(
   Environment variable overrides (`override_env_vars`) name the deployment org
   store path and never collapse a scoped user store onto the org file.
   """
+  if filename not in USER_CREDENTIAL_STORE_FILENAMES:
+    raise ValueError(
+      f"Provider credential store filename must be one of "
+      f"{sorted(USER_CREDENTIAL_STORE_FILENAMES)!r}; got {filename!r}"
+    )
   cfg = config or {}
   env = os.environ if environ is None else environ
   for key in override_config_keys:
@@ -134,6 +176,15 @@ def resolve_provider_store_paths(
   scope = normalize_user_scope(
     user_scope if user_scope is not None else cfg.get(USER_SCOPE_FIELD)
   )
+  org_path = resolve_provider_store_path(
+    family,
+    filename,
+    cfg,
+    environ=env,
+    user_scope="",
+    override_config_keys=(),
+    override_env_vars=override_env_vars,
+  )
   for key in override_config_keys:
     raw_override = str(cfg.get(key) or "").strip()
     if raw_override:
@@ -152,15 +203,6 @@ def resolve_provider_store_paths(
         return (None, org_path) if user_path == org_path else (user_path, org_path)
       return None, override_path
 
-  org_path = resolve_provider_store_path(
-    family,
-    filename,
-    cfg,
-    environ=env,
-    user_scope="",
-    override_config_keys=(),
-    override_env_vars=override_env_vars,
-  )
   if not scope:
     return None, org_path
   user_path = resolve_provider_store_path(
@@ -573,6 +615,30 @@ def get_provider_credential_pool(provider: str) -> ProviderCredentialPool:
   return pool
 
 
+def _exclude_operator_seats(
+  candidates: Sequence[PoolAccountCandidate],
+  *,
+  user_scope: Any,
+  environ: Mapping[str, str] | None,
+) -> Sequence[PoolAccountCandidate]:
+  """Drop operator personal seats unless the run scope is a deployment owner.
+
+  The owner roster is consulted only when a seat is actually in the pool, so
+  PAYG/API-key selection never depends on roster health.
+  """
+  if not any(
+    candidate.entitlement_kind == "operator_personal_subscription"
+    for candidate in candidates
+  ):
+    return candidates
+  if scope_admits_operator_seats(user_scope, environ=environ):
+    return candidates
+  return [
+    candidate for candidate in candidates
+    if candidate.entitlement_kind != "operator_personal_subscription"
+  ]
+
+
 def select_pool_candidate(
   candidates: Sequence[PoolAccountCandidate],
   *,
@@ -581,8 +647,16 @@ def select_pool_candidate(
   now: float | None = None,
   placement: str = "local",
   route: str | None = None,
+  user_scope: Any = None,
+  environ: Mapping[str, str] | None = None,
 ) -> PoolAccountCandidate | None:
-  """Select the first unblocked candidate (refreshing if needed), or fall back to candidate[0]."""
+  """Select the first unblocked candidate (refreshing if needed), or fall back to candidate[0].
+
+  Operator personal seats require an owner run scope on every placement.
+  """
+  candidates = _exclude_operator_seats(
+    candidates, user_scope=user_scope, environ=environ,
+  )
   if placement == _HOSTED_EXTERNAL_PLACEMENT:
     candidates = [
       candidate for candidate in candidates
@@ -624,6 +698,8 @@ def rotate_pool_candidate(
   pool: ProviderCredentialPool,
   refresh_fn: Callable[[PoolAccountCandidate], PoolAccountCandidate] | None = None,
   now: float | None = None,
+  user_scope: Any = None,
+  environ: Mapping[str, str] | None = None,
 ) -> PoolAccountCandidate | None:
   """Park `current_key` until `until` and return the next unblocked sibling, or `None`."""
   moment = time.time() if now is None else now
@@ -635,7 +711,10 @@ def rotate_pool_candidate(
       break
   if matched_key:
     pool.block(matched_key, until=until)
-  for candidate in candidates:
+  siblings = _exclude_operator_seats(
+    candidates, user_scope=user_scope, environ=environ,
+  )
+  for candidate in siblings:
     if candidate.key == matched_key:
       continue
     if pool.blocked_until(candidate.key) > moment:
@@ -728,6 +807,7 @@ def rotate_provider_credential(
     pool=pool,
     refresh_fn=refresh_fn,
     now=moment,
+    user_scope=config.get(USER_SCOPE_FIELD),
   )
   if selected is None:
     LOGGER.warning(
@@ -750,11 +830,13 @@ __all__ = [
   "ProviderCredentialPool",
   "REFRESH_FAILURE_BLOCK_SECONDS",
   "UNDECLARED_LIMIT_BLOCK_SECONDS",
+  "USER_CREDENTIAL_STORE_FILENAMES",
   "USER_SCOPE_FIELD",
   "atomic_write_json",
   "derive_account_identity",
   "get_provider_credential_pool",
   "get_provider_pool_hooks",
+  "is_user_credential_store_path",
   "load_pool_accounts",
   "normalize_user_scope",
   "register_provider_pool_hooks",
@@ -763,6 +845,7 @@ __all__ = [
   "resolve_provider_store_paths",
   "rotate_pool_candidate",
   "rotate_provider_credential",
+  "scope_admits_operator_seats",
   "select_pool_candidate",
   "store_base_dir",
   "store_read_lock",

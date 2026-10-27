@@ -7,11 +7,13 @@ import re
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Dict, Literal, Mapping
 
 from ..auth import ProviderCredentialFailure
 from ..rate_limit import get_global_token_bucket
 from model_authority.rates import RateTable
+from model_authority.key_pool import classify_key_failure, fingerprint, load_key_pool, pool_config_path
 from model_authority.registry import AdapterRouteSupport
 from model_authority.schema import AnthropicMessagesCompat
 from model_authority.thinking import EffortResolution, ThinkingLevel, clamp_effort
@@ -57,6 +59,8 @@ from .response_diagnostics import response_diagnostics
 from . import anthropic_quota
 from .anthropic_oauth import (
   ANTHROPIC_DEPLOYMENT_API_KEY_FIELD,
+  ANTHROPIC_CALL_CLASS_FIELD,
+  ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
   CREDENTIAL_AFFINITY_KEY_FIELD,
   CREDENTIAL_PREPARED_FIELD,
   UNDECLARED_LIMIT_BLOCK_SECONDS,
@@ -71,6 +75,7 @@ from .anthropic_oauth import (
   resolve_anthropic_credentials,
   rotate_anthropic_credential_source,
   select_anthropic_credential_source,
+  register_anthropic_static_credential,
 )
 
 
@@ -346,6 +351,29 @@ _WINDOW_STATUS_FIELDS = (
   "rate_limit_5h_status", "rate_limit_7d_status", "rate_limit_unified_status",
 )
 _COOLDOWN_REASONS = {"rate_limit": "quota", "billing": "billing", "auth": "auth"}
+_PAYG_POOL_REASONS = {
+  "billing": "credit_balance_too_low",
+  "auth": "invalid_api_key",
+  "rate_limit": "rate_limit",
+}
+
+
+class _CredentialFailureEvidence(RuntimeError):
+  """A sanitized `ProviderCredentialFailure` in the shape `classify_key_failure` reads.
+
+  Rotation holds the failure, not the provider exception; this carries its
+  status, message and limiter reset so the key pool records what the provider
+  said (reset window, usage-limit label) instead of only a literal reason.
+  """
+
+  def __init__(self, failure: ProviderCredentialFailure) -> None:
+    super().__init__(failure.message)
+    self.status_code = failure.status_code
+    self.message = failure.message
+    headers: dict[str, str] = {}
+    if failure.reset_at is not None:
+      headers["retry-after"] = str(max(failure.reset_at - time.time(), 1.0))
+    self.response = SimpleNamespace(headers=headers)
 
 
 @dataclass(frozen=True)
@@ -486,6 +514,14 @@ def _credential_material(
   }
   if ANTHROPIC_DEPLOYMENT_API_KEY_FIELD in config:
     material[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD] = config[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD]
+  if ANTHROPIC_CALL_CLASS_FIELD in config:
+    material[ANTHROPIC_CALL_CLASS_FIELD] = config[ANTHROPIC_CALL_CLASS_FIELD]
+  if ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD in config:
+    material[ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD] = config[ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD]
+  if is_api_key and selected.record is not None and selected.record.workspace_id:
+    material["workspace_id"] = selected.record.workspace_id
+  elif "workspace_id" in config:
+    material["workspace_id"] = ""
   return material
 
 
@@ -891,8 +927,9 @@ class AnthropicProvider(ModelProvider):
     # pool exactly as rotation does.
     pool_config = anthropic_pool_config(config)
     sources = await asyncio.to_thread(resolve_anthropic_credentials, pool_config)
-    if not any(member.auth_mechanism == "oauth_bearer" for member in sources.credentials):
-      return None
+    # A pool holding only the deployment API key (hosted / non-owner) is
+    # legitimate: selection and materialization still run so that key — never
+    # a setup token — is what prepare returns.
     await self._probe_usage(sources, pool_config)
     selected = await asyncio.to_thread(
       select_anthropic_credential_source,
@@ -1009,6 +1046,57 @@ class AnthropicProvider(ModelProvider):
       if failure.reset_at is not None
       else time.time() + UNDECLARED_LIMIT_BLOCK_SECONDS
     )
+    if mode == "api":
+      pool_file = pool_config_path("anthropic")
+      if pool_file is not None and pool_file.exists():
+        payg_pool = load_key_pool(
+          "anthropic", env_var="ANTHROPIC_API_KEY", repo="ai-excel-addin",
+        )
+        current_fingerprint = fingerprint(current)
+        is_pool_member = any(key.fingerprint == current_fingerprint for key in payg_pool.keys)
+        if is_pool_member:
+          can_exhaust_pool_key = (
+            failure.kind in {"auth", "rate_limit"}
+            or (
+              failure.kind == "billing"
+              and (failure.status_code != 403 or _has_billing_text(failure))
+            )
+          )
+          if can_exhaust_pool_key:
+            payg_reason = _PAYG_POOL_REASONS.get(failure.kind, "credential_exhaustion")
+            evidence = _CredentialFailureEvidence(failure)
+            # With evidence the pool records the provider's own reset/label; a
+            # failure the classifier cannot read keeps the literal reason.
+            if classify_key_failure(evidence) is not None:
+              payg_pool.mark_exhausted(current_fingerprint, payg_reason, exc=evidence)
+            else:
+              payg_pool.mark_exhausted(current_fingerprint, reason=payg_reason)
+          next_payg = payg_pool.lease()
+          if next_payg is not None and next_payg.key != current:
+            next_deployment = register_anthropic_static_credential(
+              next_payg.key,
+              credential_kind="api_key",
+              source=f"pool:anthropic:{next_payg.fingerprint}",
+              workspace_id=next_payg.workspace_id,
+            )
+            if next_deployment is not None:
+              # The re-resolved pool may no longer hold the failed key, so
+              # rotation below could not park it: park it from the pool it
+              # was resolved in. Without a re-resolve, rotation parks it.
+              failed_member = sources.by_token(current)
+              if failed_member is not None:
+                anthropic_quota.record_cooldown(
+                  failed_member.sidecar_store_path,
+                  failed_member.locator,
+                  anthropic_quota.Cooldown(
+                    scope=failure.limit_scope or "shared",
+                    until=blocked_until,
+                    reason=_COOLDOWN_REASONS.get(failure.kind, failure.kind),
+                  ),
+                )
+              pool_config[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD] = next_deployment.generation_ref
+              sources = resolve_anthropic_credentials(pool_config)
+
     selected = rotate_anthropic_credential_source(
       sources,
       current=current,
@@ -1024,7 +1112,7 @@ class AnthropicProvider(ModelProvider):
         len(sources.credentials),
       )
       return None
-    rotated = _credential_material(selected, config, user_store_path=sources.user_store_path)
+    rotated = _credential_material(selected, {**config, **pool_config}, user_store_path=sources.user_store_path)
     for field in (CREDENTIAL_AFFINITY_KEY_FIELD, CREDENTIAL_MODEL_FAMILY_FIELD):
       if field in config:
         rotated[field] = config[field]
@@ -1109,6 +1197,11 @@ class AnthropicProvider(ModelProvider):
     api_headers: Dict[str, Any] = {}
     if _COMMON_BETA_SLUGS:
       api_headers["anthropic-beta"] = ",".join(_COMMON_BETA_SLUGS)
+    raw_ws = config.get("workspace_id")
+    if raw_ws is not None and raw_ws != "":
+      if not isinstance(raw_ws, str) or not raw_ws.strip():
+        raise ValueError(f"workspace_id must be a non-empty string, got {raw_ws!r}")
+      api_headers["anthropic-workspace-id"] = raw_ws.strip()
     return BoundAsyncAnthropic(
       api_key=credential,
       auth_token="",

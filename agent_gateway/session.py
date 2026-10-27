@@ -72,15 +72,23 @@ def _normalize_optional_identity_value(value: str | None) -> str | None:
   return normalized or None
 
 
-def session_owner_user_id(session: "GatewaySession") -> str:
+def session_owner_user_id(
+  session: "GatewaySession | Any | None",
+  *,
+  required: bool = True,
+) -> str:
   """Return the canonical event-bus owner for a trusted session."""
 
-  owner_user_id = str(
-    getattr(session, "owner_user_id", None)
-    or getattr(session, "user_id", None)
-    or ""
-  ).strip()
-  if not owner_user_id:
+  owner_user_id = (
+    str(
+      getattr(session, "owner_user_id", None)
+      or getattr(session, "user_id", None)
+      or ""
+    ).strip()
+    if session is not None
+    else ""
+  )
+  if not owner_user_id and required:
     raise ValueError("session owner_user_id is required")
   return owner_user_id
 
@@ -181,7 +189,6 @@ class StreamSubscriber:
   queue: asyncio.Queue
   client_label: str | None = None
   pump_task: asyncio.Task[Any] | None = None
-  disconnect_reason: str | None = None
 
 
 @dataclass
@@ -300,6 +307,12 @@ class GatewaySession:
   # none of them can disagree with another.
   mcp_activation_fold: McpActivationFold = field(default_factory=McpActivationFold)
   loaded_local_tools: Set[str] = field(default_factory=set)
+  #: Exact research-door ceiling and tool-pack mapping recorded by
+  #: `build_local_tool_handlers` beside the session's `load_tools` handler.
+  #: `None` means no frozen ceiling / no pack catalog, respectively; these
+  #: are declared session state, never inferred with an attribute fallback.
+  research_door_grant_ceiling: frozenset[str] | None = None
+  load_tool_packs: Mapping[str, dict[str, Any]] | None = None
   request_tool_prefix: RequestToolPrefix = field(
     default_factory=RequestToolPrefix,
     init=False,
@@ -447,6 +460,7 @@ def child_gateway_session(
     risk_user_id=parent.risk_user_id,
     owner_user_id=tenant.storage_id if tenant is not None else None,
     role=tenant.role if tenant is not None else require_inherited_role(parent),
+    capabilities=normalize_session_capabilities(getattr(parent, "capabilities", ())),
     auth_config=dict(auth_config),
     channel=parent.channel,
     is_public=parent.is_public,

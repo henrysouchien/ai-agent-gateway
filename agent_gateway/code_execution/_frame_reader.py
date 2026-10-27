@@ -1,13 +1,17 @@
 """Host frame reader: nested tool calls from a running `code_execute` cell.
 
-A cell's bridged calls reach session tools through inherited pipes (subprocess)
-or container stdio (Docker), not a socket or loopback endpoint
+A cell's bridged calls reach session tools over the persistent kernel runner's
+stdin/stdout NDJSON pipe (local process or Docker container stdio), not a
+socket or loopback endpoint
 (execution-boundary design §8; clients plan §5.3/§5.5).
 `FrameReader` is session-owned and rebound by each request bundle to its current
 dispatcher. Each cell captures that binding and owns its background channel;
 session disposal awaits every remaining registration. Each `code_execute` call
-opens one `CellChannel`, registered under a random call-scoped token for the
-outer `tool_call_id`. Backend activation begins only when the cell executes;
+opens one `CellChannel`, registered under a call-scoped token for the
+outer `tool_call_id`: a v2 native token minted by the installed gateway
+claim-signing authority for the placed bundle's `storage_id` (else the
+principal's `risk_user_id`), or a random nonce when no authority is installed
+(degraded, non-edge). Backend activation begins only when the cell executes;
 completion revokes it before output collection. The same token authenticates
 native calls through `lookup_active_cell`, sharing the channel's grant, ordinal,
 ledger and source settlement. A non-executing token answers `bad_cell_token`.
@@ -15,30 +19,22 @@ ledger and source settlement. A non-executing token answers `bad_cell_token`.
 Frames, one JSON object per line. Child -> host, every frame carries
 `call_id` (child correlation id) and `cell_token`:
 
-- `hello{protocol}` -> `{protocol, parent_call_id, operations, tools}` (`tools`:
-  the granted, code-callable tool names the client binds as `hank.<tool>`)
 - `catalog{parent_call_id, request: "search", query}` -> list of `{name, description}`
 - `catalog{parent_call_id, request: "describe", operation}` -> `{name, description, input_schema}`
-- `derive{parent_call_id, name, value, expression, inputs}` -> `derive_result` (the published row)
 
 A successful `tool_result` also carries `source_refs`, the issued keys of the
-rows the call recorded; `derive` resolves them against the session's issued rows.
+rows the call recorded.
 
 Host -> child replies echo `type` and `call_id` and carry `ok` plus `result` or
-`error{code, message}`.
+`error{code, message, next_call?}`.
 
 An operation is callable iff `operation ∈ owning tool_grant ∩ operations
 registered as code-callable` (execution-boundary design §8): the grant is the
-bound dispatcher's enforced catalog for the turn (`tool_definitions`) plus
-the definitions the product binds as activatable this session
-(`activatable_tool_definitions` — the set its `load_tools` authority would
-admit, derived by that authority's owner, never a hand list here), the
-code-callable set is the registration the product binds beside it. A call to
-an activatable-but-not-yet-loaded operation first runs the bound
-`activate_tool` (the product's `load_tools` activation/binding mechanism)
-and then dispatches through the same prepared dispatcher path as any other
-nested call, so approval and authority still apply. There is no
-mutation-class filter here; the dispatcher's own policy and validation run on
+bound dispatcher's enforced catalog for the turn (`tool_definitions`); the
+code-callable set is the registration the product binds beside it. There is
+no second grant surface and no on-call activation: a tool is callable once
+the session's `load_tools` has put it in the turn's active definitions. There
+is no mutation-class filter here; the dispatcher's own policy and validation run on
 `dispatch` as for any call. Every nested call is recorded in the channel's
 ledger under the outer id (its `policy_class` is telemetry, read after the
 decision); `summary()` is what the outer result carries. Nested payloads go
@@ -50,6 +46,7 @@ operation that produced it (`produced_by_tool`, canonical name).
 """
 from __future__ import annotations
 
+import copy
 import asyncio
 import hmac
 import hashlib
@@ -57,16 +54,21 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 import weakref
-from typing import AbstractSet, Any, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import AbstractSet, Any, Callable, Dict, List, Mapping, Optional
 from agent_workflow_contracts.models import AdmittedTenant
+from agent_workflow_contracts.next_call import NextCall, next_call as build_next_call
+from pydantic import ValidationError
 
+from ..claim_signing_authority import configured_gateway_claim_signing_authority
 from ..policy_imports import load_server_policy_helpers, resolve_server_policy_tool_class
 from ..sdk_runner_helpers import server_for_tool
 from ..runner_background_tasks import jobs_wait
 from ..task_registry import TaskState
 from ..tool_dispatch_declarations import canonical_dispatch_tool_name
+from ..user_runtime_credentials import load_user_runtime_credentials
 
 from ..capability_execution import (
   execute_leaf_model_call,
@@ -80,13 +82,11 @@ from ..tool_dispatch_classification import (
 )
 from ..tool_policy_registry import PreparedToolCall, ToolInputPreparationError
 from ..tool_dispatcher_helpers import ToolExecutionContext
-from ._frame_codec import CellBudget, MAX_FRAME_BYTES, ProtocolError, decode_frame, encode_frame
+from ._frame_codec import CellBudget, ProtocolError, decode_frame, encode_frame
+from ._tool_defs import CODE_EXECUTION_DELEGATION_TOOL_DEFS
 log = logging.getLogger(__name__)
 
-BRIDGE_FD_IN_ENV = "AGENT_CODE_EXECUTE_BRIDGE_FD_IN"
-BRIDGE_FD_OUT_ENV = "AGENT_CODE_EXECUTE_BRIDGE_FD_OUT"
 CELL_TOKEN_ENV = "AGENT_CODE_EXECUTE_CELL_TOKEN"
-BRIDGE_PROTOCOL = 1
 
 # Product-owned `(operation, result) -> source handles` for one nested result,
 # and the citation registry's identity for one handle (`sources` dedup key).
@@ -95,78 +95,36 @@ SourceKey = Callable[[Dict[str, Any]], Any]
 CatalogMetadata = Callable[[str], Mapping[str, object]]
 # Product-owned decision for one exact granted operation name.
 CodeCallable = Callable[[str], bool]
-# Product-owned definitions `load_tools` could activate for this session,
-# and the activation of one such operation through that same mechanism.
-ActivatableToolDefinitions = Callable[[], List[Dict[str, Any]]]
-ActivateTool = Callable[[str], Awaitable[bool]]
 
 # Catalog previews are presentation only; source identities are never capped.
 _DESCRIPTION_PREVIEW_CHARS = 300
 
-# The bridge operations this reader answers beyond `tool_call`/`catalog`. One
-# registration: the cell's client generates `hank.<name>(...)` from the rows the
-# `hello` reply carries, and the `code_execute` prompt names them from here. An
-# op lowers to the same authority the direct door uses; it is not a tool and is
-# never in a grant or an MCP policy set.
 RUN_AGENT_OPERATION = "run_agent"
-BRIDGE_OPERATIONS: tuple[Dict[str, Any], ...] = (
-  {
-    "name": "agent",
-    "arguments": ["objective", "operation", "handles", "role", "effort", "ticker", "research_file_id"],
-    "description": (
-      "Submit a delegated job through the same admission as run_agent; "
-      "returns its task_id at once. Wait on it with hank.wait."
-    ),
-  },
-  {
-    "name": "wait",
-    "arguments": ["task_ids", "timeout"],
-    "description": (
-      "Block until the named jobs settle or timeout (seconds) elapses; "
-      "returns each job's state and, once completed, its error and "
-      "task_result_id (for agent jobs). A result reaches you as its background task "
-      "notification after the cell returns, or by get_background_result(task_id=...) "
-      "when notifications are off. Jobs keep running when the wait is interrupted."
-    ),
-  },
-  {
-    "name": "completion",
-    "arguments": ["operation", "material", "role", "effort", "evidence_handles"],
-    "description": (
-      "Submit a leaf model completion under a registered model-call operation; "
-      "returns its task_id at once. Wait on it with hank.wait."
-    ),
-  },
-  {
-    "name": "judge",
-    "arguments": ["operation", "state", "questions", "role", "effort", "evidence_handles"],
-    "description": (
-      "Submit a leaf judgment under a registered judgment operation and questions; "
-      "returns its task_id at once. Wait on it with hank.wait."
-    ),
-  },
-  {
-    "name": "workpool",
-    "arguments": ["items", "operation", "mode", "role", "effort", "context_handles", "timeout"],
-    "description": (
-      "Submit a batch of items as one P4 controller job drawing from the per-runner six-slot queue; "
-      "returns the controller task_id, submitted item keys, and item task_ids. Wait on it with hank.wait."
-    ),
-  },
-  {
-    "name": "judge_batch",
-    "arguments": ["operation", "states", "questions", "role", "effort", "evidence_handles", "wait", "timeout"],
-    "description": (
-      "Apply questions across keyed states under a registered judgment operation; "
-      "returns keyed judgments under the registered model-call operation. Wait on it with hank.wait when wait=false."
-    ),
-  },
-)
-# Every cell-to-host request a cell may send: the three protocol frames and
-# one frame per registered bridge operation. A backend's frame reader routes
+
+
+# The bridge operations this reader answers beyond `tool_call`/`catalog`. One
+# registration (`CODE_EXECUTION_DELEGATION_TOOL_DEFS`): the cell's client generates
+# `hank.<name>(...)` from the registered rows, and the `code_execute`
+# prompt names them from there. An op lowers to the same authority the direct door
+# uses; it is never in a grant or an MCP policy set.
+def _delegation_operation_rows() -> list[Dict[str, Any]]:
+  """The bridge's registered delegation-operation rows, derived from the delegation tool defs."""
+  return [
+    {
+      "name": row["name"],
+      "arguments": list(row["input_schema"]["properties"].keys()),
+      "description": row["description"],
+      "input_schema": row["input_schema"],
+    }
+    for row in CODE_EXECUTION_DELEGATION_TOOL_DEFS
+  ]
+
+
+# Every cell-to-host request a cell may send: the protocol frames and one
+# frame per registered delegation operation. A backend's frame reader routes
 # exactly these to the bridge, so a new operation needs no reader edit.
 REQUEST_FRAME_TYPES: frozenset[str] = frozenset(
-  {"hello", "catalog", "tool_call", "derive", *(str(row["name"]) for row in BRIDGE_OPERATIONS)}
+  {"catalog", "tool_call", *(str(row["name"]) for row in CODE_EXECUTION_DELEGATION_TOOL_DEFS)}
 )
 DEFAULT_WAIT_TIMEOUT_S = 600.0
 # `jobs.wait` reads the executing runner's task registry; the product binds
@@ -214,7 +172,7 @@ class ActiveCell:
       raise ToolInputPreparationError({"code": "bad_cell_token", "message": "cell has ended"})
     dispatcher = cell._dispatcher
     if dispatcher is None:
-      raise ToolInputPreparationError({"code": "bridge_unavailable", "message": f"{operation!r} is not code-callable here"})
+      raise ToolInputPreparationError({"code": "bridge_unavailable", "message": f"{operation!r} is not code-callable here; call {operation!r} directly as a tool, not from inside a cell"})
     refusal = cell._refusal(dispatcher, operation)
     if refusal is not None:
       raise ToolInputPreparationError({"code": refusal, "message": f"{operation!r} is not code-callable here"})
@@ -230,7 +188,8 @@ class ActiveCell:
     """Return this cell's pending native ledger row, never a detached copy."""
     if nested_call_id not in self._cell._native_calls:
       return None
-    return next(entry for entry in self._cell.ledger if entry["nested_call_id"] == nested_call_id)
+    with self._cell._lock:
+      return next(entry for entry in self._cell.ledger if entry["nested_call_id"] == nested_call_id)
 
   def settle_native(
     self, entry: dict, *, result: dict | None, error: dict | None,
@@ -275,19 +234,18 @@ class FrameReader:
   ) -> None:
     self._dispatcher: Any | None = None
     self._tool_definitions: Callable[[], List[Dict[str, Any]]] | None = None
-    self._activatable_tool_definitions: ActivatableToolDefinitions | None = None
-    self._activate_tool: ActivateTool | None = None
     self._extract_sources: SourceExtractor | None = None
     self._source_key: SourceKey | None = None
     self._code_callable: CodeCallable | None = None
     self._catalog_metadata: CatalogMetadata | None = None
     self._job_runner: JobRunner | None = None
+    self._grant_hint: Callable[[str], str | None] | None = None
     self._host_tools: frozenset[str] = CODE_EXECUTION_TOOL_NAMES
     self._cells: Dict[str, CellChannel] = {}
-    # Every source row this session's cells issued, by `source_refs` key. Kept
-    # with the session reader, which the session's kernel cleanup releases with
-    # it, so a retained kernel value resolves without a refetch.
-    self._issued_sources: Dict[str, Dict[str, Any]] = {}
+    # Settled per-cell summaries (`nested_calls`, `sources`) keyed by
+    # `outer_call_id` (and `task_id` for background `code` jobs). Lifetime owner:
+    # `FrameReader.aclose()` / `cleanup_code_execution(session)`.
+    self._cell_records: Dict[str, Dict[str, Any]] = {}
     self._closed = False
     self._closing_cells: tuple[CellChannel, ...] = ()
     self._principal = dict(principal or {})
@@ -304,6 +262,10 @@ class FrameReader:
     """
     self._job_runner = job_runner
 
+  def bind_grant_hint(self, grant_hint: Callable[[str], str | None] | None) -> None:
+    """Bind the product's tool-to-pack hint; the latest bind wins."""
+    self._grant_hint = grant_hint
+
   def bind_dispatcher(
     self,
     dispatcher: Any,
@@ -313,8 +275,6 @@ class FrameReader:
     source_key: SourceKey | None = None,
     code_callable: CodeCallable | None = None,
     catalog_metadata: CatalogMetadata | None = None,
-    activatable_tool_definitions: ActivatableToolDefinitions | None = None,
-    activate_tool: ActivateTool | None = None,
     host_tools: AbstractSet[str] | None = None,
   ) -> None:
     """Bind the dispatcher running this session's turn; the latest bind wins.
@@ -322,17 +282,11 @@ class FrameReader:
     `code_callable(operation)` is the product registration's decision for the
     exact installed route; a nested call needs it and the grant. Unbound means
     no operation is code-callable.
-    `activatable_tool_definitions()` names the not-yet-loaded operations the
-    session's `load_tools` authority would admit, and `activate_tool(name)`
-    activates/binds one through that mechanism before dispatch; neither
-    widens the grant past that authority.
     `source_key` is the citation registry's identity for an extracted handle;
     handles with equal keys are one source on the outer result.
     """
     self._dispatcher = dispatcher
     self._tool_definitions = tool_definitions
-    self._activatable_tool_definitions = activatable_tool_definitions
-    self._activate_tool = activate_tool
     self._extract_sources = extract_sources
     self._source_key = source_key
     self._code_callable = code_callable
@@ -344,6 +298,11 @@ class FrameReader:
     """Outer `tool_call_id`s of the cells currently registered."""
     return tuple(cell.outer_call_id for cell in self._cells.values())
 
+  def cell_record(self, call_or_task_id: str) -> Dict[str, Any]:
+    """Host-side settled ledger (`nested_calls`, `sources`) for one cell."""
+    record = self._cell_records.get(call_or_task_id)
+    return copy.deepcopy(record) if record is not None else {}
+
   def open_cell(
     self,
     outer_call_id: str,
@@ -352,7 +311,7 @@ class FrameReader:
     active: bool,
     tool_ctx: ToolExecutionContext | None = None,
   ) -> "CellChannel":
-    """Register one cell under a fresh token and create its fd pair."""
+    """Register one cell under a fresh token."""
     if self._closed:
       raise RuntimeError("the session's code execution reader is disposed")
     cell = CellChannel(self, outer_call_id, abort_event=abort_event, tool_ctx=tool_ctx)
@@ -382,7 +341,7 @@ class FrameReader:
         job_tasks.append(entry.asyncio_task)
     await asyncio.gather(*job_tasks, return_exceptions=True)
     await asyncio.gather(*(cell.aclose() for cell in self._closing_cells))
-    self._issued_sources.clear()
+    self._cell_records.clear()
 
   def is_registered(self, cell: "CellChannel") -> bool:
     return self._cells.get(cell.token) is cell and cell._active and not self._closed
@@ -391,16 +350,43 @@ class FrameReader:
     token = frame.get("cell_token")
     if not isinstance(token, str) or token != cell.token or not self.is_registered(cell):
       return False
-    parent = frame.get("parent_call_id", cell.outer_call_id if frame.get("type") == "hello" else None)
+    parent = frame.get("parent_call_id")
+    if parent is None:
+      return True
     return isinstance(parent, str) and hmac.compare_digest(parent, cell.outer_call_id)
 
   def _release(self, cell: "CellChannel") -> None:
     if self._cells.get(cell.token) is cell:
       del self._cells[cell.token]
+    summary = cell.summary()
+    self._cell_records[cell.outer_call_id] = summary
+    if cell.job is not None:
+      self._cell_records[cell.job[1]] = summary
+
+
+def _mint_cell_token(principal: Mapping[str, Any]) -> str:
+  """One call-scoped token: v2 native when a storage identity is known.
+
+  The storage identity is the placed bundle's `storage_id`, else the
+  principal's positive-int `risk_user_id`; the installed authority refuses
+  anything that is not a canonical positive decimal. With no authority, or
+  with neither a bundle nor a positive risk id (the direct, non-edge mode),
+  the token is a plain nonce; the cell registry owns liveness either way.
+  """
+  authority = configured_gateway_claim_signing_authority()
+  if authority is None:
+    return secrets.token_urlsafe(32)
+  bundle = load_user_runtime_credentials(os.environ)
+  if bundle is not None:
+    return authority.mint_native_cell_token(bundle.storage_id)
+  risk_user_id = principal.get("risk_user_id")
+  if isinstance(risk_user_id, int) and not isinstance(risk_user_id, bool) and risk_user_id > 0:
+    return authority.mint_native_cell_token(str(risk_user_id))
+  return secrets.token_urlsafe(32)
 
 
 class CellChannel:
-  """One cell's registration, fd pair, frame loop and nested-call ledger."""
+  """One cell's registration, frame handler and nested-call ledger."""
 
   def __init__(
     self,
@@ -412,7 +398,7 @@ class CellChannel:
   ) -> None:
     self._reader = reader
     self.outer_call_id = outer_call_id
-    self.token = secrets.token_urlsafe(32)
+    self.token = _mint_cell_token(reader._principal)
     self._abort_event = abort_event
     self._tool_ctx = tool_ctx
     self._active = True
@@ -425,38 +411,34 @@ class CellChannel:
     self._native_calls: Dict[str, tuple[float, Any, Any]] = {}
     self._dispatcher = reader._dispatcher
     self._tool_definitions = reader._tool_definitions
-    self._activatable_tool_definitions = reader._activatable_tool_definitions
-    self._activate_tool = reader._activate_tool
     self._extract_sources = reader._extract_sources
     self._source_key = reader._source_key
     self._code_callable = reader._code_callable
+    self._grant_hint = reader._grant_hint
     self._job_runner = reader._job_runner
     self._catalog_metadata = reader._catalog_metadata
     self._host_tools = reader._host_tools
     self._grant: Dict[str, Dict[str, Any]] | None = None
     self.budget = CellBudget()
-    # host -> child, child -> host
-    self._child_in, self._host_out = os.pipe()
-    self._host_in, self._child_out = os.pipe()
-    self._raw_fds: set[int] = {self._child_in, self._host_out, self._host_in, self._child_out}
-    self._pipe_files: List[Any] = []
-    self._read_transport: asyncio.ReadTransport | None = None
-    self._write_transport: asyncio.WriteTransport | None = None
+    # Request frames are answered by concurrent tasks and native calls arrive
+    # on producer threads; every ordinal/ledger/source mutation and read takes
+    # this lock.
+    self._lock = threading.RLock()
     self._ordinal = 0
     self.ledger: List[Dict[str, Any]] = []
     self._sources: Dict[Any, Dict[str, Any]] = {}
-    self.derived: List[Dict[str, Any]] = []
     self._inflight: set[asyncio.Task[Any]] = set()
-    self._serve_task: asyncio.Task[Any] | None = None
 
   # --- backend-facing (`_backends._base.CellBridge`) -------------------------
 
-  def child_env(self) -> Dict[str, str]:
-    env = {
-      BRIDGE_FD_IN_ENV: str(self._child_in),
-      BRIDGE_FD_OUT_ENV: str(self._child_out),
-      CELL_TOKEN_ENV: self.token,
-    }
+  def capability_env(self) -> Dict[str, str]:
+    """Per-cell env the runner applies beside the control frame's `cell_token`.
+
+    The token itself rides the cell control frame (`cell_token`), which the
+    runner exports as `CELL_TOKEN_ENV`; only the signed risk-job claim, bound
+    to this token and grant, is env.
+    """
+    env: Dict[str, str] = {}
     try:
       from ..investment_capability_claim import (
         investment_capability_signing_available,
@@ -480,13 +462,6 @@ class CellChannel:
       pass
     return env
 
-  def child_fds(self) -> tuple[int, ...]:
-    return (self._child_in, self._child_out)
-
-  def fds(self) -> tuple[int, ...]:
-    """All four pipe fds this channel created (host and child ends)."""
-    return (self._child_in, self._host_out, self._host_in, self._child_out)
-
   def activate(self) -> None:
     """Begin execution only after the backend owns its execution slot."""
     self._active = True
@@ -496,35 +471,16 @@ class CellChannel:
     """Revoke authentication at execution end, retaining the result ledger."""
     self._active = False
 
-  def close_child_ends(self) -> None:
-    self._close_raw(self._child_in, self._child_out)
-
   def close(self) -> None:
-    """End the registration and close every fd; idempotent."""
+    """End the registration; idempotent."""
     self.deactivate()
     self._reader._release(self)
-    # A pipe transport may already have closed itself (the child closed its
-    # end); closing it again touches a detached loop.
-    if self._read_transport is not None and not self._read_transport.is_closing():
-      self._read_transport.close()
-    self._read_transport = None
-    if self._write_transport is not None and not self._write_transport.is_closing():
-      self._write_transport.abort()
-    self._write_transport = None
-    # An aborted transport closes its pipe on the next loop turn; close it now
-    # so the fds are gone when the cell's call returns.
-    for pipe_file in self._pipe_files:
-      pipe_file.close()
-    self._pipe_files.clear()
-    self._close_raw(*tuple(self._raw_fds))
 
   async def aclose(self) -> None:
     """Close this registration, cancel nested work, and await cancellation."""
     self.close()
     current = asyncio.current_task()
     tasks = set(self._inflight)
-    if self._serve_task is not None:
-      tasks.add(self._serve_task)
     if current is not None:
       tasks.discard(current)
     for task in tasks:
@@ -532,49 +488,13 @@ class CellChannel:
     if tasks:
       await asyncio.gather(*tasks, return_exceptions=True)
 
-  async def serve(self) -> None:
-    """Answer frames until the child closes its end or this task is cancelled."""
-    self._serve_task = asyncio.current_task()
-    loop = asyncio.get_running_loop()
-    stream = asyncio.StreamReader(limit=MAX_FRAME_BYTES)
-    host_in = os.fdopen(self._host_in, "rb", buffering=0)
-    self._raw_fds.discard(self._host_in)
-    self._pipe_files.append(host_in)
-    host_out = os.fdopen(self._host_out, "wb", buffering=0)
-    self._raw_fds.discard(self._host_out)
-    self._pipe_files.append(host_out)
-    read_transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(stream), host_in)
-    self._read_transport = read_transport
-    write_transport, write_protocol = await loop.connect_write_pipe(
-      lambda: asyncio.StreamReaderProtocol(asyncio.StreamReader()),
-      host_out,
-    )
-    self._write_transport = write_transport
-    writer = asyncio.StreamWriter(write_transport, write_protocol, None, loop)
-    while True:
-      try:
-        line = await stream.readline()
-      except ValueError:
-        message = str(self.budget.fail("frame exceeds the 2 MiB bound"))
-        writer.write(encode_frame(_error_reply(None, None, "protocol_error", message)))
-        await writer.drain()
-        return
-      if not line:
-        return
-      try:
-        writer.write(await self.handle_frame(line))
-        await writer.drain()
-      except (BrokenPipeError, ConnectionResetError):
-        return
-
   def summary(self) -> Dict[str, Any]:
-    """`nested_calls`, `sources` and `derived` for the outer result; empty when nothing was called or derived."""
+    """`nested_calls` and `sources` for the outer result; empty when nothing was called."""
     summary: Dict[str, Any] = {}
-    if self.ledger:
-      summary["nested_calls"] = [dict(entry) for entry in self.ledger]
-      summary["sources"] = list(self._sources.values())
-    if self.derived:
-      summary["derived"] = [dict(row) for row in self.derived]
+    with self._lock:
+      if self.ledger:
+        summary["nested_calls"] = [dict(entry) for entry in self.ledger]
+        summary["sources"] = list(self._sources.values())
     return summary
 
   # --- frame handling --------------------------------------------------------
@@ -602,18 +522,23 @@ class CellChannel:
       wire = encode_frame(reply, self.budget)
       nested_id = reply.get("nested_call_id")
       if reply.get("ok") and nested_id is not None:
-        for entry in self.ledger:
-          if entry["nested_call_id"] == nested_id:
-            envelope = encode_frame({**reply, "result": None})
-            entry["result_bytes"] = len(wire) - len(envelope) + 4
-            break
+        envelope = encode_frame({**reply, "result": None})
+        result_bytes = len(wire) - len(envelope) + 4
+        with self._lock:
+          for entry in self.ledger:
+            if entry["nested_call_id"] == nested_id:
+              entry["result_bytes"] = result_bytes
+              break
       return wire
     except ProtocolError as exc:
+      # One over-limit reply is this call's correlated protocol_error; only an
+      # aggregate breach poisons the budget (`CellBudget.charge`).
       nested_id = reply.get("nested_call_id")
-      for entry in self.ledger:
-        if entry["nested_call_id"] == nested_id:
-          entry["ok"] = False
-          entry["error_code"] = "protocol_error"
+      with self._lock:
+        for entry in self.ledger:
+          if entry["nested_call_id"] == nested_id:
+            entry["ok"] = False
+            entry["error_code"] = "protocol_error"
       return self._protocol_error_wire(frame, exc)
     except Exception as exc:
       log.exception("unexpected frame reader error: %s", exc)
@@ -640,13 +565,6 @@ class CellChannel:
     call_id = frame.get("call_id")
     if not self._reader._registered(self, frame):
       return _error_reply(frame_type, call_id, "bad_cell_token", "no live cell registration for this token")
-    if frame_type == "hello":
-      return _ok_reply(frame_type, call_id, {
-        "protocol": BRIDGE_PROTOCOL,
-        "parent_call_id": self.outer_call_id,
-        "operations": [dict(row) for row in BRIDGE_OPERATIONS],
-        "tools": self._granted_code_callable_names(),
-      })
     if frame_type == "tool_call":
       return await self._tool_call(frame)
     if frame_type == "catalog":
@@ -663,15 +581,7 @@ class CellChannel:
       return await self._workpool(frame)
     if frame_type == "judge_batch":
       return await self._judge_batch(frame)
-    if frame_type == "derive":
-      return self._derive(frame)
     return _error_reply(frame_type, call_id, "protocol_error", f"unknown frame type {frame_type!r}")
-
-  def _granted_code_callable_names(self) -> List[str]:
-    """Grant ∩ code-callable tool names, in grant order (hello's `tools`)."""
-    if self._code_callable is None:
-      return []
-    return [name for name in self._granted() if self._code_callable(name)]
 
   def _loaded_granted(self) -> Dict[str, Dict[str, Any]]:
     """The turn's already-loaded grant by name, read live from the bound catalog."""
@@ -685,32 +595,18 @@ class CellChannel:
     }
 
   def _granted(self) -> Dict[str, Dict[str, Any]]:
-    """Loaded grant plus the product's activatable definitions, once per cell."""
+    """The turn's active grant, cached until an in-cell `load_tools` succeeds."""
     if self._grant is None:
-      grant = self._loaded_granted()
-      if self._activatable_tool_definitions is not None:
-        for definition in self._activatable_tool_definitions() or []:
-          name = str(definition.get("name") or "")
-          if name and name not in self._host_tools and name not in grant:
-            grant[name] = definition
-      self._grant = grant
+      self._grant = self._loaded_granted()
     return self._grant
 
-  async def _activate_if_deferred(self, operation: str) -> bool:
-    """Activate one activatable operation through the bound mechanism.
-
-    The product callback owns activation and reports loader failures unchanged.
-    """
-    if self._activate_tool is None:
-      return False
-    return await self._activate_tool(operation)
-
   def _route_row(self, name: str, definition: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = self._catalog_metadata(name) if self._catalog_metadata is not None else {}
     return {
-      **(self._catalog_metadata(name) if self._catalog_metadata is not None else {}),
+      **metadata,
       "name": name,
       "description": str(definition.get("description") or ""),
-      "input_schema": definition.get("input_schema") or {},
+      "input_schema": metadata.get("input_schema") or definition.get("input_schema") or {},
     }
 
   def _refusal(self, dispatcher: Any, operation: str) -> Optional[str]:
@@ -718,7 +614,10 @@ class CellChannel:
     if operation in self._host_tools:
       return "unknown_operation"
     if operation not in self._granted():
-      if dispatcher.route_origin_for_tool(operation) is None:
+      if (
+        dispatcher.route_origin_for_tool(operation) is None
+        and (self._grant_hint is None or self._grant_hint(operation) is None)
+      ):
         return "unknown_operation"
       return "not_granted"
     if self._code_callable is None or not self._code_callable(operation):
@@ -726,33 +625,74 @@ class CellChannel:
     return None
 
   def _new_entry(self, operation: Any) -> Dict[str, Any]:
-    self._ordinal += 1
-    nested_call_id = f"{self.outer_call_id}.{self._ordinal}"
-    entry: Dict[str, Any] = {
-      "parent_call_id": self.outer_call_id,
-      "nested_call_id": nested_call_id,
-      "ordinal": self._ordinal,
-      "operation": operation if isinstance(operation, str) else None,
-      "server": "",
-      "policy_class": "",
-      "duration_ms": 0,
-      "ok": False,
-      "error_code": None,
-      "result_bytes": 0,
-    }
-    self.ledger.append(entry)
+    with self._lock:
+      self._ordinal += 1
+      nested_call_id = f"{self.outer_call_id}.{self._ordinal}"
+      entry: Dict[str, Any] = {
+        "parent_call_id": self.outer_call_id,
+        "nested_call_id": nested_call_id,
+        "ordinal": self._ordinal,
+        "operation": operation if isinstance(operation, str) else None,
+        "server": "",
+        "policy_class": "",
+        "duration_ms": 0,
+        "ok": False,
+        "error_code": None,
+        "result_bytes": 0,
+      }
+      self.ledger.append(entry)
     return entry
 
   async def _tool_call(self, frame: Dict[str, Any]) -> Dict[str, Any]:
     call_id = frame.get("call_id")
     operation = frame.get("operation")
     tool_input = frame.get("input")
+    if "next_call" in frame:
+      try:
+        parsed_next_call = NextCall.model_validate(frame["next_call"])
+      except ValidationError as exc:
+        first_err = exc.errors()[0] if exc.errors() else {}
+        loc = ".".join(str(p) for p in first_err.get("loc", ()))
+        msg = str(first_err.get("msg", str(exc)))
+        first_msg = f"next_call.{loc}: {msg}" if loc else msg
+        return _error_reply("tool_result", call_id, "type_error", first_msg)
+      operation = parsed_next_call.tool_name
+      tool_input = dict(parsed_next_call.arguments)
+    delegation_ops = {row["name"]: row["arguments"] for row in _delegation_operation_rows()}
+    if isinstance(operation, str) and operation in delegation_ops:
+      arguments = delegation_ops[operation]
+      raw_args = frame.get("args") or []
+      raw_kwargs = tool_input or {}
+      if not isinstance(raw_args, list) or not isinstance(raw_kwargs, dict):
+        return _error_reply("tool_result", call_id, "protocol_error", "tool_call needs a string operation and an object input")
+      if len(raw_args) > len(arguments):
+        return _error_reply(
+          "tool_result", call_id, "type_error", f"hank.{operation} takes at most {len(arguments)} positional arguments",
+        )
+      delegation_frame: Dict[str, Any] = {
+        "type": operation,
+        "call_id": call_id,
+        "cell_token": frame.get("cell_token"),
+        "parent_call_id": frame.get("parent_call_id"),
+      }
+      delegation_frame.update(zip(arguments, raw_args))
+      for key, value in raw_kwargs.items():
+        if key not in arguments:
+          return _error_reply(
+            "tool_result", call_id, "type_error", f"hank.{operation} got an unexpected argument {key!r}; accepts {arguments}",
+          )
+        delegation_frame[key] = value
+      return await self._answer_frame(delegation_frame)
+    if frame.get("args"):
+      return _error_reply(
+        "tool_result", call_id, "type_error", f"hank.{operation} takes keyword arguments only",
+      )
     entry = self._new_entry(operation)
     nested_call_id = entry["nested_call_id"]
 
-    def _refuse(code: str, message: str) -> Dict[str, Any]:
+    def _refuse(code: str, message: str, next_call: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
       entry["error_code"] = code
-      reply = _error_reply("tool_result", call_id, code, message)
+      reply = _error_reply("tool_result", call_id, code, message, next_call)
       reply["nested_call_id"] = nested_call_id
       return reply
 
@@ -760,25 +700,30 @@ class CellChannel:
       return _refuse("protocol_error", "tool_call needs a string operation and an object input")
     dispatcher = self._dispatcher
     if dispatcher is None:
-      return _refuse("bridge_unavailable", "no dispatcher is bound to this session")
+      return _refuse("bridge_unavailable", "no dispatcher is bound to this session; call the operation directly as a tool outside the cell, or run in a session with a tool dispatcher bound")
     refusal = self._refusal(dispatcher, operation)
     entry["server"] = _server_of(operation)
     entry["policy_class"] = _policy_class(operation)
     if refusal == "unknown_operation":
       return _refuse(refusal, f"{operation!r} is not a tool on this session's live surface")
     if refusal == "not_granted":
-      return _refuse(refusal, f"{operation!r} is not granted to this turn")
+      pack = self._grant_hint(operation) if self._grant_hint is not None else None
+      return _refuse(
+        refusal,
+        (
+          f'{operation!r} is not granted to this turn; load its pack first: '
+          f'hank.call("load_tools", pack="{pack}") (or call it directly as a tool)'
+          if pack is not None else
+          f"{operation!r} is not granted to this turn; load its pack with load_tools (or call it directly as a tool)"
+        ),
+        next_call=build_next_call("load_tools", {"pack": pack}) if pack is not None else None,
+      )
     if refusal is not None:
       return _refuse(refusal, f"{operation!r} is not registered as code-callable")
-    if operation not in self._loaded_granted():
-      try:
-        activated = await self._activate_if_deferred(operation)
-      except ToolInputPreparationError as exc:
-        detail = exc.materialize_error()
-        return _refuse(str(detail.get("code") or "tool_error"), str(detail.get("message") or ""))
-      if not activated:
-        return _refuse("not_granted", f"{operation!r} is not granted to this turn")
-    return await self._dispatch_granted("tool_result", call_id, entry, dispatcher, operation, tool_input)
+    reply = await self._dispatch_granted("tool_result", call_id, entry, dispatcher, operation, tool_input)
+    if operation == "load_tools" and entry["ok"]:
+      self._grant = None
+    return reply
 
   async def _agent(self, frame: Dict[str, Any]) -> Dict[str, Any]:
     """`hank.agent`: the direct door, through the turn's dispatcher.
@@ -804,7 +749,7 @@ class CellChannel:
       return _refuse("protocol_error", "agent needs a non-empty string objective")
     dispatcher = self._dispatcher
     if dispatcher is None:
-      return _refuse("bridge_unavailable", "no dispatcher is bound to this session")
+      return _refuse("bridge_unavailable", "no dispatcher is bound to this session; call the agent tool directly outside the cell, or run in a session with delegation bound")
     if RUN_AGENT_OPERATION not in self._granted():
       return _refuse("not_granted", f"{RUN_AGENT_OPERATION!r} is not granted to this turn")
     tool_input: Dict[str, Any] = {"objective": objective, "background": True}
@@ -834,7 +779,7 @@ class CellChannel:
     runner = self._job_runner() if self._job_runner is not None else None
     registry = getattr(runner, "_task_registry", None)
     if registry is None:
-      return _error_reply("wait_result", call_id, "bridge_unavailable", "no job registry is bound to this session")
+      return _error_reply("wait_result", call_id, "bridge_unavailable", "no job registry is bound to this session; call the outer jobs/wait tool directly outside the cell, or run in a session with delegation bound")
     result = await jobs_wait(
       task_ids,
       registry_lookup=registry.get,
@@ -867,7 +812,7 @@ class CellChannel:
 
     runner = self._job_runner() if self._job_runner is not None else None
     if runner is None:
-      return _error_reply("completion_result", call_id, "bridge_unavailable", "no job runner is bound to this session")
+      return _error_reply("completion_result", call_id, "bridge_unavailable", "no job runner is bound to this session; call the outer completion tool directly outside the cell, or run in a session with delegation bound")
 
     role = frame.get("role")
     effort = frame.get("effort")
@@ -929,7 +874,7 @@ class CellChannel:
 
     runner = self._job_runner() if self._job_runner is not None else None
     if runner is None:
-      return _error_reply("judge_result", call_id, "bridge_unavailable", "no job runner is bound to this session")
+      return _error_reply("judge_result", call_id, "bridge_unavailable", "no job runner is bound to this session; call the outer judge tool directly outside the cell, or run in a session with delegation bound")
 
     role = frame.get("role")
     effort = frame.get("effort")
@@ -1018,14 +963,14 @@ class CellChannel:
 
     dispatcher = self._dispatcher
     if dispatcher is None:
-      return _refuse("bridge_unavailable", "no dispatcher is bound to this session")
+      return _refuse("bridge_unavailable", "no dispatcher is bound to this session; call the agent tool directly outside the cell, or run in a session with delegation bound")
     if RUN_AGENT_OPERATION not in self._granted():
       return _refuse("not_granted", f"{RUN_AGENT_OPERATION!r} is not granted to this turn")
 
     runner = self._job_runner() if self._job_runner is not None else None
     registry = getattr(runner, "_task_registry", None)
     if registry is None:
-      return _refuse("bridge_unavailable", "no job registry is bound to this session")
+      return _refuse("bridge_unavailable", "no job registry is bound to this session; call the agent tool directly outside the cell, or run in a session with delegation bound")
 
     raw_timeout = frame.get("timeout")
     timeout = (
@@ -1314,7 +1259,7 @@ class CellChannel:
     runner = self._job_runner() if self._job_runner is not None else None
     registry = getattr(runner, "_task_registry", None)
     if registry is None:
-      return _refuse("bridge_unavailable", "no job registry is bound to this session")
+      return _refuse("bridge_unavailable", "no job registry is bound to this session; call the outer tool directly outside the cell, or run in a session with delegation bound")
 
     role = frame.get("role")
     effort = frame.get("effort")
@@ -1519,67 +1464,20 @@ class CellChannel:
         continue
       # Provenance, not payload: the citation owner treats the handle as the
       # nested operation's partial, not `code_execute`'s.
-      row = self._sources.setdefault(
-        key, {**handle, "produced_by_tool": canonical_dispatch_tool_name(operation)},
-      )
       ref = _issued_ref(key)
-      self._reader._issued_sources.setdefault(ref, row)
+      with self._lock:
+        self._sources.setdefault(
+          key, {**handle, "produced_by_tool": canonical_dispatch_tool_name(operation)},
+        )
       if ref not in refs:
         refs.append(ref)
     return refs
-
-  def _derive(self, frame: Dict[str, Any]) -> Dict[str, Any]:
-    """`hank.derive`: publish a computed value with the inputs it was computed from.
-
-    Each input's `source_refs` resolve against the rows this session issued;
-    the published row carries those rows themselves. An input the session did
-    not issue, or a literal that carries no reference, is an `input_unsourced`
-    finding on the row. The row is never a source and never enters `sources`.
-    """
-    call_id = frame.get("call_id")
-    name, expression, inputs = frame.get("name"), frame.get("expression"), frame.get("inputs")
-    if not isinstance(name, str) or not isinstance(expression, str) or not isinstance(inputs, list):
-      return _error_reply(
-        "derive_result", call_id, "protocol_error",
-        "derive needs a string name, a value, a string expression and a list of inputs",
-      )
-    issued = self._reader._issued_sources
-    resolved: List[Dict[str, Any]] = []
-    findings: List[Dict[str, Any]] = []
-    for index, item in enumerate(inputs):
-      reference = item if isinstance(item, dict) else {"value": item}
-      raw_refs = reference.get("source_refs")
-      refs = list(dict.fromkeys(ref for ref in raw_refs if isinstance(ref, str))) if isinstance(raw_refs, list) else []
-      sources = [dict(issued[ref]) for ref in refs if ref in issued]
-      row = {
-        "nested_call_id": reference.get("nested_call_id"),
-        "path": reference.get("path"),
-        "value": reference.get("value"),
-        "sources": sources,
-      }
-      resolved.append(row)
-      if not refs:
-        reason = "the input carries no source reference; select it from a producer result with hank.input"
-      elif len(sources) != len(refs):
-        reason = "the input's source references were not issued by this session"
-      else:
-        continue
-      findings.append({
-        "code": "input_unsourced", "input": index,
-        "nested_call_id": row["nested_call_id"], "path": row["path"], "message": reason,
-      })
-    published = {
-      "name": name, "value": frame.get("value"), "expression": expression,
-      "status": "derived", "inputs": resolved, "findings": findings,
-    }
-    self.derived.append(published)
-    return _ok_reply("derive_result", call_id, published)
 
   def _catalog(self, frame: Dict[str, Any]) -> Dict[str, Any]:
     call_id = frame.get("call_id")
     dispatcher = self._dispatcher
     if dispatcher is None or self._tool_definitions is None:
-      return _error_reply("catalog", call_id, "bridge_unavailable", "no dispatcher is bound to this session")
+      return _error_reply("catalog", call_id, "bridge_unavailable", "no dispatcher is bound to this session; list tools via the outer tool catalog outside the cell, or run in a session with a tool dispatcher bound")
     request = frame.get("request")
     if request == "search":
       query = str(frame.get("query") or "").lower()
@@ -1589,7 +1487,8 @@ class CellChannel:
         if query not in name.lower() and query not in description.lower():
           continue
         if self._code_callable is not None and self._code_callable(name):
-          metadata = self._catalog_metadata(name) if self._catalog_metadata is not None else {}
+          raw_metadata = self._catalog_metadata(name) if self._catalog_metadata is not None else {}
+          metadata = {k: v for k, v in raw_metadata.items() if k != "input_schema"}
           rows.append({**metadata, "name": name, "description": description[:_DESCRIPTION_PREVIEW_CHARS]})
       return _ok_reply("catalog", call_id, rows)
     if request == "describe":
@@ -1599,7 +1498,7 @@ class CellChannel:
       # A registered bridge op describes itself; it is called as
       # `hank.<name>(...)`, never through `hank.call`, so `search` (the
       # grant ∩ code-callable listing) does not carry it.
-      for row in BRIDGE_OPERATIONS:
+      for row in _delegation_operation_rows():
         if row["name"] == operation:
           return _ok_reply("catalog", call_id, {"route_kind": "bridge", **row})
       op = lookup_model_call_operation(operation)
@@ -1618,15 +1517,6 @@ class CellChannel:
       definition = self._granted()[operation]
       return _ok_reply("catalog", call_id, self._route_row(operation, definition))
     return _error_reply("catalog", call_id, "protocol_error", f"unknown catalog request {request!r}")
-
-  def _close_raw(self, *fds: int) -> None:
-    for fd in fds:
-      if fd in self._raw_fds:
-        self._raw_fds.discard(fd)
-        try:
-          os.close(fd)
-        except OSError:
-          pass
 
 
 def _server_of(operation: str) -> str:
@@ -1663,5 +1553,10 @@ def _issued_ref(key: Any) -> str:
   return "src_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
 
-def _error_reply(frame_type: Any, call_id: Any, code: str, message: str) -> Dict[str, Any]:
-  return {"type": frame_type, "call_id": call_id, "ok": False, "error": {"code": code, "message": message}}
+def _error_reply(
+  frame_type: Any, call_id: Any, code: str, message: str, next_call: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+  error: Dict[str, Any] = {"code": code, "message": message}
+  if next_call is not None:
+    error["next_call"] = NextCall.model_validate(next_call).to_dict()
+  return {"type": frame_type, "call_id": call_id, "ok": False, "error": error}

@@ -8,9 +8,11 @@ Usage: cd packages/agent-gateway && python3 tests/live_smoke_test.py
 from __future__ import annotations
 
 import asyncio
-import sys
+from contextlib import contextmanager
 from pathlib import Path
-
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 # Ensure the package is importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -25,6 +27,64 @@ def divider(title: str) -> None:
   print(f"  {title}")
   print(f"{'=' * 60}")
 
+
+class _FakeAnthropicEventStream:
+  def __init__(self) -> None:
+    self._events = [
+      SimpleNamespace(
+        type="message_start",
+        message=SimpleNamespace(
+          usage=SimpleNamespace(
+            input_tokens=120,
+            output_tokens=0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+          )
+        ),
+      ),
+      SimpleNamespace(
+        type="message_delta",
+        delta=SimpleNamespace(stop_reason="end_turn"),
+        usage=SimpleNamespace(output_tokens=45),
+      ),
+    ]
+    self._idx = 0
+
+  async def __aenter__(self) -> "_FakeAnthropicEventStream":
+    return self
+
+  async def __aexit__(self, exc_type, exc, tb) -> None:
+    _ = exc_type, exc, tb
+    return None
+
+  def __aiter__(self) -> "_FakeAnthropicEventStream":
+    return self
+
+  async def __anext__(self) -> SimpleNamespace:
+    if self._idx >= len(self._events):
+      raise StopAsyncIteration
+    event = self._events[self._idx]
+    self._idx += 1
+    return event
+
+
+@contextmanager
+def _stub_anthropic_stream():
+  def _stream_factory(**_kwargs):
+    return _FakeAnthropicEventStream()
+
+  def _create_client(_self, _config, timeout=None):
+    _ = timeout
+    return SimpleNamespace(
+      messages=SimpleNamespace(stream=_stream_factory),
+      beta=SimpleNamespace(messages=SimpleNamespace(stream=_stream_factory)),
+    )
+
+  with patch(
+    "agent_gateway.providers.AnthropicProvider.create_client",
+    new=_create_client,
+  ):
+    yield
 
 def test_rate_table() -> None:
   divider("TEST: Rate table loads and Opus pricing is correct")
@@ -236,20 +296,17 @@ def test_gateway_strict_mode() -> None:
     print(f"  Status: {resp.status_code}, body: {resp.text[:200]}")
 
   # 5. Chat with correct user_id should pass the validation
-  resp = client.post(
-    "/api/chat",
-    json={"messages": [{"role": "user", "content": "hello"}], "user_id": "alice_42"},
-    headers={"Authorization": f"Bearer {token}"},
-  )
+  with _stub_anthropic_stream():
+    resp = client.post(
+      "/api/chat",
+      json={"messages": [{"role": "user", "content": "hello"}], "user_id": "alice_42"},
+      headers={"Authorization": f"Bearer {token}"},
+    )
   print(f"  /chat with user_id='alice_42' (correct) → status {resp.status_code}")
-  # Will fail at provider level (no real Anthropic key), but that's fine —
-  # the important thing is it passes the multi-user validation (not 400/401)
-  if resp.status_code not in (400, 401):
-    print("  Passed multi-user validation (provider may fail, that's expected) — PASS")
-  else:
-    body = resp.json()
-    print(f"  UNEXPECTED auth rejection: {body}")
-
+  assert resp.status_code == 200 and '"type":"turn_complete"' in resp.text, (
+    f"Expected 200 turn_complete from stubbed stream, got {resp.status_code}: {resp.text[:200]}"
+  )
+  print("  Passed multi-user validation and completed stubbed stream — PASS")
   print("  PASS")
 
 
@@ -449,29 +506,26 @@ def test_on_usage_fires_with_ledger() -> None:
     token = resp.json()["session_token"]
     print("  Session created for alice_42")
 
-    # Send a chat (will fail at Anthropic, but the runner should still attempt on_usage)
-    resp = client.post(
-      "/api/chat",
-      json={
-        "messages": [{"role": "user", "content": "hello"}],
-        "user_id": "alice_42",
-        "request_id": "trace-123",
-      },
-      headers={"Authorization": f"Bearer {token}"},
-    )
+    # Send a chat through the stubbed Anthropic stream
+    with _stub_anthropic_stream():
+      resp = client.post(
+        "/api/chat",
+        json={
+          "messages": [{"role": "user", "content": "hello"}],
+          "user_id": "alice_42",
+          "request_id": "trace-123",
+        },
+        headers={"Authorization": f"Bearer {token}"},
+      )
     print(f"  /chat status: {resp.status_code}")
 
-    # Check if any usage was recorded
-    # (May be 0 if the Anthropic call failed before returning usage data,
-    # but the wiring is exercised either way)
-    total = asyncio.run(ledger.get_total("alice_42"))
+    # Verify the stubbed stream's usage was recorded to the ledger
+    total = asyncio.run(ledger.get_total("101"))
     print(f"  Ledger after chat: {total.event_count} events, ${total.cost_usd:.6f}")
-    if total.event_count > 0:
-      print("  on_usage fired and recorded — PASS")
-    else:
-      print("  No usage recorded (Anthropic call failed before returning usage — expected with fake key)")
-      print("  Wiring confirmed by: no 400/401 from multi-user validation, runner reached provider — PASS")
-
+    assert (total.event_count, total.input_tokens, total.output_tokens) == (1, 120, 45) and total.cost_usd > 0, (
+      f"Expected stubbed stream to record 1 usage event (120 in, 45 out), got {total}"
+    )
+    print("  on_usage fired and recorded — PASS")
     # Check DLQ (should be empty if ledger worked, or have events if ledger failed)
     if dlq_path.exists():
       dlq_lines = dlq_path.read_text().strip().split("\n") if dlq_path.read_text().strip() else []

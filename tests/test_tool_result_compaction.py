@@ -2,7 +2,10 @@ import json
 from types import SimpleNamespace
 
 from agent_gateway.policy_imports import configure_server_policy, load_server_policy_module
-from agent_gateway.tool_result_compaction import truncate_model_tool_result_content
+from agent_gateway.tool_result_compaction import (
+  compact_model_tool_result_entry,
+  truncate_model_tool_result_content,
+)
 
 MAX_CHARS = 60_000
 DRIVER_COUNT = 36
@@ -215,3 +218,63 @@ def test_navigation_rows_stay_whole_when_they_fit_at_full_width() -> None:
 
   kept = json.loads(truncated)["content_projection"]["valid_keys"]
   assert kept == rows
+
+
+class _NullLogger:
+  def info(self, *args, **kwargs) -> None:
+    return None
+
+
+def test_all_fms_persist_doors_project_to_delta_receipt_without_bulk_readback(tmp_path) -> None:
+  doors = {
+    "fms_persist_historical_foundation": "historical_foundation_stage_receipt",
+    "fms_persist_forecast_assumption_set": "forecast_assumption_set_stage_receipt",
+    "fms_persist_valuation_policy": "valuation_policy_stage_receipt",
+    "fms_persist_scenario_set": "scenario_set_stage_receipt",
+  }
+  for tool_name, receipt_key in doors.items():
+    content = json.dumps(
+      {
+        "status": "staged",
+        "gate_code": "PROCEED",
+        "artifact_ref": f"artifacts/PCTY/{tool_name}.json",
+        "proposal_id": "proposal-1",
+        "verdict_echo": {
+          "verdict": "ACCEPTED_CONSTRUCTED",
+          "confidence": "HIGH",
+          "revision": "rev-1",
+          "validation": {"rows": ["v" * 1_000] * 40},
+        },
+        "readback": {
+          "typed_outputs": {
+            receipt_key: {"status": "staged"},
+            "bulk_body": {"rows": ["b" * 1_000] * 40},
+          },
+        },
+      }
+    )
+    assert len(content) > 50_000
+    result_entry = {"type": "tool_result", "tool_use_id": f"tool-{tool_name}", "content": content}
+
+    live_entry, durable_entry = compact_model_tool_result_entry(
+      result_entry,
+      tool_name=tool_name,
+      spill_dir_provider=lambda: str(tmp_path),
+      log_session_id="sess-delta",
+      logger=_NullLogger(),
+    )
+
+    assert live_entry == durable_entry
+    assert len(live_entry["content"]) < 2_000
+    projection = json.loads(live_entry["content"])
+    assert "readback" not in projection
+    assert "verdict_echo" not in projection
+    assert projection["status"] == "staged"
+    assert projection["gate_code"] == "PROCEED"
+    assert projection["artifact_ref"] == f"artifacts/PCTY/{tool_name}.json"
+    assert projection["proposal_id"] == "proposal-1"
+    assert projection["verdict"] == "ACCEPTED_CONSTRUCTED"
+    assert projection["confidence"] == "HIGH"
+    assert projection["revision"] == "rev-1"
+    assert projection["stage_receipt_status"] == "staged"
+    assert "findings" not in projection

@@ -24,6 +24,7 @@ from agent_workflow_contracts.tool_registration import (
   McpInputPreparationRoute,
   ToolRegistrationCatalog,
 )
+from .autonomous_claim_broker import AutonomousClaimSigner
 
 from ._io import _atomic_write_json, _read_json_object
 from .approval_route import session_approval_route
@@ -47,6 +48,7 @@ from .capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
 )
+from .claim_signing_authority import GatewayUserClaimSigner
 from .code_execution import CodeExecutionBundle
 from .event_log import EventLog
 from .mcp_client import McpClientManager
@@ -741,6 +743,7 @@ async def run_autonomous(
   coordinator: CoordinatorConfig | None = None,
   capability_execution_resolver: CapabilityExecutionResolver | None = None,
   commercial_usage_producer: Any | None = None,
+  user_claim_signer: GatewayUserClaimSigner | AutonomousClaimSigner | None = None,
 ) -> RunOutput:
   """Execute one already-resolved headless session-driver execution.
 
@@ -758,8 +761,10 @@ async def run_autonomous(
   `trusted_mcp_allowed_servers`; skill metadata is not an admission policy.
   No turn, cost, or wall-clock ceiling bounds the run; cost is measured through
   `on_usage` / `on_session_summary`.
-  Supplied execution-limit observations are optional and pass through to the
-  session's RunContext unchanged, whether or not this is a named skill run.
+  Supplied execution limits pass through to the session's RunContext
+  unchanged, whether or not this is a named skill run. When admitted, their
+  max_tokens is this run's max_tokens_override; a missing admission or an
+  undeclared limit leaves that override unset.
   `containment` is the process's `ContainmentSettings`; `None` constructs the
   live one (the run settings file) here, at this standalone entry point.
   Standalone top-level skill callers must bind both `top_level_skill_name` and
@@ -787,7 +792,6 @@ async def run_autonomous(
     raise ValueError(
       "run_autonomous requires an autonomous or cron capability execution"
     )
-  resolved_auth_config = dict(capability_execution.auth_config)
   if top_level_skill_name is None:
     if skill_run_id is not None:
       raise ValueError(
@@ -818,15 +822,6 @@ async def run_autonomous(
     )
     trusted_skill_name = top_level_skill_name
     trusted_skill_run_id = skill_run_id
-  max_tokens = resolved_auth_config.get("max_tokens")
-  if (
-    isinstance(max_tokens, bool)
-    or not isinstance(max_tokens, int)
-    or max_tokens <= 0
-  ):
-    raise ValueError(
-      "capability execution max_tokens must be a positive integer"
-    )
   runtime_interceptors = tuple(interceptors or ())
   resolved_mcp_allowed_servers, resolved_mcp_server_aliases = (
     _trusted_autonomous_mcp_policy(
@@ -945,6 +940,7 @@ async def run_autonomous(
       logical_server_routes=resolved_logical_server_routes,
       logical_tool_aliases=resolved_logical_tool_aliases,
       tool_registration_catalog=tool_registration_catalog,
+      user_claim_signer=user_claim_signer,
     )
     if tool_registration_catalog is None:
       mcp_client_kwargs["timeout_overrides"] = mcp_timeout_overrides
@@ -1104,13 +1100,21 @@ async def run_autonomous(
       capability_execution = replace(
         capability_execution, resolver=capability_execution_resolver,
       )
+    # No admitted limits (a non-skill run) or an undeclared skill max_tokens
+    # both leave the override unset. select_run_max_tokens then requests the
+    # bound model's registry ceiling.
+    max_tokens_override = (
+      None
+      if admitted_skill_execution_limits is None
+      else admitted_skill_execution_limits.max_tokens
+    )
     runner = AgentRunner(
       event_log=event_log,
       dispatcher=dispatcher,
       session_id=sid,
       capability_execution=capability_execution,
       allow_stub_response=False,
-      max_tokens_override=max_tokens,
+      max_tokens_override=max_tokens_override,
       mcp_client=mcp_client,
       mcp_activation_fold=session.mcp_activation_fold,
       excluded_tools=excluded_tools,
@@ -1128,6 +1132,7 @@ async def run_autonomous(
       compaction_instructions=compaction_instructions,
       coordinator=coordinator,
       agent_session_log=durable_session_log,
+      workspace_dir=Path(outputs_dir) if outputs_dir is not None else None,
       message_inbox=root_inbox,
       commercial_usage_producer=commercial_usage_producer,
     )

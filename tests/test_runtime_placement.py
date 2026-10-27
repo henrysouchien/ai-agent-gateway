@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import sqlite3
 import stat
+import subprocess
 import sys
 from textwrap import dedent
 import time
@@ -18,19 +22,29 @@ import pytest
 
 from hank_contracts.agent_api import AGENT_API_CLAIM_ENV_VARS
 from hank_contracts.user_claims import derive_user_claim_key
+from agent_gateway import AgentSessionLog, AgentSessionRef, resolve_agent_session_id
+from agent_gateway.child_environment import AUTONOMOUS_CHILD_ENVIRONMENT, filter_child_environment
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.runtime_placement import (
   LocalProcessRuntimeBackend,
   RuntimePlacement,
   RuntimePlacementStore,
   RuntimeState,
+  parse_positive_pid,
+  pid_birth_token,
 )
+import agent_gateway.runtime_placement as placement_module
 from agent_gateway.user_runtime_credentials import (
   DeskReplica,
   USER_RUNTIME_CREDENTIALS_FILE_ENV,
+  USER_STORAGE_ID_ENV,
   UserRuntimeIdentity,
   load_user_runtime_credentials,
+  mint_user_runtime_credentials,
+  write_user_runtime_credentials,
 )
+import investment_tools.state_paths as investment_state_paths
+from investment_tools.state_paths import ready_state_paths
 
 
 ORG_KEY = "placement-test-org-authority-at-least-32-bytes"
@@ -158,6 +172,128 @@ def test_runtime_retains_subject_public_keys_without_shared_secrets(
   assert runtime_environment["unsafe_environment"] == []
 
 
+def _bundle(path: Path, tmp_path: Path, storage_id: str) -> Path:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  write_user_runtime_credentials(
+    mint_user_runtime_credentials(
+      org_claim_key=ORG_KEY, identity=replace(IDENTITY, risk_user_id=int(storage_id)),
+      storage_id=storage_id, desk=_desk(tmp_path),
+    ),
+    path,
+  )
+  return path
+
+
+def _local_environment(tmp_path: Path, storage_id: str) -> dict[str, str]:
+  local = LocalProcessRuntimeBackend(placement_root=tmp_path / "local", org_claim_key=ORG_KEY)
+  user_root = tmp_path / "local" / storage_id
+  environ = local._environment(user_root / "user-data", storage_id)
+  environ[USER_RUNTIME_CREDENTIALS_FILE_ENV] = str(_bundle(user_root / "bundle.json", tmp_path, storage_id))
+  return environ
+
+
+def _agentcore_environment(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage_id: str,
+) -> dict[str, str]:
+  checkout = Path(__file__).resolve().parents[3]
+  adapter_path = checkout / "deploy/user-runtime/agentcore/runtime_adapter.py"
+  spec = importlib.util.spec_from_file_location("_placement_test_runtime_adapter", adapter_path)
+  assert spec is not None and spec.loader is not None
+  module = importlib.util.module_from_spec(spec)
+  monkeypatch.setitem(sys.modules, spec.name, module)
+  spec.loader.exec_module(module)
+  root = tmp_path / "agentcore"
+  adapter = module.RuntimeAdapter(module.AdapterConfig(root=root, image_env={}, litestream_bin=None))
+  try:
+    environ = adapter.environment({}, storage_id)
+  finally:
+    asyncio.run(adapter.client.aclose())
+  _bundle(root / "bundle.json", tmp_path, storage_id)
+  return environ
+
+
+def _initialise_investment_state(environ: dict[str, str], tmp_path: Path, name: str):
+  package_root = tmp_path / f"package-{name}"
+  package_root.mkdir()
+  return ready_state_paths(environ, home=tmp_path / "home", package_root=package_root)
+
+
+def test_placed_runtime_initialises_investment_state_in_its_desk(tmp_path: Path) -> None:
+  environ = _local_environment(tmp_path, "7331")
+  desk = (Path(environ["USER_DATA_DIR"]) / "users" / "7331").resolve()
+
+  paths = _initialise_investment_state(environ, tmp_path, "local")
+
+  assert paths.root.is_relative_to(desk)
+  assert paths.root != desk
+  assert paths.cutover_marker.is_file()
+  assert paths.cutover_marker.is_relative_to(desk)
+
+
+def test_edge_state_dir_does_not_move_a_placed_runtime_off_its_desk(tmp_path: Path) -> None:
+  local = LocalProcessRuntimeBackend(
+    placement_root=tmp_path / "local", org_claim_key=ORG_KEY,
+    extra_env={investment_state_paths.STATE_DIR_ENV: "/shared/x"},
+  )
+  user_data = tmp_path / "local" / "7331" / "user-data"
+  environ = local._environment(user_data, "7331")
+
+  desk_state = user_data / "users" / "7331" / "investment-tools"
+  assert environ[investment_state_paths.STATE_DIR_ENV] == str(desk_state)
+  assert not desk_state.exists()  # a locator only: investment_tools initialises it on first use
+  root = investment_state_paths.resolve_state_paths(
+    environ, home=tmp_path / "home", package_root=tmp_path / "package",
+  ).root
+  assert root == desk_state.resolve()
+
+
+def test_agentcore_and_local_runtimes_keep_state_and_journals_in_their_own_desk(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  environments = {
+    "agentcore": _agentcore_environment(tmp_path, monkeypatch, "7331"),
+    "local": _local_environment(tmp_path, "7331"),
+  }
+  for name, environ in environments.items():
+    desk = (Path(environ["USER_DATA_DIR"]) / "users" / "7331").resolve()
+    paths = _initialise_investment_state(environ, tmp_path, name)
+    assert paths.root.is_relative_to(desk)
+    assert paths.cutover_marker.is_file()
+    session = AgentSessionLog(
+      session_ref=AgentSessionRef(
+        user_id="alice", agent_id="analyst", agent_session_id=resolve_agent_session_id("alice", "analyst"),
+      ),
+      base_dir=environ["AGENT_SESSION_LOG_BASE_DIR"],
+    )
+    assert session.path.is_file()
+    assert session.path.resolve().is_relative_to(desk)
+    assert not session.path.resolve().is_relative_to(paths.root)
+
+
+def test_investment_tools_and_placement_agree_on_the_storage_id_env_name() -> None:
+  # investment_tools ships as its own distribution pinned to an older agent_gateway,
+  # so it declares the name itself; this pins it to the placement's.
+  assert investment_state_paths.USER_STORAGE_ID_ENV == USER_STORAGE_ID_ENV
+
+
+def test_children_of_a_placed_runtime_resolve_the_same_investment_state_root(tmp_path: Path) -> None:
+  gateway_environment = _local_environment(tmp_path, "7331")
+  gateway_paths = _initialise_investment_state(gateway_environment, tmp_path, "gateway")
+
+  child_environment = filter_child_environment(gateway_environment, purpose=AUTONOMOUS_CHILD_ENVIRONMENT)
+
+  # The credential bundle never reaches a child; the storage id and the placement's
+  # state locator alone place its state.
+  assert USER_RUNTIME_CREDENTIALS_FILE_ENV in gateway_environment
+  assert USER_RUNTIME_CREDENTIALS_FILE_ENV not in child_environment
+  child_package_root = tmp_path / "package-child"
+  child_package_root.mkdir()
+  child_paths = ready_state_paths(child_environment, home=tmp_path / "home", package_root=child_package_root)
+  desk = (Path(gateway_environment["USER_DATA_DIR"]) / "users" / "7331").resolve()
+  assert child_paths.root == gateway_paths.root
+  assert child_paths.root.is_relative_to(desk)
+
+
 def test_local_process_claim_custody_and_replacement(
   tmp_path: Path, backend: LocalProcessRuntimeBackend,
 ) -> None:
@@ -241,6 +377,123 @@ def test_backend_reload_stops_persisted_pid(
     _gone(placement.handle)
   finally:
     reloaded.stop(placement)
+
+
+def _sigterm_ignoring_product(
+  directory: Path, exit_after: float | None,
+) -> tuple[subprocess.Popen[bytes], Path]:
+  """A session-leader product that logs SIGTERM and ignores it (exiting `exit_after` s later, or never)."""
+  directory.mkdir()
+  marker = directory / "sigterm-received"
+  ready = directory / "ready"
+  script = directory / "stubborn_product.py"
+  script.write_text(dedent(f"""
+    import signal, sys, time
+    def on_term(signum, frame):
+      open({str(marker)!r}, "w").write(repr(time.monotonic()))
+      if {exit_after!r} is not None:
+        time.sleep({exit_after!r})
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, on_term)
+    open({str(ready)!r}, "w").write("1")
+    while True:
+      time.sleep(0.05)
+  """))
+  process = subprocess.Popen([sys.executable, str(script)], start_new_session=True)
+  deadline = time.monotonic() + 10
+  while not ready.exists():
+    assert time.monotonic() < deadline and process.poll() is None
+    time.sleep(0.02)
+  return process, marker
+
+
+def test_stop_sigkills_only_after_the_grace_has_elapsed(tmp_path: Path) -> None:
+  grace = 1.5
+  runtime = LocalProcessRuntimeBackend(
+    placement_root=tmp_path / "placements", org_claim_key=ORG_KEY, stop_grace=grace,
+  )
+  # A product still draining at (grace - margin) is not killed: SIGTERM only.
+  draining, marker = _sigterm_ignoring_product(tmp_path / "draining", exit_after=grace - 0.7)
+  runtime._terminate(draining.pid, draining)
+  assert draining.returncode == 0
+  assert marker.exists()
+
+  # A product that ignores SIGTERM past the grace gets SIGKILL, and not before.
+  stubborn, marker = _sigterm_ignoring_product(tmp_path / "stubborn", exit_after=None)
+  started = time.monotonic()
+  runtime._terminate(stubborn.pid, stubborn)
+  elapsed = time.monotonic() - started
+  assert stubborn.returncode == -signal.SIGKILL
+  assert marker.exists()  # SIGTERM was delivered first
+  assert elapsed >= grace
+
+
+def test_backend_reload_does_not_signal_a_reused_pid(
+  tmp_path: Path, backend: LocalProcessRuntimeBackend, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  placement = backend.start("17", IDENTITY, _desk(tmp_path))
+  assert placement.handle is not None and placement.handle_birth
+  assert backend.store.get("17") == placement
+  reloaded = LocalProcessRuntimeBackend(
+    placement_root=backend.placement_root, org_claim_key=ORG_KEY,
+  )
+  signalled: list[int] = []
+  with monkeypatch.context() as patched:
+    # The persisted pid now belongs to a different process.
+    patched.setattr(placement_module, "pid_birth_token", lambda pid: "recycled-birth")
+    patched.setattr(LocalProcessRuntimeBackend, "_terminate", staticmethod(
+      lambda pid, process=None: signalled.append(pid),
+    ))
+    stopped = reloaded.stop(placement)
+  assert stopped.state == "stopped"
+  assert stopped.handle is None and stopped.handle_birth is None
+  assert signalled == []
+  stored = reloaded.store.get("17")
+  assert stored is not None and stored.handle is None and stored.handle_birth is None
+  process = backend._processes.pop("17")
+  backend._terminate(process.pid, process)
+  _gone(placement.handle)
+
+
+def test_store_migration_adds_handle_birth_leaving_preexisting_rows_unverified(tmp_path: Path) -> None:
+  path = tmp_path / "host" / "runtime_host.sqlite3"
+  path.parent.mkdir()
+  columns = (
+    "storage_id TEXT PRIMARY KEY, url TEXT NOT NULL, state TEXT NOT NULL, "
+    "backend TEXT NOT NULL, handle TEXT, bundle_path TEXT NOT NULL, "
+    "generation INTEGER NOT NULL, started_at REAL NOT NULL, updated_at REAL NOT NULL"
+  )
+  rows = (
+    ("17", "ready", str(os.getpid())),
+    ("18", "starting", "not-a-pid"),
+    ("19", "stopped", str(os.getpid())),
+    ("20", "ready", None),
+    ("21", "ready", "99999999999"),
+  )
+  with sqlite3.connect(path) as connection:
+    connection.execute(f"CREATE TABLE runtime_placements ({columns})")
+    connection.executemany(
+      "INSERT INTO runtime_placements VALUES (?, 'http://127.0.0.1:1', ?, 'local-process', ?, 'b', 1, 1.0, 1.0)",
+      rows,
+    )
+  connection.close()
+
+  store = RuntimePlacementStore(path)
+  births = {placement.storage_id: placement.handle_birth for placement in store.list()}
+  assert births == {"17": None, "18": None, "19": None, "20": None, "21": None}
+  with sqlite3.connect(path) as inspect:
+    names = [row[1] for row in inspect.execute("PRAGMA table_info(runtime_placements)")]
+  inspect.close()
+  assert names[-1] == "handle_birth"
+  assert {placement.storage_id: placement.handle_birth for placement in RuntimePlacementStore(path).list()} == births
+
+def test_pid_primitives_accept_only_positive_int32() -> None:
+  assert parse_positive_pid(1) == 1
+  assert parse_positive_pid(0x7FFFFFFF) == 0x7FFFFFFF
+  for raw in (0, -1, 0x80000000, True, 1.0, float("inf"), "17", None):
+    with pytest.raises(ValueError, match="positive 32-bit integer"):
+      parse_positive_pid(raw)
+    assert pid_birth_token(raw) == ""  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("storage_id", ("../17", "/17", "017", "0", "１８", "18"))

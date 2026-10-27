@@ -10,6 +10,7 @@ from .runner_budget import (
 )
 from model_authority.thinking import parse_effort
 from .tool_dispatcher_approval_lifecycle import ApprovalPark
+from .tool_result_compaction import model_tool_result_max_chars
 
 
 def normalized_run_config(
@@ -285,7 +286,17 @@ def no_tool_use_turn_outcome(
 
 
 def model_visible_extra_blocks(extra_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-  return [block for block in extra_blocks if not block.get("_event_only")]
+  max_chars = model_tool_result_max_chars()
+  visible: List[Dict[str, Any]] = []
+  for block in extra_blocks:
+    if block.get("_event_only"):
+      continue
+    text = block.get("text")
+    if isinstance(text, str) and max_chars > 0 and len(text) > max_chars:
+      suffix = f"\n... [extra block truncated at {max_chars} chars]"
+      block = {**block, "text": text[:max(max_chars - len(suffix), 0)] + suffix}
+    visible.append(block)
+  return visible
 
 
 def should_execute_run_agent_batch(

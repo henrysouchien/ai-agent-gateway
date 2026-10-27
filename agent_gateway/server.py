@@ -187,7 +187,6 @@ def _generic_skill_admission_policy_resolver(
 
 
 (
-  _disconnect_stream_subscriber_for_backpressure,
   _pump_stream_subscriber,
   _register_stream_subscriber,
   _cleanup_stream_subscriber,
@@ -1275,6 +1274,15 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     session, _claims = auth.verify_token_with_payload(token)
     return session
 
+  def _require_model_selection_capability(capability_id: str) -> str:
+    normalized_capability = str(capability_id or "").strip()
+    if model_selection_policy.capabilities.get(normalized_capability) is None:
+      raise HTTPException(
+        status_code=422,
+        detail=f"no model-selection policy exists for {normalized_capability!r}",
+      )
+    return normalized_capability
+
   @router.put(
     "/model-preferences/{capability_id}",
     response_model=ModelPreferenceResponse,
@@ -1288,13 +1296,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     store = config.model_preference_store
     if store is None:
       raise HTTPException(status_code=503, detail="model preference store is unavailable")
-    normalized_capability = str(capability_id or "").strip()
-    policy = model_selection_policy.capabilities.get(normalized_capability)
-    if policy is None:
-      raise HTTPException(
-        status_code=422,
-        detail=f"no model-selection policy exists for {normalized_capability!r}",
-      )
+    normalized_capability = _require_model_selection_capability(capability_id)
     resolver = _capability_execution_resolver_for_session(
       session=session,
       build_chat_runtime=app.state.gateway_build_chat_runtime,
@@ -1386,7 +1388,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     store = config.model_preference_store
     if store is None:
       raise HTTPException(status_code=503, detail="model preference store is unavailable")
-    normalized_capability = str(capability_id or "").strip()
+    normalized_capability = _require_model_selection_capability(capability_id)
     resolver = _capability_execution_resolver_for_session(
       session=session,
       build_chat_runtime=app.state.gateway_build_chat_runtime,

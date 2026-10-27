@@ -4,7 +4,7 @@ from typing import Mapping
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY
 from model_authority.registry import AdapterRouteSupport
-from .agent_sdk import AgentSDKConfig
+from .agent_sdk import AgentSDKConfig, AgentSDKProvider
 from .anthropic import AnthropicProvider
 from .base import CostEstimate, ModelInfo, ModelProvider, StreamEvent, truncate_to_last_compaction
 from .codex import CodexProvider
@@ -28,6 +28,7 @@ from .credential_pool import (
 
 _INSTALLED_PROVIDER_CLASSES: tuple[type[ModelProvider], ...] = (
   AnthropicProvider,
+  AgentSDKProvider,
   CodexProvider,
   CopilotResponsesProvider,
   GoogleGenerateContentProvider,
@@ -85,6 +86,7 @@ INITIAL_MODEL_REGISTRY.admit_adapter_support(
 
 __all__ = [
   "AgentSDKConfig",
+  "AgentSDKProvider",
   "AnthropicProvider",
   "CodexProvider",
   "CopilotResponsesProvider",

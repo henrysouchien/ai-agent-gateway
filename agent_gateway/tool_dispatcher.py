@@ -16,10 +16,12 @@ from typing import AbstractSet, Any, Callable, cast, Dict, get_args, Mapping, Op
 from pydantic import ValidationError
 from model_authority.bind import CapabilityBind
 
+from agent_workflow_contracts.next_call import next_call as build_next_call
 from agent_workflow_contracts.tool_registration import (
   RegisteredToolIdentity,
   ToolRegistrationCatalog,
   ToolRegistrationDeclaration,
+  UnknownToolRegistrationError,
   validate_tool_registration_catalog,
   validate_tool_registration_declaration,
 )
@@ -275,7 +277,7 @@ def resolve_registered_addin_declaration(
       logical_server_id=None,
       logical_name=tool_name,
     ))
-  except LookupError:
+  except UnknownToolRegistrationError:
     return None
   policy = declaration.semantics.input_preparation_policy
   if (
@@ -609,6 +611,10 @@ class ToolDispatcher:
     """The opaque policy handle the admitted route owns, if it owns one."""
 
     return route_policy(self._approval_route)
+
+  @property
+  def session(self) -> Any | None:
+    return self._session
 
   def replace_capability_bind(self, bind: CapabilityBind) -> None:
     """Use the runner's current credential bind for subsequent tool captures."""
@@ -994,7 +1000,7 @@ class ToolDispatcher:
       repair: dict[str, Any] = {"next_call": dict(next_call)}
     elif field_name is not None:
       repair = {
-        "next_call": {"tool_name": tool_name, "arguments": copy.deepcopy(dict(tool_input))}
+        "next_call": build_next_call(tool_name, copy.deepcopy(dict(tool_input)))
       }
     else:
       repair = {}
@@ -1086,6 +1092,7 @@ class ToolDispatcher:
       run_id=run_context.run_id,
       user_id=run_context.user_id,
       profile=run_context.profile,
+      profile_name=run_context.profile_name,
       ui_blocks_run=run_context.ui_blocks_run,
       redact_text=self._secret_boundary.redact_text,
       research_file_activity_owner=self._ensure_research_file_activity,
@@ -2148,7 +2155,7 @@ class ToolDispatcher:
       role=self._role,
       tool_name=tool_name,
       is_local=is_local_tool,
-      profile_name=str(getattr(self._run_context, "profile", "") or "") or None,
+      profile_name=getattr(self._run_context, "profile_name", None),
       mcp_server=(
         self._mcp.get_server_for_tool(tool_name)
         if not is_local_tool and self._mcp.is_mcp_tool(tool_name)

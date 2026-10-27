@@ -69,6 +69,10 @@ from hank_contracts.commercial_work import (
   WORK_AUTHORIZATION_ISSUER,
 )
 from hank_contracts.commercial_claims import COMMERCIAL_CLAIM_ISSUER
+from hank_contracts.agent_api import (
+  AGENT_API_CLAIM_AUDIENCE as _AGENT_API_CLAIM_AUDIENCE,
+  AGENT_API_CLAIM_HEADERS as _AGENT_API_CLAIM_HEADERS,
+)
 from .event_log import EventLog
 from .mcp_client import McpClientManager
 from .providers import ModelProvider
@@ -162,18 +166,8 @@ class ScheduledRetentionSweeper(Protocol):
 
   def sweep(self) -> Any: ...
 
-_AGENT_API_CLAIM_AUDIENCE = "agent_api_v1"
 _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS = 60
 _AGENT_API_CLAIM_NONCE_HEX_LENGTH = 32
-_AGENT_API_CLAIM_HEADERS = {
-  "audience": "X-Agent-Claim-Audience",
-  "issued_at": "X-Agent-Claim-Issued-At",
-  "expiry": "X-Agent-Claim-Expiry",
-  "user_id": "X-Agent-Claim-User-Id",
-  "user_email": "X-Agent-Claim-User-Email",
-  "nonce": "X-Agent-Claim-Nonce",
-  "signature": "X-Agent-Claim-Signature",
-}
 _ARTIFACT_DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _ARTIFACT_ORIGIN_VALUES = frozenset({"product", "harness", "import"})
 _ARTIFACT_ORIGIN_FILTER_VALUES = frozenset({"all", *_ARTIFACT_ORIGIN_VALUES})
@@ -186,10 +180,9 @@ _ACTIVE_TURN_GRACE_SECONDS = 60.0
 #: How long a follow-up message waits for the previous turn's post-terminal
 #: teardown before the session is reported as not released.
 _ACTIVE_TURN_SETTLE_WAIT_SECONDS = 30.0
-#: Per-subscriber SSE queue bound (resource): a slow subscriber cannot grow
-#: gateway memory without bound. On overflow only that subscriber's stream ends;
-#: the turn is not stopped (it writes the event log, not the queue), and
-#: /chat/subscribe with after_seq resumes from the log.
+#: Per-subscriber SSE queue bound (resource): pump_stream_subscriber awaits
+#: subscriber.queue.put(entry), bounding per-subscriber queued entries while
+#: the turn writes EventLog without blocking on slow subscribers.
 _STREAM_SUBSCRIBER_QUEUE_MAX = 256
 _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS = 15.0
 _SIDECAR_SLUG_RE = re.compile(r"[^a-z0-9-]+")

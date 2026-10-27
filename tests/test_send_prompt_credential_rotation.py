@@ -20,6 +20,7 @@ from agent_gateway.providers.anthropic import AnthropicProvider
 from agent_gateway import CapabilityExecutionResolver, resolve_auth_config
 from agent_gateway.capability_execution import MaterializedCredential
 from agent_gateway.providers.anthropic_oauth import (
+  ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
   is_anthropic_generation_ref, resolve_anthropic_credentials,
 )
 from agent_gateway.send_prompt import _rotated_execution, send_prompt
@@ -115,14 +116,20 @@ def pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
   monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
   monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "absent-oauth.json"))
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: alice is this standalone operator.
+  monkeypatch.setenv(
+    "GATEWAY_USER_KEYS",
+    json.dumps([{"slug": "alice", "risk_user_id": 1, "role": "owner"}]),
+  )
 
 
 def test_resolve_auth_config_retains_the_selected_pool_generation(
   pool: None,
 ) -> None:
   del pool
-  config = resolve_auth_config(max_tokens=1024)
-  selected = resolve_anthropic_credentials().by_token(_REFUSED)
+  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: bind the operator's own run.
+  config = resolve_auth_config(max_tokens=1024, user_scope=1)
+  selected = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(_REFUSED)
   assert selected is not None
   assert config["auth_token"] == _REFUSED
   assert config["credential_source"] == {**selected.source_metadata(), "automatic": True}
@@ -130,11 +137,12 @@ def test_resolve_auth_config_retains_the_selected_pool_generation(
 
 
 def _run(provider: _PoolProvider) -> str:
+  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: alice's fixture owns these seats.
   execution = stub_bound_capability_execution(
     provider=provider,
     model="claude-sonnet-5",
     effort="none",
-    auth_config={"auth_mode": "oauth", "auth_token": _REFUSED, "max_tokens": 1024},
+    auth_config=resolve_auth_config(max_tokens=1024, user_scope=1),
   )
   return asyncio.run(send_prompt("hello", capability_execution=execution, user_id="alice", completion_record_root=None))
 
@@ -180,7 +188,7 @@ def test_send_prompt_rotation_names_the_sibling_generation(
 ) -> None:
   rejection = _status_error(429, _RATE_LIMIT_BODY)
   provider = _PoolProvider({_REFUSED: rejection, _SERVING: "answered"})
-  sources = resolve_anthropic_credentials()
+  sources = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True})
   member_a = sources.by_token(_REFUSED)
   member_b = sources.by_token(_SERVING)
   assert member_a is not None and member_b is not None
@@ -192,6 +200,7 @@ def test_send_prompt_rotation_names_the_sibling_generation(
     auth_config={
       "auth_mode": "oauth", "auth_token": _REFUSED, "max_tokens": 1024,
       "credential_source": member_a.source_metadata(),
+      ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
     },
   )
   if not has_generation_metadata:
@@ -249,7 +258,8 @@ def test_send_prompt_parking_persists_across_second_bind(
     assert execution.resolver is resolver
     return execution
 
-  first_config = resolve_auth_config(max_tokens=4096)
+  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: alice binds her own operator seats.
+  first_config = resolve_auth_config(max_tokens=4096, user_scope=1)
   assert first_config["auth_token"] == _REFUSED
   provider1 = _PoolProvider({_REFUSED: _status_error(429, _RATE_LIMIT_BODY), _SERVING: "answered-1"})
   first_execution = bind(first_config, provider1)
@@ -260,8 +270,8 @@ def test_send_prompt_parking_persists_across_second_bind(
   )) == "answered-1"
   assert provider1.tokens_used == [_REFUSED, _SERVING]
 
-  # Fresh resolution must honor the parking from the first execution.
-  second_config = resolve_auth_config(max_tokens=4096)
+  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: the same owner honors prior parking.
+  second_config = resolve_auth_config(max_tokens=4096, user_scope=1)
   assert second_config["auth_token"] == _SERVING
   assert second_config["credential_source"]["generation_ref"] != first_execution.bind.credential_ref
   assert len(observed_events) == 1
@@ -281,8 +291,8 @@ def test_send_prompt_pool_of_one_selects_and_does_not_rotate_infinitely(
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-solo")
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKENS", raising=False)
 
-  # 1. Initial resolution selects it
-  initial_config = resolve_auth_config(max_tokens=1024)
+  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: the owner initially selects her solo seat.
+  initial_config = resolve_auth_config(max_tokens=1024, user_scope=1)
   assert initial_config["auth_token"] == "token-solo"
 
   # 2. 429 raises provider rejection; no sibling exists, so no infinite rotation
@@ -298,6 +308,6 @@ def test_send_prompt_pool_of_one_selects_and_does_not_rotate_infinitely(
 
   assert provider.tokens_used == ["token-solo"]
 
-  # 3. Subsequent bind on pool of one still binds it (select fallback)
-  parked_config = resolve_auth_config(max_tokens=1024)
+  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: the owner's solo seat remains bindable.
+  parked_config = resolve_auth_config(max_tokens=1024, user_scope=1)
   assert parked_config["auth_token"] == "token-solo"

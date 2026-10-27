@@ -8,11 +8,21 @@ from collections import OrderedDict
 import json
 import threading
 import time
-from typing import Mapping
+from typing import Annotated, Any, Literal, Mapping
 from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 import jwt
+from pydantic import (
+  BaseModel,
+  ConfigDict,
+  Field,
+  StrictInt,
+  StrictStr,
+  ValidationError,
+  ValidationInfo,
+  field_validator,
+)
 
 
 from hank_contracts.subject_assertion import (
@@ -30,6 +40,60 @@ from hank_contracts.subject_assertion import (
   SubjectAssertionError,
   VerifiedGatewaySubject,
 )
+
+
+_CLAIM_ERROR_CODES = {
+  "schema_version": "invalid_schema_version",
+  "sub": "invalid_subject",
+  "channel": "invalid_channel",
+  "iat": "invalid_lifetime",
+  "exp": "invalid_lifetime",
+}
+
+
+class _SubjectAssertionClaims(BaseModel):
+  """Exact claim set of a verified assertion; every claim's type and bounds."""
+
+  model_config = ConfigDict(extra="forbid", strict=True)
+
+  schema_version: Annotated[StrictInt, Field(ge=1, le=1)]
+  sub: StrictStr
+  channel: Literal["web"]
+  iat: StrictInt
+  exp: StrictInt
+  # Checked by PyJWT (iss, aud), ``_normalize_email`` and ``_canonical_uuid``.
+  iss: Any
+  aud: Any
+  email: Any
+  request_id: Any
+  jti: Any
+
+  @field_validator("sub")
+  @classmethod
+  def _subject_shape(cls, value: str) -> str:
+    if not _SUBJECT.fullmatch(value):
+      raise ValueError("subject must be a canonical positive integer")
+    return value
+
+  @field_validator("exp")
+  @classmethod
+  def _lifetime_bounds(cls, value: int, info: ValidationInfo) -> int:
+    issued_at = info.data.get("iat")
+    if issued_at is not None and (
+      value <= issued_at or value - issued_at > SUBJECT_ASSERTION_MAX_LIFETIME_SECONDS
+    ):
+      raise ValueError("assertion lifetime out of bounds")
+    return value
+
+
+def _claims_error_code(exc: ValidationError) -> str:
+  errors = exc.errors(include_input=False, include_url=False)
+  if any(err["type"] in ("missing", "extra_forbidden") or not err["loc"] for err in errors):
+    return "invalid_claims"
+  for field in _CLAIM_ERROR_CODES:
+    if any(err["loc"][0] == field for err in errors):
+      return _CLAIM_ERROR_CODES[field]
+  return "invalid_claims"
 
 
 def _canonical_uuid(value: object, *, code: str) -> str:
@@ -119,11 +183,8 @@ class GatewaySubjectAssertionVerifier:
     payload_email: object,
     payload_request_id: object,
     claimed_channel: object,
-    now: int | None = None,
   ) -> VerifiedGatewaySubject:
-    current = int(time.time()) if now is None else now
-    if type(current) is not int:
-      raise SubjectAssertionError("invalid_verification_time")
+    current = int(time.time())
     if not isinstance(token, str) or not token or token != token.strip():
       raise SubjectAssertionError("assertion_required")
     try:
@@ -150,30 +211,19 @@ class GatewaySubjectAssertionVerifier:
         leeway=SUBJECT_ASSERTION_CLOCK_SKEW_SECONDS,
         # ``email`` is structurally required but explicitly nullable; PyJWT's
         # require option treats a null value as missing, so the exact-key check
-        # below owns that one claim.
+        # below owns that one claim. PyJWT's time-claim validators coerce with
+        # ``int(...)`` and raise ``TypeError`` on a non-scalar claim, outside
+        # its own exception hierarchy.
         options={"require": sorted(_REQUIRED_CLAIMS - {"email"})},
       )
-    except jwt.PyJWTError as exc:
+    except (jwt.PyJWTError, TypeError, OverflowError) as exc:
       raise SubjectAssertionError("verification_failed") from exc
-    if not isinstance(claims, dict) or set(claims) != _REQUIRED_CLAIMS:
-      raise SubjectAssertionError("invalid_claims")
-    if claims.get("schema_version") != 1 or type(claims.get("schema_version")) is not int:
-      raise SubjectAssertionError("invalid_schema_version")
-    subject = claims.get("sub")
-    if not isinstance(subject, str) or not _SUBJECT.fullmatch(subject):
-      raise SubjectAssertionError("invalid_subject")
-    if claims.get("channel") != "web":
-      raise SubjectAssertionError("invalid_channel")
-    issued_at = claims.get("iat")
-    expires_at = claims.get("exp")
-    if type(issued_at) is not int or type(expires_at) is not int:
-      raise SubjectAssertionError("invalid_lifetime")
-    if (
-      expires_at <= issued_at
-      or expires_at - issued_at > SUBJECT_ASSERTION_MAX_LIFETIME_SECONDS
-      or issued_at > current + SUBJECT_ASSERTION_CLOCK_SKEW_SECONDS
-    ):
-      raise SubjectAssertionError("invalid_lifetime")
+    try:
+      typed = _SubjectAssertionClaims.model_validate(claims)
+    except ValidationError as exc:
+      raise SubjectAssertionError(_claims_error_code(exc)) from exc
+    subject = typed.sub
+    expires_at = typed.exp
     email = _normalize_email(claims.get("email"))
     request_id = _canonical_uuid(claims.get("request_id"), code="invalid_request_id")
     jti = _canonical_uuid(claims.get("jti"), code="invalid_jti")

@@ -636,3 +636,37 @@ def test_clock_rollback_is_detected_and_writes_nothing(
     assert connection.execute(
       "SELECT COUNT(*) FROM fork_admissions"
     ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("bad_text", ["\x00", "a\x00b", "a\x00"])
+def test_text_admission_rejects_nul_bytes_with_valueerror(
+  tmp_path: Path,
+  bad_text: str,
+) -> None:
+  ledger = _ledger(tmp_path)
+  with pytest.raises(ValueError, match="canonical non-empty text"):
+    ledger.write_receipt(
+      fork_id=bad_text,
+      session_id="session-1",
+      owner="owner-1",
+      receipt_text="ok",
+    )
+  with pytest.raises(ValueError, match="canonical non-empty text"):
+    ledger.write_receipt(
+      fork_id="fork-1",
+      session_id="session-1",
+      owner="owner-1",
+      receipt_text=bad_text,
+    )
+  with pytest.raises(ValueError, match="canonical non-empty text"):
+    ledger.reserve_admission(
+      fork_id=bad_text,
+      owner="owner-1",
+      max_reserved_usd="1.00",
+    )
+  with pytest.raises(ValueError, match="canonical non-empty text"):
+    ledger.reserve_admission(
+      fork_id="fork-1",
+      owner=bad_text,
+      max_reserved_usd="1.00",
+    )

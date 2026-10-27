@@ -49,6 +49,15 @@ from . import mcp_client_oauth_storage as _oauth_storage
 from . import mcp_client_runtime as _runtime_helpers
 from . import mcp_client_startup as _startup_helpers
 from .approval_policy import sha256_args
+from .autonomous_claim_broker import AutonomousClaimSigner
+from .autonomous_runner_claims import get_agent_api_claim_ttl_seconds
+from .claim_signing_authority import (
+  MCP_CATALOG_PRINCIPAL,
+  GatewayUserClaimSigner,
+  UserClaimHttpAuth,
+  configured_gateway_claim_signing_authority,
+  sign_gateway_user_claim,
+)
 from .policy_imports import load_server_policy_helpers, update_mcp_tool_metadata
 from .tool_definition import LiveToolRouteBinding, OriginatedToolDefinition
 from .tool_dispatch_classification import (
@@ -108,12 +117,17 @@ PER_USER_SESSION_TTL_SECONDS = 60 * 60
 PER_USER_EXPIRY_MARGIN_SECONDS = 5 * 60
 PER_USER_IDLE_REAP_SECONDS = 30 * 60
 PER_USER_REAPER_INTERVAL_SECONDS = 60.0
-# One stdio child process per (server, user): this bounds the host's process
-# count, a resource fact, not a policy verdict. A full pool first evicts its
+# One connection per (server, user), a stdio child process or a streamable-HTTP
+# connection: this bounds the host's process and socket count, a resource fact,
+# not a policy verdict. A full pool first evicts its
 # least-recently-used idle instance; only when every instance is running a call
 # does a new user wait, and the error then carries the pool's count.
 PER_USER_INSTANCE_CAP = 32
 PER_USER_DRAIN_POLL_SECONDS = 0.05
+
+
+def _is_streamable_http_config(config: Mapping[str, Any]) -> bool:
+  return str(config.get("type", "stdio")).strip().lower() in _STREAMABLE_HTTP_TYPES
 
 
 @dataclass
@@ -153,17 +167,27 @@ def _suppress_mcp_stdio_termination_fallback_warnings():
   return _runtime_helpers.suppress_mcp_stdio_termination_fallback_warnings(logging.getLogger, _McpStdioTerminationFallbackFilter)
 
 
-def _build_mcp_env(server_env: Dict[str, Any] | None) -> Dict[str, str]:
+def _build_mcp_env(
+  server_env: Dict[str, Any] | None,
+  *,
+  environ: Mapping[str, str],
+  base_environ: Mapping[str, str] | None = None,
+) -> Dict[str, str]:
   return _config_helpers.build_mcp_env(
     server_env if isinstance(server_env, dict) else None,
-    environ=os.environ,
+    environ=environ,
+    base_environ=os.environ if base_environ is None else base_environ,
   )
 
 
-def _build_http_headers(headers: Dict[str, Any] | None) -> Dict[str, str]:
+def _build_http_headers(
+  headers: Dict[str, Any] | None,
+  *,
+  environ: Mapping[str, str],
+) -> Dict[str, str]:
   return _config_helpers.build_http_headers(
     headers if isinstance(headers, dict) else None,
-    environ=os.environ,
+    environ=environ,
   )
 
 
@@ -459,10 +483,17 @@ class _PerUserServerState:
 
 @dataclass(frozen=True, slots=True)
 class _PerUserGatewaySubject:
-  """Identity derived from an authenticated gateway session, never a caller id."""
+  """Identity from an authenticated session or a bound one-user HTTP signer.
+
+  `user_id`/`user_email` key and project a per-user stdio child. The claim
+  pair carries the session's signed identity or the HTTP signer's bound
+  identity, matching the subject of a placed runtime's derived claim key.
+  """
 
   user_id: str
   user_email: str | None = None
+  claim_user_id: str | None = None
+  claim_user_email: str | None = None
 
   @classmethod
   def from_gateway_session(cls, session: Any) -> "_PerUserGatewaySubject":
@@ -480,7 +511,12 @@ class _PerUserGatewaySubject:
     ):
       raise ValueError("gateway session has no canonical per-user subject")
     user_email = str(session.user_email or "").strip().lower() or None
-    return cls(user_id=owner_user_id, user_email=user_email)
+    return cls(
+      user_id=owner_user_id,
+      user_email=user_email,
+      claim_user_id=session.user_id,
+      claim_user_email=session.user_email or None,
+    )
 
 
 class _PerUserMcpError(RuntimeError):
@@ -648,9 +684,7 @@ class McpClientManager:
     input_preparation_routes: Sequence[McpInputPreparationRoute] = (),
     provider_ids_by_server: Dict[str, str] | None = None,
     server_env_passthrough: Mapping[str, AbstractSet[str]] | None = None,
-    per_user_env_resolver: Callable[
-      [str, str, str | None], Mapping[str, str]
-    ] | None = None,
+    user_claim_signer: GatewayUserClaimSigner | AutonomousClaimSigner | None = None,
     ttl_resolver: TtlResolver | None = None,
     startup_timeout: int = 15,
     default_tool_timeout: int = 30,
@@ -701,7 +735,10 @@ class McpClientManager:
       self._canonical_server_name(server_name): {str(env_name) for env_name in env_names}
       for server_name, env_names in dict(server_env_passthrough or {}).items()
     }
-    self._per_user_env_resolver = per_user_env_resolver
+    # A manager built for one user (a run, or a single-user runtime) signs every
+    # per-user streamable-HTTP request as that user. Without it the user is the
+    # session's, bound to the process's configured claim-signing authority.
+    self._user_claim_signer = user_claim_signer
     self._ttl_resolver = (
       ttl_resolver if ttl_resolver is not None else default_ttl_resolver
     )
@@ -1055,13 +1092,47 @@ class McpClientManager:
       self._connection_runtime(),
     )
 
-  async def _connect_streamable_http(self, name: str, config: Dict[str, Any]) -> _ConnectedServerState:
+  async def _connect_streamable_http(
+    self,
+    name: str,
+    config: Dict[str, Any],
+    *,
+    user_claim_auth: UserClaimHttpAuth | None = None,
+  ) -> _ConnectedServerState:
     return await _connection_helpers.connect_streamable_http(
       self,
       name,
       config,
       self._connection_runtime(),
+      user_claim_auth=user_claim_auth,
     )
+
+  def _user_claim_http_auth(
+    self,
+    claim_user_id: str | None,
+    claim_user_email: str | None,
+  ) -> UserClaimHttpAuth:
+    """Per-request claim auth for one user's streamable-HTTP connection."""
+    signer = self._user_claim_signer
+    if signer is None:
+      authority = configured_gateway_claim_signing_authority(required=True)
+      signer = authority.bind_user(
+        user_id=cast(str, claim_user_id),
+        user_email=claim_user_email,
+      )
+    if isinstance(signer, GatewayUserClaimSigner):
+      gateway_signer: GatewayUserClaimSigner = signer
+      return UserClaimHttpAuth(lambda: sign_gateway_user_claim(gateway_signer))
+    autonomous_signer: AutonomousClaimSigner = signer
+    return UserClaimHttpAuth(
+      lambda: AutonomousClaimSigner.sign_claim(
+        autonomous_signer,
+        ttl_seconds=get_agent_api_claim_ttl_seconds(),
+      )
+    )
+
+  def _catalog_claim_auth(self) -> UserClaimHttpAuth:
+    return self._user_claim_http_auth(*MCP_CATALOG_PRINCIPAL)
 
   def _build_http_auth(self, name: str, url: str, config: Dict[str, Any]) -> Any | None:
     return _connection_helpers.build_http_auth(
@@ -1862,8 +1933,8 @@ class McpClientManager:
     return bool(config and config.get("per_user") is True)
 
   @staticmethod
-  def _declared_per_user_env(config: Mapping[str, Any]) -> tuple[str, ...]:
-    raw = config.get("per_user_env")
+  def _declared_run_scoped_env(config: Mapping[str, Any]) -> tuple[str, ...]:
+    raw = config.get("run_scoped_env")
     if raw is None:
       return ()
     if (
@@ -1871,13 +1942,36 @@ class McpClientManager:
       or not raw
       or any(not isinstance(name, str) or not name.strip() for name in raw)
     ):
-      raise ValueError("per_user_env must be a non-empty list of environment names")
+      raise ValueError("run_scoped_env must be a non-empty list of environment names")
     names = tuple(name.strip() for name in raw)
     if len(set(names)) != len(names):
-      raise ValueError("per_user_env must not contain duplicate environment names")
-    if config.get("per_user") is not True:
-      raise ValueError("per_user_env requires per_user=true")
+      raise ValueError("run_scoped_env must not contain duplicate environment names")
     return names
+
+  def _scoped_server_env(
+    self,
+    server_name: str,
+    config: Mapping[str, Any],
+    *,
+    deployment_environ: Mapping[str, str] | None = None,
+    projected_env: Mapping[str, str] | None = None,
+  ) -> Dict[str, str]:
+    base_name = server_name.removesuffix("[user]")
+    canonical_name = self._canonical_server_name(base_name)
+    declared_run_scoped = (
+      frozenset(self._server_env_passthrough.get(canonical_name, ()))
+      | frozenset(self._declared_run_scoped_env(config))
+    )
+    source_env = os.environ if deployment_environ is None else deployment_environ
+    scoped: Dict[str, str] = {
+      env_name: str(source_env.get(env_name, ""))
+      for env_name in declared_run_scoped
+    }
+    if projected_env is not None:
+      for env_name, env_value in projected_env.items():
+        if isinstance(env_name, str) and isinstance(env_value, str):
+          scoped[env_name] = env_value
+    return scoped
 
   def _prepare_server_config_for_startup(
     self,
@@ -1889,66 +1983,32 @@ class McpClientManager:
     )
     if allowed_tools is not None:
       prepared["allowed_tools"] = list(allowed_tools)
-    dynamic_env_names = self._declared_per_user_env(prepared)
-    if not dynamic_env_names:
-      return prepared
-    env = dict(prepared.get("env") or {})
-    for name in dynamic_env_names:
-      env.pop(name, None)
-    prepared["env"] = env
+    if (
+      prepared.get("per_user") is True
+      and _is_streamable_http_config(prepared)
+      and prepared.get("oauth")
+    ):
+      raise ValueError(
+        "a per_user streamable-http server authenticates with its user's claim; "
+        "oauth is not supported"
+      )
+    self._declared_run_scoped_env(prepared)
     return prepared
 
-  def _resolve_per_user_env(
+  def _per_user_binding_fingerprint(
     self,
-    server_name: str,
     subject: _PerUserGatewaySubject,
-    config: Mapping[str, Any],
-  ) -> tuple[Dict[str, str], bytes] | None:
-    env_names = self._declared_per_user_env(config)
-    if not env_names:
-      return None
-    if self._per_user_env_resolver is None:
-      raise _PerUserMcpError(
-        "mcp_user_authority_unavailable",
-        "User-scoped MCP authority is not configured.",
-      )
-    try:
-      resolved = self._per_user_env_resolver(
-        server_name,
-        subject.user_id,
-        subject.user_email,
-      )
-    except Exception as exc:
-      raise _PerUserMcpError(
-        "mcp_user_authority_unavailable",
-        "User-scoped MCP authority could not be resolved.",
-      ) from exc
-    if not isinstance(resolved, Mapping):
-      raise _PerUserMcpError(
-        "mcp_user_authority_unavailable",
-        "User-scoped MCP authority is invalid.",
-      )
-    projection = {
-      str(name): str(value).strip()
-      for name, value in resolved.items()
-      if isinstance(name, str) and isinstance(value, str)
-    }
-    if set(projection) != set(env_names) or any(not projection[name] for name in env_names):
-      raise _PerUserMcpError(
-        "mcp_user_authority_unavailable",
-        "User-scoped MCP authority is incomplete.",
-      )
+  ) -> bytes:
+    """Opaque binding of a per-user HTTP connection to its claim identity."""
     canonical = json.dumps(
-      {name: projection[name] for name in sorted(env_names)},
-      sort_keys=True,
+      [subject.claim_user_id, subject.claim_user_email],
       separators=(",", ":"),
     ).encode("utf-8")
-    fingerprint = hmac.new(
+    return hmac.new(
       self._per_user_binding_hmac_key,
       canonical,
       hashlib.sha256,
     ).digest()
-    return projection, fingerprint
 
   @staticmethod
   def _canonical_broker_body(payload: Dict[str, Any]) -> bytes:
@@ -2012,33 +2072,47 @@ class McpClientManager:
     server_name: str,
     subject: _PerUserGatewaySubject,
     broker_session: tuple[str, float, str] | None = None,
-    projected_env: tuple[Dict[str, str], bytes] | None = None,
   ) -> _PerUserServerState:
     definition = self._servers.get(server_name)
     if definition is None or not definition.config:
-      raise _PerUserMcpError("sheets_unavailable", f"MCP server unavailable: {server_name}")
+      raise _PerUserMcpError(
+        "mcp_user_authority_unavailable",
+        f"MCP server unavailable: {server_name}",
+      )
     config = copy.deepcopy(definition.config)
-    env = dict(config.get("env") or {})
     binding_fingerprint: bytes | None = None
-    if projected_env is not None:
-      projection, binding_fingerprint = projected_env
-      env.update(projection)
+    claim_auth: UserClaimHttpAuth | None = None
+    if _is_streamable_http_config(config):
+      # Every request of this connection carries its own fresh claim for the
+      # session's user; no credential is projected into the config. The
+      # fingerprint rotates the connection when that identity changes.
+      claim_auth = self._user_claim_http_auth(
+        subject.claim_user_id,
+        subject.claim_user_email,
+      )
+      binding_fingerprint = self._per_user_binding_fingerprint(subject)
       expires_at = float("inf")
     else:
+      env = dict(config.get("env") or {})
       if broker_session is None:
         broker_session = await self._mint_gsheets_broker_session(subject)
       token, expires_at, broker_url = broker_session
-      env.update({
+      projection = {
         "GSHEETS_TOKEN_MODE": "broker",
         "GSHEETS_HEADLESS": "1",
         "GSHEETS_BROKER_URL": broker_url,
         "GSHEETS_BROKER_SESSION_TOKEN": token,
-      })
-    config["env"] = env
+      }
+      for env_name in projection:
+        env.setdefault(env_name, f"${{{env_name}}}")
+      config["env"] = env
+      config["_projected_env"] = dict(projection)
     # The tier-1 credential is read only by this gateway process and is never
     # copied into the child config/environment.
     host = _PerUserChildHost(server_name, subject.user_id)
-    task = host.start(self._host_per_user_child(host, config))
+    task = host.start(
+      self._host_per_user_child(host, config, user_claim_auth=claim_auth)
+    )
     self._per_user_hosts.add(host)
     task.add_done_callback(lambda _task: self._per_user_hosts.discard(host))
     try:
@@ -2088,9 +2162,17 @@ class McpClientManager:
     self,
     host: _PerUserChildHost,
     config: Dict[str, Any],
+    *,
+    user_claim_auth: UserClaimHttpAuth | None = None,
   ) -> None:
+    name = f"{host.server_name}[user]"
     try:
-      state = await self._connect_stdio_with_retries(f"{host.server_name}[user]", config)
+      if user_claim_auth is not None:
+        state = await self._connect_streamable_http(
+          name, config, user_claim_auth=user_claim_auth,
+        )
+      else:
+        state = await self._connect_stdio_with_retries(name, config)
     except BaseException as exc:
       if not host.ready.done():
         host.ready.set_exception(exc)
@@ -2185,12 +2267,10 @@ class McpClientManager:
             "mcp_user_authority_unavailable",
             f"MCP server unavailable: {server_name}",
           )
-        projected_env = self._resolve_per_user_env(
-          server_name,
-          subject,
-          definition.config,
+        http = _is_streamable_http_config(definition.config)
+        binding_fingerprint = (
+          self._per_user_binding_fingerprint(subject) if http else None
         )
-        binding_fingerprint = projected_env[1] if projected_env is not None else None
         current = self._per_user_servers.get(key)
         replacement_reason = "first_spawn"
         if current is not None:
@@ -2212,7 +2292,7 @@ class McpClientManager:
         # A forced broker-expiry replacement is the exception: the current
         # child is known invalid and must not remain cached when minting fails.
         broker_session = None
-        if projected_env is None:
+        if not http:
           try:
             broker_session = await self._mint_gsheets_broker_session(subject)
           except BaseException:
@@ -2238,20 +2318,15 @@ class McpClientManager:
               if candidate_key[0] == server_name and candidate.active_calls == 0
             ]
             if not idle:
-              projected_authority = projected_env is not None
               pool = (
                 f"({server_count} of {PER_USER_INSTANCE_CAP} instances in use); "
                 "retry when a running call finishes"
               )
               raise _PerUserMcpError(
-                (
-                  "mcp_user_authority_unavailable"
-                  if projected_authority
-                  else "sheets_unavailable"
-                ),
+                "mcp_user_authority_unavailable" if http else "sheets_unavailable",
                 (
                   f"Per-user MCP instance capacity reached {pool}"
-                  if projected_authority
+                  if http
                   else f"Google Sheets per-user instance capacity reached {pool}"
                 ),
               )
@@ -2263,13 +2338,10 @@ class McpClientManager:
           self._per_user_spawn_reservations.get(server_name, 0) + 1
         )
         try:
-          spawn_kwargs: Dict[str, Any] = {"broker_session": broker_session}
-          if projected_env is not None:
-            spawn_kwargs["projected_env"] = projected_env
           replacement = await self._spawn_per_user_server(
             server_name,
             subject,
-            **spawn_kwargs,
+            broker_session=broker_session,
           )
         except BaseException:
           if (
@@ -2524,9 +2596,20 @@ class McpClientManager:
     per_user_subject: _PerUserGatewaySubject | None = None
     if self.is_per_user_server(transport_server_name):
       try:
-        per_user_subject = _PerUserGatewaySubject.from_gateway_session(
-          gateway_session
-        )
+        if self._user_claim_signer is not None and _is_streamable_http_config(
+          cast(Mapping[str, Any], server.config)
+        ):
+          signer = self._user_claim_signer
+          per_user_subject = _PerUserGatewaySubject(
+            user_id=signer.user_id,
+            user_email=signer.user_email,
+            claim_user_id=signer.user_id,
+            claim_user_email=signer.user_email,
+          )
+        else:
+          per_user_subject = _PerUserGatewaySubject.from_gateway_session(
+            gateway_session
+          )
       except ValueError:
         if not is_sheets:
           return None, {
@@ -3319,8 +3402,8 @@ class McpClientManager:
     contexts: List[Any],
     *,
     close_timeout_seconds: float = _MCP_CLOSE_TIMEOUT_SECONDS,
-  ) -> None:
-    await _runtime_helpers.close_contexts(
+  ) -> Exception | None:
+    return await _runtime_helpers.close_contexts(
       contexts,
       close_timeout_seconds=close_timeout_seconds,
       logger=log,

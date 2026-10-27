@@ -239,6 +239,7 @@ def create_agent(
   provider_config: dict[str, Any] | None = None,
   api_key: str | None = None,
   auth_token: str | None = None,
+  user_scope: Any = None,
   rates_file: Path | None = None,
   max_tokens: int = 16_000,
   mcp_servers: dict[str, dict[str, Any]] | None = None,
@@ -319,6 +320,8 @@ def create_agent(
     auth_token: OAuth bearer token. Anthropic falls back to
       `ANTHROPIC_AUTH_TOKEN`; `provider="openai"`, `provider="codex"`, and `provider="xai"` use
       it as bearer auth.
+    user_scope: Run owner's `risk_user_id`, forwarded to provider resolution.
+      Omitted, the bind is unscoped and admits no operator seat.
     rates_file: Optional JSON rate-table override used for Anthropic provider
       construction. When omitted, the helper uses env/default resolution.
     max_tokens: Per-turn output token cap passed to the provider.
@@ -490,6 +493,7 @@ def create_agent(
       auth_token,
       provider_config,
       max_tokens=max_tokens,
+      user_scope=user_scope,
     )
   else:
     provider_instance, _provider_name, auth_config = _resolve_provider(
@@ -500,6 +504,7 @@ def create_agent(
       provider_config,
       auth_config={},
       max_tokens=max_tokens,
+      user_scope=user_scope,
     )
   if (
     isinstance(resolved_provider, str)

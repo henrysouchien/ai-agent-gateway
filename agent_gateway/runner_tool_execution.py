@@ -208,6 +208,12 @@ class AgentRunnerDispatcher(Protocol):
     prepared_call: PreparedToolCall,
   ) -> dict[str, object]: ...
 
+  def redact_raw_tool_input_for_history(
+    self,
+    tool_name: str,
+    tool_input: Mapping[str, object],
+  ) -> dict[str, object]: ...
+
   def route_origin_for_tool(self, tool_name: str) -> str | None: ...
 
   def requires_approval(
@@ -288,11 +294,13 @@ def _tool_excluded_error(
 
   role = getattr(run_context, "decider_role", None)
   profile = getattr(run_context, "profile", None)
+  profile_name = getattr(run_context, "profile_name", None)
   skill = getattr(run_context, "skill", None)
   if role is not None and role_policy_denies_tool(
     role=role,
     tool_name=tool_name,
     is_local=is_local,
+    profile_name=profile_name,
   ):
     owner = "role"
   elif skill:
@@ -649,7 +657,6 @@ class RunnerToolExecutionMixin:
         prepared_call = candidate
         tool_input = prepared_call.materialize_input()
       except ToolInputPreparationError as exc:
-        tool_input = {}
         preparation_error = exc.materialize_error()
         preparation_failed = True
       except Exception as exc:
@@ -659,7 +666,6 @@ class RunnerToolExecutionMixin:
           tool_name,
           type(exc).__name__,
         )
-        tool_input = {}
         preparation_failed = True
       finally:
         if parent_scope_token is not None:
@@ -672,40 +678,45 @@ class RunnerToolExecutionMixin:
         raise TypeError("executed call must be an exact PreparedToolCall")
       executed_prepared_call = call
 
-    redacted_tool_input: dict[str, Any] | None = None
-    if not preparation_failed:
-      redacted = self._dispatcher.redact_prepared_tool_input(
+    redacted = (
+      self._dispatcher.redact_raw_tool_input_for_history(
+        tool_name,
+        tool_input,
+      )
+      if preparation_failed
+      else self._dispatcher.redact_prepared_tool_input(
         tool_name,
         prepared_call,
       )
-      redacted = sanitize_boundary_value(
-        redacted,
-        sink="tool_input",
-        boundary=getattr(self, "_secret_boundary", None),
-      )
-      redacted_tool_input = (
-        redacted
-        if isinstance(redacted, dict)
-        else sanitization_failure_tool_input()
-      )
-      tool_input_preview = json_module.dumps(
-        redacted_tool_input,
-        default=str,
-      )[:200]
-      logger.info(
-        "[%s] Tool call: %s | input=%s",
-        self._sid,
-        tool_name,
-        tool_input_preview,
-        extra={
-          "data": {
-            "event": "tool_call",
-            "session_id": self._sid,
-            "tool": tool_name,
-            "input_preview": tool_input_preview,
-          }
-        },
-      )
+    )
+    redacted = sanitize_boundary_value(
+      redacted,
+      sink="tool_input",
+      boundary=getattr(self, "_secret_boundary", None),
+    )
+    redacted_tool_input = (
+      redacted
+      if isinstance(redacted, dict)
+      else sanitization_failure_tool_input()
+    )
+    tool_input_preview = json_module.dumps(
+      redacted_tool_input,
+      default=str,
+    )[:200]
+    logger.info(
+      "[%s] Tool call: %s | input=%s",
+      self._sid,
+      tool_name,
+      tool_input_preview,
+      extra={
+        "data": {
+          "event": "tool_call",
+          "session_id": self._sid,
+          "tool": tool_name,
+          "input_preview": tool_input_preview,
+        }
+      },
+    )
 
     if tool_name == "emit_dashboard_artifact":
       payload_bytes = len(json_module.dumps(tool_input.get("payload") or {}).encode("utf-8"))
@@ -756,29 +767,27 @@ class RunnerToolExecutionMixin:
       original_tool_name=original_tool_name,
       provider_id=provider_id,
     )
-    if not preparation_failed:
-      assert redacted_tool_input is not None
-      display = _runner_attr(self, "resolve_display", resolve_display)(
-        tool_name,
-        redacted_tool_input,
-      )
-      tool_start_event = _runner_attr(
-        self,
-        "_build_tool_call_start_event",
-        _build_tool_call_start_event,
-      )(
-        tool_call_id=tool_id,
-        tool_name=tool_name,
-        tool_input=redacted_tool_input,
-        call_index=call_index,
-        server=server,
-        started_at=tool_t0,
-        parent_assistant_message_seq=self._last_assistant_message_seq,
-      )
-      if display is not None:
-        tool_start_event["display"] = display
-      await self._append_durable_event(tool_start_event)
-      self._append(tool_start_event)
+    display = _runner_attr(self, "resolve_display", resolve_display)(
+      tool_name,
+      redacted_tool_input,
+    )
+    tool_start_event = _runner_attr(
+      self,
+      "_build_tool_call_start_event",
+      _build_tool_call_start_event,
+    )(
+      tool_call_id=tool_id,
+      tool_name=tool_name,
+      tool_input=redacted_tool_input,
+      call_index=call_index,
+      server=server,
+      started_at=tool_t0,
+      parent_assistant_message_seq=self._last_assistant_message_seq,
+    )
+    if display is not None:
+      tool_start_event["display"] = display
+    await self._append_durable_event(tool_start_event)
+    self._append(tool_start_event)
     result: Optional[Any] = None
     error: Optional[Dict[str, Any]] = None
     semantic_error: Optional[Dict[str, Any]] = None
@@ -1247,8 +1256,12 @@ class RunnerToolExecutionMixin:
     extra_blocks = await self._call_on_tool_result(
       _runner_attr(self, "ToolResultContext", ToolResultContext)(
         tool_name=tool_name,
-        tool_input=dict(tool_input),
-        redacted_tool_input=copy.deepcopy(redacted_tool_input),
+        tool_input={} if preparation_failed else dict(tool_input),
+        redacted_tool_input=(
+          None
+          if preparation_failed
+          else copy.deepcopy(redacted_tool_input)
+        ),
         result=result,
         error=error,
         duration_ms=duration_ms,

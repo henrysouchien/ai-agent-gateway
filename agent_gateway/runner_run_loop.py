@@ -3981,6 +3981,19 @@ class RunnerRunLoopMixin:
             capability_execution=self._capability_execution,
             trigger=effective_compaction_trigger,
             est_total_tokens=est_for_compaction,
+            est_static_floor_tokens=int(
+              getattr(
+                estimate_snapshot,
+                "est_static_floor_tokens",
+                int(getattr(estimate_snapshot, "est_system_tokens", 0) or 0)
+                + int(getattr(estimate_snapshot, "est_tools_tokens", 0) or 0),
+              )
+            ),
+            kernel_locals={
+              str(k): str(v)
+              for kernel_state in (getattr(getattr(self, "_gateway_session", None), "code_execution_kernels", None) or {}).values()
+              for k, v in (getattr(kernel_state, "user_ns_locals", None) or {}).items()
+            } or None,
             turn_count=turn_count,
             last_compact_turn=getattr(self, "_portable_compaction_last_turn", None),
             last_compact_failed_turn=None if force else getattr(self, "_portable_compaction_last_failed_turn", None),

@@ -22,6 +22,7 @@ from agent_gateway.mcp_client import (
   _resolve_mcp_config_path,
   _stdio_connect_retry_delay,
 )
+from agent_gateway.mcp_client_config import McpEnvExpansionError
 
 
 def test_config_helper_builds_env_and_headers_from_explicit_environ() -> None:
@@ -66,13 +67,23 @@ def test_parent_wrappers_use_parent_module_environ(monkeypatch) -> None:
   )
 
   assert _resolve_mcp_config_path() == Path("/tmp/custom-mcp.json")
-  assert _build_mcp_env({"TOKEN": "${HEADER_TOKEN}"}) == {
+  with pytest.raises(TypeError, match="environ"):
+    _build_mcp_env({"TOKEN": "${HEADER_TOKEN}"})  # pyright: ignore[reportCallIssue]  # negative: projection is required
+  with pytest.raises(TypeError, match="environ"):
+    _build_http_headers({"Authorization": "Bearer ${HEADER_TOKEN}"})  # pyright: ignore[reportCallIssue]  # negative: projection is required
+  with pytest.raises(McpEnvExpansionError, match="HEADER_TOKEN"):
+    _build_mcp_env({"TOKEN": "${HEADER_TOKEN}"}, environ={})
+  with pytest.raises(McpEnvExpansionError, match="HEADER_TOKEN"):
+    _build_http_headers({"Authorization": "Bearer ${HEADER_TOKEN}"}, environ={})
+  assert _build_mcp_env(
+    {"TOKEN": "${HEADER_TOKEN}"}, environ={"HEADER_TOKEN": "abc"},
+  ) == {
     "PATH": "/bin",
     "TOKEN": "abc",
   }
-  assert _build_http_headers({"Authorization": "Bearer ${HEADER_TOKEN}"}) == {
-    "Authorization": "Bearer abc"
-  }
+  assert _build_http_headers(
+    {"Authorization": "Bearer ${HEADER_TOKEN}"}, environ={"HEADER_TOKEN": "abc"},
+  ) == {"Authorization": "Bearer abc"}
 
 
 def test_parent_retry_delay_uses_parent_env_and_random(monkeypatch) -> None:
@@ -109,8 +120,8 @@ def test_env_and_header_helpers_ignore_non_dict_mappings(monkeypatch) -> None:
     "PATH": "/bin"
   }
   assert mcp_client_config.build_http_headers(mapping, environ={"TOKEN": "secret"}) == {}
-  assert _build_mcp_env(mapping) == {"PATH": "/bin"}  # pyright: ignore[reportArgumentType]  # negative: non-dict environment mapping ignored
-  assert _build_http_headers(mapping) == {}  # pyright: ignore[reportArgumentType]  # negative: non-dict header mapping ignored
+  assert _build_mcp_env(mapping, environ={}) == {"PATH": "/bin"}  # pyright: ignore[reportArgumentType]  # negative: non-dict environment mapping ignored
+  assert _build_http_headers(mapping, environ={}) == {}  # pyright: ignore[reportArgumentType]  # negative: non-dict header mapping ignored
 
 
 def test_config_helper_invalid_numeric_logs_warning() -> None:
@@ -269,3 +280,51 @@ def test_allowed_tools_parser_preserves_exact_canonical_order() -> None:
 def test_allowed_tools_parser_rejects_malformed_lists(value) -> None:
   with pytest.raises(ValueError, match="allowed_tools"):
     mcp_client_config.parse_allowed_tools(value)
+
+
+def test_scoped_url_expansion_refuses_unset_or_empty_risk_api_url() -> None:
+  """An HTTP url ref to an unset or empty RISK_API_URL is undeclared.
+
+  _scoped_server_env still maps a missing name to "" so a stdio env block
+  keeps its prior substitution. The HTTP url expander refuses that empty
+  value instead of producing a relative URL.
+  """
+  manager = mcp_client_module.McpClientManager(config_path=None)
+  config = {
+    "type": "streamable-http",
+    "url": "${RISK_API_URL}/api/mcp/portfolio-reads-mcp/",
+    "per_user": True,
+    "run_scoped_env": ["RISK_API_URL"],
+  }
+  for environ in ({}, {"RISK_API_URL": ""}):
+    scoped = manager._scoped_server_env(
+      "portfolio-reads-mcp",
+      config,
+      deployment_environ=environ,
+    )
+    assert scoped["RISK_API_URL"] == ""
+    with pytest.raises(
+      McpEnvExpansionError,
+      match="undeclared environment variable: RISK_API_URL",
+    ):
+      mcp_client_config.expand_http_template(config["url"], environ=scoped)
+    with pytest.raises(
+      McpEnvExpansionError,
+      match="undeclared environment variable: RISK_API_URL",
+    ):
+      mcp_client_config.build_http_headers(
+        {"X-Risk-Origin": "${RISK_API_URL}"},
+        environ=scoped,
+      )
+  assert mcp_client_config.expand_env_refs(
+    "${RISK_API_URL}",
+    environ={"RISK_API_URL": ""},
+  ) == ""
+  present = manager._scoped_server_env(
+    "portfolio-reads-mcp",
+    config,
+    deployment_environ={"RISK_API_URL": "https://risk.example.test"},
+  )
+  assert mcp_client_config.expand_http_template(config["url"], environ=present) == (
+    "https://risk.example.test/api/mcp/portfolio-reads-mcp/"
+  )

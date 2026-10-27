@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+## 0.30.0 (2026-10-27)
+
+### Changed
+
+- Every personal OAuth subscription seat is bound to the deployment owner's run scope at the single credential-pool selection/rotation owner. Investment, standalone ambient auth, capability rebind, and jury materialization carry that scope; non-pooled Codex, OpenAI, and xAI OAuth material follows the same rule, and the hosted-only predicate copies are retired.
+- BREAKING: code execution has one session-sticky Python kernel with a placement, not a host choice. `CodeExecutionConfig` drops `register_docker`, `register_subprocess`, `register_kernel` and `build_preamble` and gains `placement: Literal["local", "docker"] = "local"` and `readonly_mounts: tuple[str, ...] = ()`. `make_code_execute_tool_def(config)` takes the config alone and its input schema has no `host`. `build_code_execution` builds `KernelBackend` for `"local"` or `DockerBackend` for `"docker"`; `SubprocessBackend`, `host="auto"` fallback and the `skipped_backends` result field are removed.
+- `DockerBackend` accepts `readonly_mounts`; each existing directory is bind-mounted read-only at the same path inside the container.
+
+### Removed
+
+- BREAKING: `hank.derive` and the `derived` rows it published. `HankBridge.derive` and the `derive` request frame are gone (`hank.derive` raises `AttributeError`, like `hank.input`), cells return plain `dict`/`list` values, and the cell result carries no `derived` key. A computed figure's lineage flows through `model_document` formulas and `fms_persist_*` doors; the issued source rows a cell read still arrive as `sources`.
+
+### Fixed
+
+- `run_autonomous` no longer requires credential `auth_config["max_tokens"]`. The admitted skill limit owns `AgentRunner.max_tokens_override`; a missing admission or an undeclared limit leaves the override unset so `select_run_max_tokens` requests the bound model's registry ceiling.
+
 ## 0.29.1 (2026-10-23)
 
 ### Fixed

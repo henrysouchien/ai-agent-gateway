@@ -31,7 +31,6 @@ AUTONOMOUS_CLAIM_BROKER_FD_ENV = (
 )
 AUTONOMOUS_CLAIM_BROKER_PROTOCOL_VERSION = 3
 AUTONOMOUS_CLAIM_BROKER_MAX_FRAME_BYTES = 6 * 1024 * 1024
-AUTONOMOUS_CLAIM_BROKER_MAX_REQUESTS = 256
 AUTONOMOUS_CLAIM_BROKER_MAX_TTL_SECONDS = 600
 AUTONOMOUS_CLAIM_BROKER_IO_TIMEOUT_SECONDS = 5.0
 AUTONOMOUS_CLAIM_BROKER_MAX_IO_TIMEOUT_SECONDS = 60.0
@@ -91,6 +90,10 @@ def _canonical_json(value: object) -> bytes:
     ensure_ascii=False,
     allow_nan=False,
   ).encode("utf-8")
+
+
+def _reject_non_json_constant(value: str) -> Any:
+  raise ValueError(f"invalid JSON constant: {value}")
 
 
 def _io_timeout_seconds(value: object) -> float:
@@ -259,15 +262,25 @@ def _recv_frame(
     payload = json.loads(
       text,
       object_pairs_hook=_closed_object,
-      parse_constant=lambda value: (_ for _ in ()).throw(
-        ValueError(f"invalid JSON constant: {value}")
-      ),
+      parse_constant=_reject_non_json_constant,
     )
-  except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+  except (
+    UnicodeDecodeError,
+    TypeError,
+    ValueError,
+    json.JSONDecodeError,
+    RecursionError,
+  ) as exc:
     raise AutonomousClaimBrokerError(
       "autonomous claim broker frame is invalid JSON"
     ) from exc
-  if type(payload) is not dict or _canonical_json(payload) != raw:
+  try:
+    canonical = type(payload) is dict and _canonical_json(payload) == raw
+  except (TypeError, ValueError, RecursionError) as exc:
+    raise AutonomousClaimBrokerError(
+      "autonomous claim broker frame must be a canonical object"
+    ) from exc
+  if not canonical:
     raise AutonomousClaimBrokerError(
       "autonomous claim broker frame must be a canonical object"
     )
@@ -295,7 +308,7 @@ class _BrokerBinding:
 
 
 class AutonomousClaimBroker:
-  """Parent-owned, bounded signer for one admitted autonomous launch."""
+  """Parent-owned, time-bounded signer for one admitted autonomous launch."""
 
   __slots__ = (
     "_authority",
@@ -304,7 +317,7 @@ class AutonomousClaimBroker:
     "_closed",
     "_lock",
     "_last_wall_time",
-    "_max_requests",
+    "_claims_served",
     "_max_ttl_seconds",
     "_io_timeout_seconds",
     "_server_socket",
@@ -316,7 +329,6 @@ class AutonomousClaimBroker:
     authority: GatewayClaimSigningAuthority,
     envelope_json: str,
     *,
-    max_requests: int = AUTONOMOUS_CLAIM_BROKER_MAX_REQUESTS,
     max_ttl_seconds: int = (
       AUTONOMOUS_CLAIM_BROKER_MAX_TTL_SECONDS
     ),
@@ -327,16 +339,6 @@ class AutonomousClaimBroker:
     if type(authority) is not GatewayClaimSigningAuthority:
       raise TypeError(
         "autonomous claim broker requires exact signing authority"
-      )
-    if (
-      isinstance(max_requests, bool)
-      or not isinstance(max_requests, int)
-      or not 1
-      <= max_requests
-      <= AUTONOMOUS_CLAIM_BROKER_MAX_REQUESTS
-    ):
-      raise ValueError(
-        "autonomous claim broker max_requests is invalid"
       )
     if (
       isinstance(max_ttl_seconds, bool)
@@ -397,7 +399,7 @@ class AutonomousClaimBroker:
       )
       self._server_socket = server_socket
       self._child_socket = child_socket
-      self._max_requests = max_requests
+      self._claims_served = 0
       self._max_ttl_seconds = max_ttl_seconds
       self._io_timeout_seconds = normalized_io_timeout_seconds
       self._last_wall_time = initial_wall_time
@@ -423,6 +425,10 @@ class AutonomousClaimBroker:
   @property
   def envelope(self) -> AutonomousLaunchEnvelope:
     return self._binding.envelope
+
+  @property
+  def claims_served(self) -> int:
+    return self._claims_served
 
   def take_child_fd(self) -> int:
     with self._lock:
@@ -539,8 +545,7 @@ class AutonomousClaimBroker:
         },
         deadline=_io_deadline(self._io_timeout_seconds),
       )
-      request_count = 0
-      while request_count < self._max_requests:
+      while True:
         request = _recv_frame(
           self._server_socket,
           deadline=self._binding.monotonic_expires_at,
@@ -611,11 +616,7 @@ class AutonomousClaimBroker:
           },
           deadline=_io_deadline(self._io_timeout_seconds),
         )
-        request_count += 1
-      self._reject(
-        "request_limit_exhausted",
-        f"autonomous claim broker served its {self._max_requests} requests",
-      )
+        self._claims_served += 1
     except AutonomousClaimBrokerError as exc:
       self._reject("broker_rejected_request", _rejection_reason(exc))
     except LaunchNonceStoreError as exc:
@@ -938,7 +939,6 @@ __all__ = [
   "AUTONOMOUS_CLAIM_BROKER_MAX_FRAME_BYTES",
   "AUTONOMOUS_CLAIM_BROKER_IO_TIMEOUT_SECONDS",
   "AUTONOMOUS_CLAIM_BROKER_MAX_IO_TIMEOUT_SECONDS",
-  "AUTONOMOUS_CLAIM_BROKER_MAX_REQUESTS",
   "AUTONOMOUS_CLAIM_BROKER_MAX_TTL_SECONDS",
   "AUTONOMOUS_CLAIM_BROKER_PROTOCOL_VERSION",
   "AutonomousClaimBroker",

@@ -97,6 +97,7 @@ from .ttl_policy import (
 
 from .autonomous_runner_state import (
   AutonomousTask,
+  release_claim_broker,
   _fallback_identity_payload,
   _normalize_dispatch_scope,
   _normalize_identity_aliases,
@@ -1171,9 +1172,8 @@ class AutonomousRegistryStartMixin:
     try:
       await self._terminate_owned_process(record)
     finally:
-      if record is not None and record.claim_broker is not None:
-        record.claim_broker.close()
-        record.claim_broker = None
+      if record is not None:
+        release_claim_broker(record)
       if record is not None and record.event_channel is not None:
         record.event_channel.close()
       if record is not None and record.approval_channel is not None:

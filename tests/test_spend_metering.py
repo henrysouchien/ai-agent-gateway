@@ -706,17 +706,21 @@ def test_anthropic_rotation_material_stamps_the_class_of_the_member_it_names(
   record_kind: str, token: str, expected: tuple[str, str],
 ) -> None:
   from agent_gateway.providers.anthropic import _credential_material
+  from agent_gateway.providers.anthropic_oauth import AnthropicCredential, AnthropicOAuthRecord
 
-  selected = SimpleNamespace(
-    record=SimpleNamespace(credential_kind=record_kind),
+  selected = AnthropicCredential(
+    key="acct",
     token=token,
+    record=AnthropicOAuthRecord(
+      identity="acct",
+      access_token=token,
+      credential_kind=record_kind,
+    ),
     store_path=None,
     prepared=False,
-    source_metadata=lambda: {"account_identity": "acct"},
   )
 
-  material = _credential_material(selected, SEAT)  # type: ignore[arg-type]
-
+  material = _credential_material(selected, SEAT)
   assert (material["auth_mechanism"], material["entitlement_kind"]) == expected
 
 

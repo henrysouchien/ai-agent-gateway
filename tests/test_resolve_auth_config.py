@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 
+import json
 import sys
 from pathlib import Path
 
@@ -27,6 +28,10 @@ from model_authority.selection import project_fallback_chain
 def _clear_anthropic_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
   # Cooldowns live in the store's selection sidecar: keep it private to the test.
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "user-data"))
+  monkeypatch.setenv(
+    "GATEWAY_USER_KEYS",
+    json.dumps([{"slug": "operator", "risk_user_id": 1, "role": "owner"}]),
+  )
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKENS", raising=False)
   monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
   monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
@@ -117,42 +122,58 @@ def test_resolve_auth_config_binds_the_pool_token() -> None:
   monkeypatch = pytest.MonkeyPatch()
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
   try:
-    assert resolve_auth_config() == {
+    # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: this is the operator's run.
+    assert resolve_auth_config(user_scope=1) == {
       "auth_mode": "oauth",
       "api_key": "",
       "auth_token": "env-token",
+      "auth_user_scope": "1",
     }
   finally:
     monkeypatch.undo()
 
 
+def test_seat_serves_run_iff_owner_equals_run_owner_without_admission_stamp(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "owner-seat")
+  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: absent/non-owner scope admits no seat.
+  for scope in (None, 2):
+    config = resolve_auth_config() if scope is None else resolve_auth_config(user_scope=scope)
+    assert config["auth_mode"] == "api"
+    assert config["api_key"] == ""
+    assert config["auth_token"] == ""
+
+
 def test_resolve_auth_config_consults_pool_first_and_respects_parked_token() -> None:
   import json
   import time
-  from agent_gateway.providers.anthropic_oauth import resolve_anthropic_credentials
+  from agent_gateway.providers.anthropic_oauth import ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD, resolve_anthropic_credentials
   from agent_gateway.providers.anthropic_quota import Cooldown, record_cooldown
 
   monkeypatch = pytest.MonkeyPatch()
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-1")
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps(["token-1", "token-2"]))
   try:
-    # 1. Unblocked token-1 binds first
-    resolved_1 = resolve_auth_config()
+    # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: the owner binds the unblocked seat.
+    resolved_1 = resolve_auth_config(user_scope=1)
     assert resolved_1["auth_token"] == "token-1"
 
     # 2. Block token-1; pool selection chooses unblocked sibling token-2
-    parked = resolve_anthropic_credentials().by_token("token-1")
+    parked = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token("token-1")
     assert parked is not None
     record_cooldown(
       parked.sidecar_store_path, parked.locator,
       Cooldown(scope="shared", until=time.time() + 3600, reason="rate_limit"),
     )
-    resolved_2 = resolve_auth_config()
+    # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: the owner may select its sibling.
+    resolved_2 = resolve_auth_config(user_scope=1)
     assert resolved_2["auth_token"] == "token-2"
 
     # 3. Pool of one fallback when blocked: select binds it, avoiding upfront failure
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKENS")
-    resolved_3 = resolve_auth_config()
+    # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: the owner retains the solo seat.
+    resolved_3 = resolve_auth_config(user_scope=1)
     assert resolved_3["auth_token"] == "token-1"
   finally:
     monkeypatch.undo()
@@ -165,8 +186,9 @@ def test_resolve_auth_config_never_reads_env_auth_mode() -> None:
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
   monkeypatch.setenv("ANTHROPIC_AUTH_MODE", "api")
   try:
-    resolved = resolve_auth_config()
-    with_config = resolve_auth_config(auth_config={"api_key": "cfg-key"})
+    # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: mode inference uses the owner's seat.
+    resolved = resolve_auth_config(user_scope=1)
+    with_config = resolve_auth_config(auth_config={"api_key": "cfg-key"}, user_scope=1)
   finally:
     monkeypatch.undo()
 
@@ -339,6 +361,29 @@ def test_resolve_auth_config_openai_no_credentials_returns_minimal() -> None:
   assert "api_key" not in resolved
 
 
+def test_openai_env_auth_token_admitted_only_for_deployment_owner(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.delenv("HANK_USER_RUNTIME_CREDENTIALS_FILE", raising=False)
+  monkeypatch.setenv("OPENAI_AUTH_TOKEN", "openai-env-seat")
+  monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+  denied = resolve_auth_config(provider="openai", user_scope=13)
+  assert denied.get("auth_token", "") != "openai-env-seat"
+  assert "openai-env-seat" not in denied.values()
+
+  unscoped = resolve_auth_config(provider="openai")
+  assert unscoped.get("auth_token", "") != "openai-env-seat"
+  assert "openai-env-seat" not in unscoped.values()
+
+  owner = resolve_auth_config(provider="openai", user_scope=1)
+  assert owner == {
+    "auth_mode": "oauth",
+    "api_key": "",
+    "auth_token": "openai-env-seat",
+  }
+
+
 def test_resolve_auth_config_openai_whitespace_token_ignored() -> None:
   resolved = resolve_auth_config(
     provider="openai",
@@ -408,7 +453,8 @@ def test_resolve_auth_config_blank_args_fall_through_to_next_tier() -> None:
   monkeypatch = pytest.MonkeyPatch()
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
   try:
-    resolved = resolve_auth_config(api_key="   ", auth_token="")
+    # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: blank arguments bind the owner's seat.
+    resolved = resolve_auth_config(api_key="   ", auth_token="", user_scope=1)
   finally:
     monkeypatch.undo()
 
@@ -469,8 +515,9 @@ def test_resolve_provider_binds_anthropic_from_the_pool_only() -> None:
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
   monkeypatch.setenv("ANTHROPIC_AUTH_MODE", "api")
   try:
+    # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: this provider bind is the owner's run.
     _provider, _provider_name, config = _resolve_provider(
-      "anthropic", "claude-opus-5", None, None, None
+      "anthropic", "claude-opus-5", None, None, None, user_scope=1
     )
   finally:
     monkeypatch.undo()
@@ -603,11 +650,10 @@ def _placement(provider: str, route: str, kind: str, placement: str):
 
 
 def test_evaluate_placement_eligibility_rules() -> None:
-  for kind in ("consumer_subscription", "operator_personal_subscription"):
-    rejected = _placement("anthropic", "anthropic.public", kind, "hosted_external")
-    assert rejected.eligible is False
-    assert rejected.credential_principal is None
-    assert rejected.billing_mode is None
+  rejected = _placement("anthropic", "anthropic.public", "consumer_subscription", "hosted_external")
+  assert rejected.eligible is False
+  assert rejected.credential_principal is None
+  assert rejected.billing_mode is None
 
   for provider, route in _HOSTED_REJECTED_ROUTES:
     rejected = _placement(provider, route, "commercial_byok", "hosted_external")
@@ -619,11 +665,10 @@ def test_evaluate_placement_eligibility_rules() -> None:
   assert (hosted_byok.credential_principal, hosted_byok.billing_mode) == ("user", "byok")
   hosted_muse = _placement("muse", "muse.api", "commercial_byok", "hosted_external")
   assert (hosted_muse.credential_principal, hosted_muse.billing_mode) == ("user", "byok")
-  for kind in ("org_commercial", "platform_metered"):
+  for kind in ("org_commercial", "operator_personal_subscription", "platform_metered"):
     admitted = _placement("anthropic", "anthropic.public", kind, "hosted_external")
     assert admitted.eligible is True
     assert (admitted.credential_principal, admitted.billing_mode) == ("service", "metered")
-
   for kind in ("consumer_subscription", "commercial_byok"):
     admitted = _placement("muse", "muse.api", kind, "local")
     assert admitted.eligible is True
@@ -677,3 +722,51 @@ def test_fallback_chain_filtering_under_hosted_external() -> None:
 
   assert _STRIPPED_HOSTED_ROUTES <= projected_routes
   assert {"muse.api", "anthropic.public"} <= projected_routes
+
+
+def test_u9_build_mcp_env_expands_fmp_api_key_only_from_run_scoped_env_never_ambient_os_environ(
+  monkeypatch,
+) -> None:
+  from agent_gateway.mcp_client_config import McpEnvExpansionError, build_mcp_env
+
+  monkeypatch.setenv("FMP_API_KEY", "ambient-operator-fmp")
+  monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-operator-anthropic")
+  with pytest.raises(TypeError, match="environ"):
+    build_mcp_env({"FMP_API_KEY": "${FMP_API_KEY}"})  # pyright: ignore[reportCallIssue]  # negative: projection is required
+  with pytest.raises(McpEnvExpansionError, match="FMP_API_KEY"):
+    build_mcp_env({"FMP_API_KEY": "${FMP_API_KEY}"}, environ={})
+
+  env = build_mcp_env(
+    {"FMP_API_KEY": "${FMP_API_KEY}"}, environ={"FMP_API_KEY": "run-scoped-fmp"},
+  )
+  assert env["FMP_API_KEY"] == "run-scoped-fmp"
+  assert "ANTHROPIC_API_KEY" not in env
+
+  with pytest.raises(McpEnvExpansionError, match="ANTHROPIC_API_KEY"):
+    build_mcp_env(
+      {
+        "FMP_API_KEY": "${FMP_API_KEY}",
+        "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}",
+      },
+      environ={"FMP_API_KEY": "run-scoped-fmp"},
+    )
+
+
+def test_u9_get_anthropic_config_with_ambient_api_key_and_no_enrollment_withholds_from_non_gateway_consumers(
+  monkeypatch, tmp_path,
+) -> None:
+  from api import credentials
+  from agent_gateway.providers.anthropic_oauth import resolve_anthropic_credentials
+
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  monkeypatch.delenv("ANTHROPIC_AUTH_STORE_PATH", raising=False)
+  monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+  monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+  config = credentials.get_anthropic_config()
+  assert config["api_key"] == ""
+  assert config["auth_token"] == ""
+
+  monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-operator")
+  assert resolve_anthropic_credentials().tokens == ()
+  credentials.get_anthropic_config()
+  assert resolve_anthropic_credentials().tokens == ()

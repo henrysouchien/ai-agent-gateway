@@ -2,6 +2,7 @@ from __future__ import annotations
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -47,7 +48,6 @@ from agent_gateway.providers.base import truncate_to_last_compaction
 from agent_gateway.context_builder import SessionContextBuilder
 from agent_gateway.server_compaction import (
   CONTINUATION_NUDGE,
-  KEEP_ROUNDS,
   MIN_COMPACT_GAIN_TOKENS,
   MIN_SUMMARY_CHARS,
   PORTABLE_COMPACTION_ENV,
@@ -175,7 +175,7 @@ class _SummaryProvider(ModelProvider):
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name, context_window=200_000, max_output_tokens=4096, supports_thinking=True)
+    return ModelInfo(id=model, provider=self.name, context_window=200_000, max_output_tokens=8192, supports_thinking=True)
 
   def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
     _ = model_info
@@ -476,16 +476,16 @@ def _run_runner(
 
 
 def test_server_compaction_constants() -> None:
-  assert KEEP_ROUNDS == 0
   assert TAIL_TOKEN_BUDGET == 24_000
-  assert MIN_COMPACT_GAIN_TOKENS == 20_000
-  assert SUMMARY_MAX_TOKENS == 4_096
+  assert MIN_COMPACT_GAIN_TOKENS == 60_000
+  assert SUMMARY_MAX_TOKENS == 8_192
   assert RENDER_CHAR_BUDGET == 600_000
   assert MIN_SUMMARY_CHARS == 200
   assert PORTABLE_COMPACTION_ENV == "AGENT_GATEWAY_PORTABLE_COMPACTION"
 
 
-def test_server_compaction_split_tool_pairs() -> None:
+def test_server_compaction_split_tool_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(server_compaction, "MIN_COMPACT_GAIN_TOKENS", 1)
   messages = [
     {"role": "user", "content": "old"},
     {"role": "assistant", "content": [{"type": "tool_use", "id": "tool-old", "name": "lookup", "input": {}}]},
@@ -494,7 +494,8 @@ def test_server_compaction_split_tool_pairs() -> None:
     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool-tail", "content": "tail result"}]},
   ]
 
-  _to_summarize, tail = split_messages_for_compact(messages, keep_rounds=1)
+  tail_budget = server_compaction._estimate_messages(messages[3:])
+  _to_summarize, tail = split_messages_for_compact(messages, tail_token_budget=tail_budget)
 
   assert [message["role"] for message in tail] == ["assistant", "user"]
   assert tail[0]["content"][0]["id"] == "tool-tail"
@@ -601,7 +602,7 @@ def test_server_compaction_gain_guard() -> None:
   assert (should, reason) == (False, "failed_cooldown")
 
   should, reason = should_portable_compact(
-    est_total_tokens=191_000,
+    est_total_tokens=170_000 + MIN_COMPACT_GAIN_TOKENS + 1_000,
     est_summarize_tokens=100_000,
     trigger=160_000,
     native_compaction=False,
@@ -1355,8 +1356,11 @@ def test_server_compaction_render_fallback_prompt_omits_bulk_payloads() -> None:
   assert "Conversation transcript to compact" in prompt
 
 
-@pytest.mark.parametrize("keep_rounds,budget", [(0, 0), (1, 1), (20, 100_000)])
-def test_pending_batch_is_required_chronological_tail(keep_rounds: int, budget: int) -> None:
+@pytest.mark.parametrize("budget", [0, 1, 24_000, 100_000])
+def test_pending_batch_is_required_chronological_tail(budget: int) -> None:
+  """A pending `preserve_tool_result_ids` batch stays in the chronological tail at
+  every budget (0 and 1 included), and any `tool_result` within
+  `MODEL_TOOL_RESULT_MIN_CHARS` (`tool_result_compaction.py:17`) stays verbatim."""
   batch = [
     {"role": "assistant", "provider": "codex", "content": [
       {"type": "thinking", "thinking": "retain metadata", "signature": "opaque"},
@@ -1374,14 +1378,14 @@ def test_pending_batch_is_required_chronological_tail(keep_rounds: int, budget: 
   messages = [{"role": "user", "content": "older"}, *batch]
   pending = {"a"}
   prefix, tail = split_messages_for_compact(
-    messages, keep_rounds=keep_rounds, tail_token_budget=budget,
+    messages, tail_token_budget=budget,
     preserve_tool_result_ids=pending,
   )
   assert prefix + tail == messages
   assert tail[-len(batch):] == batch
   assert pending == {"a"}
   assert sum("UNDELIVERED_SENTINEL" in str(message) for message in tail) == 1
-  assert split_messages_for_compact(messages, keep_rounds=0) == (messages, [])
+  assert split_messages_for_compact(messages) == (messages, [])
 
 
 def test_pending_tail_supersedes_old_anchor_and_counts_tail_once(monkeypatch) -> None:
@@ -1403,7 +1407,9 @@ def test_pending_tail_supersedes_old_anchor_and_counts_tail_once(monkeypatch) ->
     capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
     trigger=1,
     est_total_tokens=overhead + server_compaction._estimate_messages(messages),
+    est_static_floor_tokens=overhead,
     preserve_tool_result_ids={"a"},
+    force=True,
   ))
   assert result.applied
   assert result.est_after == overhead + server_compaction._estimate_messages(result.messages)
@@ -1414,6 +1420,29 @@ def test_pending_tail_supersedes_old_anchor_and_counts_tail_once(monkeypatch) ->
   )
   assert "obsolete anchor" not in str(normalized)
   assert "UNDELIVERED_SENTINEL" in str(normalized)
+
+
+@pytest.mark.parametrize("budget", [0, 1, 24_000])
+def test_pending_batch_beyond_tail_budget_compacts_oversized_tool_result_in_place(
+  budget: int,
+) -> None:
+  """Governing design: `docs/design/harness-context-and-kernel-pass-through-2026-10-24.md:249`
+  (§4 Slice 4 Invariant 2) — `TAIL_TOKEN_BUDGET = 24_000` bounds the preserved
+  `preserve_tool_result_ids` suffix, compacting any oversized preserved tool
+  result block in place before splitting (floored at `MODEL_TOOL_RESULT_MIN_CHARS`
+  from `tool_result_compaction.py:17` when `budget` is 0 or 1)."""
+  messages = [
+    {"role": "user", "content": "older"},
+    {"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "lookup", "input": {}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "x" * 120_000}]},
+  ]
+  prefix, tail = split_messages_for_compact(
+    messages, tail_token_budget=budget, preserve_tool_result_ids={"a"},
+  )
+  assert prefix == [{"role": "user", "content": "older"}]
+  assert len(tail) == 2
+  assert tail[1]["content"][0]["tool_use_id"] == "a"
+  assert server_compaction._estimate_messages(tail) <= max(2_000, budget)
 
 
 @pytest.mark.parametrize("session_id", ["sess-0123456789abcdef-full-session-id", None])
@@ -1991,10 +2020,78 @@ def test_summary_too_short_holds_the_next_turns_back_until_the_estimate_grows(
 def test_should_portable_compact_gates_on_last_compact_failed_turn() -> None:
   should_compact, reason = server_compaction.should_portable_compact(
     est_total_tokens=200_000,
-    est_summarize_tokens=50_000,
+    est_summarize_tokens=80_000,
     trigger=100_000,
     native_compaction=False,
     turn_count=4,
     last_compact_failed_turn=4,
   )
   assert (should_compact, reason) == (False, "failed_cooldown")
+
+
+def test_summarize_messages_injects_deterministic_state_map_when_tool_state_present() -> None:
+  assert "<analysis>" not in server_compaction.DEFAULT_SERVER_COMPACTION_INSTRUCTIONS
+  messages = [
+    {"role": "user", "content": "Build me a model for PAYC."},
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "call_1",
+          "name": "model_document",
+          "input": {
+            "research_file_id": 42,
+            "revision": "rev-7",
+            "item_id": "rev_line",
+            "ops": [{"item_id": "cogs_line"}, {"item_id": "rev_line"}],
+          },
+        },
+        {
+          "type": "tool_use",
+          "id": "call_2",
+          "name": "code_execute",
+          "input": {"code": "df = pd.read_csv('a.csv')\nrows = []\nstats = {'n': 1}\nvalue = compute(df)\n"},
+        },
+        {"type": "tool_use", "id": "call_3", "name": "check_model", "input": {}},
+      ],
+    },
+    {
+      "role": "user",
+      "content": [
+        {"type": "tool_result", "tool_use_id": "call_1", "content": json.dumps({"item_ids": ["margin_line"]})},
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_2",
+          "content": json.dumps({
+            "kernel_locals": {
+              "df": "DataFrame[3,4](a,b,c,d)",
+              "rows": "list[2]",
+              "stats": "dict[1](n)",
+            }
+          }),
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_3",
+          "content": json.dumps({
+            "root_causes": [{"root_item_id": "revenue", "period": 2025, "reason": "source_value_unavailable"}],
+            "validation": {"findings": [{"check_id": "cash_tie"}, {"code": "BS_IMBALANCE"}]},
+          }),
+        },
+      ],
+    },
+  ]
+  summary, _usage = _run(
+    summarize_messages(
+      messages,
+      None,
+      capability_execution=stub_bound_capability_execution(
+        provider=_SummaryProvider(), model="model", effort="high",
+      ),
+    )
+  )
+  assert "[STATE MAP] research_file_id=42 | model_document_revision=rev-7" in summary
+  assert "inspected_items=[cogs_line, rev_line, margin_line]" in summary
+  assert "open_root_causes=[revenue:source_value_unavailable, cash_tie, BS_IMBALANCE]" in summary
+  assert "kernel_locals=[df:DataFrame[3,4](a,b,c,d), rows:list[2], stats:dict[1](n)]" in summary

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 import logging
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Literal, Mapping, Sequence, cast
@@ -59,9 +59,10 @@ SUBSCRIPTION_ENTITLEMENT_KINDS: frozenset[str] = frozenset({
   "consumer_subscription",
   "operator_personal_subscription",
 })
-HOSTED_REJECTED_ENTITLEMENT_KINDS: frozenset[str] = SUBSCRIPTION_ENTITLEMENT_KINDS | {
+HOSTED_REJECTED_ENTITLEMENT_KINDS: frozenset[str] = frozenset({
+  "consumer_subscription",
   "local_unauthenticated",
-}
+})
 # Channels whose requests run on hosted infrastructure for external users.
 # Hosted key-channel egress is hosted_external by construction
 # (`api/runtime_egress.py`), not by channel.
@@ -187,7 +188,7 @@ def evaluate_placement_eligibility(
       )
     if norm_kind == "commercial_byok":
       return PlacementEligibility(True, "user", "byok", None)
-    if norm_kind in {"org_commercial", "platform_metered"}:
+    if norm_kind in {"org_commercial", "operator_personal_subscription", "platform_metered"}:
       return PlacementEligibility(True, "service", "metered", None)
     return PlacementEligibility(False, None, None, f"unsupported_entitlement_kind:{norm_kind}")
   if norm_kind in {"commercial_byok", "consumer_subscription"}:
@@ -288,6 +289,19 @@ class AuthConfig:
   def to_dict(self) -> dict[str, Any]:
     return dict(self._raw)
 
+
+PUBLIC_AUTH_CONFIG_FIELDS: frozenset[str] = frozenset(
+  f.name for f in fields(AuthConfig) if not f.name.startswith("_")
+) | frozenset({
+  "auth_mode",
+  "base_url",
+  "baseURL",
+  "compat",
+  "integration_id",
+  "ownership",
+  "placement",
+  "rate_table_version",
+})
 
 @dataclass
 class ResolverResult:

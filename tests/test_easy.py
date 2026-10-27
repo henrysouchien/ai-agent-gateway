@@ -1027,8 +1027,13 @@ def test_resolve_provider_codex_auth_config_with_oauth() -> None:
 
 
 def test_create_agent_blank_auth_token_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
+  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: this standalone bind is the operator's own run.
+  monkeypatch.setenv(
+    "GATEWAY_USER_KEYS",
+    json.dumps([{"slug": "operator", "risk_user_id": 1, "role": "owner"}]),
+  )
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
-  app = create_agent("test", auth_token="   ")
+  app = create_agent("test", auth_token="   ", user_scope=1)
   assert _service_auth_config(app)["auth_mode"] == "oauth"
   assert _service_auth_config(app)["auth_token"] == "env-token"
 

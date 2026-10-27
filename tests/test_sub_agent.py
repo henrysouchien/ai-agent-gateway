@@ -4129,6 +4129,7 @@ def test_child_run_context_inherits_the_calling_run_profile() -> None:
       tool_name="run_agent",
       event_log=None,
       profile="community",
+      profile_name="community",
     ),
     skill_run_id="skill-run-1",
     skill_name="risk-review",
@@ -4140,6 +4141,7 @@ def test_child_run_context_inherits_the_calling_run_profile() -> None:
   )
 
   assert run_context.profile == "community"
+  assert run_context.profile_name == "community"
   assert run_context.skill == "risk-review"
 
 
@@ -4195,7 +4197,7 @@ class _KernelChildProvider(ModelProvider):
         else "print(child_token)\nprint(os.getpid())"
       )
       call_id = f"kernel-cell-{self.turn}"
-      tool_input = {"code": code, "host": "kernel"}
+      tool_input = {"code": code}
       tool_name = "code_execute"
       yield StreamEvent(
         type="tool_use_start", tool_id=call_id, tool_name=tool_name,
@@ -4322,12 +4324,7 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
       channel="cli",
     )
     bind_session_approval_route(parent_session, None, None)
-    config = CodeExecutionConfig(
-      register_docker=False,
-      register_subprocess=False,
-      register_kernel=True,
-      work_dir_root=str(tmp_path),
-    )
+    config = CodeExecutionConfig(work_dir_root=str(tmp_path))
     parent_bundle = build_code_execution(parent_session, config=config)
     mcp_client = McpClientManager(config_path=None)
     child_sessions: list[GatewaySession] = []
@@ -4433,7 +4430,7 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
       initial, error = await parent_dispatcher.dispatch(
         "parent-seed",
         "code_execute",
-        {"code": "parent_token = 'parent-local'\nimport os\nprint(os.getpid())", "host": "kernel"},
+        {"code": "parent_token = 'parent-local'\nimport os\nprint(os.getpid())"},
       )
       assert error is None and initial is not None
       parent_pid = int(initial["stdout"].strip())
@@ -4619,7 +4616,7 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
       alive, alive_error = await parent_dispatcher.dispatch(
         "parent-after-child",
         "code_execute",
-        {"code": "print(parent_token)\nprint('child_token' in globals())\nprint(os.getpid())", "host": "kernel"},
+        {"code": "print(parent_token)\nprint('child_token' in globals())\nprint(os.getpid())"},
       )
       assert alive_error is None and alive is not None
       assert alive["stdout"] == f"parent-local\nFalse\n{parent_pid}\n"
@@ -4645,7 +4642,7 @@ class _BackgroundCellChildProvider(_KernelChildProvider):
           if result not in self.results:
             self.results.append(result)
     if self.turn == 1:
-      tool_input = {"code": "print('child-job')", "background": True, "host": "subprocess"}
+      tool_input = {"code": "print('child-job')", "background": True}
       yield StreamEvent(type="tool_use_start", tool_id="bg-cell-1", tool_name="code_execute")
       yield StreamEvent(
         type="tool_use_end", tool_id="bg-cell-1", tool_name="code_execute", tool_input=tool_input,
@@ -4667,7 +4664,7 @@ def test_child_background_cell_is_a_code_job_on_the_child_registry(tmp_path: Pat
       role="owner", tenant_id="tenant-test", channel="cli",
     )
     bind_session_approval_route(parent_session, None, None)
-    config = CodeExecutionConfig(register_docker=False, register_kernel=False, work_dir_root=str(tmp_path))
+    config = CodeExecutionConfig(work_dir_root=str(tmp_path))
     parent_bundle = build_code_execution(parent_session, config=config)
     mcp_client = McpClientManager(config_path=None)
     provider = _BackgroundCellChildProvider("success", lambda: None)

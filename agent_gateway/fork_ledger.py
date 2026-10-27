@@ -333,7 +333,7 @@ class AdmissionReservation:
 def _required_text(value: object, *, field_name: str) -> str:
   if not isinstance(value, str):
     raise TypeError(f"{field_name} must be text")
-  if not value or value != value.strip() or len(value) > _MAX_TEXT_LENGTH:
+  if not value or "\x00" in value or value != value.strip() or len(value) > _MAX_TEXT_LENGTH:
     raise ValueError(f"{field_name} must be canonical non-empty text")
   return value
 

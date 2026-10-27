@@ -3,11 +3,20 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
+import secrets
 import threading
 import weakref
-from typing import Any, Mapping, NamedTuple, Protocol
+from typing import Any, Callable, Generator, Literal, Mapping, NamedTuple, Protocol, overload
+
+import httpx2
+from hank_contracts.agent_api import (
+  AGENT_API_CLAIM_ENV_VARS,
+  AGENT_API_CLAIM_HEADERS,
+)
 
 from .autonomous_runner_claims import get_agent_api_claim_ttl_seconds, sign_user_claim
+from .runtime_placement import _storage_id
 from .ttl_policy import AGENT_API_CLAIM_TTL, TtlResolver, resolve_ttl_seconds
 
 
@@ -18,9 +27,42 @@ GATEWAY_CLAIM_SIGNING_AUTHORITY_FD_V1 = "fd-v1"
 LEGACY_CLAIM_HMAC_KEY_ENV = "AGENT_API_USER_CLAIM_HMAC_KEY"
 CLAIM_SIGNING_KEY_MIN_BYTES = 32
 CLAIM_SIGNING_KEY_MAX_BYTES = 4096
+NATIVE_PRODUCER_SIGNATURE_HEADER = "X-Agent-Code-Producer-Signature"
+
+# The local multi-user gateway lists tools without selecting a user's data.
+# The reserved .invalid address cannot name a Risk user for tools/call.
+# Placed runtimes and one-user runs instead list as their bound user.
+MCP_CATALOG_PRINCIPAL = ("mcp-catalog", "mcp-catalog@hank.invalid")
 
 _configured_authority: GatewayClaimSigningAuthority | None = None
 _configured_authority_lock = threading.Lock()
+
+
+_NATIVE_RISK_REQUEST_DOMAIN = b"hank/native-risk-cell/v1\0"
+_NATIVE_CELL_TOKEN_DOMAIN = b"hank/native-cell-token/v2\0"
+_NATIVE_CELL_TOKEN_NONCE_BYTES = 32
+_NATIVE_CELL_TOKEN_PATTERN = re.compile(
+  r"v2_([0-9]+)_([0-9a-f]{64})_([0-9a-f]{64})", re.ASCII,
+)
+
+
+def _parse_native_cell_token(token: str) -> tuple[str, str, str] | None:
+  """The one v2 token shape; the storage segment is `_storage_id`'s to judge."""
+  match = _NATIVE_CELL_TOKEN_PATTERN.fullmatch(token)
+  if match is None:
+    return None
+  storage, nonce, mac = match.groups()
+  try:
+    _storage_id(storage)
+  except ValueError:
+    return None
+  return storage, nonce, mac
+
+
+def native_cell_token_storage(token: str) -> str | None:
+  """Parse the one v2 grammar without a key; None when `token` is not v2."""
+  parsed = _parse_native_cell_token(token)
+  return None if parsed is None else parsed[0]
 
 
 def _canonical_secret(secret: bytes | str) -> str:
@@ -215,16 +257,53 @@ class GatewayClaimSigningAuthority:
       now=now,
     )
 
+  def _native_mac(self, domain: bytes, *parts: bytes) -> bytes:
+    mac = hmac.new(self.__secret.encode("utf-8"), digestmod=hashlib.sha256)
+    mac.update(domain)
+    for part in parts:
+      mac.update(part)
+    return mac.digest()
+
+  def sign_native_risk_request(self, body: bytes) -> str:
+    """Sign a producer callback body without exposing holder key material."""
+    return self._native_mac(_NATIVE_RISK_REQUEST_DOMAIN, body).hex()
+
   def verify_native_risk_request(self, body: bytes, signature: str) -> bool:
     """Authenticate the producer callback without exposing holder key material."""
     try:
       supplied = bytes.fromhex(signature)
     except ValueError:
       return False
-    mac = hmac.new(self.__secret.encode("utf-8"), digestmod=hashlib.sha256)
-    mac.update(b"hank/native-risk-cell/v1\0")
-    mac.update(body)
-    return hmac.compare_digest(mac.digest(), supplied)
+    return hmac.compare_digest(
+      self._native_mac(_NATIVE_RISK_REQUEST_DOMAIN, body), supplied,
+    )
+
+  def _native_cell_token_mac(self, storage: str, nonce: str) -> str:
+    return self._native_mac(
+      _NATIVE_CELL_TOKEN_DOMAIN,
+      storage.encode("ascii"), b"\0", nonce.encode("ascii"),
+    ).hex()
+
+  def mint_native_cell_token(self, storage_id: str) -> str:
+    """Mint a key-bound cell token; the cell registry owns its liveness."""
+    nonce = secrets.token_hex(_NATIVE_CELL_TOKEN_NONCE_BYTES)
+    token = f"v2_{storage_id}_{nonce}_{self._native_cell_token_mac(storage_id, nonce)}"
+    if native_cell_token_storage(token) != storage_id:
+      raise ValueError("native cell token storage must be a canonical positive numeric identity")
+    return token
+
+  def verify_native_cell_token(self, token: str) -> str | None:
+    """Return the token's storage id when it carries this key's MAC."""
+    parsed = _parse_native_cell_token(token)
+    if parsed is None:
+      return None
+    storage, nonce, supplied = parsed
+    if not hmac.compare_digest(
+      self._native_cell_token_mac(storage, nonce).encode("ascii"),
+      supplied.encode("ascii"),
+    ):
+      return None
+    return storage
 
 
 class _GatewayUserClaimBinding(NamedTuple):
@@ -339,6 +418,36 @@ def sign_gateway_user_claim(
   )
 
 
+def agent_api_claim_http_headers(
+  claim: Mapping[str, str],
+) -> dict[str, str]:
+  """The seven `X-Agent-Claim-*` request headers of one signed claim."""
+
+  return {
+    AGENT_API_CLAIM_HEADERS[field]: claim[AGENT_API_CLAIM_ENV_VARS[field]]
+    for field in AGENT_API_CLAIM_HEADERS
+  }
+
+
+class UserClaimHttpAuth(httpx2.Auth):
+  """Signs every request of one connection with a fresh user claim.
+
+  A claim's lifetime is short by design, so one set of headers fixed at
+  connect time would expire under a long-lived connection. `mint_claim`
+  returns a newly signed claim (env-named fields, as the signers produce)
+  for the one user the connection is bound to.
+  """
+
+  def __init__(self, mint_claim: Callable[[], Mapping[str, str]]) -> None:
+    self._mint_claim = mint_claim
+
+  def auth_flow(
+    self, request: httpx2.Request,
+  ) -> Generator[httpx2.Request, httpx2.Response, None]:
+    request.headers.update(agent_api_claim_http_headers(self._mint_claim()))
+    yield request
+
+
 class UserClaimSigner(Protocol):
   """Identity-bound signer marker used by shared runtime plumbing."""
 
@@ -397,6 +506,20 @@ def install_gateway_claim_signing_authority(
     _configured_authority = authority
 
 
+@overload
+def configured_gateway_claim_signing_authority(
+  *,
+  required: Literal[True],
+) -> GatewayClaimSigningAuthority: ...
+
+
+@overload
+def configured_gateway_claim_signing_authority(
+  *,
+  required: bool = False,
+) -> GatewayClaimSigningAuthority | None: ...
+
+
 def configured_gateway_claim_signing_authority(
   *,
   required: bool = False,
@@ -417,8 +540,12 @@ __all__ = [
   "GATEWAY_CLAIM_SIGNING_AUTHORITY_FD_V1",
   "GatewayClaimSigningAuthority",
   "GatewayUserClaimSigner",
+  "UserClaimHttpAuth",
   "UserClaimSigner",
   "LEGACY_CLAIM_HMAC_KEY_ENV",
+  "MCP_CATALOG_PRINCIPAL",
+  "agent_api_claim_http_headers",
+  "NATIVE_PRODUCER_SIGNATURE_HEADER",
   "configured_gateway_claim_signing_authority",
   "gateway_user_claim_signer_identity",
   "install_gateway_claim_signing_authority",

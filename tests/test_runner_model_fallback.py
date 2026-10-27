@@ -35,6 +35,7 @@ from agent_gateway.providers import StreamEvent
 from hank_contracts.commercial_work import WorkStartSpendLedger
 from agent_gateway.providers.anthropic_oauth import (
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
+  ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
   resolve_anthropic_credentials,
 )
 from agent_gateway.providers.anthropic_quota import Cooldown, record_cooldown
@@ -334,7 +335,7 @@ def _resolver(
     for provider in providers_with_credentials
   }
   material = {
-    "anthropic": {"auth_mode": "oauth", "auth_token": _TOKEN_A, "provider": "anthropic"},
+    "anthropic": {"auth_mode": "oauth", "auth_token": _TOKEN_A, "provider": "anthropic", ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True},
     "codex": {"auth_mode": "api", "api_key": _CODEX_KEY, "provider": "codex"},
     "openai": {"auth_mode": "api", "api_key": _OPENAI_KEY, "provider": "openai"},
     "xai": {"auth_mode": "api", "api_key": _GROK_KEY, "provider": "xai"},
@@ -454,7 +455,7 @@ def _isolated_anthropic_accounts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 
 
 def _park(token: str, *, until: float) -> None:
-  member = resolve_anthropic_credentials().by_token(token)
+  member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(token)
   assert member is not None
   record_cooldown(
     member.sidecar_store_path, member.locator,
@@ -995,7 +996,7 @@ def test_entry_binds_the_account_whose_block_window_has_ended() -> None:
   assert hop["to"]["model_key"] == SONNET
   assert hop["skipped"] == []
   assert world.calls[-1] == ("anthropic", "claude-sonnet-test", _TOKEN_B)
-  member_b = resolve_anthropic_credentials().by_token(_TOKEN_B)
+  member_b = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(_TOKEN_B)
   assert member_b is not None
   live = turn.runner.capability_execution
   assert live.bind.model_key == SONNET

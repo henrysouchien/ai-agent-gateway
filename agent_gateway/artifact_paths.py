@@ -50,8 +50,14 @@ _TICKER_RE = re.compile(r"^[A-Z]{1,6}$")
 # Hyphens stay excluded so preferred lines (EFC-PC, PPL-PA) keep failing per
 # the non-common-equity policy above.
 _EXTENDED_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.]{0,14}$")
-_SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+# Component length cap (128 chars) is owned by the artifact-store and skill-catalog
+# contracts (api/agent/shared/canvas_artifact_store.py:19,
+# api/agent/shared/document_artifact_erase.py:25, api/agent/skills/catalog.py:737-738)
+# so `<id>.payload.json` / `<id>.docx` stays within the 255-byte POSIX NAME_MAX limit.
+MAX_ARTIFACT_COMPONENT_LENGTH = 128
+MAX_ARTIFACT_FILENAME_LENGTH = MAX_ARTIFACT_COMPONENT_LENGTH + len(".payload.json")
+_SKILL_NAME_RE = re.compile(r"^(?=.{1,128}$)[a-z0-9]+(?:-[a-z0-9]+)*$")
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 ISSUE_INBOX_DB_ENV = "AGENT_ISSUE_INBOX_DB_PATH"
 _ISSUE_INBOX_STORE_DIRECTORY = ("gateway", "issue-inbox")
 _ISSUE_INBOX_DB_FILENAME = "issue-inbox.sqlite3"
@@ -466,7 +472,8 @@ def _validate_artifact_id(artifact_id: str) -> str:
 
 def _validate_path_component(value: str, label: str) -> str:
   decoded = _decode_path_component(value).strip()
-  if not decoded:
+  max_len = MAX_ARTIFACT_FILENAME_LENGTH if label == "path" else MAX_ARTIFACT_COMPONENT_LENGTH
+  if not decoded or len(decoded) > max_len:
     raise ArtifactPathError(f"invalid {label} path component")
   if ".." in decoded or "/" in decoded or "\\" in decoded:
     raise ArtifactPathError(f"invalid {label} path component")

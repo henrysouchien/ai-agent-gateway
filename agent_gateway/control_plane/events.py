@@ -37,7 +37,7 @@ def _require_bearer_session(request: Request, auth: AuthManager) -> GatewaySessi
 
 
 def _sse_data(event: dict[str, Any]) -> bytes:
-  return f"data: {json.dumps(event, sort_keys=True, default=str)}\n\n".encode("utf-8")
+  return f"data: {json.dumps(event, sort_keys=True, default=str, allow_nan=False)}\n\n".encode("utf-8")
 
 
 def _sse_keepalive() -> bytes:
@@ -105,14 +105,36 @@ async def _projected_control_event_chunks(
   next_keepalive_at = time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
   next_entry_task: asyncio.Future[Any] | None = None
 
+  def encode_envelope(envelope: dict[str, Any]) -> bytes:
+    try:
+      return _sse_data(envelope)
+    except Exception as exc:
+      error_text = str(exc)
+      log.warning(
+        "SSE serialization failed: %s",
+        error_text,
+        exc_info=exc,
+      )
+      error_event = adapt_control_event(
+        {
+          "type": "stream_error",
+          "error": f"SSE serialization failed: {error_text}",
+        },
+        DEFAULT_SCHEMA_VERSION,
+      )
+      return _sse_data({
+        "run_id": envelope.get("run_id"),
+        "seq": envelope.get("seq"),
+        "event": error_event,
+      })
+
   async def flush_pending() -> bytes | None:
     nonlocal pending
     if pending is None:
       return None
     envelope = pending
     pending = None
-    return _sse_data(envelope)
-
+    return encode_envelope(envelope)
   try:
     while True:
       now = time.monotonic()
@@ -236,7 +258,7 @@ async def _projected_control_event_chunks(
       next_keepalive_at = (
         time.monotonic() + _PROJECTED_KEEPALIVE_SECONDS
       )
-      yield _sse_data(envelope)
+      yield encode_envelope(envelope)
   finally:
     if next_entry_task is not None:
       next_entry_task.cancel()

@@ -277,10 +277,15 @@ pipeline stage or turn opened that generation. Exiting a scope outside the task
 that entered it also leaves the scope entered for good.
 
 A server marked `per_user` in its config entry serves definitions only; calls
-route to a child keyed by `(server, user)` that `McpClientManager` spawns on
-first dispatch. Each such child also gets a per-user host task that owns its
-lifecycle: it hands the connected state to the caller, keeps the child until it
-is retired, and then closes it.
+route to a connection keyed by `(server, user)` that `McpClientManager` opens
+on first dispatch. A per-user streamable-HTTP entry — the six Risk servers on
+the interactive gateway (local and production) and the hosted runtime — is not
+a spawned process: each request carries a fresh signed user claim
+(`UserClaimHttpAuth` in `claim_signing_authority.py`; Risk
+`mcp_user_endpoint.py` refuses internal-only tools on that surface for every
+role). A per-user stdio entry is a spawned child. Either way, a per-user host
+task owns the lifecycle: it hands the connected state to the caller, keeps the
+connection until it is retired, and then closes it.
 
 A child is retired by the periodic idle reaper, by a replacement (forced
 refresh, near broker expiry, changed credential binding, dead transport), by

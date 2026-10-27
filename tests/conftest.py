@@ -25,6 +25,8 @@ def _isolated_gateway_state(monkeypatch, tmp_path_factory):
   monkeypatch.setenv("HANK_SPEND_LEDGER_PATH", str(state / "spend" / "api_spend.sqlite"))
   monkeypatch.setenv("HANK_SPEND_SETTINGS_PATH", str(state / "spend-settings.json"))
   monkeypatch.setenv("HANK_RUN_SETTINGS_PATH", str(state / "run-settings.json"))
+  monkeypatch.setenv("HANK_KEY_POOL_DIR", str(state / "credentials"))
+  monkeypatch.setenv("HANK_KEY_POOL_STATE_DIR", str(state / "credentials"))
 
 
 @pytest.fixture(autouse=True)

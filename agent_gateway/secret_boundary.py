@@ -6,8 +6,10 @@ import logging
 import re
 from typing import Any
 
+from .auth import PUBLIC_AUTH_CONFIG_FIELDS
 from .capability_execution import BoundCapabilityExecution
-from .providers.anthropic_oauth import ANTHROPIC_USER_SCOPE_FIELD
+from .providers.anthropic_oauth import ANTHROPIC_PUBLIC_AUTH_CONFIG_FIELDS
+from .providers.credential_pool import POOL_PUBLIC_AUTH_CONFIG_FIELDS
 from .ui_blocks_metrics import record as record_package_counter
 
 
@@ -16,27 +18,15 @@ SANITIZATION_FAILED = "<secret-sanitization-failed>"
 UNSUPPORTED_VALUE = "<unsupported-boundary-value>"
 
 # Redaction fails closed: every string value in an auth_config registers as
-# secret material unless its key is a provably non-secret selection/config
-# field. A provider adding a new credential key is redacted by default instead
-# of silently escaping the boundary. These key names mirror the auth_config
-# reads in providers/*, capability_execution.py, model_authority's binding.py,
-# runner_auth.py, and easy.py.
-_NON_SECRET_AUTH_CONFIG_FIELDS = frozenset({
-  "auth_mode",
-  "auth_store_path",
-  "base_url",
-  "baseURL",
-  "billing_mode",
-  "compat",
-  "max_tokens",
-  "provider",
-  "rate_table_version",
-  "token_expires_at",
-  # The user identity whose credential pool this material came from, named by
-  # the credential owner itself (providers/anthropic_oauth.py) rather than
-  # re-spelled here.
-  ANTHROPIC_USER_SCOPE_FIELD,
-})
+# secret material unless its key is in the public field set declared by the
+# credential contract owners (auth.py, providers/anthropic_oauth.py, and
+# providers/credential_pool.py). A provider adding a new credential key is
+# redacted by default instead of silently escaping the boundary.
+_NON_SECRET_AUTH_CONFIG_FIELDS: frozenset[str] = (
+  PUBLIC_AUTH_CONFIG_FIELDS
+  | ANTHROPIC_PUBLIC_AUTH_CONFIG_FIELDS
+  | POOL_PUBLIC_AUTH_CONFIG_FIELDS
+)
 _MIN_SUBSTRING_SECRET_LENGTH = 8
 # Depth is a stack bound, not a coverage budget: nothing walked here is larger
 # than what the model itself wrote, so an over-deep subtree is dropped where it

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import gc
 import hashlib
@@ -9,7 +10,9 @@ from pathlib import Path
 import threading
 from typing import cast
 
+import httpx2
 import pytest
+from hank_contracts.agent_api import AGENT_API_CLAIM_HEADERS
 
 from agent_gateway import claim_signing_authority as authority_module
 from agent_gateway.autonomous_runner_claims import get_agent_api_claim_ttl_seconds
@@ -18,6 +21,7 @@ from agent_gateway.claim_signing_authority import (
   GATEWAY_CLAIM_SIGNING_AUTHORITY_FD_V1,
   GatewayClaimSigningAuthority,
   GatewayUserClaimSigner,
+  UserClaimHttpAuth,
   LEGACY_CLAIM_HMAC_KEY_ENV,
   configured_gateway_claim_signing_authority,
   gateway_user_claim_signer_identity,
@@ -48,6 +52,73 @@ def test_native_producer_body_mac_binds_domain_key_and_exact_request() -> None:
   ).hexdigest()
   assert not authority.verify_native_risk_request(body, other_key)
   assert not authority.verify_native_risk_request(body, "not-hex")
+
+
+def test_sign_native_risk_request_is_the_exact_domain_hmac_verify_accepts() -> None:
+  authority = GatewayClaimSigningAuthority(_SECRET)
+  body = b'{"action":"catalog","cell_token":"opaque"}'
+  expected = hmac.new(
+    _SECRET, b"hank/native-risk-cell/v1\0" + body, hashlib.sha256,
+  ).hexdigest()
+  assert authority.sign_native_risk_request(body) == expected
+  assert authority.verify_native_risk_request(body, authority.sign_native_risk_request(body))
+  assert authority.sign_native_risk_request(body + b" ") != expected
+  assert GatewayClaimSigningAuthority(
+    b"another-producer-key-at-least-32-bytes!!",
+  ).sign_native_risk_request(body) != expected
+
+
+_NONCE = "ab" * 32
+
+
+def _v2_token(storage: str, nonce: str, key: bytes = _SECRET) -> str:
+  mac = hmac.new(
+    key, b"hank/native-cell-token/v2\0" + storage.encode() + b"\0" + nonce.encode(),
+    hashlib.sha256,
+  ).hexdigest()
+  return f"v2_{storage}_{nonce}_{mac}"
+
+
+def test_native_cell_token_binds_grammar_storage_nonce_and_key() -> None:
+  authority = GatewayClaimSigningAuthority(_SECRET)
+  token = authority.mint_native_cell_token("42")
+  assert authority_module.native_cell_token_storage(token) == "42"
+  assert authority.verify_native_cell_token(token) == "42"
+  assert authority.mint_native_cell_token("42") != token
+  assert authority.verify_native_cell_token(_v2_token("42", _NONCE)) == "42"
+
+  _, _, nonce, mac = token.split("_")
+  other = GatewayClaimSigningAuthority(b"another-producer-key-at-least-32-bytes!!")
+  assert other.verify_native_cell_token(token) is None
+  assert authority_module.native_cell_token_storage(token) == "42"  # parser is key-free
+  assert authority.verify_native_cell_token(f"v2_43_{nonce}_{mac}") is None
+  assert authority.verify_native_cell_token(f"v2_42_{'cd' * 32}_{mac}") is None
+  assert authority.verify_native_cell_token(f"v2_42_{nonce}_{'0' * 64}") is None
+
+
+@pytest.mark.parametrize("storage", ["0", "042", "-1", "+1", "4.2", "4_2", "", "٤٢", "４２"])
+def test_native_cell_token_rejects_noncanonical_storage(storage: str) -> None:
+  authority = GatewayClaimSigningAuthority(_SECRET)
+  with pytest.raises(ValueError):
+    authority.mint_native_cell_token(storage)
+  forged = f"v2_{storage}_{_NONCE}_{'0' * 64}"
+  assert authority_module.native_cell_token_storage(forged) is None
+  assert authority.verify_native_cell_token(forged) is None
+
+
+@pytest.mark.parametrize("shape", [
+  "", "opaque", "v1_42_{n}_{m}", "V2_42_{n}_{m}", "v2_42_{n}", "v2_42_{n}_{m}_extra",
+  "v2_42_{n}_{m}\n", " v2_42_{n}_{m}", "v2.42.{n}.{m}", "v2_42_{n}.1700000000_{m}",
+  "v2_42_{nu}_{m}", "v2_42_{n63}_{m}", "v2_42_{n}_{mu}", "v2_42_{n}_{m63}",
+])
+def test_native_cell_token_parser_accepts_only_the_v2_grammar(shape: str) -> None:
+  authority = GatewayClaimSigningAuthority(_SECRET)
+  mac = _v2_token("42", _NONCE).rsplit("_", 1)[1]
+  token = shape.format(
+    n=_NONCE, m=mac, nu=_NONCE.upper(), n63=_NONCE[:-1], mu=mac.upper(), m63=mac[:-1],
+  )
+  assert authority_module.native_cell_token_storage(token) is None
+  assert authority.verify_native_cell_token(token) is None
 
 
 class _ObservedEnvironment(dict[str, str]):
@@ -602,3 +673,36 @@ def test_failed_environment_publication_does_not_install_authority(
     install_gateway_claim_signing_authority(authority)
 
   assert configured_gateway_claim_signing_authority() is None
+
+
+def test_user_claim_http_auth_signs_each_request_with_a_fresh_claim() -> None:
+  authority = GatewayClaimSigningAuthority(_SECRET)
+  signer = authority.bind_user(user_id="42", user_email="owner@example.test")
+  seen: list[httpx2.Request] = []
+
+  def respond(request: httpx2.Request) -> httpx2.Response:
+    seen.append(request)
+    return httpx2.Response(200)
+
+  async def scenario() -> None:
+    auth = UserClaimHttpAuth(lambda: sign_gateway_user_claim(signer))
+    async with httpx2.AsyncClient(
+      auth=auth, transport=httpx2.MockTransport(respond),
+    ) as client:
+      await client.post("https://risk.example.test/api/mcp/x/")
+      await client.post("https://risk.example.test/api/mcp/x/")
+
+  asyncio.run(scenario())
+
+  verified = [
+    authority.verify_user_claim({
+      field: request.headers[header]
+      for field, header in AGENT_API_CLAIM_HEADERS.items()
+    })
+    for request in seen
+  ]
+  assert all(claim is not None for claim in verified)
+  assert {(claim["user_id"], claim["user_email"]) for claim in verified if claim} == {
+    ("42", "owner@example.test"),
+  }
+  assert len({claim["nonce"] for claim in verified if claim}) == 2

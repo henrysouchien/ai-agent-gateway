@@ -13,6 +13,7 @@ if str(PKG_DIR) not in sys.path:
 
 import agent_gateway.mcp_client as mcp_client_module  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager, _build_mcp_env  # noqa: E402
+from agent_gateway.mcp_client_config import McpEnvExpansionError  # noqa: E402
 
 
 def _run(coro):
@@ -51,7 +52,7 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
     },
   )
 
-  env = _build_mcp_env({})
+  env = _build_mcp_env({}, environ={})
 
   assert env == {
     "PATH": "/usr/bin:/bin",
@@ -98,11 +99,19 @@ def test_build_mcp_env_expands_explicit_investment_claim_public_key_only(
     {"INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY": "server-public-key"},
   )
 
-  env = _build_mcp_env({
+  spec = {
     "INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY": (
       "${INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY}"
     ),
-  })
+  }
+  with pytest.raises(TypeError, match="environ"):
+    _build_mcp_env(spec)  # pyright: ignore[reportCallIssue]  # negative: projection is required
+  with pytest.raises(McpEnvExpansionError, match="INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY"):
+    _build_mcp_env(spec, environ={})
+  env = _build_mcp_env(
+    spec,
+    environ={"INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY": "server-public-key"},
+  )
 
   assert env == {
     "INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY": "server-public-key",
@@ -127,7 +136,8 @@ def test_build_mcp_env_adds_explicit_server_env_and_overrides_allowlist(monkeypa
       "PATH": "/custom/bin",
       "EXTRA_FLAG": "enabled",
       "IGNORED_NONE": None,
-    }
+    },
+    environ={},
   )
 
   assert env["ANTHROPIC_API_KEY"] == "explicit-anthropic"
@@ -142,7 +152,13 @@ def test_build_mcp_env_adds_explicit_server_env_and_overrides_allowlist(monkeypa
 def test_build_mcp_env_expands_single_env_ref(monkeypatch) -> None:
   monkeypatch.setattr(mcp_client_module.os, "environ", {"FMP_API_KEY": "secret"})
 
-  env = _build_mcp_env({"FMP_API_KEY": "${FMP_API_KEY}"})
+  with pytest.raises(TypeError, match="environ"):
+    _build_mcp_env({"FMP_API_KEY": "${FMP_API_KEY}"})  # pyright: ignore[reportCallIssue]  # negative: projection is required
+  with pytest.raises(McpEnvExpansionError, match="FMP_API_KEY"):
+    _build_mcp_env({"FMP_API_KEY": "${FMP_API_KEY}"}, environ={})
+  env = _build_mcp_env(
+    {"FMP_API_KEY": "${FMP_API_KEY}"}, environ={"FMP_API_KEY": "secret"},
+  )
 
   assert env["FMP_API_KEY"] == "secret"
 
@@ -154,12 +170,22 @@ def test_build_mcp_env_expands_risk_module_dotenv_pointer(monkeypatch) -> None:
     {"RISK_MODULE_DOTENV": "/tmp/synthetic-risk-module.env"},
   )
 
-  env = _build_mcp_env({"RISK_MODULE_DOTENV": "${RISK_MODULE_DOTENV}"})
+  with pytest.raises(TypeError, match="environ"):
+    _build_mcp_env({"RISK_MODULE_DOTENV": "${RISK_MODULE_DOTENV}"})  # pyright: ignore[reportCallIssue]  # negative: projection is required
+  with pytest.raises(McpEnvExpansionError, match="RISK_MODULE_DOTENV"):
+    _build_mcp_env({"RISK_MODULE_DOTENV": "${RISK_MODULE_DOTENV}"}, environ={})
+  env = _build_mcp_env(
+    {"RISK_MODULE_DOTENV": "${RISK_MODULE_DOTENV}"},
+    environ={"RISK_MODULE_DOTENV": "/tmp/synthetic-risk-module.env"},
+  )
 
   assert env["RISK_MODULE_DOTENV"] == "/tmp/synthetic-risk-module.env"
 
   monkeypatch.setattr(mcp_client_module.os, "environ", {})
-  env = _build_mcp_env({"RISK_MODULE_DOTENV": "${RISK_MODULE_DOTENV}"})
+  env = _build_mcp_env(
+    {"RISK_MODULE_DOTENV": "${RISK_MODULE_DOTENV}"},
+    environ={"RISK_MODULE_DOTENV": ""},
+  )
 
   assert env["RISK_MODULE_DOTENV"] == ""
 
@@ -212,7 +238,16 @@ def test_server_env_passthrough_uses_parent_value_without_literal(
   jobs_spec = captured["jobs-mcp"]["env"]
   assert isinstance(jobs_spec, dict)
   assert jobs_spec == {env_name: f"${{{env_name}}}"}
-  assert _build_mcp_env(jobs_spec)[env_name] == "parent-secret"
+  with pytest.raises(TypeError, match="environ"):
+    _build_mcp_env(jobs_spec)  # pyright: ignore[reportCallIssue]  # negative: projection is required
+  with pytest.raises(McpEnvExpansionError, match=env_name):
+    _build_mcp_env(jobs_spec, environ={})
+  assert _build_mcp_env(
+    jobs_spec,
+    environ=manager._scoped_server_env(
+      "jobs-mcp", captured["jobs-mcp"], deployment_environ=mcp_client_module.os.environ,
+    ),
+  )[env_name] == "parent-secret"
   assert captured["idea-workbench-mcp"]["env"] == {}
   assert "must-not-reach-child" not in json.dumps(captured)
 
@@ -318,7 +353,7 @@ def test_server_env_passthrough_preserves_literal_when_parent_value_is_empty(
 def test_build_mcp_env_expands_multiple_env_refs(monkeypatch) -> None:
   monkeypatch.setattr(mcp_client_module.os, "environ", {"FOO": "a", "BAR": "b"})
 
-  env = _build_mcp_env({"COMBO": "${FOO}/${BAR}"})
+  env = _build_mcp_env({"COMBO": "${FOO}/${BAR}"}, environ={"FOO": "a", "BAR": "b"})
 
   assert env["COMBO"] == "a/b"
 
@@ -326,7 +361,7 @@ def test_build_mcp_env_expands_multiple_env_refs(monkeypatch) -> None:
 def test_build_mcp_env_preserves_literal_without_refs(monkeypatch) -> None:
   monkeypatch.setattr(mcp_client_module.os, "environ", {})
 
-  env = _build_mcp_env({"PLAIN": "no-refs-here"})
+  env = _build_mcp_env({"PLAIN": "no-refs-here"}, environ={})
 
   assert env["PLAIN"] == "no-refs-here"
 
@@ -334,15 +369,19 @@ def test_build_mcp_env_preserves_literal_without_refs(monkeypatch) -> None:
 def test_build_mcp_env_preserves_literal_dollars_outside_refs(monkeypatch) -> None:
   monkeypatch.setattr(mcp_client_module.os, "environ", {"FOO": "x"})
 
-  env = _build_mcp_env({"PWD": "pa$$word-$5-${FOO}"})
+  env = _build_mcp_env({"PWD": "pa$$word-$5-${FOO}"}, environ={"FOO": "x"})
 
   assert env["PWD"] == "pa$$word-$5-x"
 
 
-def test_build_mcp_env_expands_undefined_ref_to_empty_string(monkeypatch) -> None:
+def test_build_mcp_env_refuses_undefined_ref_but_accepts_declared_empty_value(monkeypatch) -> None:
   monkeypatch.setattr(mcp_client_module.os, "environ", {})
 
-  env = _build_mcp_env({"MISSING": "${UNDEFINED_XYZ}"})
+  with pytest.raises(McpEnvExpansionError, match="UNDEFINED_XYZ"):
+    _build_mcp_env({"MISSING": "${UNDEFINED_XYZ}"}, environ={})
+  env = _build_mcp_env(
+    {"MISSING": "${UNDEFINED_XYZ}"}, environ={"UNDEFINED_XYZ": ""},
+  )
 
   assert env["MISSING"] == ""
 
@@ -354,7 +393,9 @@ def test_build_mcp_env_expands_refs_once_without_recursion(monkeypatch) -> None:
     {"FOO": "${BAR}", "BAR": "should-not-appear"},
   )
 
-  env = _build_mcp_env({"NEST": "${FOO}"})
+  env = _build_mcp_env(
+    {"NEST": "${FOO}"}, environ={"FOO": "${BAR}", "BAR": "should-not-appear"},
+  )
 
   assert env["NEST"] == "${BAR}"
 

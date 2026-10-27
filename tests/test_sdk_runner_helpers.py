@@ -293,7 +293,7 @@ def test_sdk_runner_helpers_detect_catalogless_policy_owner_mismatch(monkeypatch
     policy_imports,
     "_server_policy",
     SimpleNamespace(
-      get_forbidden_tools_for_session=lambda _session: frozenset(),
+      get_forbidden_tools_for_session=lambda _session, *, profile_name=None, role=None: frozenset(),
       get_server_for_policy_tool=lambda name: (
         "portfolio-trades-mcp" if name == "execute_trade" else None
       ),

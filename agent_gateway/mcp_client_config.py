@@ -62,6 +62,10 @@ STDIO_SHELL_EXEC_ENV_RE = re.compile(
 )
 
 
+class McpEnvExpansionError(ValueError):
+  """Raised when an MCP template references an undeclared or ambient environment variable."""
+
+
 def resolve_mcp_config_path(
   config_path: McpConfigPathInput = UNSET,
   *,
@@ -82,35 +86,67 @@ def resolve_mcp_config_path(
 def build_mcp_env(
   server_env: Mapping[str, Any] | None,
   *,
-  environ: Mapping[str, str] | None = None,
+  environ: Mapping[str, str],
+  base_environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-  env_source = os.environ if environ is None else environ
-  env = {k: v for k, v in env_source.items() if k in DEFAULT_ENV_ALLOWLIST}
+  allowlist_source = base_environ if base_environ is not None else (
+    environ
+    if any(k in DEFAULT_ENV_ALLOWLIST for k in environ)
+    else os.environ
+  )
+  env = {k: str(v) for k, v in allowlist_source.items() if k in DEFAULT_ENV_ALLOWLIST}
   if not isinstance(server_env, dict):
     return env
 
   for key, value in server_env.items():
     if value is None:
       continue
-    env[str(key)] = expand_env_refs(value, environ=env_source)
+    env[str(key)] = expand_env_refs(value, environ=environ)
   return env
 
 
-def expand_env_refs(value: Any, *, environ: Mapping[str, str] | None = None) -> str:
-  env = os.environ if environ is None else environ
-  raw = str(value)
-  return ENV_REF_RE.sub(lambda match: env.get(match.group(1), ""), raw)
+def expand_env_refs(value: Any, *, environ: Mapping[str, str]) -> str:
+
+  def expand(match: re.Match[str]) -> str:
+    name = match.group(1)
+    if name not in environ:
+      raise McpEnvExpansionError(
+        f"MCP template references undeclared environment variable: {name}"
+      )
+    return str(environ[name])
+
+  return ENV_REF_RE.sub(expand, str(value))
+
+
+def expand_http_template(value: Any, *, environ: Mapping[str, str]) -> str:
+  """Expand ${NAME} in an HTTP url or header.
+
+  An unset or empty name is the same refusal as an undeclared variable.
+  Substituting "" would turn ${RISK_API_URL}/api/mcp/... into a relative URL.
+  Stdio env blocks keep expand_env_refs, which substitutes a declared empty value.
+  """
+
+  def expand(match: re.Match[str]) -> str:
+    name = match.group(1)
+    resolved = environ.get(name)
+    if resolved is None or resolved == "":
+      raise McpEnvExpansionError(
+        f"MCP template references undeclared environment variable: {name}"
+      )
+    return str(resolved)
+
+  return ENV_REF_RE.sub(expand, str(value))
 
 
 def build_http_headers(
   headers: Mapping[str, Any] | None,
   *,
-  environ: Mapping[str, str] | None = None,
+  environ: Mapping[str, str],
 ) -> dict[str, str]:
   if not isinstance(headers, dict):
     return {}
   return {
-    str(key): expand_env_refs(value, environ=environ)
+    str(key): expand_http_template(value, environ=environ)
     for key, value in headers.items()
     if value is not None
   }
@@ -364,6 +400,7 @@ __all__ = [
   "MCP_STDIO_CONNECT_STABILIZE_ENV",
   "McpConfigPathInput",
   "McpConfigPathUnset",
+  "McpEnvExpansionError",
   "MCP_STDIO_RETRYABLE_EXCEPTION_NAMES",
   "MCP_STDIO_RETRYABLE_MESSAGE_MARKERS",
   "STDIO_SHELL_COMMAND_NAMES",
@@ -376,6 +413,7 @@ __all__ = [
   "env_nonnegative_float",
   "env_nonnegative_int",
   "expand_env_refs",
+  "expand_http_template",
   "is_retryable_stdio_connect_error",
   "is_retryable_stdio_startup_error",
   "iter_exception_tree",

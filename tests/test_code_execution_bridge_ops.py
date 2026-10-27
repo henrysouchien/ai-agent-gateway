@@ -17,7 +17,7 @@ from typing import Any, AsyncIterator
 
 from agent_gateway import AgentRunner, SessionStore, ToolDispatcher
 from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution
-from agent_gateway.code_execution._frame_reader import BRIDGE_OPERATIONS
+from agent_gateway.code_execution._tool_defs import CODE_EXECUTION_DELEGATION_TOOL_DEFS
 from agent_gateway.capability_execution import (
   ModelCallOperation,
   execute_leaf_model_call,
@@ -43,7 +43,7 @@ RUN_AGENT_DEFINITION = {
 
 def _setup(run_agent: Any, *, grant_run_agent: bool) -> tuple[Any, ToolDispatcher]:
   session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
-  bundle = build_code_execution(session, config=CodeExecutionConfig(register_docker=False))
+  bundle = build_code_execution(session, config=CodeExecutionConfig())
   mcp = _CaptureMcp(frame_reader=bundle.frame_reader)
   definitions = list(_tool_definitions(bundle))
   handlers = dict(bundle.handlers)
@@ -96,7 +96,7 @@ async def _run_cell(
   *,
   timeout_ms: int | None = None,
 ) -> dict[str, Any]:
-  tool_input: dict[str, Any] = {"code": textwrap.dedent(code), "host": "subprocess"}
+  tool_input: dict[str, Any] = {"code": textwrap.dedent(code)}
   if timeout_ms is not None:
     tool_input["timeout_ms"] = timeout_ms
   result, error = await dispatcher.dispatch(OUTER_ID, "code_execute", tool_input)
@@ -124,7 +124,9 @@ def test_agent_submits_through_run_agent_and_wait_reads_the_registry() -> None:
       a = hank.agent("say DONE-1", role="fast")
       b = hank.agent(objective="say DONE-2", handles=["h1"])
       found = [row["name"] for row in hank.search("") if row.get("route_kind") == "bridge"]
-      print(json.dumps({"a": a, "b": b, "ops": sorted(hank._operations), "found": found,
+      print(json.dumps({"a": a, "b": b,
+                        "ops": [hank.describe(name)["name"] for name in ("agent", "completion", "judge", "judge_batch", "wait", "workpool")],
+                        "found": found,
                         "described": hank.describe("wait")["arguments"]}))
       print(json.dumps(hank.wait([a["task_id"], b["task_id"], "nope"], timeout=5)))
       try:
@@ -132,7 +134,7 @@ def test_agent_submits_through_run_agent_and_wait_reads_the_registry() -> None:
       except TypeError as exc:
         print("TypeError", "bogus" in str(exc))
       try:
-        hank.frobnicate
+        hank.code_execute
       except AttributeError:
         print("AttributeError")
     """)
@@ -140,7 +142,7 @@ def test_agent_submits_through_run_agent_and_wait_reads_the_registry() -> None:
   result = asyncio.run(run())
   submitted, waited, type_error, attribute_error = [line for line in result["stdout"].splitlines() if line.strip()]
   submitted = json.loads(submitted)
-  assert submitted["ops"] == sorted(row["name"] for row in BRIDGE_OPERATIONS)
+  assert submitted["ops"] == sorted(row["name"] for row in CODE_EXECUTION_DELEGATION_TOOL_DEFS)
   assert submitted["a"] == {"task_id": "bg_1", "status": "running"}
   assert submitted["found"] == []  # search stays the grant ∩ code-callable listing
   assert submitted["described"] == ["task_ids", "timeout"]
@@ -572,7 +574,7 @@ def test_leaf_call_usage_reaches_the_commercial_producer_with_its_real_state() -
 
 
 def test_prompt_names_registered_model_call_operations() -> None:
-  tool_def = make_code_execute_tool_def(CodeExecutionConfig(), available_hosts=("auto",))
+  tool_def = make_code_execute_tool_def(CodeExecutionConfig())
   desc = tool_def["description"]
   assert "general_completion" in desc
   assert "citation_review" in desc

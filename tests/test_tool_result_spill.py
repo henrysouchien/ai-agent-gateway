@@ -1165,7 +1165,7 @@ def test_code_execution_ensure_work_dir_is_idempotent_and_concurrency_safe(
   session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
   bundle = build_code_execution(
     session,
-    config=CodeExecutionConfig(register_docker=False, work_dir_root=str(tmp_path)),
+    config=CodeExecutionConfig(work_dir_root=str(tmp_path)),
   )
 
   with ThreadPoolExecutor(max_workers=2) as pool:
@@ -1281,7 +1281,7 @@ def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(
     result, error = await _dispatch_bundle_tool(
       bundle,
       "code_execute",
-      {"host": "subprocess", "code": code},
+      {"code": code},
     )
     assert error is None
     assert result is not None
@@ -1289,10 +1289,14 @@ def test_runner_spills_large_tool_result_and_exact_reader_is_retry_safe(
     assert result["stdout"] == f"{PAYLOAD_SIZE}\n"
 
     if DockerBackend().available():
+      docker_bundle = build_code_execution(
+        session,
+        config=CodeExecutionConfig(placement="docker", work_dir_root=str(_shared_code_execution_root)),
+      )
       result, error = await _dispatch_bundle_tool(
-        bundle,
+        docker_bundle,
         "code_execute",
-        {"host": "docker", "code": code},
+        {"code": code},
       )
       assert error is None
       assert result is not None
@@ -1687,7 +1691,7 @@ def test_run_agent_sub_runner_spills_into_own_job_root(
     )
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(register_docker=False, work_dir_root=str(tmp_path)),
+      config=CodeExecutionConfig(work_dir_root=str(tmp_path)),
     )
     spill_sink = SpillSink(
       root_provider=bundle.ensure_work_dir,

@@ -412,6 +412,14 @@ def test_clean_emission_sites_stamp_display_from_redacted_input() -> None:
       assert prepared_call.materialize_input() == raw_input
       return dict(redacted_input)
 
+
+    @staticmethod
+    def redact_raw_tool_input_for_history(
+      tool_name: str,
+      tool_input: dict[str, object],
+    ) -> dict[str, object]:
+      _ = tool_name, tool_input
+      return dict(redacted_input)
     @staticmethod
     def settle_tool_result(
       _tool_name: str,

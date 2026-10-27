@@ -282,7 +282,7 @@ def _canonical_body(value: Mapping[str, Any]) -> bytes:
       ensure_ascii=False,
       allow_nan=False,
     ).encode("utf-8")
-  except (TypeError, ValueError) as exc:
+  except (TypeError, ValueError, RecursionError) as exc:
     raise AutonomousApprovalChannelProtocolError(
       "autonomous approval frame is not canonical JSON"
     ) from exc
@@ -311,7 +311,13 @@ def _decode_decision(
       object_pairs_hook=_reject_duplicate_fields,
       parse_constant=_reject_non_json_constant,
     )
-  except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+  except (
+    UnicodeDecodeError,
+    TypeError,
+    ValueError,
+    json.JSONDecodeError,
+    RecursionError,
+  ) as exc:
     raise AutonomousApprovalChannelProtocolError(
       "autonomous approval frame is malformed"
     ) from exc

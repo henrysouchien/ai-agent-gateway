@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Protocol, Sequence, Tuple, TYPE_CHECKING
 
+from agent_workflow_contracts.next_call import next_call as build_next_call
 if TYPE_CHECKING:
   from .ui_blocks_run import UiBlocksRunContext
 
@@ -196,7 +197,7 @@ def active_local_tool_schema(
 
   pack = _deferred_local_tool_pack(tool_name, channel)
   if pack is not None:
-    next_call = {"tool_name": "load_tools", "arguments": {"pack": pack}}
+    next_call = build_next_call("load_tools", {"pack": pack})
     fix = f'Load tool pack "{pack}" with load_tools(pack="{pack}") and retry.'
     return None, {
       "code": "tool_schema_unavailable",
@@ -620,8 +621,9 @@ class ToolExecutionContext:
   request_id: str | None = None
   run_id: str | None = None
   user_id: str | None = None
-  # The calling run's profile; a child run inherits it as its own (sub_agent).
+  # The calling run's label and product profile; a child run inherits profile_name (sub_agent).
   profile: str | None = None
+  profile_name: str | None = None
   ui_blocks_run: "UiBlocksRunContext | None" = field(default=None, repr=False)
   approval_id: str | None = None
   approval_chain_id: str | None = None

@@ -13,6 +13,7 @@ from typing import Any, Final, Mapping, Sequence
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from agent_workflow_contracts.models import AdmittedTenant
+from agent_workflow_contracts.next_call import next_call as build_next_call
 
 from .skill_limits import SkillExecutionLimits
 from hank_contracts.investment_claims import (
@@ -102,7 +103,7 @@ def investment_capability_claim_unavailable_error(
     "route": "run_agent",
     "operations": list(operations),
     "next_call": (
-      {"tool_name": "run_agent", "arguments": {"operation": operations[0]}}
+      build_next_call("run_agent", {"operation": operations[0]})
       if operations
       else None
     ),

@@ -15,6 +15,7 @@ from agent_gateway.auth import (
   MissingUserIdError,
 )
 from agent_gateway.approval_route import bind_session_approval_route
+from agent_gateway.providers.anthropic_oauth import ANTHROPIC_USER_SCOPE_FIELD
 from agent_gateway.session import AuthManager
 from agent_gateway.ttl_policy import (
   CONTROL_SESSION_TTL,
@@ -180,7 +181,8 @@ def _resolve_control_identity(
     )
   return identity_resolver(
     user_id,
-    risk_user_id=risk_user_id,
+    # 0 is this layer's unresolved sentinel; non-None states an id to the canonical resolver.
+    risk_user_id=risk_user_id if risk_user_id > 0 else None,
     user_email=user_email,
     role=role,
     channel=channel,
@@ -287,6 +289,8 @@ def build_session_router(
       )
       resolved_model_entitled_keys = result.model_entitled_keys
       resolved_auth_config = result.auth_config.to_dict()
+      # Stamp the validated run owner's scope so anthropic_oauth seat admission keys on it even when the resolver omitted it.
+      resolved_auth_config[ANTHROPIC_USER_SCOPE_FIELD] = str(resolved_risk_user_id)
       resolved_credential_principal = result.credential_principal
       resolved_allow_service_for_interactive = (
         result.allow_service_for_interactive
