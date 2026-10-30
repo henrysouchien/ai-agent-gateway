@@ -38,6 +38,14 @@ LOGGER = logging.getLogger(__name__)
 
 KIMI_CODE_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
 DEFAULT_KIMI_CODE_OAUTH_HOST = "https://auth.kimi.com"
+KIMI_CODE_AUTH_STORE_PATH_ENV = "KIMI_CODE_AUTH_STORE_PATH"
+KIMI_AUTH_STORE_PATH_ENV = "KIMI_AUTH_STORE_PATH"
+KIMI_CODE_AUTH_TOKEN_ENV = "KIMI_CODE_AUTH_TOKEN"
+# Environment names that carry one person's Kimi Code OAuth identity (store path
+# and token); a non-owner placement must not inherit them.
+KIMI_CODE_PERSONAL_OAUTH_ENV_NAMES = frozenset(
+  {KIMI_CODE_AUTH_STORE_PATH_ENV, KIMI_AUTH_STORE_PATH_ENV, KIMI_CODE_AUTH_TOKEN_ENV}
+)
 DEFAULT_KIMI_CODE_CLI_VERSION = "1.0"
 KIMI_CODE_DEVICE_ID_FILENAME = "device_id"
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
@@ -169,7 +177,7 @@ def resolve_kimi_code_store_path(
     environ=environ,
     user_scope=user_scope,
     override_config_keys=("auth_store_path",),
-    override_env_vars=("KIMI_CODE_AUTH_STORE_PATH", "KIMI_AUTH_STORE_PATH"),
+    override_env_vars=(KIMI_CODE_AUTH_STORE_PATH_ENV, KIMI_AUTH_STORE_PATH_ENV),
   )
 
 
@@ -186,7 +194,7 @@ def resolve_kimi_code_store_paths(
     environ=environ,
     user_scope=user_scope,
     override_config_keys=("auth_store_path",),
-    override_env_vars=("KIMI_CODE_AUTH_STORE_PATH", "KIMI_AUTH_STORE_PATH"),
+    override_env_vars=(KIMI_CODE_AUTH_STORE_PATH_ENV, KIMI_AUTH_STORE_PATH_ENV),
   )
 
 
@@ -568,7 +576,7 @@ def resolve_kimi_code_pool_candidates(
         )
 
   for auth_mode, env_name in (
-    ("oauth", "KIMI_CODE_AUTH_TOKEN"),
+    ("oauth", KIMI_CODE_AUTH_TOKEN_ENV),
     ("api", "KIMI_CODE_API_KEY"),
     ("api", "KIMI_API_KEY"),
   ):

@@ -39,6 +39,10 @@ ANTIGRAVITY_SCOPES = (
 )
 ANTIGRAVITY_DAILY_CLOUDCODE_URL = "https://daily-cloudcode-pa.googleapis.com"
 ANTIGRAVITY_DEFAULT_PORT = 51121
+GOOGLE_ANTIGRAVITY_AUTH_STORE_PATH_ENV = "GOOGLE_ANTIGRAVITY_AUTH_STORE_PATH"
+# Environment names that carry one person's Antigravity OAuth identity; a
+# non-owner placement must not inherit them.
+GOOGLE_ANTIGRAVITY_PERSONAL_OAUTH_ENV_NAMES = frozenset({GOOGLE_ANTIGRAVITY_AUTH_STORE_PATH_ENV})
 
 
 def resolve_antigravity_store_path(
@@ -54,7 +58,7 @@ def resolve_antigravity_store_path(
     environ=environ,
     user_scope=user_scope,
     override_config_keys=("auth_store_path",),
-    override_env_vars=("GOOGLE_ANTIGRAVITY_AUTH_STORE_PATH",),
+    override_env_vars=(GOOGLE_ANTIGRAVITY_AUTH_STORE_PATH_ENV,),
   )
 
 
@@ -71,7 +75,7 @@ def resolve_antigravity_store_paths(
     environ=environ,
     user_scope=user_scope,
     override_config_keys=("auth_store_path",),
-    override_env_vars=("GOOGLE_ANTIGRAVITY_AUTH_STORE_PATH",),
+    override_env_vars=(GOOGLE_ANTIGRAVITY_AUTH_STORE_PATH_ENV,),
   )
 
 

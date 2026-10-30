@@ -44,6 +44,7 @@ def _bundle_environ(
   bundle = mint_user_runtime_credentials(
     org_claim_key="org-secret",
     storage_id=storage_id,
+    generation=1,
     identity=UserRuntimeIdentity("henry-key", "excel", slug, email, risk_user_id, "owner", ()),
     desk=DeskReplica("file:///replica", None, None, None, None),
   )

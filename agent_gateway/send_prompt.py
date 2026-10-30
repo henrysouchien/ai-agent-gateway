@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 import time
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 if TYPE_CHECKING:
   from .capability_execution import BoundCapabilityExecution
@@ -28,6 +28,7 @@ def _prepare_bound_execution(
   capability_execution: BoundCapabilityExecution,
 ) -> tuple[dict[str, Any], int, EffortResolution]:
   from model_authority.binding import require_capability_execution_bind
+  from .runner_state import select_run_max_tokens
   from .capability_execution import BoundCapabilityExecution
 
   if not isinstance(capability_execution, BoundCapabilityExecution):
@@ -37,20 +38,9 @@ def _prepare_bound_execution(
   capability_bind = capability_execution.bind
   provider = capability_execution.provider
   config = dict(capability_execution.auth_config)
-  max_tokens = config.get("max_tokens")
-  if (
-    isinstance(max_tokens, bool)
-    or not isinstance(max_tokens, int)
-    or max_tokens <= 0
-  ):
-    raise ValueError(
-      "bound_auth_config.max_tokens must be a positive integer"
-    )
 
   model_info = provider.get_model_info(capability_bind.upstream_model)
-  model_max_output = int(getattr(model_info, "max_output_tokens", 0) or 0)
-  if model_max_output > 0 and max_tokens > model_max_output:
-    max_tokens = model_max_output
+  max_tokens = select_run_max_tokens(config, model_info=model_info).value
 
   effort_resolution = require_capability_execution_bind(
     capability_bind,
@@ -58,6 +48,11 @@ def _prepare_bound_execution(
     auth_config=config,
   )
   return config, max_tokens, effort_resolution
+
+
+def _credential_identity(config: Mapping[str, Any]) -> str:
+  """The secret this bind sends: its ``auth_token``, else its ``api_key``."""
+  return str(config.get("auth_token") or config.get("api_key") or "")
 
 
 def _rotated_execution(
@@ -158,6 +153,7 @@ async def send_prompt(
   config, max_tokens, effort_resolution = _prepare_bound_execution(execution)
   capability_bind = execution.bind
   provider = execution.provider
+  attempted_credentials = {_credential_identity(config)}
   model = capability_bind.upstream_model
   client: Any = None
   text_parts: list[str] = []
@@ -352,6 +348,12 @@ async def send_prompt(
         rotated_execution = _rotated_execution(execution, exc)
         if rotated_execution is None:
           raise
+        rotated_identity = _credential_identity(rotated_execution.auth_config)
+        if rotated_identity in attempted_credentials:
+          # The rotation came back to a credential this call already tried; this
+          # attempt's own rejection is the one to surface.
+          raise
+        attempted_credentials.add(rotated_identity)
         await provider.close_client(client)
         client = None
         execution = rotated_execution

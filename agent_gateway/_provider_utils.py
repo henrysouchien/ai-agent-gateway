@@ -70,6 +70,11 @@ def resolve_auth_config(
 
   # --- Non-Anthropic path ---
   if provider_name != "anthropic":
+    from .providers.credential_pool import normalize_user_scope
+
+    normalized_scope = normalize_user_scope(user_scope)
+    if normalized_scope:
+      result["auth_user_scope"] = normalized_scope
     resolved_key = (
       (api_key or "").strip()
       or str(result.get("api_key", "")).strip()
@@ -201,7 +206,6 @@ def _resolve_provider(
   provider_config: dict[str, Any] | None,
   *,
   auth_config: dict[str, Any] | None = None,
-  max_tokens: int = 16_000,
   user_scope: Any = None,
 ) -> tuple[ModelProvider, str, dict[str, Any]]:
   provider_name: str
@@ -274,8 +278,6 @@ def _resolve_provider(
   else:
     resolved_auth_config = dict(auth_config or {})
 
-  if "max_tokens" not in resolved_auth_config or auth_config is None:
-    resolved_auth_config["max_tokens"] = max_tokens
   if provider_config:
     resolved_auth_config.update(provider_config)
 

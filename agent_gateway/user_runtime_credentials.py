@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ USER_RUNTIME_CREDENTIALS_FILE_ENV = "HANK_USER_RUNTIME_CREDENTIALS_FILE"
 # The placed runtime's storage id: a non-secret identifier, unlike the bundle,
 # so children inherit it and per-user state roots derive from it alone.
 USER_STORAGE_ID_ENV = "HANK_USER_STORAGE_ID"
+APPROVAL_CLAIM_KEY_SCHEME = "user-claim-approval.v1"
 
 
 @dataclass(frozen=True)
@@ -49,15 +52,37 @@ class UserClaimSigningDelegation:
 class UserRuntimeCredentials:
   schema_version: Literal["user-runtime-credentials.v1"]
   storage_id: str
+  generation: int
   user: UserRuntimeIdentity
   desk: DeskReplica
   claim_signing: UserClaimSigningDelegation
+  approval_claim_signing: UserClaimSigningDelegation
 
 
 def _text(value: object, name: str) -> str:
   if not isinstance(value, str) or not value or value != value.strip() or "\x00" in value:
     raise ValueError(f"{name} must be a canonical non-empty string")
   return value
+
+
+def derive_approval_claim_key(
+  org_hmac_secret: str, user_id: str, user_email: str, generation: int,
+) -> str:
+  """Derive an approval-only generation key directly from the organization secret.
+
+  A runtime's generic claim key cannot derive this key or a replacement's key.
+  Length-prefixed identity fields prevent newline-separated identity collisions.
+  Inputs are canonical typed values supplied by the credential/placement owner.
+  """
+  uid = user_id.encode("utf-8")
+  email = user_email.encode("utf-8")
+  message = (
+    APPROVAL_CLAIM_KEY_SCHEME.encode("ascii") + b"\n"
+    + str(len(uid)).encode("ascii") + b":" + uid + b"\n"
+    + str(len(email)).encode("ascii") + b":" + email + b"\n"
+    + str(generation).encode("ascii")
+  )
+  return hmac.new(org_hmac_secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 
 def _object(value: object, name: str) -> dict[str, object]:
@@ -70,9 +95,15 @@ def bundle_from_json(value: dict[str, object]) -> UserRuntimeCredentials:
   """Validate the external bundle shape; product auth owns channel/role policy."""
   if value.get("schema_version") != "user-runtime-credentials.v1":
     raise ValueError("schema_version must be user-runtime-credentials.v1")
+  generation = value.get("generation")
+  if type(generation) is not int or generation <= 0:
+    raise ValueError("generation must be a positive integer")
   user = _object(value.get("user"), "user")
   desk = _object(value.get("desk"), "desk")
-  claim = _object(value.get("claim_signing"), "claim_signing")
+  delegations = {
+    name: _object(value.get(name), name)
+    for name in ("claim_signing", "approval_claim_signing")
+  }
   risk_id = user.get("risk_user_id")
   if type(risk_id) is not int or risk_id <= 0:
     raise ValueError("user.risk_user_id must be a positive integer")
@@ -88,14 +119,24 @@ def bundle_from_json(value: dict[str, object]) -> UserRuntimeCredentials:
     role=_text(user.get("role"), "user.role"),
     capabilities=tuple(_text(item, "user.capabilities") for item in capabilities),
   )
-  if claim.get("scheme") != USER_CLAIM_KEY_SCHEME:
-    raise ValueError("claim_signing.scheme must equal USER_CLAIM_KEY_SCHEME")
-  user_id = _text(claim.get("user_id"), "claim_signing.user_id")
-  if user_id != identity.slug:
-    raise ValueError("claim_signing.user_id must equal user.slug")
-  user_email = _text(claim.get("user_email"), "claim_signing.user_email")
-  if user_email != identity.email:
-    raise ValueError("claim_signing.user_email must equal user.email")
+  signing: dict[str, UserClaimSigningDelegation] = {}
+  for name, scheme in (
+    ("claim_signing", USER_CLAIM_KEY_SCHEME),
+    ("approval_claim_signing", APPROVAL_CLAIM_KEY_SCHEME),
+  ):
+    claim = delegations[name]
+    if claim.get("scheme") != scheme:
+      raise ValueError(f"{name}.scheme must equal {scheme}")
+    user_id = _text(claim.get("user_id"), f"{name}.user_id")
+    if user_id != identity.slug:
+      raise ValueError(f"{name}.user_id must equal user.slug")
+    user_email = _text(claim.get("user_email"), f"{name}.user_email")
+    if user_email != identity.email:
+      raise ValueError(f"{name}.user_email must equal user.email")
+    signing[name] = UserClaimSigningDelegation(
+      scheme=scheme, user_id=user_id, user_email=user_email,
+      key=_text(claim.get("key"), f"{name}.key"),
+    )
   optional: dict[str, str | None] = {}
   for name in ("aws_access_key_id", "aws_secret_access_key", "aws_session_token", "expires_at"):
     if name not in desk:
@@ -104,12 +145,11 @@ def bundle_from_json(value: dict[str, object]) -> UserRuntimeCredentials:
   return UserRuntimeCredentials(
     schema_version="user-runtime-credentials.v1",
     storage_id=_text(value.get("storage_id"), "storage_id"),
+    generation=generation,
     user=identity,
     desk=DeskReplica(url=_text(desk.get("url"), "desk.url"), **optional),
-    claim_signing=UserClaimSigningDelegation(
-      scheme=USER_CLAIM_KEY_SCHEME, user_id=user_id, user_email=user_email,
-      key=_text(claim.get("key"), "claim_signing.key"),
-    ),
+    claim_signing=signing["claim_signing"],
+    approval_claim_signing=signing["approval_claim_signing"],
   )
 
 
@@ -121,13 +161,18 @@ def bundle_to_json(bundle: UserRuntimeCredentials) -> dict[str, object]:
 
 def mint_user_runtime_credentials(
   *, org_claim_key: str, identity: UserRuntimeIdentity, storage_id: str, desk: DeskReplica,
+  generation: int,
 ) -> UserRuntimeCredentials:
   bundle = UserRuntimeCredentials(
-    schema_version="user-runtime-credentials.v1", storage_id=storage_id,
+    schema_version="user-runtime-credentials.v1", storage_id=storage_id, generation=generation,
     user=identity, desk=desk,
     claim_signing=UserClaimSigningDelegation(
       scheme=USER_CLAIM_KEY_SCHEME, user_id=identity.slug, user_email=identity.email,
       key=derive_user_claim_key(org_claim_key, identity.slug, identity.email),
+    ),
+    approval_claim_signing=UserClaimSigningDelegation(
+      scheme=APPROVAL_CLAIM_KEY_SCHEME, user_id=identity.slug, user_email=identity.email,
+      key=derive_approval_claim_key(org_claim_key, identity.slug, identity.email, generation),
     ),
   )
   return bundle_from_json(bundle_to_json(bundle))

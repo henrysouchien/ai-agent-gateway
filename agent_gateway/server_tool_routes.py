@@ -77,9 +77,9 @@ async def tool_approval_response(
   session = auth.verify_token(token)
 
   pending = session.pending_tools.get(payload.tool_call_id)
-  # A live pending entry keeps its own validation (duplicate, nonce, queue);
-  # only a call whose live entry is gone resolves through the durable request.
-  if pending is None:
+  # A park never consumes the live queue, including while its ask is being
+  # persisted. Its dispatcher-owned delivery mode must apply before cleanup.
+  if pending is None or pending.get("durable_approval") is True:
     store, policy = _resolve_store_and_policy(
       target_session=session,
       app_state=request.app.state,

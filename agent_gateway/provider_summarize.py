@@ -10,6 +10,7 @@ from .capability_execution import BoundCapabilityExecution
 from .runner_hooks_lifecycle import prepare_session_id, rebind_refreshed_credential
 from model_authority.thinking import parse_effort
 from .runner_stream_turn import STREAM_PROGRESS_LOG_INTERVAL
+from .runner_state import select_run_max_tokens
 from .runner_streaming import _stream_with_stall_timeout
 from .spend_metering import ProviderCallMeter
 
@@ -121,10 +122,14 @@ async def provider_summarize(
     raise RuntimeError(f"No active credential configured for provider={provider.name}")
 
   model_info = provider.get_model_info(model)
-  token_limit = int(max_tokens)
-  if token_limit <= 0:
+  if int(max_tokens) <= 0:
     raise ValueError("provider summarize max_tokens must be positive")
-  token_limit = min(token_limit, int(getattr(model_info, "max_output_tokens", token_limit) or token_limit))
+  max_tokens_selection = select_run_max_tokens(
+    run_config,
+    model_info=model_info,
+    requested=int(max_tokens),
+  )
+  token_limit = max_tokens_selection.value
   effort_resolution = provider.resolve_effort(
     requested=requested_effort,
     model=model,

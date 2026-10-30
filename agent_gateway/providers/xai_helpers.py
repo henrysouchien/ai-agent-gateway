@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-from .base import StreamEvent
+from .base import StreamEvent, stream_error
 from .codex_helpers import (
   _ResponsesStreamState,
   _convert_messages,
@@ -44,14 +44,14 @@ def map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Strea
   event_type = event.get("type")
   if event_type == "error":
     detail = str(event.get("message") or event.get("code") or json.dumps(event, separators=(",", ":")))
-    raise RuntimeError(f"xAI error: {detail}")
+    raise stream_error(f"xAI error: {detail}", event.get("code"))
   if event_type == "response.failed":
     response_value = event.get("response")
     response = response_value if isinstance(response_value, dict) else {}
     error_value = response.get("error")
     error = error_value if isinstance(error_value, dict) else {}
     detail = str(error.get("message") or "xAI response failed")
-    raise RuntimeError(f"xAI response failed: {detail}")
+    raise stream_error(f"xAI response failed: {detail}", error.get("code"))
   had_active_tool = state.current_block_type == "tool_use"
   mapped = _map_responses_event(event, state)
   # xAI may deliver a complete function call in output_item.added without

@@ -30,6 +30,7 @@ from .base import (
   admitted_entry,
   authority_rate_table,
   model_info_from_entry,
+  stream_error,
   truncate_to_last_compaction,
 )
 from .response_diagnostics import response_diagnostics
@@ -43,18 +44,20 @@ log = logging.getLogger(__name__)
 _DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"
 _CLOUD_TAG_RE = re.compile(r"(?:-cloud|:cloud)\b", re.IGNORECASE)
 
+# Typed HTTP transport retry classification at provider entry (with 5xx in is_retryable_error);
+# 408/409 are transient request-timeout/conflict statuses, not usage-limit signals.
 _RETRYABLE_STATUSES = frozenset({408, 409})
-_USAGE_LIMIT_RE = re.compile(
-  r"\b(?:rate(?:\s+limit(?:ed|ing)?|\s+limited)|too many requests"
-  r"|usage(?:\s+limit|\s+exhausted)|quota(?:\s+exhausted|\s+exceeded))\b",
-  re.IGNORECASE,
-)
+# Typed ``error.code`` / ``error.type`` values that name a rate or usage exhaustion.
+_USAGE_LIMIT_CODES = frozenset({
+  "rate_limit",
+  "rate_limit_error",
+  "rate_limit_exceeded",
+  "too_many_requests",
+  "usage_limit",
+  "quota_exceeded",
+})
 _CONTENT_REFUSAL_RE = re.compile(
   r"\b(?:content[_\s-]*filter|content[_\s-]*policy|safety[_\s-]*violation|refused to)\b",
-  re.IGNORECASE,
-)
-_BILLING_NOT_USAGE_RE = re.compile(
-  r"\b(?:payment|credit(?:s)?|subscription|billing|insufficient[_\s-]+quota)\b",
   re.IGNORECASE,
 )
 _SURROGATE_RE = re.compile(
@@ -683,12 +686,7 @@ def _is_content_refusal(exc: Exception) -> bool:
 
 
 def _is_usage_limit_only(exc: Exception) -> bool:
-  if _is_context_length_exception(exc) or _is_content_refusal(exc):
-    return False
-  searchable = _exception_text(exc)
-  if not _USAGE_LIMIT_RE.search(searchable):
-    return False
-  return _BILLING_NOT_USAGE_RE.search(searchable) is None
+  return str(_error_code_from_exception(exc) or "").strip().lower() in _USAGE_LIMIT_CODES
 
 
 def _retry_after_reset_at(exc: Exception) -> float | None:
@@ -1055,7 +1053,11 @@ class OllamaLocalProvider(ModelProvider):
         if isinstance(item.get("error"), dict) and "choices" not in item:
           error = item["error"]
           detail = str(error.get("message") or error.get("type") or "ollama stream error")
-          raise RuntimeError(f"ollama stream error: {detail}")
+          code = error.get("code")
+          raise stream_error(
+            f"ollama stream error: {detail}",
+            error.get("type") if code is None else code,
+          )
         model_name = item.get("model")
         if isinstance(model_name, str) and model_name.strip():
           provider_model = model_name.strip()

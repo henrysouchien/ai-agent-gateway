@@ -276,8 +276,6 @@ def test_post_commit_audit_failure_wake_recovers_same_process(
     coordinator = AutonomousApprovalDeliveryCoordinator(
       store=store,
       registry=object(),  # type: ignore[arg-type]
-      batch_limit=1,
-      fallback_retry_base_seconds=0.001,
     )
     delivered = asyncio.Event()
 
@@ -435,6 +433,14 @@ def test_exact_duplicate_reconciliation_is_idempotent(
   assert first["state"] == "published"
   assert second == first
   assert first["attempt_count"] == 1
+  with pytest.raises(ValueError, match="decision changed"):
+    store.reconcile_autonomous_approval_delivery_duplicate(
+      "approval-duplicate",
+      tool_call_id="tool-duplicate",
+      nonce="nonce-duplicate",
+      approved=False,
+    )
+  assert _get_delivery(store, "duplicate") == first
 
 
 def test_two_duplicate_retriers_converge_on_one_publication(
@@ -564,7 +570,7 @@ def test_acknowledgment_requires_exact_authority_and_is_terminal(
   assert unchanged == acknowledged
 
 
-def test_delivery_failures_back_off_then_quarantine(
+def test_pending_delivery_failure_stays_pending_and_can_later_publish(
   tmp_path: Path,
 ) -> None:
   store = SQLiteApprovalStore(
@@ -573,71 +579,77 @@ def test_delivery_failures_back_off_then_quarantine(
   )
   _create_decision(store, "retry")
 
-  prior_next_attempt_ns = 0
-  delivery = None
-  for attempt in range(1, 6):
-    delivery = asyncio.run(
+  for expected_attempts in (1, 2):
+    failed = asyncio.run(
       store.record_autonomous_approval_delivery_failure(
         "approval-retry",
         tool_call_id="tool-retry",
         nonce="nonce-retry",
-        error=f"failure {attempt}",
+        error=f"failure {expected_attempts}",
       )
     )
-    assert delivery["attempt_count"] == attempt
-    assert delivery["last_attempt_ns"] is not None
-    assert delivery["next_attempt_ns"] >= delivery["last_attempt_ns"]
-    if attempt < 5:
-      assert delivery["next_attempt_ns"] >= prior_next_attempt_ns
-    prior_next_attempt_ns = delivery["next_attempt_ns"]
-    assert delivery["state"] == (
-      "quarantined" if attempt == 5 else "pending"
-    )
 
-  assert delivery is not None
-  assert delivery["quarantined_at"] is not None
+    assert failed["state"] == "pending"
+    assert failed["attempt_count"] == expected_attempts
+    assert failed["last_error"] == f"failure {expected_attempts}"
+    assert failed["last_attempt_ns"] is not None
+    assert failed["quarantined_at"] is None
+    assert [
+      row["approval_id"]
+      for row in asyncio.run(
+        store.list_pending_autonomous_approval_deliveries()
+      )
+    ] == ["approval-retry"]
+
+  with store.autonomous_approval_delivery_append_transaction(
+    "approval-retry",
+    tool_call_id="tool-retry",
+    nonce="nonce-retry",
+    approved=True,
+  ):
+    pass
+
+  published = _get_delivery(store, "retry")
+  assert published["state"] == "published"
+  assert published["attempt_count"] == 3
   assert asyncio.run(
     store.list_pending_autonomous_approval_deliveries()
   ) == []
-  with pytest.raises(RuntimeError, match="not pending"):
-    with store.autonomous_approval_delivery_append_transaction(
-      "approval-retry",
-      tool_call_id="tool-retry",
-      nonce="nonce-retry",
-      approved=True,
-    ):
-      pass
 
 
-def test_retry_deadline_quarantines_first_late_failure(
-  monkeypatch: pytest.MonkeyPatch,
+def test_published_delivery_failure_keeps_its_state(
   tmp_path: Path,
 ) -> None:
   store = SQLiteApprovalStore(
     tmp_path / "approvals.sqlite3",
     audit_emitter=RecordingAuditEmitter(),
   )
-  ready = _create_decision(store, "deadline")
-  monkeypatch.setattr(
-    approval_store_module.time,
-    "time_ns",
-    lambda: ready["retry_deadline_ns"],
-  )
+  _create_decision(store, "published-failure")
+  with store.autonomous_approval_delivery_append_transaction(
+    "approval-published-failure",
+    tool_call_id="tool-published-failure",
+    nonce="nonce-published-failure",
+    approved=True,
+  ):
+    pass
+  published = _get_delivery(store, "published-failure")
 
-  delivery = asyncio.run(
+  failed = asyncio.run(
     store.record_autonomous_approval_delivery_failure(
-      "approval-deadline",
-      tool_call_id="tool-deadline",
-      nonce="nonce-deadline",
-      error="late first failure",
+      "approval-published-failure",
+      tool_call_id="tool-published-failure",
+      nonce="nonce-published-failure",
+      error="late failure",
     )
   )
 
-  assert delivery["attempt_count"] == 1
-  assert delivery["state"] == "quarantined"
+  assert failed["state"] == "published"
+  assert failed["quarantined_at"] is None
+  assert failed["attempt_count"] == published["attempt_count"] + 1
+  assert failed["last_error"] == "late failure"
 
 
-def test_pending_selector_is_bounded_and_excludes_published(
+def test_pending_selector_pages_by_sequence_and_excludes_published(
   tmp_path: Path,
 ) -> None:
   store = SQLiteApprovalStore(
@@ -648,9 +660,32 @@ def test_pending_selector_is_bounded_and_excludes_published(
     _create_decision(store, suffix)
 
   selected = asyncio.run(
-    store.list_pending_autonomous_approval_deliveries(limit=2)
+    store.list_pending_autonomous_approval_deliveries()
   )
-  assert len(selected) == 2
+  assert len(selected) == 3
+  first_sequence = selected[0]["delivery_sequence"]
+  assert [
+    row["delivery_sequence"]
+    for row in asyncio.run(
+      store.list_pending_autonomous_approval_deliveries(
+        after_sequence=first_sequence,
+      )
+    )
+  ] == [row["delivery_sequence"] for row in selected[1:]]
+  assert [
+    row["delivery_sequence"]
+    for row in asyncio.run(
+      store.list_pending_autonomous_approval_deliveries(
+        through_sequence=first_sequence,
+      )
+    )
+  ] == [first_sequence]
+  assert asyncio.run(
+    store.list_pending_autonomous_approval_deliveries(
+      after_sequence=first_sequence,
+      through_sequence=first_sequence,
+    )
+  ) == []
   with store.autonomous_approval_delivery_append_transaction(
     selected[0]["approval_id"],
     tool_call_id=selected[0]["tool_call_id"],
@@ -659,19 +694,49 @@ def test_pending_selector_is_bounded_and_excludes_published(
   ):
     pass
   remaining = asyncio.run(
-    store.list_pending_autonomous_approval_deliveries(limit=3)
+    store.list_pending_autonomous_approval_deliveries()
   )
   assert len(remaining) == 2
   assert selected[0]["approval_id"] not in {
     delivery["approval_id"] for delivery in remaining
   }
-  for invalid_limit in (0, 257, True):
-    with pytest.raises(ValueError, match="1..256"):
-      asyncio.run(
-        store.list_pending_autonomous_approval_deliveries(
-          limit=invalid_limit
-        )
+
+
+def test_outbox_with_retry_columns_keeps_rows_on_open(
+  tmp_path: Path,
+) -> None:
+  database_path = tmp_path / "approvals.sqlite3"
+  store = SQLiteApprovalStore(
+    database_path,
+    audit_emitter=RecordingAuditEmitter(),
+  )
+  before = _create_decision(store, "legacy")
+  with sqlite3.connect(database_path) as conn:
+    conn.execute(
+      "ALTER TABLE autonomous_approval_delivery_outbox "
+      "ADD COLUMN retry_deadline_ns INTEGER NOT NULL DEFAULT 1"
+    )
+    conn.execute(
+      "ALTER TABLE autonomous_approval_delivery_outbox "
+      "ADD COLUMN next_attempt_ns INTEGER NOT NULL DEFAULT 1"
+    )
+
+  reopened = SQLiteApprovalStore(
+    database_path,
+    audit_emitter=RecordingAuditEmitter(),
+  )
+
+  with sqlite3.connect(database_path) as conn:
+    columns = {
+      str(row[1])
+      for row in conn.execute(
+        "PRAGMA table_info(autonomous_approval_delivery_outbox)"
       )
+    }
+  assert columns == set(
+    approval_store_module._AUTONOMOUS_APPROVAL_DELIVERY_OUTBOX_COLUMNS
+  )
+  assert _get_delivery(reopened, "legacy") == before
 
 
 def test_main_database_create_requires_parent_fsync(

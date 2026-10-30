@@ -393,7 +393,7 @@ V1_FIELD_PROJECTION: dict[str, frozenset[str]] = {
   ),
 }
 
-CONTROL_V1_ATTRIBUTION_FIELDS = frozenset({"run_id", "control_run_id", "sub_agent_id"})
+CONTROL_V1_ATTRIBUTION_FIELDS = frozenset({"run_id", "control_run_id", "sub_agent_id", "task_id"})
 CONTROL_V1_EXTENSION_EVENT_TYPES: frozenset[str] = frozenset(
   {
     "run_state_changed",

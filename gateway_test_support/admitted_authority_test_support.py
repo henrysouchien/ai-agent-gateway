@@ -136,7 +136,6 @@ def sealed_admitted_task(
     max_tokens=4096,
     resume_mechanics=AgentResumeMechanics(
       resumable=False,
-      max_chain_depth=0,
       transcript_strategy="durable_reconstruction",
       prompt_strategy="reuse_exact",
       tool_grant_strategy="reissue_exact",

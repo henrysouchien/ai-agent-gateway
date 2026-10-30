@@ -8,15 +8,59 @@ import os
 import threading
 import time
 from concurrent import futures
+from collections.abc import AsyncGenerator, Awaitable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 
 from anyio import EndOfStream
+import httpx2
 from mcp.types import PaginatedRequestParams
 
+from .claim_mint_client import mint_gateway_user_claim
+from .claim_signing_authority import UserClaimHttpAuth, agent_api_claim_http_headers
 from .mcp_client_config import expand_http_template, iter_exception_tree
 from .mcp_client_oauth_storage import oauth_token_cache_path
+
+
+class _RemoteUserClaimHttpAuth(UserClaimHttpAuth):
+  """Keep remote claim I/O on the async request path only."""
+
+  def __init__(
+    self, mint_claim: Callable[[], Awaitable[Mapping[str, str]]],
+  ) -> None:
+    super().__init__(self._require_async)
+    self._mint_remote_claim = mint_claim
+
+  @staticmethod
+  def _require_async() -> Mapping[str, str]:
+    raise RuntimeError("remote claim mint requires asynchronous HTTP")
+
+  async def async_auth_flow(
+    self, request: httpx2.Request,
+  ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
+    request.headers.update(
+      agent_api_claim_http_headers(await self._mint_remote_claim())
+    )
+    yield request
+
+
+def _remote_user_claim_http_auth(
+  scoped_env: Mapping[str, str],
+) -> UserClaimHttpAuth | None:
+  if "AGENT_API_CLAIM_MINT_URL" not in scoped_env:
+    return None
+  mint_url = scoped_env["AGENT_API_CLAIM_MINT_URL"]
+  if not mint_url.strip():
+    raise ValueError("AGENT_API_CLAIM_MINT_URL must not be empty")
+  api_key = scoped_env.get("GATEWAY_API_KEY")
+  if api_key is None or not api_key.strip():
+    raise ValueError("remote claim mint requires GATEWAY_API_KEY")
+
+  async def mint_claim() -> dict[str, str]:
+    return await mint_gateway_user_claim(base_url=mint_url, api_key=api_key)
+
+  return _RemoteUserClaimHttpAuth(mint_claim)
 
 
 #: Bounded backoff between loopback reconnect attempts of one idempotent
@@ -340,12 +384,21 @@ async def connect(
   if server_type in runtime.streamable_http_types:
     # A per-user server's startup connection only lists its catalog; the
     # per-user connections that serve a user's calls are made per user.
+    projected_raw = config.get("_projected_env")
+    projected = projected_raw if isinstance(projected_raw, Mapping) else None
+    scoped_env, _ = manager._scoped_server_env(
+      name,
+      config,
+      deployment_environ=runtime.environ,
+      projected_env=projected,
+    )
+    user_claim_auth = _remote_user_claim_http_auth(scoped_env)
+    if user_claim_auth is None and config.get("per_user") is True:
+      user_claim_auth = manager._catalog_claim_auth()
     return await manager._connect_streamable_http(
       name,
       config,
-      user_claim_auth=(
-        manager._catalog_claim_auth() if config.get("per_user") is True else None
-      ),
+      user_claim_auth=user_claim_auth,
     )
   if server_type == "stdio":
     return await manager._connect_stdio_with_retries(name, config)
@@ -485,7 +538,7 @@ async def connect_stdio(
     env_raw = config.get("env")
     projected_raw = config.get("_projected_env")
     projected = projected_raw if isinstance(projected_raw, Mapping) else None
-    scoped_env = manager._scoped_server_env(
+    scoped_env, absent_env = manager._scoped_server_env(
       name,
       config,
       deployment_environ=runtime.environ,
@@ -495,6 +548,7 @@ async def connect_stdio(
       env_raw if isinstance(env_raw, dict) else None,
       environ=scoped_env,
       base_environ=runtime.environ,
+      absent=absent_env,
     )
     runtime.preflight_stdio_executable(command, args, env)
 
@@ -559,13 +613,20 @@ async def connect_streamable_http(
     headers_raw = config.get("headers")
     projected_raw = config.get("_projected_env")
     projected = projected_raw if isinstance(projected_raw, Mapping) else None
-    scoped_env = manager._scoped_server_env(
+    scoped_env, _ = manager._scoped_server_env(
       name,
       config,
       deployment_environ=runtime.environ,
       projected_env=projected,
     )
     url = expand_http_template(configured_url, environ=scoped_env)
+    auth = _remote_user_claim_http_auth(scoped_env)
+    if auth is None:
+      auth = (
+        user_claim_auth
+        if user_claim_auth is not None
+        else manager._build_http_auth(name, url, config)
+      )
     headers = runtime.build_http_headers(
       headers_raw if isinstance(headers_raw, dict) else None,
       environ=scoped_env,
@@ -578,11 +639,6 @@ async def connect_streamable_http(
     sse_read_expected_seconds = float(config.get("sse_read_timeout", 300))
     terminate_on_close = bool(config.get("terminate_on_close", True))
     tool_prefix = str(config.get("tool_prefix", "") or "").strip()
-    auth = (
-      user_claim_auth
-      if user_claim_auth is not None
-      else manager._build_http_auth(name, url, config)
-    )
 
     log.info(
       "streamable-http for %s: no socket-read deadline; read expectation %gs",

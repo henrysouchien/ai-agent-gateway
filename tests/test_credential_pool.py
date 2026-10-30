@@ -17,11 +17,13 @@ from agent_gateway.providers import ModelProvider
 from agent_gateway.providers.credential_pool import (
   PoolAccountCandidate,
   ProviderCredentialPool,
-  REFRESH_FAILURE_BLOCK_SECONDS,
+  STATIC_ORG_STORE_SPECS,
+  first_org_credential_source,
   get_provider_credential_pool,
   load_pool_accounts,
   rotate_pool_candidate,
   rotate_provider_credential,
+  seed_org_credential_stores,
   select_pool_candidate,
   remove_pool_account,
   upsert_pool_account,
@@ -197,7 +199,7 @@ def test_select_and_rotate_keep_token_and_project_of_unblocked_seat() -> None:
   ) is first
 
 
-def test_selection_refresh_failure_parks_first_and_serves_second() -> None:
+def test_selection_refresh_failure_skips_first_and_serves_second() -> None:
   first, second = _candidates()
   pool = ProviderCredentialPool()
   refreshed: list[str] = []
@@ -214,11 +216,10 @@ def test_selection_refresh_failure_parks_first_and_serves_second() -> None:
   assert selected is not None
   assert selected is second
   assert refreshed == [first.key, second.key]
-  assert pool.blocked_until(first.key) == 100 + REFRESH_FAILURE_BLOCK_SECONDS
   assert selected.record["project_id"] == "project-second"
 
 
-def test_rotation_refresh_failure_parks_sibling_and_serves_next() -> None:
+def test_rotation_refresh_failure_skips_sibling_and_serves_next() -> None:
   first, second = _candidates()
   third = PoolAccountCandidate(
     provider="google_antigravity", key="third@example.com",
@@ -237,7 +238,6 @@ def test_rotation_refresh_failure_parks_sibling_and_serves_next() -> None:
   )
   assert selected is third
   assert pool.blocked_until(first.key) == 200
-  assert pool.blocked_until(second.key) == 100 + REFRESH_FAILURE_BLOCK_SECONDS
 
 
 def test_owner_scope_selects_the_operator_seat() -> None:
@@ -989,3 +989,141 @@ def test_xai_concurrent_pool_resolution_does_not_deadlock_active_refresh(
   refreshed, count = asyncio.run(run_both())
   assert refreshed["access_token"] == "xai-refreshed-access"
   assert count == 1
+
+
+def _write_store(base: Path, family: str, filename: str, text: str) -> Path:
+  path = base / family / filename
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(text, encoding="utf-8")
+  return path
+
+
+def test_static_org_store_specs_are_the_eight_org_stores() -> None:
+  assert STATIC_ORG_STORE_SPECS == (
+    ("google_antigravity", "oauth.json"),
+    ("google", "oauth.json"),
+    ("google", "credentials.json"),
+    ("copilot", "oauth.json"),
+    ("kimi_code", "credentials.json"),
+    ("muse", "credentials.json"),
+    ("ollama_cloud", "credentials.json"),
+    ("xai", "credentials.json"),
+  )
+
+
+def test_first_org_credential_source_is_first_existing_per_file(tmp_path: Path) -> None:
+  shared, fallback = tmp_path / "shared", tmp_path / "fallback"
+  shared_xai = _write_store(shared, "xai", "credentials.json", "shared-xai")
+  _write_store(fallback, "xai", "credentials.json", "fallback-xai")
+  fallback_muse = _write_store(fallback, "muse", "credentials.json", "fallback-muse")
+
+  assert first_org_credential_source([shared, fallback], "xai", "credentials.json") == shared_xai
+  assert first_org_credential_source([shared, fallback], "muse", "credentials.json") == fallback_muse
+  assert first_org_credential_source([shared, fallback], "copilot", "oauth.json") is None
+  assert first_org_credential_source([], "xai", "credentials.json") is None
+
+
+def test_seed_org_credential_stores_prefers_first_base_per_file_without_overwrite(
+  tmp_path: Path,
+) -> None:
+  shared, fallback, target = tmp_path / "shared", tmp_path / "fallback", tmp_path / "target"
+  _write_store(shared, "xai", "credentials.json", "shared-xai")
+  _write_store(fallback, "xai", "credentials.json", "fallback-xai")
+  _write_store(fallback, "muse", "credentials.json", "fallback-muse")
+  _write_store(shared, "copilot", "oauth.json", "shared-copilot")
+  existing = _write_store(target, "copilot", "oauth.json", "target-copilot")
+
+  seeded = seed_org_credential_stores([shared, fallback], target, **_owner_kwargs())
+
+  assert seeded == ("muse/credentials.json", "xai/credentials.json")
+  assert (target / "xai" / "credentials.json").read_text(encoding="utf-8") == "shared-xai"
+  assert (target / "muse" / "credentials.json").read_text(encoding="utf-8") == "fallback-muse"
+  assert existing.read_text(encoding="utf-8") == "target-copilot"
+  assert seed_org_credential_stores([shared, fallback], target, **_owner_kwargs()) == ()
+  assert (target / "xai" / "credentials.json").read_text(encoding="utf-8") == "shared-xai"
+
+
+def test_seed_org_credential_stores_seeds_all_specs_with_private_modes(tmp_path: Path) -> None:
+  source, target = tmp_path / "source", tmp_path / "target"
+  for family, filename in STATIC_ORG_STORE_SPECS:
+    path = _write_store(source, family, filename, f"{family}/{filename}")
+    path.chmod(0o644)
+    path.parent.chmod(0o755)
+
+  seeded = seed_org_credential_stores([source], target, **_owner_kwargs())
+
+  assert seeded == tuple(f"{family}/{filename}" for family, filename in STATIC_ORG_STORE_SPECS)
+  for family, filename in STATIC_ORG_STORE_SPECS:
+    copied = target / family / filename
+    assert copied.read_text(encoding="utf-8") == f"{family}/{filename}"
+    assert stat.S_IMODE(copied.stat().st_mode) == 0o600
+    assert stat.S_IMODE(copied.parent.stat().st_mode) == 0o700
+
+
+def test_seed_org_credential_stores_skips_specs_missing_from_every_base(tmp_path: Path) -> None:
+  source, target = tmp_path / "source", tmp_path / "target"
+  _write_store(source, "kimi_code", "credentials.json", "kimi")
+
+  assert seed_org_credential_stores(
+    [source], target, **_owner_kwargs(),
+  ) == ("kimi_code/credentials.json",)
+  assert not (target / "xai").exists()
+
+
+def _write_json_store(base: Path, family: str, filename: str, payload: dict[str, Any]) -> Path:
+  return _write_store(base, family, filename, json.dumps(payload))
+
+
+def test_seed_org_credential_stores_non_owner_gets_no_personal_seat(tmp_path: Path) -> None:
+  source, target = tmp_path / "source", tmp_path / "target"
+  _write_json_store(source, "ollama_cloud", "credentials.json", {"api_key": "ollama-org-key"})
+  _write_json_store(source, "xai", "credentials.json", {"api_key": "xai-org-key"})
+  _write_json_store(source, "google", "oauth.json", {
+    "accounts": [
+      {"identity": "seat@example.com", "access_token": "personal-access", "refresh_token": "personal-refresh"},
+    ],
+    "access_token": "personal-access", "refresh_token": "personal-refresh",
+  })
+  _write_json_store(source, "copilot", "oauth.json", {"refresh_token": "personal-refresh-only"})
+  _write_json_store(source, "kimi_code", "credentials.json", {
+    "accounts": [
+      {"identity": "seat", "access_token": "personal-kimi", "source": "subscription"},
+      {"identity": "org", "api_key": "kimi-org-key"},
+    ],
+  })
+  _write_json_store(source, "muse", "credentials.json", {
+    "api_key": "muse-personal-key", "source": "subscription",
+  })
+
+  for scope_kwargs in (
+    {"user_scope": "17", "environ": _OWNER_ENVIRON},
+    {"environ": _OWNER_ENVIRON},
+  ):
+    non_owner = tmp_path / f"target-{len(scope_kwargs)}"
+    seeded = seed_org_credential_stores([source], non_owner, **scope_kwargs)
+
+    assert seeded == (
+      "kimi_code/credentials.json", "ollama_cloud/credentials.json", "xai/credentials.json",
+    )
+    assert not (non_owner / "google").exists()
+    assert not (non_owner / "copilot").exists()
+    assert not (non_owner / "muse").exists()
+    ollama = json.loads((non_owner / "ollama_cloud" / "credentials.json").read_text(encoding="utf-8"))
+    assert ollama["api_key"] == "ollama-org-key"
+    kimi = json.loads((non_owner / "kimi_code" / "credentials.json").read_text(encoding="utf-8"))
+    assert [account["identity"] for account in kimi["accounts"]] == ["org"]
+    assert "personal-kimi" not in (non_owner / "kimi_code" / "credentials.json").read_text(encoding="utf-8")
+    for path in non_owner.rglob("*"):
+      if path.is_file():
+        assert "personal" not in path.read_text(encoding="utf-8")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_seed_org_credential_stores_owner_copies_personal_seats_verbatim(tmp_path: Path) -> None:
+  source, target = tmp_path / "source", tmp_path / "target"
+  seat = _write_json_store(source, "google", "oauth.json", {"access_token": "personal-access"})
+
+  assert seed_org_credential_stores(
+    [source], target, **_owner_kwargs(),
+  ) == ("google/oauth.json",)
+  assert (target / "google" / "oauth.json").read_bytes() == seat.read_bytes()

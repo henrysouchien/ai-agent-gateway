@@ -669,3 +669,26 @@ def test_split_control_attribution_does_not_mutate_input() -> None:
   split_control_attribution(event)
 
   assert event == {"type": "text_delta", "run_id": "run-1", "text": "hello"}
+
+
+def test_stamped_skill_result_captured_task_id_is_attribution_and_survives_control_projection() -> None:
+  stamped = {
+    "type": "skill_result_captured",
+    "skill_run_id": "skill-run-1",
+    "skill": "fingerprint-research",
+    "scope": "ticker",
+    "ticker": "FOO",
+    "portfolio_id": None,
+    "run_id": "bg-1",
+    "control_run_id": "bg-1",
+    "task_id": "task-1",
+  }
+
+  attribution, payload = split_control_attribution(stamped)
+  wire = ControlV1Adapter().transform(stamped)
+
+  assert attribution == {"run_id": "bg-1", "control_run_id": "bg-1", "task_id": "task-1"}
+  assert "task_id" not in payload
+  assert payload["skill_run_id"] == "skill-run-1"
+  assert wire is not None
+  assert wire["task_id"] == "task-1"

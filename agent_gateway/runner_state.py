@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Sequence, Set, Tuple
 
@@ -11,6 +12,8 @@ from .runner_budget import (
 from model_authority.thinking import parse_effort
 from .tool_dispatcher_approval_lifecycle import ApprovalPark
 from .tool_result_compaction import model_tool_result_max_chars
+
+log = logging.getLogger("agent_gateway.runner_state")
 
 
 def normalized_run_config(
@@ -49,8 +52,12 @@ def normalized_run_config(
     "model": normalized_model,
     "effort": requested_effort.value,
     "thinking_enabled_requested": requested_effort.value != "none",
-    "max_tokens": int(config.get("max_tokens", 16000)),
   })
+  raw_max_tokens = config.get("max_tokens")
+  if raw_max_tokens is None:
+    config.pop("max_tokens", None)
+  else:
+    config["max_tokens"] = int(raw_max_tokens)
   return config
 
 
@@ -65,36 +72,36 @@ class MaxTokensSelection:
 def select_run_max_tokens(
   config: Dict[str, Any],
   *,
-  max_tokens_override: int | None,
   model_info: Any,
+  requested: int | None = None,
 ) -> MaxTokensSelection:
-  """Owner of a run's per-turn output request.
+  """Owner of every output-token request: the one fit to the model ceiling.
 
-  A declared override (operator env, skill declaration, sub-agent or fork
-  handoff) is requested as given and clamped down to the model's output
-  ceiling. With no override the run requests that ceiling itself; the
-  credential-bound `config["max_tokens"]` is read only when the provider
-  reports no ceiling.
+  A run requests the bound model's registry output ceiling. A caller that
+  sizes its own output (a summary, a one-shot prompt) passes `requested`; the
+  owner fits it to the ceiling and records `requested`, `model_max_output` and
+  `clamped` on the selection, logging the fit when it lowers the request. No
+  provider or call site fits it again. Credential `config["max_tokens"]` is
+  read only when the provider reports no ceiling and no `requested` is given.
+  Nothing invents a default.
   """
   model_max_output = int(getattr(model_info, "max_output_tokens", 0) or 0)
-  if max_tokens_override is not None:
-    requested = int(max_tokens_override)
-  elif model_max_output > 0:
-    requested = model_max_output
-  else:
-    requested = int(config["max_tokens"])
-  if model_max_output > 0 and requested > model_max_output:
-    return MaxTokensSelection(
-      value=model_max_output,
-      requested=requested,
-      model_max_output=model_max_output,
-      clamped=True,
+  if requested is None:
+    requested = model_max_output if model_max_output > 0 else int(config["max_tokens"])
+  value = min(requested, model_max_output) if model_max_output > 0 else requested
+  clamped = value != requested
+  if clamped:
+    log.info(
+      "max_tokens fitted to model ceiling | requested=%d model_max_output=%d value=%d",
+      requested,
+      model_max_output,
+      value,
     )
   return MaxTokensSelection(
-    value=requested,
+    value=value,
     requested=requested,
     model_max_output=model_max_output,
-    clamped=False,
+    clamped=clamped,
   )
 
 
@@ -171,32 +178,12 @@ def completed_assistant_content_blocks(content_blocks: List[Any]) -> List[Any]:
 
 
 @dataclass(frozen=True)
-class MaxTokensContinuationDecision:
-  attempts: int
-  should_continue: bool
-
-
-@dataclass(frozen=True)
 class NoToolUseTurnOutcome:
   action: Literal["continue", "break"]
   messages: List[Dict[str, Any]]
   max_tokens_continuations: int
   reason: str
-  max_tokens_decision: MaxTokensContinuationDecision | None = None
   runtime_guard: Tuple[str, str] | None = None
-
-
-def max_tokens_continuation_decision(
-  *,
-  current_attempts: int,
-  max_attempts: int,
-  unbounded: bool = False,
-) -> MaxTokensContinuationDecision:
-  attempts = current_attempts + 1
-  return MaxTokensContinuationDecision(
-    attempts=attempts,
-    should_continue=unbounded or attempts <= max_attempts,
-  )
 
 
 def no_tool_use_turn_outcome(
@@ -207,9 +194,7 @@ def no_tool_use_turn_outcome(
   stop_reason: str | None,
   pending_notification_count: int,
   max_tokens_continuations: int,
-  max_tokens_max_attempts: int,
   max_tokens_nudge: str,
-  unbounded_max_tokens_continuations: bool = False,
 ) -> NoToolUseTurnOutcome:
   if stop_reason in {"pause_turn", "compaction"}:
     return NoToolUseTurnOutcome(
@@ -227,38 +212,24 @@ def no_tool_use_turn_outcome(
     )
 
   if stop_reason == "max_tokens":
-    continuation_decision = max_tokens_continuation_decision(
-      current_attempts=max_tokens_continuations,
-      max_attempts=max_tokens_max_attempts,
-      unbounded=unbounded_max_tokens_continuations,
-    )
-    if continuation_decision.should_continue:
-      messages: List[Dict[str, Any]] = []
-      assistant_content = completed_assistant_content_blocks(content_blocks)
-      if assistant_content:
-        messages.append(
-          assistant_turn_message(
-            assistant_content,
-            provider=provider,
-            model=model,
-            stop_reason=stop_reason,
-          )
+    messages: List[Dict[str, Any]] = []
+    assistant_content = completed_assistant_content_blocks(content_blocks)
+    if assistant_content:
+      messages.append(
+        assistant_turn_message(
+          assistant_content,
+          provider=provider,
+          model=model,
+          stop_reason=stop_reason,
         )
-      messages.append(user_turn_message(max_tokens_nudge))
-      return NoToolUseTurnOutcome(
-        action="continue",
-        messages=messages,
-        max_tokens_continuations=continuation_decision.attempts,
-        reason="max_tokens_continue",
-        max_tokens_decision=continuation_decision,
-        runtime_guard=("max_tokens_truncation", max_tokens_nudge),
       )
+    messages.append(user_turn_message(max_tokens_nudge))
     return NoToolUseTurnOutcome(
-      action="break",
-      messages=[],
-      max_tokens_continuations=continuation_decision.attempts,
-      reason="max_tokens_terminal",
-      max_tokens_decision=continuation_decision,
+      action="continue",
+      messages=messages,
+      max_tokens_continuations=max_tokens_continuations + 1,
+      reason="max_tokens_continue",
+      runtime_guard=("max_tokens_truncation", max_tokens_nudge),
     )
 
   if pending_notification_count > 0:

@@ -169,7 +169,11 @@ def _strict_session_driver_config(
     },
   )
 
-  def _materialize_service_credential(handle: CredentialHandle) -> MaterializedCredential:
+  def _materialize_service_credential(
+    handle: CredentialHandle,
+    *,
+    user_scope: object = None,
+  ) -> MaterializedCredential:
     if handle is not service_handle:
       raise RuntimeError("unknown server multi-user test credential handle")
     return service_material
@@ -187,7 +191,6 @@ def _strict_session_driver_config(
 def _make_app(
   *,
   credentials_resolver=None,
-  resolver_timeout_seconds: float = 5.0,
   channel_profile_allowlist: dict[str, frozenset[str]] | None = None,
   transcript_dir: Path | None = None,
   selected_content_admitter=None,
@@ -223,7 +226,6 @@ def _make_app(
         },
       ),
       credentials_resolver=credentials_resolver,
-      resolver_timeout_seconds=resolver_timeout_seconds,
       channel_profile_allowlist=channel_profile_allowlist,
       build_chat_runtime=_build_chat_runtime,
       transcript_dir=transcript_dir,
@@ -344,7 +346,7 @@ class _ReplayProvider(ModelProvider):
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
   def build_request_params(
     self,
@@ -1134,24 +1136,6 @@ def test_chat_metadata_reaches_runtime_and_transcript(tmp_path: Path) -> None:
   ]
   chat_request = next(event for event in transcript_events if event.get("type") == "chat_request")
   assert chat_request["metadata"] == metadata
-
-
-def test_credentials_resolver_timeout_returns_structured_error() -> None:
-  async def _resolver(_api_key: str, _init_request):
-    await asyncio.sleep(0.05)
-    return _resolver_result_for("slow")
-
-  app, _captured_requests, _run_calls = _make_app(
-    credentials_resolver=_resolver,
-    resolver_timeout_seconds=0.01,
-  )
-
-  with TestClient(app) as client:
-    response = client.post("/api/chat/init", json={"api_key": "gateway-key", "user_id": "alice"})
-
-  assert response.status_code == 504
-  assert response.json()["error"] == "credentials_timeout"
-  assert response.json()["user_id"] == "alice"
 
 
 def test_credentials_resolver_raise_returns_structured_error() -> None:

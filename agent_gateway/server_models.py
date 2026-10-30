@@ -135,30 +135,10 @@ ControlProfileNamesProvider = Callable[[], Iterable[str]]
 ControlProfileLoader = Callable[[str], Any]
 
 
-@dataclass(frozen=True)
-class SessionExecutionPolicy:
-  """Trusted per-turn runner limits; model selection belongs to product policy."""
-
-  max_tokens: int | None = None
-
-  def __post_init__(self) -> None:
-    value = self.max_tokens
-    if value is not None and (
-      isinstance(value, bool) or not isinstance(value, int) or value <= 0
-    ):
-      raise ValueError("max_tokens must be a positive integer")
-
-
-SessionExecutionPolicyResolver = Callable[
-  [Mapping[str, Any]],
-  SessionExecutionPolicy | None,
-]
-
-
-ServiceAuthConfigResolver = Callable[
-  [CredentialHandle],
-  MaterializedCredential,
-]
+class ServiceAuthConfigResolver(Protocol):
+  def __call__(
+    self, handle: CredentialHandle, *, user_scope: Any = None,
+  ) -> MaterializedCredential: ...
 
 
 class ScheduledRetentionSweeper(Protocol):
@@ -695,9 +675,6 @@ class ChatRequest(BaseModel):
   _capability_execution_resolver: CapabilityExecutionResolver | None = PrivateAttr(
     default=None
   )
-  _session_execution_policy: SessionExecutionPolicy | None = PrivateAttr(
-    default=None
-  )
   _selection_snapshot: SelectionSnapshot | None = PrivateAttr(default=None)
   _selection_provenance: SelectionProvenance | None = PrivateAttr(default=None)
 
@@ -792,20 +769,6 @@ class ChatRequest(BaseModel):
   @property
   def capability_execution_resolver(self) -> CapabilityExecutionResolver | None:
     return self._capability_execution_resolver
-
-  @property
-  def session_execution_policy(self) -> SessionExecutionPolicy | None:
-    return self._session_execution_policy
-
-  def _bind_session_execution_policy(
-    self,
-    policy: SessionExecutionPolicy | None,
-  ) -> None:
-    if self._session_execution_policy is not None:
-      raise ValueError("session execution policy is already bound for this turn")
-    if policy is not None and not isinstance(policy, SessionExecutionPolicy):
-      raise TypeError("session execution policy must be SessionExecutionPolicy")
-    self._session_execution_policy = policy
 
   def _bind_capability_execution_resolver(
     self,
@@ -1112,12 +1075,11 @@ class GatewayServerConfig:
     model_selection_policy: Required product default and selection policy.
     model_preference_store: Durable account-wide per-capability preference
       store. Preferences remain intent and are re-admitted for each session.
-    session_execution_policy_resolver: Trusted per-turn runner-limit resolver;
-      it cannot select a model or effort.
     service_provider_handles: Secret-free service credential provenance by
       provider family.
     service_auth_config_resolver: Trusted server callback that materializes the
-      selected service credential after principal resolution.
+      selected service credential after principal resolution, called as
+      `resolver(handle, user_scope=<effective run scope>)`.
     capability_adapter_resolver: Trusted callback that returns the exact
       adapter implementation for a bound adapter ID. Preparation uses it to
       validate credential material and exact effort before any durable or
@@ -1231,7 +1193,6 @@ class GatewayServerConfig:
   credentials_resolver: CredentialsResolver | None = None
   dispatch_scope_validator: DispatchScopeValidator | None = None
   commercial_work_start_gate: "CommercialWorkStartGate | None" = None
-  resolver_timeout_seconds: float = 5.0
   mcp_client: Optional[McpClientManager] = None
   mcp_meta_inject_servers: frozenset[str] | None = None
   tool_registration_catalog: Any | None = None
@@ -1244,7 +1205,6 @@ class GatewayServerConfig:
   model_registry: ProductModelRegistry | None = None
   model_selection_policy: ProductModelSelectionPolicy | None = None
   model_preference_store: ModelPreferenceStore | None = None
-  session_execution_policy_resolver: SessionExecutionPolicyResolver | None = None
   service_provider_handles: Mapping[str, CredentialHandle] = field(default_factory=dict)
   service_auth_config_resolver: ServiceAuthConfigResolver | None = None
   capability_adapter_resolver: CapabilityAdapterResolver | None = None

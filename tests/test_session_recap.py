@@ -951,6 +951,7 @@ class _UsageProvider(ModelProvider):
       id=model,
       provider=self.name,
       supports_thinking=True,
+      max_output_tokens=16_384,
     )
 
   def build_request_params(

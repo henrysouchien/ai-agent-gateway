@@ -1,11 +1,9 @@
-"""Cell lineage: producer values are plain, and the host ledger keeps their sources.
+"""Producer containers retain ordinary JSON behavior alongside input lineage.
 
-`hank.call` returns plain `dict`/`list` values; a cell computes on them with
-ordinary Python and returns plain `dict`/`list` values. There is no
-`hank.derive`: provenance is recorded host-side on the cell's nested-call
-ledger (`nested_calls` with `source_refs`, and `sources`), and lineage into a
-model flows only through `model_document` formulas / `fms_persist`. The
-sticky-kernel journey runs real interpreters through the real dispatcher.
+The host ledger records producer sources. Reference-carrying dict/list values
+remain usable by ordinary Python, JSON, deepcopy and pandas across sticky cells;
+explicit ``hank.derive`` publication adds observations without primary sources.
+The sticky-kernel journey runs real interpreters through the real dispatcher.
 """
 import asyncio
 import json
@@ -110,14 +108,14 @@ def _observations() -> list[dict[str, Any]]:
   ]
 
 
-def test_retained_producer_values_are_plain_and_a_later_cell_returns_plain_dicts(tmp_path: Path) -> None:
+def test_retained_producer_values_support_plain_computation_in_a_later_cell(tmp_path: Path) -> None:
   async def run() -> None:
     session, _bundle, dispatcher = _session(tmp_path)
     try:
       first = await _cell(dispatcher, "cell-1", f"""
         cpi = hank.call({FRED_SERIES!r}, series_id="CPIAUCSL", tail={_MONTHS})
         unused = hank.call({FRED_SERIES!r}, series_id="UNRATE", tail={_MONTHS})
-        assert type(cpi) is dict and type(cpi["observations"]) is list and type(cpi["observations"][0]) is dict
+        assert isinstance(cpi, dict) and isinstance(cpi["observations"], list) and isinstance(cpi["observations"][0], dict)
         print(len(cpi["observations"]))
       """)
       cpi_row = _row(first["sources"], "CPIAUCSL")
@@ -151,24 +149,22 @@ def test_retained_producer_values_are_plain_and_a_later_cell_returns_plain_dicts
   asyncio.run(run())
 
 
-def test_hank_has_no_derive_and_calling_it_raises_attribute_error(tmp_path: Path) -> None:
+def test_derive_publishes_literal_inputs_as_findings(tmp_path: Path) -> None:
   async def run() -> None:
     session, _bundle, dispatcher = _session(tmp_path)
     try:
       result = await _cell(dispatcher, "cell-1", """
-        import json
-        absent = not hasattr(hank, "derive")
-        try:
-          hank.derive("x", 1.0, expression="x", inputs=[])
-          raised = None
-        except AttributeError as error:
-          raised = str(error)
-        print(json.dumps([absent, raised]))
+        hank.derive("sum", 3.0, expression="1.0 + 2.0", inputs=[1.0, 2.0])
       """)
-      absent, raised = json.loads(result["stdout"])
-      assert absent is True and raised == "derive"
-      # A rejected attribute is not an operation: nothing was framed to the host.
-      assert "nested_calls" not in result and "sources" not in result and "derived" not in result
+      row, = result["derived"]
+      assert (row["name"], row["value"], row["expression"], row["status"]) == (
+        "sum", 3.0, "1.0 + 2.0", "derived",
+      )
+      assert [(item["value"], item["sources"]) for item in row["inputs"]] == [(1.0, []), (2.0, [])]
+      assert [(finding["code"], finding["input"]) for finding in row["findings"]] == [
+        ("input_unsourced", 0), ("input_unsourced", 1),
+      ]
+      assert "nested_calls" not in result and "sources" not in result
     finally:
       await cleanup_code_execution(session)
 
@@ -181,7 +177,7 @@ def test_repeated_reads_of_one_call_keep_one_ledger_entry_and_one_source(tmp_pat
     try:
       first = await _cell(dispatcher, "cell-1", f"""
         obs = hank.call({FRED_SERIES!r}, series_id="CPIAUCSL", tail={_MONTHS})["observations"]
-        assert type(obs) is list and type(obs[0]) is dict
+        assert isinstance(obs, list) and isinstance(obs[0], dict)
       """)
       assert len(first["sources"]) == 1 and len(first["nested_calls"]) == 1
       result = await _cell(dispatcher, "cell-2", """
@@ -235,12 +231,11 @@ def test_producer_values_behave_as_plain_json(tmp_path: Path) -> None:
         copied = copy.deepcopy(obs)
         frame = pd.DataFrame(obs)
         print(json.dumps({{
-            "types": [type(cpi) is dict, type(obs) is list, type(obs[0]) is dict, type(obs[:2]) is list],
+            "types": [isinstance(cpi, dict), isinstance(obs, list), isinstance(obs[0], dict), isinstance(obs[:2], list)],
             "equal": [cpi == plain, obs == plain["observations"], copied == obs],
             "same_json": json.dumps(cpi, sort_keys=True) == json.dumps(plain, sort_keys=True),
             "repr": repr(obs[:2]) == repr(plain["observations"][:2]),
             "frame": [frame.shape[0], float(frame["value"].iloc[-1])],
-            "no_derive": not hasattr(hank, "derive"),
         }}))
       """)
       result = await _cell(dispatcher, "cell-2", """
@@ -249,7 +244,7 @@ def test_producer_values_behave_as_plain_json(tmp_path: Path) -> None:
       """)
       checks = json.loads(first["stdout"])
       assert checks["types"] == [True, True, True, True] and checks["equal"] == [True, True, True]
-      assert checks["same_json"] and checks["repr"] and checks["no_derive"]
+      assert checks["same_json"] and checks["repr"]
       assert checks["frame"] == [_MONTHS, 250.0 + (_MONTHS - 1) * 1.5]
       assert json.loads(result["stdout"]) == checks["frame"][1]
       assert "derived" not in first and "derived" not in result
@@ -315,18 +310,18 @@ def test_native_result_carried_into_a_cell_is_plain_and_the_ledger_keeps_its_sou
   asyncio.run(run())
 
 
-def test_sliced_producer_list_is_a_plain_list(tmp_path: Path) -> None:
+def test_sliced_producer_list_supports_plain_list_computation(tmp_path: Path) -> None:
   async def run() -> None:
     session, _bundle, dispatcher = _session(tmp_path)
     try:
       first = await _cell(dispatcher, "cell-1", f"""
         obs = hank.call({FRED_SERIES!r}, series_id="CPIAUCSL", tail={_MONTHS})["observations"]
-        assert type(obs) is list and type(obs[-12:]) is list
+        assert isinstance(obs, list) and isinstance(obs[-12:], list)
       """)
       result = await _cell(dispatcher, "cell-2", """
         import json
         window = obs[-12:]
-        assert type(window) is list and len(window) == 12
+        assert isinstance(window, list) and len(window) == 12
         mean = sum(row["value"] for row in window) / len(window)
         print(json.dumps({"mean": mean, "window": window, "last": window[-1]}))
       """)

@@ -65,6 +65,8 @@ _SKIP_THOUGHT_FIELD = "requires_skip_thought_signature_on_first_function_call"
 _ABSENT = object()
 _INT63_MASK = (1 << 63) - 1
 _SESSION_RANDOM_BOUND = 9_000_000_000_000_000_000
+# Typed HTTP transport retry classification at provider entry (with 5xx in is_retryable_error);
+# 408/409 are transient request-timeout/conflict statuses, not usage-limit signals.
 _RETRYABLE_STATUSES = frozenset({408, 409})
 _CONTENT_ERROR_REASONS = frozenset({
   "SAFETY",
@@ -100,17 +102,6 @@ _SURROGATE_RE = re.compile(
 )
 _BASE64_SIGNATURE_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 _GOOGLE_STATUS_RE = re.compile(r'"status"\s*:\s*"([A-Z0-9_]+)"')
-_USAGE_LIMIT_RE = re.compile(
-  r"\b("
-  r"resource[\s_-]*exhausted"
-  r"|exceeded your current quota"
-  r"|quota[\s_-]*(?:exhausted|exceeded|limit)"
-  r"|rate[\s_-]*limit(?:ed|ing)?"
-  r"|too many requests"
-  r"|usage[\s_-]*limit"
-  r")\b",
-  re.IGNORECASE,
-)
 _CONTENT_REFUSAL_RE = re.compile(
   r"\b("
   r"safety"
@@ -749,12 +740,7 @@ def _is_usage_limit_only(exc: Exception) -> bool:
     return False
   if _is_context_length_exception(exc) or _is_content_refusal(exc):
     return False
-  google_status = _google_status(exc)
-  if google_status == "RESOURCE_EXHAUSTED":
-    return True
-  if google_status in {"PERMISSION_DENIED", "UNAUTHENTICATED", "INVALID_ARGUMENT"}:
-    return False
-  return _USAGE_LIMIT_RE.search(_searchable(exc)) is not None
+  return _google_status(exc) == "RESOURCE_EXHAUSTED"
 
 
 def _retry_after_raw(exc: Exception) -> str | None:

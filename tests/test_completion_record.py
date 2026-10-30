@@ -44,7 +44,7 @@ class _Provider(ModelProvider):
     return True
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name, supports_thinking=True)
+    return ModelInfo(id=model, provider=self.name, supports_thinking=True, max_output_tokens=16_384)
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> object:
     return object()

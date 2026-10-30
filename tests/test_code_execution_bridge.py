@@ -17,7 +17,7 @@ import sys
 import textwrap
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -288,6 +288,7 @@ def _setup(
   delay_s: float = 0.0,
   extract_sources: Any = None,
   code_callable: Any = None,
+  placement: Literal["local", "docker"] = "local",
 ) -> tuple[Any, Any, _CaptureMcp, ToolDispatcher]:
   """A session on a live turn whose runner owns background cells as `code` jobs."""
   session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
@@ -295,7 +296,7 @@ def _setup(
   session.active_turn = SessionStream(event_log=EventLog(), runner_task=None, runtime_owner=runner)
   bundle = build_code_execution(
     session,
-    config=CodeExecutionConfig(),
+    config=CodeExecutionConfig(placement=placement),
     job_runner=lambda: runner,
   )
   mcp = _CaptureMcp(delay_s=delay_s, frame_reader=bundle.frame_reader)
@@ -430,6 +431,104 @@ def test_two_reads_compose_in_one_cell() -> None:
       await cleanup_code_execution(session)
 
   asyncio.run(_run())
+
+
+def test_retained_bridge_list_has_public_kernel_locals_summary() -> None:
+  async def run() -> None:
+    session, _bundle, _mcp, dispatcher = _setup(extract_sources=_filings_extractor)
+    try:
+      result, error = await _run_cell(dispatcher, f'''
+        rows = hank.call({GET_FILINGS!r}, cik="0000320193")["filings"]
+      ''')
+      assert error is None, error
+      assert result["return_code"] == 0, result["stderr"]
+      assert result["stdout"] == "[bound in kernel: rows = list[2]]\n"
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(run())
+
+
+def test_successful_bridge_producers_return_their_original_input_references() -> None:
+  async def run() -> None:
+    session, _bundle, mcp, dispatcher = _setup(extract_sources=_filings_extractor)
+    try:
+      result, error = await _run_cell(dispatcher, f'''
+        import json
+        filings = hank.call({GET_FILINGS!r}, cik="0000320193")
+        series = hank.call({FRED_SERIES!r}, series_id="CPIAUCSL")
+        print(json.dumps([
+            hank.input(filings["filings"], 0),
+            hank.input(series["observations"], 0),
+        ]))
+      ''')
+      assert error is None, error
+      assert result["return_code"] == 0, result["stderr"]
+      filing_input, series_input = json.loads(result["stdout"])
+      filing_call, series_call = result["nested_calls"]
+      assert filing_input["nested_call_id"] == filing_call["nested_call_id"]
+      assert filing_input["source_refs"] == filing_call["source_refs"]
+      assert filing_input["source_refs"]
+      assert filing_input["path"] == ["filings", 0]
+      assert filing_input["value"] == _FILINGS_RESULT["filings"][0]
+      assert series_input["nested_call_id"] == series_call["nested_call_id"]
+      assert series_input["source_refs"] == series_call["source_refs"] == []
+      assert series_input["path"] == ["observations", 0]
+      assert series_input["value"] == _FRED_RESULT["observations"][0]
+      assert len(mcp.calls) == 2
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(run())
+
+
+def test_dict_live_views_keep_original_equal_scalar_slots_without_sourcing_insertions() -> None:
+  async def run() -> None:
+    session, _bundle, mcp, dispatcher = _setup(extract_sources=_filings_extractor)
+    try:
+      result, error = await _run_cell(dispatcher, f'''
+        import json
+        filings = hank.call({GET_FILINGS!r}, cik="0000320193")
+        row = filings["filings"][0]
+        items = row.items()
+        values = row.values()
+        keys = row.keys()
+        original = row["accession"]
+        row["added"] = original
+        assert "added" in keys
+        assert ("added", original) in items
+        assert list(values).count(original) == 3
+        selected = [
+            hank.input(row, "accession"),
+            hank.input(row, "accession_number"),
+            hank.input(row, "added"),
+        ]
+        print(json.dumps(selected))
+        for index, operand in enumerate(selected):
+            hank.derive("slot_" + str(index), operand["value"],
+                        expression="selected", inputs=[operand])
+      ''')
+      assert error is None, error
+      assert result["return_code"] == 0, result["stderr"]
+      first, second, inserted = json.loads(result["stdout"])
+      call, = result["nested_calls"]
+      assert first["value"] == second["value"] == inserted["value"]
+      assert first["source_refs"] == second["source_refs"] == call["source_refs"]
+      assert first["path"] == ["filings", 0, "accession"]
+      assert second["path"] == ["filings", 0, "accession_number"]
+      first_row, second_row, inserted_row = result["derived"]
+      for row in (first_row, second_row):
+        assert row["findings"] == []
+        assert row["inputs"][0]["sources"] == result["sources"]
+      assert inserted_row["inputs"][0]["sources"] == []
+      assert [(item["code"], item["input"]) for item in inserted_row["findings"]] == [
+        ("input_unsourced", 0),
+      ]
+      assert len(mcp.calls) == 1
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(run())
 
 
 def test_reader_refuses_ungranted_non_code_callable_and_unknown_operations() -> None:
@@ -1399,6 +1498,76 @@ def test_background_cell_is_a_code_job_whose_result_carries_its_bridge() -> None
   asyncio.run(_run())
 
 
+def test_kernel_approval_continuation_keeps_the_job_runner_for_background_and_wait() -> None:
+  """A kernel approval park clears the live turn; the runner seen before it stays bound.
+
+  The product accessor reads `session.active_turn.runtime_owner` and answers
+  None once continuation clears that turn. The qualifier runs while the runner
+  is still there, so a later background cell and `hank.wait` must keep that
+  registry instead of refusing `code_execution_unavailable` / `bridge_unavailable`.
+  """
+
+  async def _run() -> None:
+    session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+    runner = _job_runner()
+    session.active_turn = SessionStream(event_log=EventLog(), runner_task=None, runtime_owner=runner)
+    bundle = build_code_execution(
+      session,
+      config=CodeExecutionConfig(),
+      job_runner=lambda: session.active_turn.runtime_owner if session.active_turn is not None else None,
+    )
+    mcp = _CaptureMcp(frame_reader=bundle.frame_reader)
+    dispatcher = _bind(bundle, mcp)
+    try:
+      assert bundle.approval_qualifier("code_execute", {"code": "print(1)"}) == "kernel"
+      session.active_turn = None
+
+      started, error = await _run_cell(
+        dispatcher,
+        """
+        print("continued")
+        """,
+        background=True,
+      )
+      assert error is None, error
+      assert started["status"] == "running"
+      task_id = started["task_id"]
+      # Continuation cleared the live turn, so collection reads the runner the
+      # qualifier captured — the same registry and payload reads `_collect_background` makes.
+      entry = runner._task_registry.get(task_id)
+      assert entry is not None and entry.task_type == "code"
+      assert entry.asyncio_task is not None
+      await entry.asyncio_task
+      collected = runner._background_task_payload(entry)
+      assert entry.state == TaskState.COMPLETED
+      assert collected["stdout"] == "continued\n", collected
+
+      waited, error = await _run_cell(
+        dispatcher,
+        f"""
+        import json
+        print(json.dumps(hank.wait([{task_id!r}], timeout=30)))
+        """,
+      )
+      assert error is None, error
+      assert waited["return_code"] == 0, waited
+      assert "bridge_unavailable" not in waited["stdout"]
+      assert "bridge_unavailable" not in waited.get("stderr", "")
+      observed = json.loads(waited["stdout"])
+      assert "source_refs" not in observed and "nested_call_id" not in observed
+      assert not waited.get("nested_calls")
+      assert not waited.get("sources")
+      assert observed["unknown"] == []
+      assert observed["pending"] == []
+      assert observed["jobs"][task_id]["completed"] is True
+      assert observed["jobs"][task_id]["state"] == "completed"
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+
 def test_registry_kill_cancels_a_running_background_cell_and_closes_it(monkeypatch: pytest.MonkeyPatch) -> None:
   async def _run() -> None:
     handles = _record_started_handles(monkeypatch)
@@ -2223,99 +2392,26 @@ def test_native_settlement_retrieves_live_entry_without_repreparing_executed_inp
 
   asyncio.run(run())
 
+def test_non_sandboxed_compute_requires_approval() -> None:
+  """Non-sandboxed code execution asks at the existing approval door."""
+  """Non-sandboxed code execution asks at the existing approval door."""
+  from agent.shared.tool_registration import build_product_tool_registration_composition
+  from agent.shared.tool_policy import requires_approval
 
-def test_skills_as_code_bridge_read_path_exercises_library_and_reaches_approval_door() -> None:
-  """Phase 3+: cell exercises new library (dilution) over bridge read path;
-  asserts permitted writes like refresh_filings are code-callable;
-  proves money-class ops (execute_trade) are code-callable and reach the
-  dispatcher's approval door (refused with approval_required under NoApprovalRoute),
-  while code_execute itself is structurally absent from the cell grant.
-  """
-  from api.agent.shared.server_policies import server_tool_is_code_callable
-  from api.agent.shared.tool_policy import requires_approval
-
-  def _real_code_callable(op: str) -> bool:
-    if op.startswith("mcp__"):
-      parts = op.split("__")
-      if len(parts) >= 3:
-        return server_tool_is_code_callable(parts[1], parts[2])
-    return False
-
+  composition = build_product_tool_registration_composition()
+  from product_local_input_preparation_runtime import bind_product_local_input_preparation_context
+  from agent.shared.tool_policy_implementations import product_redaction_context_factory
   async def _run() -> None:
-    session, bundle, mcp, dispatcher = _setup(code_callable=_real_code_callable)
-    dispatcher._needs_approval = lambda name, tool_input, qualifier: (
-      requires_approval(name.split("__", 2)[2], tool_input, qualifier)
-      if name.startswith("mcp__")
-      else requires_approval(name, tool_input, qualifier)
-    )
+    session, bundle, mcp, dispatcher = _setup()
+    dispatcher._tool_registration_catalog = composition.catalog
+    dispatcher._tool_policy_implementations = composition.policy_implementations
+    dispatcher._needs_approval = requires_approval
+    dispatcher._input_preparation_context_factory = bind_product_local_input_preparation_context(bundle)
+    dispatcher._redaction_context_factory = product_redaction_context_factory
     try:
-      result, error = await _run_cell(dispatcher, f"""
-        from dilution.treasury_stock import OptionTranche, treasury_stock_method
-        import json
-
-        # 0. Host tool (code_execute) is structurally absent from the cell grant
-        assert "code_execute" not in [row["name"] for row in hank.search("")]
-        try:
-            _ = hank.code_execute
-            raise AssertionError("hank.code_execute should not exist")
-        except AttributeError:
-            pass
-        host_err = None
-        try:
-            hank.call("code_execute", code="1+1")
-        except HankBridgeError as exc:
-            host_err = exc.code
-        print("host_tool_error:", host_err)
-
-        # 1. Read path via domain-clients bridge
-        filings = hank.call({GET_FILINGS!r}, cik="0000320193", limit=2)
-        assert len(filings["filings"]) == 2
-
-        # 2. Compute dilution with new library
-        tranches = [
-            OptionTranche(strike_price=50.0, shares=1000.0),
-            OptionTranche(strike_price=80.0, shares=1000.0),
-        ]
-        dilution_res = treasury_stock_method(tranches, stock_price=100.0)
-        print("net_dilutive_shares:", dilution_res.net_dilutive_shares)
-
-        # 3. Permitted write (cache refresh) IS code-callable
-        refresh_res = hank.call({REFRESH_FILINGS!r}, cik="0000320193")
-        assert refresh_res["refreshed"] is True
-        print("permitted_write: success")
-
-        # 4. Money-class op (execute_trade) is code-callable and reaches the approval door
-        denied_error = None
-        try:
-            hank.call({EXECUTE_TRADE!r}, preview_id="pv-123")
-        except HankBridgeError as exc:
-            denied_error = exc.code
-        print("protected_write_denied:", denied_error)
-      """)
-      assert error is None, error
-      assert result["return_code"] == 0, result["stderr"]
-      assert "host_tool_error: unknown_operation" in result["stdout"]
-      assert "net_dilutive_shares: 700.0" in result["stdout"]
-      assert "permitted_write: success" in result["stdout"]
-      assert "protected_write_denied: approval_required" in result["stdout"]
-
-      # Verify bridge dispatched the read and permitted write, but NEVER executed the unattended trade
-      assert mcp.calls == [
-        (GET_FILINGS, {"cik": "0000320193", "limit": 2}),
-        (REFRESH_FILINGS, {"cik": "0000320193"}),
-      ]
-      nested = result["nested_calls"]
-      assert len(nested) == 4
-      assert nested[0]["operation"] == "code_execute"
-      assert nested[0]["ok"] is False
-      assert nested[0]["error_code"] == "unknown_operation"
-      assert nested[1]["operation"] == GET_FILINGS
-      assert nested[1]["ok"] is True
-      assert nested[2]["operation"] == REFRESH_FILINGS
-      assert nested[2]["ok"] is True
-      assert nested[3]["operation"] == EXECUTE_TRADE
-      assert nested[3]["ok"] is False
-      assert nested[3]["error_code"] == "approval_required"
+      result, error = await _run_cell(dispatcher, "pass")
+      assert result is None
+      assert error is not None and error["code"] == "approval_required"
       await cleanup_code_execution(session)
     finally:
       pass
@@ -2346,6 +2442,7 @@ def _place_bundle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, storage_id: s
       email="alice@example.test", risk_user_id=17, role="analyst", capabilities=(),
     ),
     storage_id=storage_id,
+    generation=1,
     desk=DeskReplica(
       url="https://desk.example.test", aws_access_key_id=None, aws_secret_access_key=None,
       aws_session_token=None, expires_at=None,

@@ -236,21 +236,19 @@ def test_skill_limit_observations_are_signed_but_not_cli_arguments() -> None:
   first = _workload(
     mode="skill",
     skill="quant-research",
-    admitted_skill_execution_limits=SkillExecutionLimits(32_000),
+    admitted_skill_execution_limits=SkillExecutionLimits(),
   )
   second = _workload(
     mode="skill",
     skill="quant-research",
-    admitted_skill_execution_limits=SkillExecutionLimits(2),
+    admitted_skill_execution_limits=SkillExecutionLimits(),
   )
 
   assert first == second
-  assert first.receipt()["admitted_skill_execution_limits"] == {
-    "max_tokens": 32_000,
-  }
+  assert first.receipt()["admitted_skill_execution_limits"] == {}
   parsed = _verify(_signed(workload=first)).workload
   assert type(parsed.admitted_skill_execution_limits) is SkillExecutionLimits
-  assert parsed.admitted_skill_execution_limits == SkillExecutionLimits(32_000)
+  assert parsed.admitted_skill_execution_limits == SkillExecutionLimits()
 
   payload = json.loads(_signed(workload=first))
   payload["workload"]["admitted_skill_execution_limits"] = {"max_tokens": 2}
@@ -261,16 +259,13 @@ def test_skill_limit_observations_are_signed_but_not_cli_arguments() -> None:
 @pytest.mark.parametrize(
   "value",
   [
-    {},
-    {"max_turns": 20, "max_tokens": 32_000},
+    {"extra": None},
     {
       "max_turns": 20,
       "max_tokens": 32_000,
       "max_budget_usd": 20.0,
       "extra": None,
     },
-    {"max_tokens": True},
-    {"max_tokens": 0},
   ],
 )
 def test_v7_skill_workload_rejects_malformed_signed_limits(value: object) -> None:
@@ -325,18 +320,14 @@ def test_signed_non_skill_workload_carries_limit_observation(
 ) -> None:
   overrides: _WorkloadOverrides = {
     **kwargs,
-    "admitted_skill_execution_limits": SkillExecutionLimits(32_000),
+    "admitted_skill_execution_limits": SkillExecutionLimits(),
   }
   workload = _workload(**overrides)
   verified = _verify(_signed(workload=workload))
 
   assert verified.workload.mode == workload.mode
-  assert verified.workload.admitted_skill_execution_limits == SkillExecutionLimits(
-    32_000
-  )
-  assert verified.payload()["workload"]["admitted_skill_execution_limits"] == {
-    "max_tokens": 32_000,
-  }
+  assert verified.workload.admitted_skill_execution_limits == SkillExecutionLimits()
+  assert verified.payload()["workload"]["admitted_skill_execution_limits"] == {}
 
 
 def test_envelope_rejects_tampering_and_wrong_signature() -> None:

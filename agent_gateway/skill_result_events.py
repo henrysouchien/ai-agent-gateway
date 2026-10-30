@@ -12,11 +12,9 @@ from .skill_lifecycle import (
   TopLevelSkillLifecycleMetadata,
 )
 from .sub_agent_skill_state import (
-  ChildOutcomeClassification,
   classify_child_outcome,
   is_context_door_name,
   is_declared_terminal_door,
-  terminal_fms_result_disposition,
 )
 
 
@@ -36,12 +34,7 @@ def build_skill_result_captured_event(
   output_memory_file: str | None = None,
   duration_s: float | None = None,
   canonical_result_evidence_authoritative: bool = False,
-  declared_terminal_doors: Iterable[str] | None = None,
 ) -> dict[str, Any] | None:
-  # ``declared_terminal_doors`` is the persist expectation:
-  # ``persist_expectation_doors(admitted_task)`` — the terminal-result doors,
-  # and only when the operation declares ``result_requires_persist``. A
-  # coordinator carries its children's doors without owing a persist of its own.
   artifact_identity = SkillLifecycleArtifactIdentity(
     scope=scope,
     ticker=ticker,
@@ -67,39 +60,11 @@ def build_skill_result_captured_event(
     fms_results, artifact_events = canonical_evidence
   artifact_refs = _artifact_refs(fms_results, artifact_events)
   primary_fms = _primary_fms(fms_results)
-  door_names = {
-    str(item.get("tool_name"))
-    for item in door_results
-    if item.get("tool_name")
-  }
   classification = classify_child_outcome(
     result,
     error,
-    declared_terminal_doors=door_names,
     door_results=door_results,
   )
-  declared_terminals = frozenset(declared_terminal_doors or ())
-  if (
-    classification.succeeded
-    and declared_terminals
-    and not artifact_refs
-    and not any(
-      item.get("tool_name") in declared_terminals
-      and terminal_fms_result_disposition(item) == "success"
-      for item in door_results
-    )
-  ):
-    # The grant declares a terminal door; ending with no accepted answer from
-    # it and no artifact is not a success, whatever the narrative claims.
-    classification = ChildOutcomeClassification(
-      outcome="blocked",
-      succeeded=False,
-      error={
-        "code": "no_gate_produced",
-        "message": "skill ended without an accepted terminal door result or artifact",
-        "child_outcome": "blocked",
-      },
-    )
   if not classification.is_final:
     return None
   primary_door_status = (
@@ -116,10 +81,10 @@ def build_skill_result_captured_event(
     "outcome": outcome,
     # The child's status is the child's own disposition, from the same owner
     # as exit_code (``classify_child_outcome``, which already fails the run
-    # when its declared terminal door failed). Reading it off the last FMS
-    # envelope instead paired a failure status with exit code 0 whenever a
-    # non-terminal door reported one, which the lifecycle contract rejects.
-    # Door statuses stay visible inside ``fms_results``.
+    # when its received terminal or context door failed). Reading it off the
+    # last FMS envelope instead paired a failure status with exit code 0
+    # whenever a non-terminal door reported one, which the lifecycle contract
+    # rejects. Door statuses stay visible inside ``fms_results``.
     "status": classification.outcome,
     "gate_code": _gate_code(primary_fms),
     "artifact_refs": artifact_refs,

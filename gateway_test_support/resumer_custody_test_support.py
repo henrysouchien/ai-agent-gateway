@@ -68,7 +68,6 @@ def canonical_read_custody_task(
     payload["operation"]["execution_class"] = source.model_bind.capability_id
     payload["operation"]["resumable"] = True
     snapshot["resume_mechanics"]["resumable"] = True
-    snapshot["resume_mechanics"]["max_chain_depth"] = 3
     snapshot["provider_tool_definitions"] = [
       {"definition": {
         "name": "web_search",

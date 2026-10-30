@@ -51,7 +51,6 @@ def test_control_session_resolves_ttl_per_user_with_default_fallback(
   app.include_router(build_session_router(
     auth=auth,
     credentials_resolver=None,
-    resolver_timeout_seconds=1,
     tenant_id="test-product",
     allow_service_credentials_for_interactive=False,
     identity_resolver=fake_identity_resolver,

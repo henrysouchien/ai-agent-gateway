@@ -30,6 +30,7 @@ class HttpCommercialAuthorityClient:
     environment: str,
     key_id: str,
     secret: bytes,
+    # The only hang bound on the signed POST to the commercial authority: resource containment.
     timeout_seconds: float = 5.0,
     clock: Callable[[], int] = lambda: int(time.time()),
     post: Callable[..., httpx.Response] = httpx.post,

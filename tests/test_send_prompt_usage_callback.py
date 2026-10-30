@@ -50,7 +50,7 @@ def _bound_auth_config(
 ) -> dict[str, Any]:
   config = {
     "provider": bind.provider,
-    "max_tokens": 4096,
+    # no "max_tokens": the model registry ceiling is the only output limit
     "auth_mode": "api",
     "api_key": "test-key",
   }
@@ -102,6 +102,7 @@ class _PreflightProvider(ModelProvider):
       id=model,
       provider=self.name,
       supports_thinking=True,
+      max_output_tokens=16_384,
     )
 
   def create_client(
@@ -216,12 +217,18 @@ def test_send_prompt_usage_event_sets_provider() -> None:
   assert events[0].cost_usd == 0.0042
   assert provider.request_params is not None
   assert provider.request_params["model"] == bind.upstream_model
-  assert provider.request_params["max_tokens"] == 4096
+  assert (
+    provider.request_params["max_tokens"]
+    == provider.get_model_info(bind.upstream_model).max_output_tokens
+  )
   assert provider.request_params["thinking_level"] is ThinkingLevel.NONE
   assert provider.request_params["effort_resolution"].effective is ThinkingLevel.NONE
 
 
-def test_send_prompt_clamps_max_tokens_to_model_max_output() -> None:
+@pytest.mark.parametrize("legacy_max_tokens", [None, 1, 4096, 200_000])
+def test_send_prompt_sends_model_max_output_regardless_of_auth_config_max_tokens(
+  legacy_max_tokens: int | None,
+) -> None:
   class _FakeProvider(_PreflightProvider):
     def __init__(self) -> None:
       super().__init__()
@@ -250,6 +257,9 @@ def test_send_prompt_clamps_max_tokens_to_model_max_output() -> None:
     effort="none",
     credential_principal="user",
   ).bind
+  config_changes: dict[str, Any] = {}
+  if legacy_max_tokens is not None:
+    config_changes["max_tokens"] = legacy_max_tokens
 
   result = asyncio.run(
     send_prompt_module.send_prompt(
@@ -257,7 +267,7 @@ def test_send_prompt_clamps_max_tokens_to_model_max_output() -> None:
       capability_execution=_bound_execution(
         bind=bind,
         provider_adapter=provider,
-        max_tokens=200_000,
+        **config_changes,
       ),
       user_id="alice",
       completion_record_root=None,

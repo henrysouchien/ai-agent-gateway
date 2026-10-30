@@ -31,7 +31,6 @@ def build_autonomous_cmd(
   skill: str | None = None,
   pack: str | None = None,
   deliver: bool = True,
-  context: str | None = None,
   ticker: str | None = None,
   research_file_id: int | None = None,
   normalize_autonomous_profile_func: Callable[[str], str] = normalize_autonomous_profile,
@@ -49,8 +48,8 @@ def build_autonomous_cmd(
     cmd.append("--no-deliver")
 
   if normalized_mode == "once":
-    if task or skill or pack or context or ticker:
-      raise ValueError("mode='once' does not accept task, skill, pack, context, or ticker")
+    if task or skill or pack or ticker:
+      raise ValueError("mode='once' does not accept task, skill, pack, or ticker")
     if research_file_id is not None:
       raise ValueError("research_file_id requires mode='skill' or mode='task'")
     return cmd
@@ -58,7 +57,7 @@ def build_autonomous_cmd(
   if normalized_mode == "task":
     if not task or not task.strip():
       raise ValueError("task is required when mode='task'")
-    if skill or pack or context or ticker:
+    if skill or pack or ticker:
       raise ValueError("mode='task' only accepts the task parameter")
     cmd.extend(["--task", task.strip()])
     if research_file_id is not None:
@@ -68,7 +67,7 @@ def build_autonomous_cmd(
   if normalized_mode == "pack":
     if not pack or not pack.strip():
       raise ValueError("pack is required when mode='pack'")
-    if task or skill or context or ticker:
+    if task or skill or ticker:
       raise ValueError("mode='pack' only accepts the pack parameter")
     if research_file_id is not None:
       raise ValueError("research_file_id requires mode='skill' or mode='task'")
@@ -84,8 +83,6 @@ def build_autonomous_cmd(
     cmd.extend(["--research-file-id", str(research_file_id)])
   if ticker and ticker.strip():
     cmd.extend(["--ticker", canonicalize_ticker(ticker)])
-  if context and context.strip():
-    cmd.extend(["--context", context.strip()])
   return cmd
 
 

@@ -27,11 +27,6 @@ VALUATION_READY_BATCH_DISPATCH_TOOL_DEF: dict[str, Any] = {
         "type": "string",
         "description": "Explicit public-company ticker symbol to run through the valuation-ready workflow.",
       },
-      "budget_usd": {
-        "type": "number",
-        "description": "Optional total batch budget. Defaults to the valuation-ready catalog suggestion.",
-        "minimum": 0,
-      },
       "required_filings": {
         "type": "array",
         "description": "Exact SEC filing fiscal periods checked before spend (YYYY-Q1..Q4 or YYYY-FY); periods not yet ready return as warnings.",
@@ -99,27 +94,8 @@ def _normalize_ticker(value: Any) -> str | None:
     return None
 
 
-def _valuation_ready_defaults(app_state: Any) -> dict[str, Any]:
-  skill_application = getattr(
-    app_state,
-    "gateway_skill_application",
-    None,
-  )
-  if skill_application is None:
-    raise RuntimeError("batch compiled skill application is unavailable")
-  defaults = batches._batch_backend(app_state).controller.batch_workflow_defaults(
-    VALUATION_READY_TEMPLATE,
-    skill_application=skill_application,
-  )
-  if type(defaults) is not dict:
-    raise TypeError("batch workflow defaults must be an exact dict")
-  return defaults
-
-
 def _dispatch_spec(
   tool_input: dict[str, Any],
-  *,
-  app_state: Any,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
   ticker = _normalize_ticker((tool_input or {}).get("ticker"))
   if ticker is None:
@@ -128,30 +104,10 @@ def _dispatch_spec(
       "message": "valuation_ready_batch_dispatch requires a valid explicit ticker.",
       "details": {"verdict": "INSUFFICIENT_DATA", "reason": "missing_or_invalid_ticker"},
     }
-  defaults = _valuation_ready_defaults(app_state)
-  budget_raw = (tool_input or {}).get("budget_usd")
-  if budget_raw is None:
-    budget_usd = float(defaults.get("suggested_budget_usd_per_name") or 25.0)
-  else:
-    try:
-      budget_usd = float(budget_raw)
-    except (TypeError, ValueError):
-      return None, {
-        "code": "invalid_budget",
-        "message": "budget_usd must be numeric when provided.",
-        "details": {"verdict": "INSUFFICIENT_DATA", "reason": "invalid_budget"},
-      }
-    if budget_usd < 0:
-      return None, {
-        "code": "invalid_budget",
-        "message": "budget_usd must be non-negative.",
-        "details": {"verdict": "INSUFFICIENT_DATA", "reason": "invalid_budget"},
-      }
   return {
     "source": EXPLICIT_TICKER_SOURCE,
     "universe": [ticker],
     "pipeline_template": VALUATION_READY_TEMPLATE,
-    "budget_usd": budget_usd,
     "corpus_requirements": [{
       "ticker": ticker,
       "required_filings": (tool_input or {}).get("required_filings"),
@@ -167,16 +123,7 @@ def _make_dispatch_handler(*, app_state: Any, session: Any) -> LocalToolHandler:
     tool_ctx: ToolExecutionContext,
     **_: object,
   ) -> tuple[Any | None, dict[str, Any] | None]:
-    try:
-      spec, error = _dispatch_spec(
-        tool_input or {},
-        app_state=app_state,
-      )
-    except (RuntimeError, TypeError, ValueError) as exc:
-      return None, {
-        "code": "batch_dispatch_failed",
-        "message": str(exc),
-      }
+    spec, error = _dispatch_spec(tool_input or {})
     if error is not None:
       return None, error
     assert spec is not None
@@ -236,7 +183,6 @@ def _make_dispatch_handler(*, app_state: Any, session: Any) -> LocalToolHandler:
       "source": EXPLICIT_TICKER_SOURCE,
       "pipeline_template": VALUATION_READY_TEMPLATE,
       "ticker": spec["universe"][0],
-      "budget_usd": spec["budget_usd"],
     }, None
 
   return _handle

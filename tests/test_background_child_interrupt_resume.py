@@ -60,6 +60,10 @@ class _LiveChildProvider(_ResumeTestProvider):
       yield StreamEvent(
         type="tool_use_end", tool_id=f"read-{name}",
         tool_name="web_search", tool_input={"query": name},
+        raw_block={
+          "type": "tool_use", "id": f"read-{name}",
+          "name": "web_search", "input": {"query": name},
+        },
       )
       yield StreamEvent(type="message_end", stop_reason="tool_use")
       return
@@ -126,12 +130,18 @@ semantic_metadata:
       user_id="alice", role="owner",
     )
 
+    self.session = session
+    self.executed: list[dict[str, Any]] = []
+    self.require_approval = False
+
     async def web_search(tool_input: dict[str, Any], **_kwargs: Any):
+      self.executed.append(tool_input)
       return {"evidence": f"Original evidence for {tool_input['query']}"}, None
 
     local = {"web_search": web_search}
     self.resume_handler = make_resume_handler(
       [self.runner], operation_resume_bindings=None, parent_session=session,
+      needs_approval=lambda *_args: self.require_approval,
       mcp_client=_NullMcpClient(), local_tool_handlers=local,
       excluded_tools_resolver=frozenset,
       capability_execution_resolver=self.resolver,
@@ -141,6 +151,7 @@ semantic_metadata:
     self.run_agent = make_run_agent_handler(
       [self.runner], parent_session=session, skill_loader=loader,
       mcp_client=_NullMcpClient(), local_tool_handlers=local,
+      needs_approval=lambda *_args: self.require_approval,
       capability_execution_resolver=self.resolver,
     )
     self.resumed_runs: list[dict[str, Any]] = []
@@ -521,5 +532,126 @@ def test_interrupt_immediately_after_registration_survives_handler_cleanup(
     assert terminal[0]["final_state"] == TaskState.INTERRUPTED.value
     assert terminal[0]["result"] == entry.result
     assert runner.interrupt_background_task(entry.task_id) is False
+
+  asyncio.run(case())
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("restored", [False, True])
+def test_child_approval_continuation_retains_prepark_tool_use(
+  children, tmp_path: Path, background: bool, restored: bool,
+) -> None:
+  from agent_gateway.approval_policy import ApprovalVote
+  from agent_gateway.admission import root_context
+  from agent_gateway.approval_route import DurableLocalApprovalRoute
+  from agent_gateway.approval_store import SQLiteApprovalStore
+  from agent_gateway.sub_agent import ApprovedCallRef, continue_approved_child
+  from gateway_test_support.approval_policy_test_support import FixedOutcomeApprovalPolicy
+
+  async def case() -> None:
+    live = children()
+    runner = live.runner
+    store = SQLiteApprovalStore(tmp_path / "child-approvals.sqlite3")
+    live.session.agent_session_log = runner._agent_session_log
+    live.session.approval_route = DurableLocalApprovalRoute(
+      store, FixedOutcomeApprovalPolicy("request_user_approval"), live.session,
+    )
+    root_context(live.session, withheld_tools=frozenset(), research_file_id=None)
+    live.require_approval = True
+    live.provider.release["first"].set()
+    try:
+      result, error = await live.run_agent({
+        "operation": live.operation,
+        "objective": "[child:first] Review the original admitted evidence.",
+        "background": background,
+      }, call_index=1)
+      assert error is None
+      assert result is not None
+      tasks = runner._task_registry.list_tasks()
+      assert len(tasks) == 1
+      source = tasks[0]
+      if source.asyncio_task is not None:
+        await asyncio.wait_for(asyncio.shield(source.asyncio_task), timeout=5)
+      assert source.state == TaskState.AWAITING_APPROVAL
+      assert live.executed == []
+      log = runner._agent_session_log
+      assert log is not None
+      approvals, _ = await log.query(event_types={"tool_approval_request"})
+      assert len(approvals) == 1
+      approval = approvals[0].event
+      request = await store.get(approval["approval_id"])
+      assert request is not None
+      binding, _ = await store._read_executable_binding_for_executor(
+        job_id=source.task_id, tool_call_id=request.tool_call_id,
+        nonce=approval["nonce"], tenant_storage_id="alice",
+      )
+      assert await store._read_completed_executable_result_for_executor(binding=binding) is None
+      await store.record_vote(request.approval_id, ApprovalVote(
+        vote_id="child-vote", approval_id=request.approval_id,
+        decider_id="alice", decider_role="owner", decision="approved",
+        decision_reason=None, decided_at=request.requested_at,
+      ))
+      # Approval delivery can restore a host after the original parent turn.
+      # Rebuild the source from its durable registration, not the warm claim.
+      if restored:
+        runner._task_registry = TaskRegistry()
+      parked_messages = await reconstruct_messages_for_task(log, source.task_id)
+      completed = []
+      successor, resume_error = await continue_approved_child(
+        runner, parked_task_id=source.task_id,
+        approved_call=ApprovedCallRef(source.task_id, request.tool_call_id, approval["nonce"]),
+        on_complete=completed.append, on_park=None,
+      )
+      assert resume_error is None
+      assert successor is not None and successor.asyncio_task is not None
+      await asyncio.wait_for(asyncio.shield(successor.asyncio_task), timeout=5)
+      assert successor.state == TaskState.COMPLETED, {
+        "result": successor.result, "parked_messages": parked_messages,
+        "binding_result": await store._read_completed_executable_result_for_executor(binding=binding),
+      }
+      assert completed == [successor]
+      assert live.executed == [{"query": "first"}]
+      assert await store._read_completed_executable_result_for_executor(binding=binding) == (
+        {"evidence": "Original evidence for first"}, None,
+      )
+      replay, replay_error = await continue_approved_child(
+        runner, parked_task_id=source.task_id,
+        approved_call=ApprovedCallRef(source.task_id, request.tool_call_id, approval["nonce"]),
+        on_complete=completed.append, on_park=None,
+      )
+      assert replay_error is None and replay is successor
+      assert completed == [successor]
+      assert live.executed == [{"query": "first"}]
+      assert live.provider.calls["first"] == 2
+      transcript = await reconstruct_messages_for_task(log, successor.task_id)
+      uses = [
+        block for message in transcript if isinstance(message["content"], list)
+        for block in message["content"]
+        if block["type"] == "tool_use" and block["id"] == request.tool_call_id
+      ]
+      results = [
+        block for message in transcript if isinstance(message["content"], list)
+        for block in message["content"]
+        if block["type"] == "tool_result" and block["tool_use_id"] == request.tool_call_id
+      ]
+      assert len(uses) == len(results) == 1
+      assert uses[0]["input"] == {"query": "first"}
+      assert json.loads(results[0]["content"]) == {"evidence": "Original evidence for first"}
+      rows, _ = await log.query(order="asc")
+      registrations = [
+        row for row in rows
+        if row.event["type"] == "task_registered" and row.event["task_id"] == source.task_id
+      ]
+      assert len(registrations) == 1
+      original_assistant = next(
+        row for row in rows if row.event["type"] == "assistant_message"
+        and any(
+          block.get("id") == request.tool_call_id
+          for block in row.event.get("content_blocks", [])
+        )
+      )
+      assert registrations[0].seq < original_assistant.seq
+    finally:
+      await live.close()
 
   asyncio.run(case())

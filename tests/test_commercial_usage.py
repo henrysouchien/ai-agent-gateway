@@ -15,12 +15,16 @@ from hank_contracts.commercial_work import (
   WorkStartSpendLedger,
 )
 from agent_gateway.commercial_contract import canonical_usage_payload_sha256
+from agent_gateway.commercial_contract import packaged_usage_v3_contract_directory
 from hank_contracts.usage import (
   CommercialUsageLineage,
   CommercialUsageOutboxError,
   CommercialUsageCircuitOpen,
 )
-from agent_gateway.commercial_usage import CommercialUsageProducer
+from agent_gateway.commercial_usage import (
+  CommercialUsageObservation,
+  CommercialUsageProducer,
+)
 from agent_gateway.multi_user.billing import SessionUsageSummary, UsageEvent
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker
 from agent_gateway.runner_usage import call_usage_event_hook
@@ -327,6 +331,252 @@ async def test_verified_work_start_emits_attempt_authoritative_usage_v3() -> Non
   assert payload["work_authorization_id"] == str(authorization.authorization_id)
   assert payload["source_payload_sha256"] == canonical_usage_payload_sha256(payload)
   assert emitted == [payload]
+
+
+def _observation(**changes) -> CommercialUsageObservation:
+  facts = {
+    "source_product": "hank-agent-gateway",
+    "environment": "prod",
+    "operation": "messages.create",
+    "authenticated_subject": "user:123",
+  }
+  facts.update(changes)
+  return CommercialUsageObservation(**facts)
+
+
+_COMMERCIAL_NULL_FIELDS = (
+  "execution_context_id",
+  "workflow_run_id",
+  "funding_route_id",
+  "reservation_id",
+  "shadow_rate_version",
+  "workflow_attempt_group_id",
+  "workflow_attempt_number",
+  "retry_of_workflow_run_id",
+  "workflow_attempt_kind",
+  "work_authorization_id",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("billing_mode", ("metered", "byok"))
+async def test_observation_emits_shared_contract_shape_without_commercial_lineage(
+  billing_mode,
+) -> None:
+  emitted = []
+
+  def sink(payloads):
+    emitted.extend(payloads)
+    return "outbox"
+
+  producer = CommercialUsageProducer(
+    enabled=True,
+    claim=None,
+    lineage=None,
+    sink=sink,
+    observation=_observation(),
+  )
+  event = _event(billing_mode=billing_mode, provider_reported_model="claude-reported")
+  payload = await producer.emit(event)
+
+  assert payload is not None
+  assert emitted == [payload]
+  assert payload["schema_version"] == 3
+  assert payload["authenticated_subject"] == "user:123"
+  assert payload["source_product"] == "hank-agent-gateway"
+  assert payload["environment"] == "prod"
+  assert payload["operation"] == "messages.create"
+  assert payload["raw_billing_mode"] == billing_mode
+  for field in _COMMERCIAL_NULL_FIELDS:
+    assert field in payload and payload[field] is None, field
+  # Exact bind identity and a separately observed reported identity.
+  assert payload["capability_bind"] == event.capability_bind
+  assert payload["provider"] == "anthropic"
+  assert payload["model"] == "claude-sonnet-test"
+  assert payload["capability_id"] == "portfolio.review"
+  assert payload["provider_reported_model"] == "claude-reported"
+  assert payload["source_payload_sha256"] == canonical_usage_payload_sha256(payload)
+  # The packaged contract itself accepts the shape (no private validator).
+  from jsonschema import Draft202012Validator
+  import json
+
+  schema = json.loads(
+    (
+      packaged_usage_v3_contract_directory()
+      / "commercial-usage-event-v3.schema.json"
+    ).read_text()
+  )
+  assert not list(Draft202012Validator(schema).iter_errors(payload))
+
+
+@pytest.mark.asyncio
+async def test_observation_keeps_unreported_model_null_and_digest_covers_subject() -> None:
+  producer_a = CommercialUsageProducer(
+    enabled=True, claim=None, lineage=None, sink=lambda _: "outbox",
+    observation=_observation(),
+  )
+  producer_b = CommercialUsageProducer(
+    enabled=True, claim=None, lineage=None, sink=lambda _: "outbox",
+    observation=_observation(authenticated_subject="user:124"),
+  )
+  first = await producer_a.emit(_event())
+  second = await producer_b.emit(_event())
+
+  assert first is not None and second is not None
+  assert first["provider_reported_model"] is None
+  assert first["source_payload_sha256"] != second["source_payload_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_observation_provider_unit_deltas_keep_subject_and_nulls() -> None:
+  emitted = []
+
+  def sink(payloads):
+    emitted.extend(payloads)
+    return "outbox"
+
+  producer = CommercialUsageProducer(
+    enabled=True, claim=None, lineage=None, sink=sink, observation=_observation()
+  )
+  await producer.emit(
+    _event(provider_unit_deltas={"web.search": 2}, separately_billed_tool_cost_usd=0)
+  )
+
+  assert [item["operation"] for item in emitted] == ["messages.create", "web.search"]
+  for item in emitted:
+    assert item["authenticated_subject"] == "user:123"
+    assert item["source_payload_sha256"] == canonical_usage_payload_sha256(item)
+    for field in _COMMERCIAL_NULL_FIELDS:
+      assert item[field] is None, field
+
+
+@pytest.mark.asyncio
+async def test_observation_has_no_reservation_stop_or_spend_ledger() -> None:
+  def tripped_guard(_billing_mode):
+    raise CommercialUsageCircuitOpen("circuit open")
+
+  def sink(_payloads):
+    return "outbox"
+
+  sink.assert_work_allowed = tripped_guard  # type: ignore[attr-defined]
+
+  observation = CommercialUsageProducer(
+    enabled=True, claim=None, lineage=None, sink=sink, observation=_observation()
+  )
+  # An unavailable durable transport never refuses observed work ...
+  observation.assert_work_allowed("metered")
+  observation.assert_work_allowed("byok")
+  # ... while commercial work keeps its fail-closed guard.
+  commercial = CommercialUsageProducer(
+    enabled=True, claim=_claim(), lineage=_lineage(), sink=sink
+  )
+  with pytest.raises(CommercialUsageCircuitOpen):
+    commercial.assert_work_allowed("metered")
+  from agent_gateway.commercial_work_start import commercial_budget_stop_fields
+
+  assert commercial_budget_stop_fields(observation) is None
+  assert await observation.reconcile(
+    SessionUsageSummary(
+      user_id="123", session_id="sess_001", request_id="req_001",
+      input_tokens=1000, output_tokens=200, cache_read_tokens=300,
+      cache_creation_tokens=100, cost=0.0125, turns=1, channel="mcp",
+      started_at=NOW - 1, ended_at=NOW,
+      usage_event_count=1, usage_event_ids=("evt_001",),
+      capability_bind=_event().capability_bind,
+    )
+  ) is None
+
+
+def test_observation_context_is_exclusive_and_validated() -> None:
+  sink = lambda _: "outbox"  # noqa: E731
+  with pytest.raises(ValueError, match="cannot carry a commercial claim"):
+    CommercialUsageProducer(
+      enabled=True, claim=_claim(), lineage=_lineage(), sink=sink,
+      observation=_observation(),
+    )
+  with pytest.raises(ValueError, match="cannot carry a commercial claim"):
+    CommercialUsageProducer(
+      enabled=True, claim=None, lineage=None, sink=sink,
+      work_start=_work_start(), observation=_observation(),
+    )
+  with pytest.raises(ValueError, match="durable sink"):
+    CommercialUsageProducer(
+      enabled=True, claim=None, lineage=None, sink=None,
+      observation=_observation(),
+    )
+  for subject in ("123", "user:0", "user:012", "user:", "user:-1", "user:1.5", "USER:1"):
+    with pytest.raises(ValueError, match="observation usage subject"):
+      _observation(authenticated_subject=subject)
+  with pytest.raises(ValueError, match="operation"):
+    _observation(operation="")
+  # Without observation, enabled commercial usage still demands full lineage.
+  with pytest.raises(ValueError, match="requires claim, lineage"):
+    CommercialUsageProducer(enabled=True, claim=None, lineage=None, sink=sink)
+
+
+@pytest.mark.asyncio
+async def test_observation_lands_in_the_real_durable_outbox(tmp_path) -> None:
+  durability = CommercialUsageDurability.create(
+    outbox_path=tmp_path / "usage.sqlite3",
+    spool_path=tmp_path / "usage.spool",
+    circuit_state_path=tmp_path / "circuit.json",
+    max_backlog=10,
+    max_storage_bytes=10_000_000,
+  )
+  producer = durability.producer(observation=_observation())
+  payload = await producer.emit(_event())
+
+  assert payload is not None
+  assert durability.outbox.health()["backlog_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+  ("estimated", "reported", "expected_estimated", "expected_reported"),
+  (
+    (0.004634124, "0.004634125", "0.00463412", "0.00463413"),
+    (0.004634125, "0.004634124", "0.00463413", "0.00463412"),
+    (0.000000001, "0.000000005", "0.00000000", "0.00000001"),
+    (0.004634124, None, "0.00463412", None),
+  ),
+)
+async def test_observation_costs_round_half_up_to_eight_places_before_durability(
+  tmp_path, estimated, reported, expected_estimated, expected_reported,
+) -> None:
+  durability = CommercialUsageDurability.create(
+    outbox_path=tmp_path / "usage.sqlite3",
+    spool_path=tmp_path / "usage.spool",
+    circuit_state_path=tmp_path / "circuit.json",
+    max_backlog=10,
+    max_storage_bytes=10_000_000,
+  )
+  producer = durability.producer(observation=_observation())
+  payload = await producer.emit(
+    _event(cost_usd=estimated, provider_reported_cost_usd=reported)
+  )
+
+  assert payload is not None
+  assert payload["producer_estimated_cost_usd"] == expected_estimated
+  assert payload["provider_reported_cost_usd"] == expected_reported
+  assert payload["source_payload_sha256"] == canonical_usage_payload_sha256(payload)
+  stored = durability.outbox.get("evt_001")
+  assert stored is not None
+  assert stored.payload == payload
+
+
+@pytest.mark.asyncio
+async def test_commercial_cost_precision_is_not_changed_by_observation_normalization() -> None:
+  producer = CommercialUsageProducer(
+    enabled=True, claim=_claim(), lineage=_lineage(), sink=lambda _: "outbox",
+  )
+  payload = await producer.emit(
+    _event(cost_usd=0.004634124, provider_reported_cost_usd="0.004634125")
+  )
+
+  assert payload is not None
+  assert payload["producer_estimated_cost_usd"] == "0.004634124"
+  assert payload["provider_reported_cost_usd"] == "0.004634125"
+  assert payload["source_payload_sha256"] == canonical_usage_payload_sha256(payload)
 
 
 @pytest.mark.asyncio
@@ -727,6 +977,7 @@ async def test_send_prompt_real_producer_emits_metered_canonical_identity() -> N
         id=model,
         provider=self.name,
         supports_thinking=True,
+        max_output_tokens=16_384,
       )
 
     def create_client(self, config, *, timeout=None):

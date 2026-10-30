@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import inspect
 import json
 import logging
@@ -36,6 +37,7 @@ from .usage_reconciliation import CommercialUsageReconciliationTracker
 logger = logging.getLogger(__name__)
 
 _CODE = re.compile(r"^[a-z][a-z0-9._:-]{0,127}$")
+_AUTHENTICATED_SUBJECT = re.compile(r"^user:[1-9][0-9]*$")
 CommercialUsageSink = Callable[
   [list[dict[str, Any]]],
   UsageDurability | Awaitable[UsageDurability],
@@ -46,6 +48,36 @@ class CommercialUsageReconciler(Protocol):
     self,
     summary: SessionUsageSummary,
   ) -> CommercialUsageReconciliationReport | None: ...
+
+
+@dataclass(frozen=True)
+class CommercialUsageObservation:
+  """Authenticated-owner context for observation-only Usage V3.
+
+  It asserts no commercial claim, workflow, funding route, reservation, rate
+  policy or work authorization: only the server-configured identity of the
+  gateway, the inference operation, and the authenticated Risk user.
+  """
+
+  source_product: str
+  environment: str
+  operation: str
+  authenticated_subject: str
+
+  def __post_init__(self) -> None:
+    if not isinstance(self.source_product, str) or not _CODE.fullmatch(self.source_product):
+      raise ValueError("observation usage source product is invalid")
+    if not isinstance(self.environment, str) or not _CODE.fullmatch(self.environment):
+      raise ValueError("observation usage environment is invalid")
+    if not isinstance(self.operation, str) or not _CODE.fullmatch(self.operation):
+      raise ValueError("observation usage operation is invalid")
+    if (
+      not isinstance(self.authenticated_subject, str)
+      or not _AUTHENTICATED_SUBJECT.fullmatch(self.authenticated_subject)
+    ):
+      raise ValueError(
+        "observation usage subject must be user:<positive Risk user id>"
+      )
 
 
 class CommercialUsageProducer:
@@ -61,8 +93,19 @@ class CommercialUsageProducer:
     work_start: CommercialWorkStartContext | None = None,
     reconciliation_tracker: Any | None = None,
     on_reconciliation: Callable[[Any], Awaitable[None] | None] | None = None,
+    observation: CommercialUsageObservation | None = None,
   ) -> None:
     self._enabled = enabled
+    if observation is not None:
+      if not isinstance(observation, CommercialUsageObservation):
+        raise TypeError("observation usage requires an observation context")
+      if claim is not None or lineage is not None or work_start is not None:
+        raise ValueError(
+          "observation usage cannot carry a commercial claim, lineage or work start"
+        )
+      if reconciliation_tracker is not None:
+        raise ValueError("observation usage has no commercial reconciliation")
+    self._observation = observation
     if work_start is not None:
       if not isinstance(work_start, CommercialWorkStartContext):
         raise TypeError("commercial Usage V3 requires verified work-start context")
@@ -96,7 +139,10 @@ class CommercialUsageProducer:
       / "commercial-usage-event-v3.schema.json"
     )
     self._validator = Draft202012Validator(json.loads(schema.read_text()))
-    if enabled and (claim is None or lineage is None or sink is None):
+    if enabled and (
+      sink is None
+      or (observation is None and (claim is None or lineage is None))
+    ):
       raise ValueError("enabled commercial usage requires claim, lineage, and durable sink")
 
   @property
@@ -104,7 +150,9 @@ class CommercialUsageProducer:
     return self._enabled
 
   def assert_work_allowed(self, billing_mode: BillingMode) -> None:
-    if not self._enabled or self._sink is None:
+    # Observation never stops work: an unavailable sink is handled by its
+    # outbox/spool, not by refusing the turn.
+    if not self._enabled or self._sink is None or self._observation is not None:
       return
     guard = getattr(self._sink, "assert_work_allowed", None)
     if callable(guard):
@@ -169,8 +217,9 @@ class CommercialUsageProducer:
       return None
     claim = self._claim
     lineage = self._lineage
+    observation = self._observation
     sink = self._sink
-    if claim is None or lineage is None or sink is None:
+    if sink is None:
       raise RuntimeError("commercial usage producer lost required configuration")
     if (
       not isinstance(event.event_id, str)
@@ -188,7 +237,7 @@ class CommercialUsageProducer:
     # a work-start lineage naming another capability is logged, and the event is
     # published under the bind (the closed Usage V3 contract has no divergence field).
     bind = CapabilityBind.from_json(event.capability_bind)
-    if lineage.capability_id != bind.capability_id:
+    if lineage is not None and lineage.capability_id != bind.capability_id:
       logger.warning(
         "commercial usage %s: lineage capability %s differs from capability bind %s; "
         "billed as the bind",
@@ -204,7 +253,11 @@ class CommercialUsageProducer:
     ):
       raise ValueError("reasoning tokens must be an informational output subset")
     # Money: Hank-funded usage without a budget reservation is unbillable spend.
-    if event.billing_mode == "metered" and lineage.reservation_id is None:
+    if (
+      lineage is not None
+      and event.billing_mode == "metered"
+      and lineage.reservation_id is None
+    ):
       raise ValueError(
         "Hank-funded commercial usage requires reservation lineage: start the "
         "work under a metered work authorization whose reservation_id names "
@@ -220,22 +273,49 @@ class CommercialUsageProducer:
     occurred_at = datetime.fromtimestamp(event.timestamp, timezone.utc).isoformat().replace(
       "+00:00", "Z"
     )
+    if observation is not None:
+      # Observation asserts no commercial identity: every commercial lineage
+      # key is an explicit null and the authenticated subject names the owner.
+      identity: dict[str, Any] = {
+        "source_product": observation.source_product,
+        "environment": observation.environment,
+        "execution_context_id": None,
+        "workflow_run_id": None,
+        "reservation_id": None,
+        "funding_route_id": None,
+        "operation": observation.operation,
+        "shadow_rate_version": None,
+        "authenticated_subject": observation.authenticated_subject,
+      }
+    else:
+      if claim is None or lineage is None:
+        raise RuntimeError("commercial usage producer lost required configuration")
+      identity = {
+        "source_product": lineage.source_product,
+        "environment": claim.environment,
+        "execution_context_id": str(claim.context_id),
+        "workflow_run_id": lineage.workflow_run_id,
+        "reservation_id": lineage.reservation_id,
+        "funding_route_id": lineage.funding_route_id,
+        "operation": lineage.operation,
+        "shadow_rate_version": claim.shadow_rate_version,
+      }
     payload: dict[str, Any] = {
       "schema_version": 3,
-      "source_product": lineage.source_product,
+      "source_product": identity["source_product"],
       "source_event_id": event.event_id,
-      "environment": claim.environment,
+      "environment": identity["environment"],
       "occurred_at": occurred_at,
-      "execution_context_id": str(claim.context_id),
+      "execution_context_id": identity["execution_context_id"],
       "request_id": event.request_id,
       "session_id": event.session_id,
       "parent_turn_id": event.parent_turn_id,
-      "workflow_run_id": lineage.workflow_run_id,
-      "reservation_id": lineage.reservation_id,
-      "funding_route_id": lineage.funding_route_id,
+      "workflow_run_id": identity["workflow_run_id"],
+      "reservation_id": identity["reservation_id"],
+      "funding_route_id": identity["funding_route_id"],
       "channel": event.channel,
       "provider": bind.provider,
-      "operation": lineage.operation,
+      "operation": identity["operation"],
       "model": bind.upstream_model,
       "capability_id": bind.capability_id,
       "capability_bind": bind.to_json(),
@@ -259,7 +339,7 @@ class CommercialUsageProducer:
         if event.provider_reported_cost_usd is not None else "producer_estimate"
       ),
       "producer_rate_version": event.rate_table_version,
-      "shadow_rate_version": claim.shadow_rate_version,
+      "shadow_rate_version": identity["shadow_rate_version"],
       "raw_billing_mode": event.billing_mode,
       "workflow_attempt_group_id": None,
       "workflow_attempt_number": None,
@@ -267,6 +347,17 @@ class CommercialUsageProducer:
       "workflow_attempt_kind": None,
       "work_authorization_id": None,
     }
+    if "authenticated_subject" in identity:
+      payload["authenticated_subject"] = identity["authenticated_subject"]
+      # Risk stores these observations at eight decimal places. Normalize only
+      # this shape before hashing; existing commercial payload bytes stay exact.
+      for field in ("producer_estimated_cost_usd", "provider_reported_cost_usd"):
+        value = payload[field]
+        if value is not None:
+          payload[field] = format(
+            Decimal(value).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP),
+            "f",
+          )
     if self._work_start is not None:
       authorization = self._work_start.authorization
       payload.update({

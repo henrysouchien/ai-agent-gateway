@@ -25,7 +25,7 @@ def _bound(model_info: ModelInfo, effort: EffortResolution) -> float:
 
 
 def test_a_cloud_transport_keeps_the_hung_peer_bound() -> None:
-  info = ModelInfo(id="cloud", provider="anthropic", context_window=1_000_000)
+  info = ModelInfo(id="cloud", provider="anthropic", context_window=1_000_000, max_output_tokens=16_384)
   assert _bound(info, _NO_THINKING) == STREAM_STALL_TIMEOUT
   assert _bound(info, _THINKING) == STREAM_THINKING_STALL_TIMEOUT
 
@@ -33,7 +33,7 @@ def test_a_cloud_transport_keeps_the_hung_peer_bound() -> None:
 def test_a_local_prefill_transport_scales_the_bound_from_its_context_window() -> None:
   # qwen3.8:27b on this Mac: 262144-token window. 25517 prompt tokens took 65 s to a first
   # chunk and 60945 took up to 232 s, past the 60 s bound this scaling replaces.
-  info = ModelInfo(id="qwen", provider="ollama", context_window=262_144, first_progress_after_prefill=True)
+  info = ModelInfo(id="qwen", provider="ollama", context_window=262_144, first_progress_after_prefill=True, max_output_tokens=16_384)
   bound = _bound(info, _NO_THINKING)
   assert bound == 262_144 / LOCAL_PREFILL_TOKENS_PER_SECOND
   assert bound > 65
@@ -42,12 +42,12 @@ def test_a_local_prefill_transport_scales_the_bound_from_its_context_window() ->
 
 
 def test_a_small_local_window_never_drops_below_the_base_bound() -> None:
-  info = ModelInfo(id="tiny", provider="ollama", context_window=2_048, first_progress_after_prefill=True)
+  info = ModelInfo(id="tiny", provider="ollama", context_window=2_048, first_progress_after_prefill=True, max_output_tokens=16_384)
   assert _bound(info, _NO_THINKING) == STREAM_STALL_TIMEOUT
 
 
 def test_an_explicit_per_run_bound_still_wins() -> None:
-  info = ModelInfo(id="qwen", provider="ollama", context_window=262_144, first_progress_after_prefill=True)
+  info = ModelInfo(id="qwen", provider="ollama", context_window=262_144, first_progress_after_prefill=True, max_output_tokens=16_384)
   assert effective_stream_stall_timeout(5.0, config={}, model_info=info, max_tokens=4096) == 5.0
 
 

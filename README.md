@@ -40,6 +40,29 @@ Model-facing resume still reissues the grant and synthesizes interrupted calls.
 Callers supply `on_complete` and the required `on_park` keyword (`None` when no
 park callback is needed). Configured operation-resume bindings apply to this
 successor just as they do to the other resume paths.
+Foreground children register in the shared journal before the child attaches for
+its first model turn. The one `task_registered` names the child's gateway session
+as `sub_agent_id`, so lineage reconstruction retains assistant tool calls made
+before an approval park. Foreground settlement appends `task_completed` and
+`agent_completion`, not another registration; approved continuation executes the
+original durable binding once and carries its real result into the successor.
+The warm foreground registry claim retains the same admitted task and bind as
+the journal, so delivery through a warm host and a restored host uses the same
+continuation authority.
+
+
+Root approval continuations retain the parked turn's sequence space, even after
+its active-turn reattach window expires. The prior turn is settled and cleared
+before `EventLog(first_seq=session.last_completed_turn.event_log.next_seq)`
+starts the successor; a cold restore without a predecessor starts at sequence `1`.
+`iter_from(after_seq)` always returns entries strictly after that absolute
+sequence, not after a local list offset. Each continuation closes its own turn
+and flushes its entries through the same wire projection and per-turn transcript
+writer as `/chat`, including when no subscriber is connected. Hosts explicitly
+supply the restorer's `transcript_dir`. Already-delivered checks run after the
+previous turn settles, under the continuation lock with the session slot held.
+A no-op releases that empty slot without a terminal or transcript entry.
+A second approval park is a turn terminal, not the end of the continued run.
 
 ## Main entrypoints
 
@@ -89,10 +112,12 @@ When a rate-limited pool has no unblocked account, or an outage outlasts the
 transient retry budget, `rebind_model_fallback()` binds the next eligible
 entry of the frozen selection snapshot's role chain (through the same
 resolver, with that entry's own credential) for the turn's remaining
-attempts; the runner emits `model_fallback` and the next turn binds the
-primary again.
+attempts; the runner emits `model_fallback`. The authenticated resolver
+remembers failed chain positions for fresh child runners, which resume at the
+first remaining entry without re-probing them. Declared resets and credential
+changes revive their entries; a newly prepared root turn starts at its primary.
 [`agent_gateway/providers/`](agent_gateway/providers/README.md) builds each request
-from the bound entry. Mechanism: `docs/reference/model-authority.md`.
+from the bound entry. Mechanism: [model authority](../../docs/reference/model-authority.md).
 
 `admit(SpawnRequest(...), parent, owners=AdmissionOwners(...))` returns the
 selected context and exact `ResolvedAuthority`, without materializing credentials.
@@ -120,6 +145,10 @@ For a parked call, the lifecycle sends original prepared input, exact backend,
 dispatch context and admitted job/tenant/credential identity through that writer
 before publishing the public approval request. A route without a writer publishes
 no executable capture; public events and pending-tool maps never carry it.
+A durable-park pending entry is marked before the approval request is published.
+An original-token vote therefore always uses durable continuation, even while the
+ask is being persisted and the live pending entry still exists; it never enters
+the live queue that the parked call will not consume.
 `AdmissionOwners.frozen_bind` retains a plan-frozen model bind without
 reselection; `materialize_bind()` is the single reauthorization owner. Fresh spawns select effort within the registered role; profile
 overlays remain deferred. Declared operation children determine nested spawning.
@@ -283,9 +312,10 @@ provider's multi-account credential pool, or update an existing account by
 identity without overwriting other seats. `providers/credential_pool.py` owns
 the shared `"accounts"` store envelope, legacy single-record migration, and
 cooldowns for every pool provider except Anthropic. A scoped user's accounts
-lead the deployment pool; usage limits and refresh failures park a seat so the
-running request can rotate to an unblocked sibling, keeping that seat's token
-and provider-specific fields together.
+lead the deployment pool; a usage limit that declares its reset parks that seat
+until then so the running request can rotate to an unblocked sibling, keeping
+that seat's token and provider-specific fields together. A limit with no declared
+reset, or a failed refresh, skips the seat for that selection or rotation only.
 Public `google` OAuth uses PKCE S256; `gemini` Antigravity uses confidential-client
 loopback OAuth with `ANTIGRAVITY_CLIENT_SECRET`, not PKCE.
 
@@ -309,7 +339,7 @@ without parking. Set an account's policy with
 `python3 -m agent_gateway.cli auth policy anthropic --identity ACCOUNT
 [--user N|--store PATH] (--priority INT --reserve-pct FLOAT | --reset)`; inspect
 it with `auth list anthropic --usage` (cached view only). Mechanism:
-`docs/reference/provider-authentication-and-token-methods.md`.
+[provider authentication and token methods](../../docs/reference/provider-authentication-and-token-methods.md).
 
 The complete session-token, chat request, and SSE walkthrough is in the
 [quickstart](docs/quickstart.md).
@@ -355,8 +385,7 @@ result carries `compute_ms` (unpaused time the deadline counted) and
 was open, so overlapping concurrent waits are not summed). The optional
 `host_wait_ms` operand
 (`CodeExecutionConfig.default_host_wait_ms`) is recorded and echoed as
-`requested_host_wait_ms`, never armed as a wait. The subprocess backend still
-bounds the whole process wall time.
+`requested_host_wait_ms`, never armed as a wait.
 
 Native calls parked for local approval capture their original `PreparedToolCall`
 and dispatch operands privately on the route's ledger store, before publication.

@@ -379,7 +379,6 @@ class SkillProfile:
   mcp_tools: dict[str, list[str]] | None = None
   session_inject_servers: list[str] | None = None
   state_dir: str | None = None
-  max_tokens: int | None = None
   thinking: bool | None = None
   initial_message: str | None = None
   delivery_label: str | None = None
@@ -389,9 +388,8 @@ class SkillProfile:
   #: A persist_state-false skill ends on its first successful FMS door result unless it
   #: declares otherwise (``terminal_on_persist: false``: it persists several units, then reports).
   terminal_on_persist: bool = True
-  #: A skill that owes a persist declares ``result_requires_persist: true``: a run that ends with
-  #: no accepted terminal door result and no artifact settles blocked. Coordinators and read-only
-  #: skills leave it False and keep their narrative outcome.
+  #: A skill that owes a persist declares ``result_requires_persist: true``. Coordinators and
+  #: read-only skills leave it False.
   result_requires_persist: bool = False
   mode: str = "full"
   tool_packs_enabled: bool = True
@@ -400,7 +398,6 @@ class SkillProfile:
   # The first nine positional fields through metadata are a public contract.
   effort: str | None = None
   provider: str | None = None
-  max_structured_reads: int | None = None
   execution_class: str = field(kw_only=True)
   role: str | None = None
   children: tuple[str, ...] = ()
@@ -419,25 +416,6 @@ def _coerce_authored_identifier(
   if not isinstance(value, str) or not value.strip():
     raise ValueError(f"{path}: '{field_name}' must be a non-empty string")
   return value.strip()
-
-
-def _coerce_optional_int(value: Any, *, field_name: str, path: Path) -> int | None:
-  if value is None:
-    return None
-  if isinstance(value, bool):
-    raise ValueError(f"{path}: '{field_name}' must be an integer")
-  if isinstance(value, int):
-    return value
-  if isinstance(value, float) and value.is_integer():
-    return int(value)
-  if isinstance(value, str):
-    text = value.strip()
-    if text:
-      try:
-        return int(text)
-      except ValueError as exc:
-        raise ValueError(f"{path}: '{field_name}' must be an integer") from exc
-  raise ValueError(f"{path}: '{field_name}' must be an integer")
 
 
 def _coerce_optional_bool(value: Any, *, field_name: str, path: Path) -> bool:
@@ -612,7 +590,6 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
   raw_state_class = frontmatter.pop("state_class", None)
   raw_mutation_mode = frontmatter.pop("mutation_mode", None)
   raw_tool_packs_enabled = frontmatter.pop("tool_packs_enabled", None)
-  raw_max_structured_reads = frontmatter.pop("max_structured_reads", None)
   raw_subagent_return_contract = frontmatter.pop("subagent_return_contract", None)
   raw_subagent_result_mode = frontmatter.pop("subagent_result_mode", None)
   if raw_subagent_return_contract is not None or raw_subagent_result_mode is not None:
@@ -644,7 +621,6 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
   raw_mcp_servers = metadata.pop("mcp_servers", None)
   raw_session_inject_servers = metadata.pop("session_inject_servers", None)
   raw_state_dir = metadata.pop("state_dir", None)
-  raw_max_tokens = metadata.pop("max_tokens", None)
   raw_thinking = metadata.pop("thinking", None)
   raw_effort = metadata.pop("effort", None)
   raw_initial_message = metadata.pop("initial_message", None)
@@ -671,11 +647,6 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     strict_items=True,
   )
   coerced_state_dir = _clean_string(raw_state_dir)
-  coerced_max_tokens = _coerce_optional_int(
-    raw_max_tokens,
-    field_name="max_tokens",
-    path=path,
-  )
   coerced_thinking = (
     None
     if raw_thinking is None
@@ -724,13 +695,6 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
       path=path,
     )
   )
-  coerced_max_structured_reads = _coerce_optional_int(
-    raw_max_structured_reads,
-    field_name="max_structured_reads",
-    path=path,
-  )
-  if coerced_max_structured_reads is not None and coerced_max_structured_reads < 1:
-    raise ValueError(f"{path}: 'max_structured_reads' must be greater than or equal to 1")
 
   for key, coerced in [
     ("mcp_servers", coerced_mcp_servers),
@@ -759,7 +723,6 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     mcp_tools=coerced_mcp_tools,
     session_inject_servers=coerced_session_inject_servers,
     state_dir=coerced_state_dir,
-    max_tokens=coerced_max_tokens,
     thinking=coerced_thinking,
     initial_message=coerced_initial_message,
     delivery_label=coerced_delivery_label,
@@ -774,7 +737,6 @@ def parse_skill_source(text: str, *, path: Path) -> SkillProfile:
     mutation_mode=_clean_string(raw_mutation_mode),
     effort=coerced_effort,
     provider=_clean_string(raw_provider),
-    max_structured_reads=coerced_max_structured_reads,
     execution_class=execution_class,
     role=role,
     children=children,

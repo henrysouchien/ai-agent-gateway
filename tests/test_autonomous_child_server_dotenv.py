@@ -167,7 +167,6 @@ def test_local_topology_keeps_authenticated_child_on_its_selected_gateway(
   monkeypatch.setattr(mcp_config.user_identity, "resolve_storage_user_id", lambda *_: "1")
   monkeypatch.setattr(mcp_config, "_resolve_gateway_api_key", lambda *_: "selected-mcp-key")
   monkeypatch.setattr(mcp_config, "_PRIVATE_TMP", tmp_path / "rendered")
-  monkeypatch.setattr(mcp_config, "_local_provider_dotenv_paths", lambda *_: (risk_root / ".env",))
   render = mcp_config._materialize_mcp_config("1", "alice@example.com", "analyst")
   servers = json.loads(render.path.read_text(encoding="utf-8"))["mcpServers"]
   assert {

@@ -1,11 +1,10 @@
 """ACUI-27: a turn that exhausts max_tokens with no usable tool call must not
-silently end the run — the runner nudges and continues (bounded), and request
+silently end the run — the runner nudges and continues, and request
 max_tokens is clamped to the model's max_output_tokens."""
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 import re
-import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,7 +28,7 @@ from agent_gateway import (  # noqa: E402
   ToolDispatcher,
 )
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
-from agent_gateway.runner import _MAX_TOKENS_CONTINUATIONS, _MAX_TOKENS_NUDGE, StreamTurnResult  # noqa: E402
+from agent_gateway.runner import _MAX_TOKENS_NUDGE, StreamTurnResult  # noqa: E402
 from agent_gateway.final_narrative_artifact import read_final_narrative  # noqa: E402
 from agent_gateway.sub_agent_narrative_result import final_child_visible_text  # noqa: E402
 from agent_gateway.task_registry import ParentMessage, RegistryOwner  # noqa: E402
@@ -81,7 +80,6 @@ def _make_runner(
   session_id: str = "sess-max-tokens",
   agent_session_log: AgentSessionLog | None = None,
   message_inbox: asyncio.Queue[ParentMessage] | None = None,
-  max_tokens_override: int | None = None,
   containment: ContainmentSettings = ContainmentSettings(),
 ) -> AgentRunner:
   event_log = EventLog()
@@ -103,7 +101,6 @@ def _make_runner(
     session_id=session_id,
     capability_execution=_dispatcher_execution_88,
     get_tool_definitions=lambda: [],
-    max_tokens_override=max_tokens_override,
     agent_session_log=agent_session_log,
     message_inbox=message_inbox,
     containment=containment,
@@ -150,32 +147,6 @@ def test_max_tokens_turn_with_no_tool_use_continues_with_nudge() -> None:
     replayed_assistant = follow_up[-2]
     assert replayed_assistant["role"] == "assistant"
     assert all(block.get("type") != "tool_use" for block in replayed_assistant["content"])
-
-  _run(_case())
-
-
-def test_max_tokens_continuation_is_bounded(caplog) -> None:
-  async def _case() -> None:
-    runner = _make_runner(_StubProvider())
-    calls = {"n": 0}
-
-    async def _fake_stream_turn(**kwargs: Any):
-      calls["n"] += 1
-      return object(), StreamTurnResult(
-        full_text="",
-        stop_reason="max_tokens",
-        content_blocks=[{"type": "text", "text": "truncated"}],
-      )
-
-    runner._stream_turn = _fake_stream_turn
-    caplog.set_level(logging.WARNING, logger="agent_gateway.runner")
-    await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
-
-    # initial turn + bounded continuations, then the run ends instead of looping
-    assert calls["n"] == 1 + _MAX_TOKENS_CONTINUATIONS
-    assert f"continuing with truncation nudge (1/{_MAX_TOKENS_CONTINUATIONS})" in caplog.text
-    assert f"continuing with truncation nudge ({_MAX_TOKENS_CONTINUATIONS}/{_MAX_TOKENS_CONTINUATIONS})" in caplog.text
-    assert f"after {_MAX_TOKENS_CONTINUATIONS} continuation attempts" in caplog.text
 
   _run(_case())
 
@@ -441,51 +412,31 @@ def test_max_tokens_turn_with_tool_uses_is_not_intercepted() -> None:
   _run(_case())
 
 
-async def _requested_max_tokens(runner: AgentRunner) -> int:
-  seen: dict[str, Any] = {}
-
-  async def _fake_stream_turn(**kwargs: Any):
-    seen["max_tokens"] = kwargs["max_tokens"]
-    return object(), StreamTurnResult(
-      full_text="done",
-      stop_reason="end_turn",
-      content_blocks=[{"type": "text", "text": "done"}],
-    )
-
-  runner._stream_turn = _fake_stream_turn
-  await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
-  return seen["max_tokens"]
-
-
-def test_request_max_tokens_without_override_is_model_ceiling() -> None:
+def test_request_max_tokens_is_model_ceiling() -> None:
   runner = _make_runner(
     _StubProvider(max_output_tokens=128_000),
     auth_config={"api_key": "k", "max_tokens": 16_000},
   )
 
-  assert _run(_requested_max_tokens(runner)) == 128_000
+  async def _requested() -> int:
+    seen: dict[str, Any] = {}
+
+    async def _fake_stream_turn(**kwargs: Any):
+      seen["max_tokens"] = kwargs["max_tokens"]
+      return object(), StreamTurnResult(
+        full_text="done",
+        stop_reason="end_turn",
+        content_blocks=[{"type": "text", "text": "done"}],
+      )
+
+    runner._stream_turn = _fake_stream_turn
+    await runner.run(messages=[{"role": "user", "content": "Start"}], system_prompt="x")
+    return seen["max_tokens"]
+
+  assert _run(_requested()) == 128_000
 
 
-def test_request_max_tokens_override_clamped_to_model_max_output() -> None:
-  runner = _make_runner(
-    _StubProvider(max_output_tokens=16_384),
-    max_tokens_override=64_000,
-  )
-
-  assert _run(_requested_max_tokens(runner)) == 16_384
-
-
-@pytest.mark.parametrize(
-  ("max_tokens_override", "expected"),
-  [(None, "64000"), (20_000, "20000"), (128_000, "64000")],
-)
-def test_sdk_run_output_limit_resolves_like_the_run_loop(
-  max_tokens_override: int | None,
-  expected: str,
-) -> None:
-  # The SDK child merges this env over the gateway's own, so it is always set:
-  # an unset override requests the model ceiling (64,000 for the stub model),
-  # never whatever CLAUDE_CODE_MAX_OUTPUT_TOKENS the gateway process holds.
+def test_sdk_run_output_limit_is_model_ceiling() -> None:
   runner = AgentSDKRunner(
     event_log=EventLog(),
     session_id="sess-sdk-max-tokens",
@@ -496,10 +447,9 @@ def test_sdk_run_output_limit_resolves_like_the_run_loop(
     ),
     capability_execution=stub_sdk_capability_execution(),
     system_prompt="x",
-    max_tokens_override=max_tokens_override,
   )
 
-  assert runner._credential_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == expected
+  assert runner._credential_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "64000"
 
 
 def test_child_max_tokens_chain_that_never_answers_meets_the_abort(

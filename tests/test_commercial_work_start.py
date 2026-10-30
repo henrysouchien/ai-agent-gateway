@@ -157,6 +157,8 @@ def _consumption_record() -> WorkAuthorizationConsumptionRecord:
 
 def _materialize_service_credential(
   handle: CredentialHandle,
+  *,
+  user_scope: object = None,
 ) -> MaterializedCredential:
   assert handle is _SERVICE_HANDLE
   return MaterializedCredential(
@@ -377,6 +379,34 @@ def test_enabled_gate_requires_complete_dependencies_and_both_headers() -> None:
   assert raised.value.status_code == 401
   assert raised.value.code == "commercial_work_authority_required"
   assert order == []
+  for partial in (
+    {COMMERCIAL_WORK_AUTHORIZATION_HEADER: WORK_TOKEN},
+    {COMMERCIAL_CLAIM_HEADER: CLAIM_TOKEN, COMMERCIAL_WORK_AUTHORIZATION_HEADER: ""},
+    {COMMERCIAL_CLAIM_HEADER: "", COMMERCIAL_WORK_AUTHORIZATION_HEADER: ""},
+  ):
+    with pytest.raises(CommercialWorkStartError) as raised:
+      gate.verify_claim(partial, session=session)
+    assert raised.value.status_code == 401
+    assert raised.value.code == "commercial_work_authority_required"
+  assert order == []
+
+
+def test_enabled_gate_admits_a_request_with_neither_header_as_ordinary() -> None:
+  order: list[str] = []
+  gate, _, authorization_verifier, store = _gate(order)
+  session, request, _ = _request_facts()
+
+  verified_claim = gate.verify_claim({}, session=session)
+  assert verified_claim is None
+  pending = gate.authorize_request(
+    verified_claim, session=session, request=request, channel="mcp"
+  )
+  assert pending is None
+  assert gate.consume(pending) is None
+  # No commercial verification, facts resolution, or consumption happened.
+  assert order == []
+  assert authorization_verifier.calls == []
+  assert store.attached == []
 
 
 def test_gate_claim_precedes_bound_facts_and_consumes_without_retaining_tokens() -> None:
@@ -636,7 +666,8 @@ def _server_app(tmp_path: Path, *, provider_delay: float = 0):
   async def build_runtime(_session, request, _channel, _auth_manager, *, storage_root: Path | None = None):
     order.append("runtime")
     observed_contexts.append(request.commercial_work_start)
-    assert order.index("consume") < order.index("runtime")
+    if request.commercial_work_start is not None:
+      assert order.index("consume") < order.index("runtime")
     capability_execution = request.capability_execution
     assert capability_execution is not None
     return ChatRuntime(
@@ -786,15 +817,18 @@ def test_server_claim_refusal_never_prepares_or_resolves_facts(
   assert WORK_TOKEN not in caplog.text
 
 
-def test_server_rejects_missing_or_replayed_authority_before_runtime(
+def test_server_rejects_partial_or_replayed_authority_before_runtime(
   tmp_path: Path,
 ) -> None:
   app, _, store, order, _ = _server_app(tmp_path)
   with TestClient(app) as client:
     token = _session_token(client)
-    missing = client.post(
+    partial = client.post(
       "/api/chat",
-      headers={"Authorization": f"Bearer {token}"},
+      headers={
+        "Authorization": f"Bearer {token}",
+        COMMERCIAL_CLAIM_HEADER: CLAIM_TOKEN,
+      },
       json={
         "request_id": "request-1",
         "user_id": "101",
@@ -802,8 +836,8 @@ def test_server_rejects_missing_or_replayed_authority_before_runtime(
         "messages": [{"role": "user", "content": "hello"}],
       },
     )
-    assert missing.status_code == 401
-    assert missing.json()["error"] == "commercial_work_authority_required"
+    assert partial.status_code == 401
+    assert partial.json()["error"] == "commercial_work_authority_required"
     assert "runtime" not in order
 
     store.error = WorkAuthorizationAlreadyAttached(_consumption_record())
@@ -821,6 +855,33 @@ def test_server_rejects_missing_or_replayed_authority_before_runtime(
     assert replay.json()["error"] == "commercial_work_authority_already_consumed"
     assert "runtime" not in order
     assert "provider_start" not in order
+
+
+def test_server_admits_headerless_request_as_ordinary_turn_without_authority(
+  tmp_path: Path,
+) -> None:
+  app, _, store, order, observed = _server_app(tmp_path)
+  with TestClient(app) as client:
+    token = _session_token(client)
+    with client.stream(
+      "POST",
+      "/api/chat",
+      headers={"Authorization": f"Bearer {token}"},
+      json={
+        "request_id": "request-1",
+        "user_id": "101",
+        "context": {"channel": "mcp"},
+        "messages": [{"role": "user", "content": "hello"}],
+      },
+    ) as response:
+      assert response.status_code == 200
+      list(response.iter_lines())
+
+  assert observed == [None]
+  assert store.attached == []
+  for stage in ("verify_claim", "resolve_facts", "verify_authorization", "consume"):
+    assert stage not in order
+  assert order.index("runtime") < order.index("provider_start")
 
 
 def test_concurrent_requests_reserve_one_dispatch_before_consumption(

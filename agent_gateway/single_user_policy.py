@@ -17,8 +17,8 @@ from .policy_imports import resolve_effective_role
 class SingleUserApprovalPolicy:
   """The one owner of which classes need a human, for every channel.
 
-  Approval is required only where the class is the money boundary (a live
-  order). Every other class is approved here, with no prompt and no client
+  Approval is required for live orders and for compute whose backend is not
+  sandboxed. Other classes are approved here, with no prompt and no client
   round-trip; the durable request still records the decision.
   """
 
@@ -60,6 +60,7 @@ class SingleUserApprovalPolicy:
     if (
       request.approval_constraint == "fresh_human_owner"
       or request.tool_class in MONEY_BOUNDARY_TOOL_CLASSES
+      or request.tool_name == "code_execute"
     ):
       return ApprovalDecision(
         outcome="request_user_approval",

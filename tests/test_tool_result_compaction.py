@@ -1,11 +1,14 @@
+import copy
 import json
 from types import SimpleNamespace
 
 from agent_gateway.policy_imports import configure_server_policy, load_server_policy_module
+from agent_gateway.secret_boundary import SecretBoundary, sanitize_boundary_value
 from agent_gateway.tool_result_compaction import (
   compact_model_tool_result_entry,
   truncate_model_tool_result_content,
 )
+from agent_gateway.tool_result_spill import SpillCapabilities, SpillSink
 
 MAX_CHARS = 60_000
 DRIVER_COUNT = 36
@@ -278,3 +281,318 @@ def test_all_fms_persist_doors_project_to_delta_receipt_without_bulk_readback(tm
     assert projection["revision"] == "rev-1"
     assert projection["stage_receipt_status"] == "staged"
     assert "findings" not in projection
+
+
+def _persist_projection(payload: dict, tmp_path) -> dict:
+  entry = {"type": "tool_result", "tool_use_id": "tool-undo", "content": json.dumps(payload)}
+  live_entry, durable_entry = compact_model_tool_result_entry(
+    entry,
+    tool_name="fms_persist_scenario_multiple_pricing",
+    spill_dir_provider=lambda: str(tmp_path),
+    log_session_id="sess-undo",
+    logger=_NullLogger(),
+  )
+  assert live_entry == durable_entry
+  return json.loads(live_entry["content"])
+
+
+def _applied_multiple_pricing_payload(receipt: dict) -> dict:
+  return {
+    "status": "applied",
+    "gate_code": "PROCEED",
+    "artifact_ref": "artifacts/PCTY/scenario_multiple_pricing.json",
+    "proposal_id": "proposal-undo",
+    "verdict_echo": {"verdict": "ACCEPTED_CONSTRUCTED", "confidence": "HIGH", "revision": "rev-2"},
+    "receipt": receipt,
+  }
+
+
+def test_applied_persist_projection_keeps_the_undo_handle_and_drops_the_signed_token(tmp_path) -> None:
+  signed_token = "SIGNED-UNDO-TOKEN-" + "s" * 400
+  payload = _applied_multiple_pricing_payload(
+    {
+      "undo_available": True,
+      "undo_token_id": "undo-123",
+      "undo_expires_at": 1_790_000_000,
+      "undo_token": signed_token,
+    }
+  )
+
+  content_before = json.dumps(payload)
+  projection = _persist_projection(payload, tmp_path)
+
+  assert projection["status"] == "applied"
+  assert projection["undo_available"] is True
+  assert projection["undo_token_id"] == "undo-123"
+  assert projection["undo_expires_at"] == 1_790_000_000
+  assert "undo_token" not in projection
+  assert signed_token not in json.dumps(projection)
+  assert "receipt" not in projection
+  assert json.dumps(payload) == content_before
+
+
+def test_persist_projection_does_not_synthesize_undo_fields(tmp_path) -> None:
+  for receipt in (
+    {},
+    {"receipt_id": "r-1"},
+  ):
+    projection = _persist_projection(_applied_multiple_pricing_payload(receipt), tmp_path)
+    assert not [key for key in projection if key.startswith("undo_")], receipt
+
+  staged = _applied_multiple_pricing_payload({})
+  del staged["receipt"]
+  staged["status"] = "staged"
+  projection = _persist_projection(staged, tmp_path)
+  assert projection["status"] == "staged"
+  assert not [key for key in projection if key.startswith("undo_")]
+  assert "receipt" not in projection
+
+  explicit_no_undo = _persist_projection(
+    _applied_multiple_pricing_payload({"undo_available": False}), tmp_path
+  )
+  assert explicit_no_undo["undo_available"] is False
+  assert "undo_token_id" not in explicit_no_undo
+  assert "undo_expires_at" not in explicit_no_undo
+
+
+_SECRET = "CUSTOM-ACTIVE-CREDENTIAL-TOOL-RESULT-8f21d7"
+_CUT_PREFIX = _SECRET[:10]
+_MODEL_CUT_CHARS = 4_000
+
+
+def _secret_entry(content: str) -> dict:
+  return {"type": "tool_result", "tool_use_id": "tool-secret", "content": content}
+
+
+def _retained(entry: dict) -> dict:
+  safe = sanitize_boundary_value(
+    entry,
+    sink="tool_result",
+    boundary=SecretBoundary((_SECRET,)),
+  )
+  assert isinstance(safe, dict) and safe is not entry
+  return safe
+
+
+def _secret_across_the_model_cut() -> dict:
+  # The model ladder cuts this string at 2000 chars, ten chars into the secret.
+  return _secret_entry(
+    json.dumps(
+      {
+        "status": "ok",
+        "public": "public-result-marker",
+        "blob": "p" * 1_990 + _SECRET + "q" * 6_000,
+      }
+    )
+  )
+
+
+def test_durable_preview_is_cut_from_the_projected_content_and_live_stays_raw() -> None:
+  entry = _secret_across_the_model_cut()
+  retained = _retained(entry)
+  entry_before, retained_before = copy.deepcopy(entry), copy.deepcopy(retained)
+  prior_live, prior_durable = compact_model_tool_result_entry(
+    entry,
+    tool_name="lookup",
+    log_session_id="sess-secret",
+    logger=_NullLogger(),
+    max_chars=_MODEL_CUT_CHARS,
+  )
+  # Without a retained entry the durable copy is the live one: the raw cut.
+  assert prior_durable is prior_live
+  assert _CUT_PREFIX in prior_live["content"]
+
+  live_entry, durable_entry = compact_model_tool_result_entry(
+    entry,
+    tool_name="lookup",
+    log_session_id="sess-secret",
+    logger=_NullLogger(),
+    max_chars=_MODEL_CUT_CHARS,
+    retained_entry=retained,
+  )
+
+  assert entry == entry_before and retained == retained_before
+  assert live_entry == prior_live
+  assert _CUT_PREFIX in live_entry["content"]
+  assert durable_entry is not live_entry
+  assert durable_entry["tool_use_id"] == "tool-secret"
+  durable_payload = json.loads(durable_entry["content"])
+  assert durable_payload["_runner_truncated"] is True
+  assert durable_payload["original_chars"] == len(retained["content"])
+  assert durable_payload["content_projection"]["public"] == "public-result-marker"
+  assert _CUT_PREFIX not in durable_entry["content"]
+  # The cut now falls inside the redaction marker, not inside the secret.
+  assert "p" * 1_990 + "<redacted-" in durable_entry["content"]
+
+
+def test_spill_set_is_written_from_the_projected_content_and_live_keeps_the_raw_preview(
+  tmp_path,
+) -> None:
+  entry = _secret_across_the_model_cut()
+  retained = _retained(entry)
+  prior_live, _ = compact_model_tool_result_entry(
+    entry,
+    tool_name="lookup",
+    log_session_id="sess-secret",
+    logger=_NullLogger(),
+    max_chars=_MODEL_CUT_CHARS,
+  )
+  publications = []
+
+  live_entry, durable_entry = compact_model_tool_result_entry(
+    entry,
+    tool_name="lookup",
+    spill_sink=SpillSink(
+      root_provider=lambda: str(tmp_path),
+      capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+    ),
+    log_session_id="sess-secret",
+    logger=_NullLogger(),
+    max_chars=_MODEL_CUT_CHARS,
+    on_spill_publication=publications.append,
+    retained_entry=retained,
+  )
+
+  live_payload = json.loads(live_entry["content"])
+  prior_payload = json.loads(prior_live["content"])
+  assert live_payload.pop("spill_ref").startswith("spill:v1:")
+  assert live_payload.pop("spill_summary")["payload_kind"]
+  assert live_payload == prior_payload
+  assert _CUT_PREFIX in live_entry["content"]
+  (publication,) = publications
+  assert publication.spill_ref in live_entry["content"]
+  assert _CUT_PREFIX not in durable_entry["content"]
+  assert "spill_ref" not in json.loads(durable_entry["content"])
+  spill_files = [path for path in tmp_path.rglob("*") if path.is_file()]
+  assert spill_files
+  spilled = [path.read_text(encoding="utf-8") for path in spill_files]
+  assert all(_CUT_PREFIX not in text for text in spilled)
+  assert any(json.loads(text)["public"] == "public-result-marker" for text in spilled)
+  assert any("<redacted-secret>" in text for text in spilled)
+
+
+def test_untruncated_entry_keeps_the_live_object_and_returns_the_retained_one() -> None:
+  entry = _secret_entry(json.dumps({"public": "public-result-marker", "echo": _SECRET}))
+  retained = _retained(entry)
+
+  live_entry, durable_entry = compact_model_tool_result_entry(
+    entry,
+    tool_name="lookup",
+    log_session_id="sess-secret",
+    logger=_NullLogger(),
+    max_chars=_MODEL_CUT_CHARS,
+    retained_entry=retained,
+  )
+
+  assert live_entry is entry
+  assert durable_entry is retained
+  assert _SECRET in live_entry["content"]
+  assert _SECRET not in durable_entry["content"]
+  assert json.loads(durable_entry["content"])["public"] == "public-result-marker"
+
+
+def test_non_text_entry_returns_the_live_object_and_the_retained_one() -> None:
+  entry = {"type": "tool_result", "tool_use_id": "tool-secret", "content": [{"type": "text", "text": _SECRET}]}
+  retained = _retained(entry)
+
+  live_entry, durable_entry = compact_model_tool_result_entry(
+    entry,
+    tool_name="lookup",
+    log_session_id="sess-secret",
+    logger=_NullLogger(),
+    retained_entry=retained,
+  )
+
+  assert live_entry is entry
+  assert durable_entry is retained
+  assert _SECRET not in json.dumps(durable_entry)
+
+
+def test_fms_terminal_projection_is_projected_per_copy() -> None:
+  envelope = {
+    "status": "staged",
+    "gate_code": "PROCEED",
+    "artifact_ref": "artifacts/PCTY/business-model.json",
+    "proposal_id": f"proposal-{_SECRET}",
+    "error": None,
+    "verdict": {
+      "verdict": "BM_CONSTRUCTED",
+      "confidence": "MEDIUM",
+      "revision": "pcty-business-model-rev-1",
+      "validation": {"large": "v" * 5_000},
+    },
+    "readback": {
+      "typed_outputs": {
+        "business_model_stage_receipt": {"status": "accepted"},
+        "business_model": {"segments": ["x" * 5_000]},
+      }
+    },
+  }
+  entry = _secret_entry(json.dumps(envelope))
+  retained = _retained(entry)
+
+  live_entry, durable_entry = compact_model_tool_result_entry(
+    entry,
+    tool_name="fms_persist_business_model",
+    log_session_id="sess-secret",
+    logger=_NullLogger(),
+    retained_entry=retained,
+  )
+
+  live_projection = json.loads(live_entry["content"])
+  durable_projection = json.loads(durable_entry["content"])
+  assert "readback" not in live_projection and "readback" not in durable_projection
+  assert live_projection["proposal_id"] == f"proposal-{_SECRET}"
+  assert durable_projection["proposal_id"] == "proposal-<redacted-secret>"
+  assert durable_projection["gate_code"] == live_projection["gate_code"] == "PROCEED"
+  assert durable_entry["tool_use_id"] == live_entry["tool_use_id"] == "tool-secret"
+  assert _SECRET not in durable_entry["content"]
+
+
+def test_redaction_that_lengthens_content_spills_the_projected_text_and_leaves_live_raw(tmp_path) -> None:
+  # An 8-char secret becomes the 17-char marker: the raw content fits the limit
+  # while the retained copy does not.
+  short_secret = "ab12cd34"
+  max_chars = 1_500
+  entry = _secret_entry(
+    json.dumps({"public": "public-result-marker", "echo": (short_secret + " ") * 100})
+  )
+  assert len(entry["content"]) < max_chars
+  retained = sanitize_boundary_value(
+    entry,
+    sink="tool_result",
+    boundary=SecretBoundary((short_secret,)),
+  )
+  assert len(retained["content"]) > max_chars
+  publications = []
+
+  live_entry, durable_entry = compact_model_tool_result_entry(
+    entry,
+    tool_name="lookup",
+    spill_sink=SpillSink(
+      root_provider=lambda: str(tmp_path),
+      capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+    ),
+    log_session_id="sess-secret",
+    logger=_NullLogger(),
+    max_chars=max_chars,
+    on_spill_publication=publications.append,
+    retained_entry=retained,
+  )
+
+  assert live_entry is entry
+  assert short_secret in live_entry["content"]
+  assert durable_entry is not retained
+  assert durable_entry["tool_use_id"] == "tool-secret"
+  durable_payload = json.loads(durable_entry["content"])
+  assert durable_payload["_runner_truncated"] is True
+  assert durable_payload["original_chars"] == len(retained["content"])
+  assert "spill_ref" not in durable_payload
+  assert short_secret not in durable_entry["content"]
+  (publication,) = publications
+  spill_files = [path for path in tmp_path.rglob("*") if path.is_file()]
+  assert len(spill_files) == 1
+  spilled = spill_files[0].read_text(encoding="utf-8")
+  assert json.loads(spilled) == json.loads(retained["content"])
+  assert short_secret not in spilled
+  assert publication.spill_ref.startswith(f"spill:v1:{spill_files[0].name}:")

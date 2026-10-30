@@ -11,8 +11,11 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
+import httpx2
+from hank_contracts.agent_api import AGENT_API_CLAIM_ENV_VARS, AGENT_API_CLAIM_HEADERS
 from anyio import ClosedResourceError
 from mcp import MCPError
 from mcp.types import CONNECTION_CLOSED, CallToolResult, ListToolsResult, PaginatedRequestParams, Tool
@@ -29,6 +32,252 @@ from agent_gateway.tool_registration import RegisteredMcpToolCompilationError  #
 from agent_workflow_contracts.tool_registration import (  # noqa: E402
   ToolRegistrationCatalog,
 )
+
+
+@pytest.fixture
+def http_claim_connection(monkeypatch):
+  clients = []
+  legacy_calls = []
+  scoped_env = {}
+  legacy_auth = object()
+
+  class Context:
+    async def __aenter__(self) -> Any:
+      return self
+
+    async def __aexit__(self, *_args):
+      pass
+
+  class Client(Context):
+    def __init__(self, **kwargs):
+      self.options = kwargs
+      clients.append(self)
+
+  class Stream(Context):
+    async def __aenter__(self):
+      return object(), object()
+
+  async def close_contexts(contexts):
+    for context in reversed(contexts):
+      await context.__aexit__(None, None, None)
+
+  async def initialize(**kwargs):
+    return SimpleNamespace(exit_contexts=kwargs["exit_contexts"])
+
+  def build_auth(*args):
+    legacy_calls.append(args)
+    return legacy_auth
+
+  manager = McpClientManager(config_path=None)
+  monkeypatch.setattr(
+    manager, "_scoped_server_env",
+    lambda *_args, **_kwargs: (scoped_env, set()),
+  )
+  monkeypatch.setattr(manager, "_build_http_auth", build_auth)
+  monkeypatch.setattr(manager, "_initialize_session_state", initialize)
+  runtime = SimpleNamespace(
+    environ={},
+    streamable_http_types={"http", "streamable-http"},
+    close_contexts=close_contexts,
+    build_http_headers=lambda *_args, **_kwargs: {},
+    httpx_module=SimpleNamespace(AsyncClient=Client, Timeout=httpx2.Timeout),
+    streamable_http_client_factory=lambda *_args, **_kwargs: Stream(),
+    client_session_factory=lambda *_args: Context(),
+    parse_allowed_tools=lambda _value: None,
+  )
+  monkeypatch.setattr(manager, "_connection_runtime", lambda: runtime)
+
+  async def connect(user_claim_auth=None):
+    return await mcp_client_connections.connect_streamable_http(
+      manager, "remote", {"url": "https://mcp.example/mcp"},
+      cast(mcp_client_connections.McpConnectionRuntime, runtime),
+      user_claim_auth=user_claim_auth,
+    )
+
+  return scoped_env, clients, legacy_calls, legacy_auth, connect, manager
+
+
+def test_http_remote_claim_auth_mints_fresh_claims_without_second_auth(
+  http_claim_connection, monkeypatch,
+):
+  scoped_env, clients, legacy_calls, _legacy_auth, connect, _manager = http_claim_connection
+  scoped_env.update({
+    "AGENT_API_CLAIM_MINT_URL": "https://gateway.example",
+    "GATEWAY_API_KEY": "roster-key",
+  })
+  calls = []
+
+  async def mint(**kwargs):
+    calls.append(kwargs)
+    return {
+      env_name: f"{field}-{len(calls)}"
+      for field, env_name in AGENT_API_CLAIM_ENV_VARS.items()
+    }
+
+  monkeypatch.setattr(mcp_client_connections, "mint_gateway_user_claim", mint)
+
+  async def scenario():
+    state = await connect(user_claim_auth=object())
+    try:
+      assert calls == []
+      auth = clients[0].options["auth"]
+      assert isinstance(auth, mcp_client_connections.UserClaimHttpAuth)
+      for generation in (1, 2):
+        request = httpx2.Request("POST", "https://mcp.example/mcp")
+        flow = auth.async_auth_flow(request)
+        signed = await anext(flow)
+        assert signed.headers[AGENT_API_CLAIM_HEADERS["signature"]] == (
+          f"signature-{generation}"
+        )
+        await flow.aclose()
+      assert calls == [
+        {"base_url": "https://gateway.example", "api_key": "roster-key"},
+        {"base_url": "https://gateway.example", "api_key": "roster-key"},
+      ]
+      assert legacy_calls == []
+      assert set(clients[0].options) == {"headers", "timeout", "auth"}
+    finally:
+      await state.exit_contexts[0].__aexit__(None, None, None)
+
+  asyncio.run(scenario())
+
+
+def test_manager_connect_remote_claim_auth_never_requires_local_signer(
+  http_claim_connection, monkeypatch,
+):
+  scoped_env, clients, legacy_calls, _legacy_auth, _connect, manager = http_claim_connection
+  scoped_env.update({
+    "AGENT_API_CLAIM_MINT_URL": "https://gateway.example",
+    "GATEWAY_API_KEY": "roster-key",
+  })
+  signer_calls = []
+  mint_calls = []
+  claims = {
+    env_name: f"remote-{field}"
+    for field, env_name in AGENT_API_CLAIM_ENV_VARS.items()
+  }
+
+  def unexpected_catalog_auth():
+    signer_calls.append(True)
+    raise AssertionError("remote startup must not access the local signer")
+
+  async def mint(**kwargs):
+    mint_calls.append(kwargs)
+    return claims
+
+  monkeypatch.setattr(manager, "_catalog_claim_auth", unexpected_catalog_auth)
+  monkeypatch.setattr(mcp_client_connections, "mint_gateway_user_claim", mint)
+
+  async def scenario():
+    state = await manager._connect(
+      "remote",
+      {"type": "http", "per_user": True, "url": "https://mcp.example/mcp"},
+    )
+    try:
+      assert mint_calls == []
+      auth = clients[0].options["auth"]
+      assert isinstance(auth, mcp_client_connections.UserClaimHttpAuth)
+      request = httpx2.Request("POST", "https://mcp.example/mcp")
+      flow = auth.async_auth_flow(request)
+      signed = await anext(flow)
+      try:
+        for field, header_name in AGENT_API_CLAIM_HEADERS.items():
+          assert signed.headers[header_name] == claims[AGENT_API_CLAIM_ENV_VARS[field]]
+      finally:
+        await flow.aclose()
+      assert mint_calls == [
+        {"base_url": "https://gateway.example", "api_key": "roster-key"},
+      ]
+      assert signer_calls == []
+      assert legacy_calls == []
+    finally:
+      await state.exit_contexts[0].__aexit__(None, None, None)
+
+  asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("supplied_claim_auth", [False, True])
+def test_http_absent_mint_url_preserves_legacy_auth(
+  http_claim_connection, supplied_claim_auth,
+):
+  _env, clients, legacy_calls, legacy_auth, connect, _manager = http_claim_connection
+  claim_auth = object() if supplied_claim_auth else None
+
+  async def scenario():
+    state = await connect(user_claim_auth=claim_auth)
+    try:
+      assert clients[0].options["auth"] is (
+        claim_auth if supplied_claim_auth else legacy_auth
+      )
+      assert len(legacy_calls) == (0 if supplied_claim_auth else 1)
+    finally:
+      await state.exit_contexts[0].__aexit__(None, None, None)
+
+  asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("per_user", [False, True])
+def test_manager_connect_absent_mint_url_preserves_catalog_auth(
+  http_claim_connection, monkeypatch, per_user,
+):
+  _env, clients, legacy_calls, legacy_auth, _connect, manager = http_claim_connection
+  catalog_auth = object()
+  signer_calls = []
+
+  def catalog_claim_auth():
+    signer_calls.append(True)
+    return catalog_auth
+
+  monkeypatch.setattr(manager, "_catalog_claim_auth", catalog_claim_auth)
+
+  async def scenario():
+    state = await manager._connect(
+      "remote",
+      {"type": "http", "per_user": per_user, "url": "https://mcp.example/mcp"},
+    )
+    try:
+      assert clients[0].options["auth"] is (catalog_auth if per_user else legacy_auth)
+      assert signer_calls == ([True] if per_user else [])
+      assert len(legacy_calls) == (0 if per_user else 1)
+    finally:
+      await state.exit_contexts[0].__aexit__(None, None, None)
+
+  asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("environment", [
+  {"AGENT_API_CLAIM_MINT_URL": "", "GATEWAY_API_KEY": "roster-key"},
+  {"AGENT_API_CLAIM_MINT_URL": "  ", "GATEWAY_API_KEY": "roster-key"},
+  {"AGENT_API_CLAIM_MINT_URL": "https://gateway.example"},
+  {"AGENT_API_CLAIM_MINT_URL": "https://gateway.example", "GATEWAY_API_KEY": ""},
+  {"AGENT_API_CLAIM_MINT_URL": "https://gateway.example", "GATEWAY_API_KEY": "  "},
+])
+@pytest.mark.parametrize("manager_connect", [False, True])
+def test_http_invalid_remote_mint_configuration_never_falls_back(
+  http_claim_connection, environment, monkeypatch, manager_connect,
+):
+  scoped_env, clients, legacy_calls, _legacy_auth, connect, manager = http_claim_connection
+  scoped_env.update(environment)
+
+  async def unexpected_mint(**_kwargs):
+    raise AssertionError("invalid configuration must fail before minting")
+
+  def unexpected_catalog_auth():
+    raise AssertionError("invalid configuration must fail before local signing")
+
+  monkeypatch.setattr(manager, "_catalog_claim_auth", unexpected_catalog_auth)
+
+  monkeypatch.setattr(mcp_client_connections, "mint_gateway_user_claim", unexpected_mint)
+  with pytest.raises(ValueError, match="AGENT_API_CLAIM_MINT_URL|GATEWAY_API_KEY"):
+    if manager_connect:
+      asyncio.run(manager._connect(
+        "remote",
+        {"type": "http", "per_user": True, "url": "https://mcp.example/mcp"},
+      ))
+    else:
+      asyncio.run(connect(user_claim_auth=object()))
+  assert clients == []
+  assert legacy_calls == []
 
 
 class _ListedToolsSession:

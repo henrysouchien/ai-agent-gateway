@@ -75,7 +75,6 @@ def test_create_agent_from_yaml_forwards_resolved_config(
         "outputs_dir": "artifacts",
         "mcp_servers": {"fs": {"command": "npx", "args": ["-y", "server", "."]}},
         "code_execution": True,
-        "max_tokens": 2048,
       },
       sort_keys=False,
     ),
@@ -98,7 +97,6 @@ def test_create_agent_from_yaml_forwards_resolved_config(
       "system_prompt": "Use tools carefully.",
       "model_key": "openai.gpt-5-6",
       "effort": "high",
-      "max_tokens": 2048,
       "mcp_servers": {"fs": {"command": "npx", "args": ["-y", "server", "."]}},
       "skills_dir": tmp_path / "skills",
       "skill_state_file": tmp_path / "skill_state.json",
@@ -355,6 +353,7 @@ def test_project_config_rejects_unknown_key_naming_it(tmp_path: Path) -> None:
     "model: claude-sonnet-4",
     "max_turns: 8",
     "max_budget_usd: 1.5",
+    "max_tokens: 2048",
   ],
 )
 def test_project_config_loads_retired_key_with_warning(

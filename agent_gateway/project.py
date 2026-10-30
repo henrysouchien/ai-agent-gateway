@@ -30,10 +30,9 @@ _TOP_LEVEL_KEYS = {
   "outputs_dir",
   "mcp_servers",
   "code_execution",
-  "max_tokens",
 }
 # Keys an earlier `agent init` scaffold wrote and the schema later retired: its own history, not an allowlist.
-_RETIRED_KEYS = frozenset({"per_turn_timeout", "provider", "model", "max_turns", "max_budget_usd"})
+_RETIRED_KEYS = frozenset({"per_turn_timeout", "provider", "model", "max_turns", "max_budget_usd", "max_tokens"})
 
 
 class AgentProjectError(ValueError):
@@ -59,7 +58,6 @@ class AgentProjectConfig:
   outputs_dir: Path | None
   mcp_servers: dict[str, dict[str, Any]]
   code_execution: bool
-  max_tokens: int
 
 
 def validate_project_name(name: str) -> str:
@@ -89,7 +87,6 @@ def default_agent_config_payload(
     "outputs_dir": "outputs",
     "mcp_servers": {},
     "code_execution": False,
-    "max_tokens": 16000,
   }
   if model_key is not None:
     payload["model_key"] = model_key
@@ -220,7 +217,6 @@ def load_agent_project_config(config_path: str | Path = DEFAULT_AGENT_CONFIG) ->
     outputs_dir=_optional_path(base_dir, payload.get("outputs_dir")),
     mcp_servers=mcp_servers,
     code_execution=_bool(payload.get("code_execution"), False),
-    max_tokens=_int(payload.get("max_tokens"), 16000, key="max_tokens"),
   )
 
 
@@ -234,7 +230,6 @@ def create_agent_from_yaml(config_path: str | Path = DEFAULT_AGENT_CONFIG) -> Fa
   return create_agent(
     config.system_prompt,
     **selection,
-    max_tokens=config.max_tokens,
     mcp_servers=config.mcp_servers or None,
     skills_dir=config.skills_dir,
     skill_state_file=config.skill_state_file,

@@ -24,6 +24,16 @@ from .credential_pool import (
 DEFAULT_GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 DEFAULT_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 DEFAULT_GOOGLE_SCOPE = "https://www.googleapis.com/auth/generative-language"
+GOOGLE_AUTH_STORE_PATH_ENV = "GOOGLE_AUTH_STORE_PATH"
+GEMINI_AUTH_STORE_PATH_ENV = "GEMINI_AUTH_STORE_PATH"
+GOOGLE_AUTH_TOKEN_ENV = "GOOGLE_AUTH_TOKEN"
+GEMINI_AUTH_TOKEN_ENV = "GEMINI_AUTH_TOKEN"
+# Environment names that carry one person's Google OAuth identity (store path
+# and tokens); a non-owner placement must not inherit them.
+GOOGLE_PERSONAL_OAUTH_ENV_NAMES = frozenset({
+  GOOGLE_AUTH_STORE_PATH_ENV, GEMINI_AUTH_STORE_PATH_ENV,
+  GOOGLE_AUTH_TOKEN_ENV, GEMINI_AUTH_TOKEN_ENV,
+})
 EXPIRY_MARGIN_SECONDS = 60
 _HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
@@ -86,7 +96,7 @@ def resolve_google_oauth_settings(
     environ=env,
     user_scope=user_scope,
     override_config_keys=("auth_store_path",),
-    override_env_vars=("GOOGLE_AUTH_STORE_PATH", "GEMINI_AUTH_STORE_PATH"),
+    override_env_vars=(GOOGLE_AUTH_STORE_PATH_ENV, GEMINI_AUTH_STORE_PATH_ENV),
   )
 
   return GoogleOAuthSettings(
@@ -112,7 +122,7 @@ def resolve_google_oauth_store_paths(
     environ=environ,
     user_scope=user_scope,
     override_config_keys=("auth_store_path",),
-    override_env_vars=("GOOGLE_AUTH_STORE_PATH", "GEMINI_AUTH_STORE_PATH"),
+    override_env_vars=(GOOGLE_AUTH_STORE_PATH_ENV, GEMINI_AUTH_STORE_PATH_ENV),
   )
 
 
@@ -263,8 +273,8 @@ def resolve_google_pool_candidates(
         auth_mode=auth_mode,
       ))
   for env_name, auth_mode in (
-    ("GOOGLE_AUTH_TOKEN", "oauth"),
-    ("GEMINI_AUTH_TOKEN", "oauth"),
+    (GOOGLE_AUTH_TOKEN_ENV, "oauth"),
+    (GEMINI_AUTH_TOKEN_ENV, "oauth"),
     ("GEMINI_API_KEY", "api"),
     ("GOOGLE_API_KEY", "api"),
   ):

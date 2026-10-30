@@ -100,11 +100,6 @@ def _require_optional_identifier(value: object, *, field_name: str) -> None:
     raise ValueError(f"{field_name} must be a canonical non-empty string")
 
 
-def _require_optional_positive_int(value: object, *, field_name: str) -> None:
-  if value is not None and (type(value) is not int or value < 1):
-    raise ValueError(f"{field_name} must be a positive integer")
-
-
 def _canonical_string_set(
   values: object,
   *,
@@ -150,9 +145,7 @@ class OperationRuntimePolicy:
   tool_packs_enabled: bool = True
   model: str | None = None
   provider: str | None = None
-  max_tokens: int | None = None
   effort: Effort | None = None
-  max_structured_reads: int | None = None
   initial_message: str | None = None
   delivery_label: str | None = None
 
@@ -203,11 +196,6 @@ class OperationRuntimePolicy:
     _require_optional_identifier(self.provider, field_name="provider")
     _require_optional_identifier(self.initial_message, field_name="initial_message")
     _require_optional_identifier(self.delivery_label, field_name="delivery_label")
-    _require_optional_positive_int(self.max_tokens, field_name="max_tokens")
-    _require_optional_positive_int(
-      self.max_structured_reads,
-      field_name="max_structured_reads",
-    )
 
     exact_tool_ids = _canonical_string_set(
       self.exact_tool_ids,

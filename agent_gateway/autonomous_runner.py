@@ -33,7 +33,6 @@ from .autonomous_control_files import (
 )
 from .autonomous_control_contract import (
   AUTONOMOUS_OPERATOR_AGGREGATE_BYTES_LIMIT,
-  AUTONOMOUS_OPERATOR_MESSAGE_LIMIT,
   AUTONOMOUS_OPERATOR_RECORD_FIELDS,
   encode_closed_control_record,
 )
@@ -459,7 +458,6 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     mode: str,
     task: str | None,
     skill: str | None,
-    context: str | None,
     pack: str | None = None,
     deliver: bool = True,
     ticker: str | None = None,
@@ -473,7 +471,6 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       skill=skill,
       pack=pack,
       deliver=deliver,
-      context=context,
       ticker=ticker,
       research_file_id=research_file_id,
       normalize_autonomous_profile_func=normalize_autonomous_profile,
@@ -1647,7 +1644,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
   def status(self, task_id: str) -> dict[str, Any]:
     return self._status_payload(self._get(task_id))
 
-  async def wait(self, task_id: str, *, timeout_sec: int = 600) -> dict[str, Any]:
+  async def wait(self, task_id: str, *, timeout_sec: float) -> dict[str, Any]:
     record = self._get(task_id)
     if self._is_active_process_state(record) and record.reaper_task is not None:
       try:
@@ -1766,14 +1763,6 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         raise RuntimeError(
           "autonomous operator inbox lost a delivered message"
         )
-      if (
-        len(records_by_message_id)
-        >= AUTONOMOUS_OPERATOR_MESSAGE_LIMIT
-      ):
-        raise RuntimeError(
-          "autonomous operator inbox exceeds its message quota"
-        )
-
       sent_at_ns = time.time_ns()
       inbox_record = {
         "version": 1,

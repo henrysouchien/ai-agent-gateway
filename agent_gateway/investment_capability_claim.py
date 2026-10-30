@@ -211,26 +211,6 @@ def investment_capability_signing_available() -> bool:
   return True
 
 
-def _approved_budget(
-  execution_limits: SkillExecutionLimits | None,
-) -> dict[str, int | float]:
-  """Sign the quant containment bound and admitted token limit, as present.
-
-  Cost and turns are not minted. investment-tools records those as
-  measurements; the issuer refuses none.
-  """
-
-  numbers: dict[str, int | float | None] = {
-    "max_wall_clock_seconds": 5_400,
-    "max_tokens": (
-      None if execution_limits is None else execution_limits.max_tokens
-    ),
-  }
-  return {
-    field: value for field, value in numbers.items() if value is not None
-  }
-
-
 def issue_investment_capability_claim(
   *,
   user_id: str,
@@ -311,12 +291,7 @@ def issue_investment_capability_claim(
     capability_ids = sorted(grant.capability_ids)
     effect_classes = sorted(grant.effect_classes)
   if "quant_research" in capability_ids:
-    effective_limits = (
-      admitted_skill_execution_limits
-      if admitted_skill_execution_limits is not None or skill is not None
-      else SkillExecutionLimits(32_000)
-    )
-    approved_budget = _approved_budget(effective_limits)
+    approved_budget = {"max_wall_clock_seconds": 5_400}
   else:
     approved_budget = None
   if routed_tool == "start_quant_research":

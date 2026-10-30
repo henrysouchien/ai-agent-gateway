@@ -19,6 +19,8 @@ from .task_registry import TaskEntry
 
 log = logging.getLogger("agent_gateway.fork_task_registry")
 
+# A diagnostic cost estimate for a learn fork, not a spend cap; the budget env override
+# reads it only as a default. The one-fork-per-session ``session_cap`` is concurrency containment.
 DEFAULT_LEARN_FORK_COST_ESTIMATE_USD = Decimal("2.00")
 DEFAULT_FORK_SHUTDOWN_TIMEOUT_SECONDS = 120.0
 
@@ -207,6 +209,7 @@ class ForkTaskRegistry:
 
     if self._shutting_down:
       return self._skip(fork_id, "shutting_down")
+    # One fork per session at a time: concurrency and cost containment, reported as the ``learning_fork_skipped`` diagnostic.
     if session_id in self._tasks_by_session:
       return self._skip(fork_id, "session_cap")
     retained_bytes = _retained_size(handoff)

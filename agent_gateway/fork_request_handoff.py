@@ -3,11 +3,14 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from model_authority.bind import CapabilityBind
 from .execution_identity import resolved_execution_identity
-from .tool_dispatcher import _SpawningTurn
+from .runner_state import select_run_max_tokens
+
+if TYPE_CHECKING:
+  from .tool_dispatcher import _SpawningTurn
 
 
 MarkerPosition = tuple[int, int]
@@ -229,12 +232,12 @@ def _build_handoff(
   execution.validate()
   credential_handle_id, tenant_id = _credential_identity(runner)
   config = dict(execution.auth_config)
-  max_tokens = int(
-    getattr(runner, "_last_request_max_tokens", None)
-    or getattr(runner, "_max_tokens_override", None)
-    or config.get("max_tokens")
-    or 0
-  )
+  last_request = getattr(runner, "_last_request_max_tokens", None)
+  if isinstance(last_request, bool) or not isinstance(last_request, int) or last_request <= 0:
+    model_info = execution.provider.get_model_info(execution.bind.upstream_model)
+    max_tokens = select_run_max_tokens(config, model_info=model_info).value
+  else:
+    max_tokens = last_request
   return ForkRequestHandoff(
     _messages=_freeze(messages),
     rendered_system_blocks=system_blocks,

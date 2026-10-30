@@ -27,6 +27,7 @@ from .base import (
   admitted_entry,
   authority_rate_table,
   model_info_from_entry,
+  stream_error,
   truncate_to_last_compaction,
 )
 from .anthropic_helpers import (
@@ -63,7 +64,6 @@ from .anthropic_oauth import (
   ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
   CREDENTIAL_AFFINITY_KEY_FIELD,
   CREDENTIAL_PREPARED_FIELD,
-  UNDECLARED_LIMIT_BLOCK_SECONDS,
   AnthropicCredential,
   AnthropicCredentialSources,
   AnthropicRequestBinding,
@@ -429,6 +429,29 @@ def _limit_evidence(exc: Exception, *, now: float) -> _LimitEvidence | None:
 def _has_billing_text(failure: ProviderCredentialFailure) -> bool:
   text = f"{failure.message} {failure.error_code or ''}"
   return any(pattern.search(text) for pattern in _BILLING_PATTERNS)
+
+
+def _rejection_error_code(exc: Exception) -> str | None:
+  """The typed code a rejected response's error envelope carries, as sent.
+
+  `error.details.error_code` names an account-level refusal (an organization that
+  does not allow OAuth) and, when present, is the code; otherwise `error.type` is.
+  Only a non-empty string is a code; malformed fields are not stringified.
+  """
+
+  body = _exception_body(exc)
+  error = body.get("error") if isinstance(body, dict) else None
+  if not isinstance(error, dict):
+    return None
+  details = error.get("details")
+  code = (
+    details.get("error_code")
+    if isinstance(details, dict) and "error_code" in details
+    else error.get("type")
+  )
+  if code is not None and not isinstance(code, str):
+    raise TypeError("error code must be a string")
+  return code if code is not None and code.strip() else None
 
 
 def _projected_rate_limit_field(exc: Exception, response: Any, field: str) -> str:
@@ -1010,7 +1033,8 @@ class AnthropicProvider(ModelProvider):
     """The next unblocked sibling credential for the same bound model.
 
     Limits and denials park the rejected API key or OAuth seat, for the scope
-    the limiter named, until the reset the provider reported. The sibling
+    the limiter named, until the reset the provider reported; a failure that
+    reported no reset parks nothing and only rotates. The sibling
     retains its own authentication mode; the caller rebuilds its client from
     that material and the same `model_key`. With no sibling left the run keeps
     the existing rate-limit retry.
@@ -1035,17 +1059,11 @@ class AnthropicProvider(ModelProvider):
     sources = resolve_anthropic_credentials(pool_config)
     if failure.reset_at is None:
       log.info(
-        "Anthropic %s failure (status=%s) reported no reset window; parking this "
-        "credential for %.0fs and rotating",
+        "Anthropic %s failure (status=%s) reported no reset window; rotating "
+        "without parking this credential",
         failure.kind,
         failure.status_code,
-        UNDECLARED_LIMIT_BLOCK_SECONDS,
       )
-    blocked_until = (
-      failure.reset_at
-      if failure.reset_at is not None
-      else time.time() + UNDECLARED_LIMIT_BLOCK_SECONDS
-    )
     if mode == "api":
       pool_file = pool_config_path("anthropic")
       if pool_file is not None and pool_file.exists():
@@ -1082,15 +1100,17 @@ class AnthropicProvider(ModelProvider):
             if next_deployment is not None:
               # The re-resolved pool may no longer hold the failed key, so
               # rotation below could not park it: park it from the pool it
-              # was resolved in. Without a re-resolve, rotation parks it.
+              # was resolved in, to the reset the provider declared. Without a
+              # re-resolve, rotation parks it. A failure that declared no reset
+              # parks nothing.
               failed_member = sources.by_token(current)
-              if failed_member is not None:
+              if failed_member is not None and failure.reset_at is not None:
                 anthropic_quota.record_cooldown(
                   failed_member.sidecar_store_path,
                   failed_member.locator,
                   anthropic_quota.Cooldown(
                     scope=failure.limit_scope or "shared",
-                    until=blocked_until,
+                    until=failure.reset_at,
                     reason=_COOLDOWN_REASONS.get(failure.kind, failure.kind),
                   ),
                 )
@@ -1100,7 +1120,7 @@ class AnthropicProvider(ModelProvider):
     selected = rotate_anthropic_credential_source(
       sources,
       current=current,
-      until=blocked_until,
+      until=failure.reset_at,
       model=config.get(CREDENTIAL_MODEL_FAMILY_FIELD),
       scope=failure.limit_scope or "shared",
       reason=_COOLDOWN_REASONS.get(failure.kind, failure.kind),
@@ -1167,7 +1187,7 @@ class AnthropicProvider(ModelProvider):
     client_kwargs: Dict[str, Any] = {
       "base_url": _bound_anthropic_base_url(config),
       # The gateway owns provider retry policy: runner_stream_turn's bounded
-      # STREAM_RETRY_MAX loop plus this provider's next_credential rotation.
+      # TRANSPORT_RETRY_POLICY loop plus this provider's next_credential rotation.
       # The SDK's own retry (anthropic 1.6.0 DEFAULT_MAX_RETRIES=2) is a second
       # writer: _calculate_retry_timeout obeys the 429's retry-after verbatim
       # (capped only at 4_294_967 s) and sleeps it inside the request, so a
@@ -1178,6 +1198,8 @@ class AnthropicProvider(ModelProvider):
       "max_retries": 0,
     }
     if timeout is not None:
+      # connect=5.0 is transport containment: an unreachable endpoint fails fast into
+      # is_retryable_error / the credential pool instead of consuming the whole request budget.
       client_kwargs["timeout"] = httpx2.Timeout(timeout=timeout, connect=5.0)
 
     if mode == "oauth":
@@ -1937,7 +1959,10 @@ class AnthropicProvider(ModelProvider):
         betas=betas,
       )
       log.warning("Anthropic request rejected during stream: %s; %s", detail, context)
-      rejection = RuntimeError(f"Anthropic request rejected (stage=stream): {detail}; {context}")
+      rejection = stream_error(
+        f"Anthropic request rejected (stage=stream): {detail}; {context}",
+        _rejection_error_code(exc),
+      )
       _carry_rate_limit_evidence(rejection, exc)
       raise rejection from None
 
@@ -1953,6 +1978,9 @@ class AnthropicProvider(ModelProvider):
       ),
     )
 
+  # Transport eligibility only: connection failures, 5xx, 429 and the 200-status stream
+  # error row are the typed transport/rate failures the runner's bounded retry loop and
+  # credential rotation handle. It classifies failures; it never parks on a usage limit.
   def is_retryable_error(self, exc: Exception) -> bool:
     try:
       import httpx2

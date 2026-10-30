@@ -233,7 +233,6 @@ def _error_payload(
   session_id: str | None = None,
   request_user: str | None = None,
   session_user: str | None = None,
-  timeout_seconds: float | None = None,
 ) -> tuple[int, Dict[str, Any]]:
   if isinstance(exc, CredentialsTimeoutError):
     payload: Dict[str, Any] = {
@@ -242,8 +241,6 @@ def _error_payload(
     }
     if user_id is not None:
       payload["user_id"] = user_id
-    if timeout_seconds is not None:
-      payload["timeout_seconds"] = timeout_seconds
     return 504, payload
 
   if isinstance(exc, MissingUserIdError):

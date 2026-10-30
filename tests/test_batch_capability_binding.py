@@ -11,6 +11,7 @@ from fastapi import HTTPException
 
 from model_authority.binding import (
   AuthContext,
+  CapabilityResolutionError,
   CredentialHandle,
   ModelSelectionIntent,
   resolve_capability_model,
@@ -74,6 +75,7 @@ def _config(
   *,
   service_handle: CredentialHandle | None = None,
   materialized_handles: list[CredentialHandle] | None = None,
+  materialized_scopes: list[Any] | None = None,
 ) -> SimpleNamespace:
   provider = _Provider()
   material_by_identity = (
@@ -90,9 +92,15 @@ def _config(
     else {}
   )
 
-  def _materialize(handle: CredentialHandle) -> MaterializedCredential:
+  def _materialize(
+    handle: CredentialHandle,
+    *,
+    user_scope: Any = None,
+  ) -> MaterializedCredential:
     if materialized_handles is not None:
       materialized_handles.append(handle)
+    if materialized_scopes is not None:
+      materialized_scopes.append(user_scope)
     return material_by_identity[id(handle)]
 
   return SimpleNamespace(
@@ -161,14 +169,20 @@ def test_standalone_batch_materializes_only_service_principal() -> None:
     actor_id=None,
   )
 
+  materialized_scopes: list[Any] = []
+
   resolver, execution = batches._batch_capability_execution_context(
     app_state=SimpleNamespace(
-      gateway_config=_config(service_handle=service_handle)
+      gateway_config=_config(
+        service_handle=service_handle,
+        materialized_scopes=materialized_scopes,
+      )
     ),
-    user_id="alice",
+    user_id="1",
     authenticated_session=None,
   )
 
+  assert materialized_scopes == ["1"]
   assert resolver.auth_context.user_provider_handles == {}
   assert (
     resolver.auth_context.service_provider_handles["anthropic"]
@@ -176,6 +190,42 @@ def test_standalone_batch_materializes_only_service_principal() -> None:
   )
   assert execution.bind.credential_principal == "service"
   assert execution.auth_config["api_key"] == "service-secret"
+
+
+def test_authenticated_batch_materializes_service_principal_for_the_session_risk_user() -> None:
+  service_handle = CredentialHandle(
+    handle_id="service:batch:anthropic",
+    provider="anthropic",
+    principal="service",
+    tenant_id="tenant-a",
+    actor_id=None,
+  )
+  session = GatewaySession(
+    session_id="sess-batch-service-scope",
+    api_key_hash="hash",
+    created_at=int(time.time()),
+    expires_at=int(time.time()) + 60,
+    user_id="alice",
+    owner_user_id="alice",
+    risk_user_id=7,
+    kind="control",
+    tenant_id="tenant-a",
+  )
+  materialized_scopes: list[Any] = []
+
+  _resolver, execution = batches._batch_capability_execution_context(
+    app_state=SimpleNamespace(
+      gateway_config=_config(
+        service_handle=service_handle,
+        materialized_scopes=materialized_scopes,
+      )
+    ),
+    user_id="alice",
+    authenticated_session=session,
+  )
+
+  assert execution.bind.credential_principal == "service"
+  assert materialized_scopes == [7]
 
 
 def test_authenticated_batch_rejects_session_owner_mismatch() -> None:
@@ -442,7 +492,7 @@ def test_authenticated_cross_provider_batch_preserves_session_selection() -> Non
     model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
     model_registry=INITIAL_MODEL_REGISTRY,
     service_provider_handles={"anthropic": service_handle},
-    service_auth_config_resolver=lambda handle: (
+    service_auth_config_resolver=lambda handle, *, user_scope=None: (
       service_material
       if handle is service_handle
       else pytest.fail("unexpected service handle")
@@ -559,6 +609,7 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
       actor_id=None,
     )
     materialized_handles: list[CredentialHandle] = []
+    materialized_scopes: list[Any] = []
     started = asyncio.Event()
     release = asyncio.Event()
     captured: dict[str, Any] = {}
@@ -604,6 +655,7 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
       gateway_config=_config(
         service_handle=service_handle,
         materialized_handles=materialized_handles,
+        materialized_scopes=materialized_scopes,
       ),
     )
     monkeypatch.setattr(
@@ -633,6 +685,7 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
     assert execution.bind.registry_revision == resolver.registry.revision
     assert execution.bind.policy_revision == resolver.selection_policy.revision
     assert materialized_handles == [service_handle]
+    assert materialized_scopes == ["alice"]
     parent = root_context(
       captured["parent_session"],
       withheld_tools=frozenset(),
@@ -795,3 +848,34 @@ def test_sessionless_batch_dispatch_without_role_fails_closed() -> None:
         dispatch_key="roleless-batch-dispatch",
       )
     )
+
+
+def test_batch_credential_unavailable_remains_a_503(monkeypatch: pytest.MonkeyPatch) -> None:
+  def _unavailable(**_kwargs: Any) -> None:
+    raise CapabilityResolutionError(
+      "credential_unavailable", "no active credential", capability_id="session.driver",
+    )
+
+  registry = SimpleNamespace(
+    lookup_batch_dispatch=lambda **_kwargs: None,
+    close=lambda: None,
+  )
+  backend = SimpleNamespace(registry_for_user=lambda _user_id: registry)
+  monkeypatch.setattr(batches, "_batch_backend", lambda _state: backend)
+  monkeypatch.setattr(batches, "_task_registry_for_state", lambda _state: SimpleNamespace())
+  async def _no_reconcile(**_kwargs: Any) -> None:
+    return None
+
+  monkeypatch.setattr(batches, "_reconcile_active_batches_before_fresh_admission", _no_reconcile)
+  monkeypatch.setattr(batches, "_batch_capability_execution_context", _unavailable)
+  with pytest.raises(batches._BatchDispatchNotAdmitted) as raised:
+    asyncio.run(
+      batches.dispatch_batch_in_process(
+        {"source": "quality_screen", "universe": ["MSFT"]},
+        app_state=SimpleNamespace(),
+        user_id="1",
+        role="owner",
+        dispatch_key="credential-unavailable-503",
+      )
+    )
+  assert raised.value.status_code == 503

@@ -268,6 +268,7 @@ def test_tool_scoped_calls_derive_route_properties_from_one_exact_identity() -> 
       "identity",
       "prepared_input",
       "trusted_context",
+      "exact_backend",
     }
 
 

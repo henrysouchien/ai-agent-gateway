@@ -72,9 +72,7 @@ def _policy_kwargs() -> dict[str, Any]:
     "tool_packs_enabled": True,
     "model": "analysis-model",
     "provider": "openai",
-    "max_tokens": 8_000,
     "effort": "high",
-    "max_structured_reads": 8,
     "initial_message": "Reviewing the filing.",
     "delivery_label": "Filing review",
   }
@@ -114,7 +112,7 @@ def test_runtime_policy_copies_and_deeply_freezes_input_collections() -> None:
   with pytest.raises(TypeError):
     policy.mcp_tools_by_server["filings-mcp"] = frozenset()  # type: ignore[index]
   with pytest.raises(FrozenInstanceError):
-    policy.max_tokens = 1  # type: ignore[misc]
+    policy.effort = "low"  # type: ignore[misc]
 
 
 @pytest.mark.parametrize(

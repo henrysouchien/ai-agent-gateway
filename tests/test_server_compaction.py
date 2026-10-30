@@ -253,7 +253,7 @@ class _ClampingSummaryProvider(_SummaryProvider):
       requested=requested,
       effective=(
         requested
-        if max_tokens == 512
+        if max_tokens == model_info.max_output_tokens
         else ThinkingLevel.LOW
       ),
       thinking_enabled_effective=True,
@@ -900,7 +900,7 @@ def test_server_compaction_rendered_summary_preserves_bound_effort(
   )
 
 
-def test_server_compaction_refuses_clamped_summary_effort_without_provider_call(
+def test_server_compaction_summary_effort_uses_registry_ceiling_not_credential_max_tokens(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   monkeypatch.setattr(server_compaction, "MIN_COMPACT_GAIN_TOKENS", 10)
@@ -912,38 +912,46 @@ def test_server_compaction_refuses_clamped_summary_effort_without_provider_call(
     auth_config={"api_key": "test", "max_tokens": 512},
   )
   provider.effort_resolutions.clear()
+  model_info = provider.get_model_info("model")
+  assert model_info.max_output_tokens == 8192
 
-  with pytest.raises(
-    server_compaction.SummaryEffortUnsupported,
-    match="cannot preserve bound effort",
-  ):
-    _run(
-      maybe_compact_current_messages(
-        [{"role": "user", "content": "x" * 200}],
-        None,
-        capability_execution=execution,
-        trigger=1,
-        est_total_tokens=100,
-      )
+  result = _run(
+    maybe_compact_current_messages(
+      [{"role": "user", "content": "x" * 200}],
+      None,
+      capability_execution=execution,
+      trigger=1,
+      est_total_tokens=100,
     )
+  )
+
+  assert result.applied is True
+  assert result.anchor_block is not None
+  assert result.anchor_block["content"] == ANCHOR_SUMMARY
+  assert result.summary_chars >= MIN_SUMMARY_CHARS
   assert provider.effort_resolutions
   assert all(
-    resolution["max_tokens"] == 512
-    for resolution in provider.effort_resolutions[:-1]
+    resolution == {
+      "requested": ThinkingLevel.HIGH,
+      "model": "model",
+      "model_info": model_info,
+      "max_tokens": 8192,
+      "request_context": {
+        "auth_mode": "api",
+        "base_url": None,
+        "compat": None,
+      },
+    }
+    for resolution in provider.effort_resolutions
   )
-  assert provider.effort_resolutions[-1] == {
-    "requested": ThinkingLevel.HIGH,
-    "model": "model",
-    "model_info": provider.get_model_info("model"),
-    "max_tokens": SUMMARY_MAX_TOKENS,
-    "request_context": {
-      "auth_mode": "api",
-      "base_url": None,
-      "compat": None,
-    },
-  }
-  assert provider.client_creations == 0
-  assert provider.requests == []
+  assert provider.client_creations == 1
+  assert len(provider.requests) == 1
+  request = provider.requests[-1]
+  assert request["max_tokens"] == 8192
+  assert request["thinking_level"] is ThinkingLevel.HIGH
+  assert request["tools"] == []
+  assert request["messages"][:-1] == [{"role": "user", "content": "x" * 200}]
+  assert request["messages"][-1]["role"] == "user"
 
 
 def test_server_compaction_summary_strips_analysis(monkeypatch: pytest.MonkeyPatch) -> None:

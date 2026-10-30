@@ -1,7 +1,9 @@
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
+import copy
 import hashlib
 import json
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,6 +51,7 @@ from agent_gateway.runner_background_tasks import (  # noqa: E402
   build_agent_completion_envelope,
   ordinary_parent_result_policy,
 )
+from agent_gateway.tool_result_spill import SpillCapabilities, SpillSink  # noqa: E402
 from agent_gateway.runner_tool_execution import RunnerToolExecutionMixin  # noqa: E402
 from agent_gateway.runner_tool_audit import redact_tool_input_for_event  # noqa: E402
 from agent_gateway.tool_policy_registry import PreparedToolCall, ToolInputPreparationError  # noqa: E402
@@ -573,6 +576,381 @@ def test_unhandled_tool_exception_is_projected_once_at_its_source(
     serialized = json.dumps(projection)
     assert secret not in serialized
     assert "<redacted-secret>" in serialized
+
+
+_RESULT_SECRET = "CUSTOM-ACTIVE-CREDENTIAL-TOOL-RESULT-8f21d7"
+_RESULT_PUBLIC = "public-result-marker"
+
+
+class _LiveResultDispatcher(_Dispatcher):
+  """Returns one fixed (result, error) pair; the result object is the caller's."""
+
+  def __init__(self, result: Any, error: dict[str, Any] | None = None) -> None:
+    self.result = result
+    self.error = error
+
+  async def dispatch(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    call_index: int = 0,
+    allow_uncertain_mcp_replay: bool = True,
+    on_executed_prepared_call: Any | None = None,
+  ):
+    _ = tool_id, tool_name, tool_input, call_index
+    return self.result, self.error
+
+
+def _result_secret_runner(
+  tmp_path: Path,
+  dispatcher: _Dispatcher,
+  *,
+  spill_root: Path | None = None,
+) -> tuple[AgentRunner, AgentSessionLog]:
+  session_log = AgentSessionLog(path=tmp_path / "sessions" / "secret-result.jsonl")
+  runner = AgentRunner(
+    event_log=EventLog(session_id="secret-result"),
+    dispatcher=dispatcher,  # type: ignore[arg-type]
+    session_id="secret-result",
+    capability_execution=stub_runner_capability_execution(
+      provider=_Provider(),
+      model="stub-model",
+      effort="none",
+      auth_config={"api_key": _RESULT_SECRET},
+    ),
+    user_id="alice",
+    billing_mode="byok",
+    rate_table_version="unknown",
+    agent_session_log=session_log,
+    code_execution_spill_dir_provider=(
+      None
+      if spill_root is None
+      else SpillSink(
+        root_provider=lambda: str(spill_root),
+        capabilities=SpillCapabilities(code_execute=True, spill_read=True),
+      )
+    ),
+  )
+  runner._runner_id = "writer-secret-result"
+  return runner, session_log
+
+
+def _tool_done_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+  return [
+    record
+    for record in caplog.records
+    if getattr(record, "data", {}).get("event") == "tool_done"
+  ]
+
+
+def _durable_complete_events(session_log: AgentSessionLog) -> list[dict[str, Any]]:
+  durable, _ = _run(session_log.query(order="asc"))
+  return [
+    entry.event for entry in durable if entry.event.get("type") == "tool_call_complete"
+  ]
+
+
+def test_tool_result_secret_is_absent_from_every_retained_result_copy(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  live_result = {
+    "status": "ok",
+    "public": _RESULT_PUBLIC,
+    "echo": f"upstream replied with {_RESULT_SECRET}",
+  }
+  original = copy.deepcopy(live_result)
+  runner, session_log = _result_secret_runner(
+    tmp_path,
+    _LiveResultDispatcher(live_result),
+  )
+
+  with caplog.at_level(logging.INFO, logger="agent_gateway.runner"):
+    _run(
+      runner._execute_single_tool(
+        "tool-result-secret",
+        "lookup",
+        {"query": "ordinary"},
+        {"tools": []},
+      )
+    )
+
+  # The live object is never rewritten; only retained copies are projected.
+  assert live_result == original
+
+  (done,) = _tool_done_records(caplog)
+  assert _RESULT_SECRET not in done.getMessage()
+  assert _RESULT_PUBLIC in done.getMessage()
+  assert getattr(done, "data")["result_bytes"] == len(json.dumps(original))
+  assert getattr(done, "data")["error"] is False
+
+  durable_events = _durable_complete_events(session_log)
+  streamed_events = [
+    entry.event
+    for entry in runner._log.entries
+    if entry.event.get("type") == "tool_call_complete"
+  ]
+  replay = _run(SessionContextBuilder(agent_session_log=session_log).build())
+  assert len(durable_events) == len(streamed_events) == 1
+  for event in (durable_events[0], streamed_events[0]):
+    assert event["tool_call_id"] == "tool-result-secret"
+    assert event["tool_name"] == "lookup"
+    assert event["result"]["public"] == _RESULT_PUBLIC
+    assert event["result"]["status"] == "ok"
+    assert _RESULT_SECRET not in json.dumps(event)
+    assert _RESULT_PUBLIC in json.dumps(event["final_tool_result_blocks"])
+  assert _RESULT_SECRET not in json.dumps(replay)
+
+
+def test_streamed_result_cut_never_splits_a_secret_before_it_is_redacted(
+  tmp_path: Path,
+) -> None:
+  # Over the 2 MiB event frame, the streamed copy is projected with strings cut
+  # at 8000 chars; the secret starts ten chars before that cut.
+  live_result = {
+    "status": "ok",
+    "public": _RESULT_PUBLIC,
+    "blob": "p" * 7_990 + _RESULT_SECRET + "q" * (2 * 1024 * 1024),
+  }
+  runner, session_log = _result_secret_runner(
+    tmp_path,
+    _LiveResultDispatcher(live_result),
+  )
+
+  _run(
+    runner._execute_single_tool(
+      "tool-result-cut",
+      "lookup",
+      {"query": "ordinary"},
+      {"tools": []},
+    )
+  )
+
+  assert live_result["blob"].count(_RESULT_SECRET) == 1
+  (streamed,) = [
+    entry.event
+    for entry in runner._log.entries
+    if entry.event.get("type") == "tool_call_complete"
+  ]
+  (durable,) = _durable_complete_events(session_log)
+  assert streamed["result"]["_runner_truncated"] is True
+  assert streamed["result"]["public"] == _RESULT_PUBLIC
+  assert streamed["tool_call_id"] == durable["tool_call_id"] == "tool-result-cut"
+  # The secret's own prefix would survive a cut taken before redaction.
+  assert _RESULT_SECRET[:10] not in json.dumps(streamed)
+  assert _RESULT_SECRET not in json.dumps(durable)
+
+
+def test_tool_error_secret_is_absent_from_the_warning_and_error_detail(
+  tmp_path: Path,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  # The raw error text puts the secret across the 200-char error_detail cut.
+  error = {
+    "code": "upstream_error",
+    "sub_code": "auth_rejected",
+    "message": "x" * 120 + _RESULT_SECRET,
+  }
+  runner, _session_log = _result_secret_runner(
+    tmp_path,
+    _LiveResultDispatcher(None, error),
+  )
+
+  with caplog.at_level(logging.INFO, logger="agent_gateway.runner"):
+    _run(
+      runner._execute_single_tool(
+        "tool-error-secret",
+        "lookup",
+        {"query": "ordinary"},
+        {"tools": []},
+      )
+    )
+
+  (done,) = _tool_done_records(caplog)
+  assert done.levelno == logging.WARNING
+  assert _RESULT_SECRET not in done.getMessage()
+  assert "<redacted-secret>" in done.getMessage()
+  assert _RESULT_SECRET[:10] not in getattr(done, "data")["error_detail"]
+  assert getattr(done, "data")["error_sub_code"] == "auth_rejected"
+  assert getattr(done, "data")["error"] is True
+  (streamed,) = [
+    entry.event
+    for entry in runner._log.entries
+    if entry.event.get("type") == "tool_call_complete"
+  ]
+  assert streamed["error"]["code"] == "upstream_error"
+  assert _RESULT_SECRET not in json.dumps(streamed["error"])
+
+
+_RESULT_CUT_PREFIX = _RESULT_SECRET[:10]
+_MODEL_CUT_CHARS = "4000"
+
+
+def _spill_texts(root: Path) -> list[str]:
+  return [
+    path.read_text(encoding="utf-8")
+    for path in sorted(root.rglob("*"))
+    if path.is_file()
+  ]
+
+
+def _streamed_complete_events(runner: AgentRunner) -> list[dict[str, Any]]:
+  return [
+    entry.event
+    for entry in runner._log.entries
+    if entry.event.get("type") == "tool_call_complete"
+  ]
+
+
+def test_model_cut_leaves_live_result_raw_and_every_retained_copy_projected(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  # The 2000-char model string cut falls ten chars into the secret, so a preview
+  # or spill taken from the live text would retain the secret's prefix.
+  monkeypatch.setenv(gateway_runner.MODEL_TOOL_RESULT_MAX_CHARS_ENV, _MODEL_CUT_CHARS)
+  live_result = {
+    "status": "ok",
+    "public": _RESULT_PUBLIC,
+    "blob": "p" * 1_990 + _RESULT_SECRET + "q" * 6_000,
+  }
+  original = copy.deepcopy(live_result)
+  spill_root = tmp_path / "spills"
+  spill_root.mkdir(mode=0o700)
+  runner, session_log = _result_secret_runner(
+    tmp_path,
+    _LiveResultDispatcher(live_result),
+    spill_root=spill_root,
+  )
+
+  live_entry, _tool_name, _extra = _run(
+    runner._execute_single_tool(
+      "tool-model-cut",
+      "lookup",
+      {"query": "ordinary"},
+      {"tools": []},
+    )
+  )
+
+  assert live_result == original
+  # The live, model-visible entry keeps its prior raw semantics, pointer included.
+  live_payload = json.loads(live_entry["content"])
+  assert live_entry["tool_use_id"] == "tool-model-cut"
+  assert live_payload["_runner_truncated"] is True
+  assert live_payload["spill_ref"].startswith("spill:v1:")
+  assert _RESULT_CUT_PREFIX in live_entry["content"]
+  assert live_payload["content_projection"]["public"] == _RESULT_PUBLIC
+
+  (durable,) = _durable_complete_events(session_log)
+  (streamed,) = _streamed_complete_events(runner)
+  replay = _run(SessionContextBuilder(agent_session_log=session_log).build())
+  for event in (durable, streamed):
+    (block, *_rest) = event["final_tool_result_blocks"]
+    preview = json.loads(block["content"])
+    assert block["tool_use_id"] == "tool-model-cut"
+    assert preview["_runner_truncated"] is True
+    assert preview["content_projection"]["public"] == _RESULT_PUBLIC
+    assert "spill_ref" not in preview
+    assert _RESULT_CUT_PREFIX not in json.dumps(event)
+  assert _RESULT_CUT_PREFIX not in json.dumps(replay)
+
+  spills = _spill_texts(spill_root)
+  assert spills
+  assert all(_RESULT_CUT_PREFIX not in text for text in spills)
+  assert any(_RESULT_PUBLIC in text for text in spills)
+  assert any("<redacted-secret>" in text for text in spills)
+
+
+def test_untruncated_result_stays_raw_live_and_is_projected_in_retained_copies(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv(gateway_runner.MODEL_TOOL_RESULT_MAX_CHARS_ENV, _MODEL_CUT_CHARS)
+  live_result = {
+    "status": "ok",
+    "public": _RESULT_PUBLIC,
+    "echo": f"upstream replied with {_RESULT_SECRET}",
+  }
+  spill_root = tmp_path / "spills"
+  spill_root.mkdir(mode=0o700)
+  runner, session_log = _result_secret_runner(
+    tmp_path,
+    _LiveResultDispatcher(live_result),
+    spill_root=spill_root,
+  )
+
+  live_entry, _tool_name, _extra = _run(
+    runner._execute_single_tool(
+      "tool-no-cut",
+      "lookup",
+      {"query": "ordinary"},
+      {"tools": []},
+    )
+  )
+
+  assert json.loads(live_entry["content"]) == live_result
+  assert _RESULT_SECRET in live_entry["content"]
+  (durable,) = _durable_complete_events(session_log)
+  (streamed,) = _streamed_complete_events(runner)
+  for event in (durable, streamed):
+    (block, *_rest) = event["final_tool_result_blocks"]
+    assert block["tool_use_id"] == "tool-no-cut"
+    assert json.loads(block["content"])["public"] == _RESULT_PUBLIC
+    assert _RESULT_SECRET not in json.dumps(event)
+  assert _spill_texts(spill_root) == []
+
+
+def test_fms_terminal_projection_stays_raw_live_and_is_projected_in_retained_copies(
+  tmp_path: Path,
+) -> None:
+  live_result = {
+    "status": "staged",
+    "gate_code": "PROCEED",
+    "artifact_ref": "artifacts/PCTY/business-model.json",
+    "proposal_id": f"proposal-{_RESULT_SECRET}",
+    "error": None,
+    "verdict": {
+      "verdict": "BM_CONSTRUCTED",
+      "confidence": "MEDIUM",
+      "revision": "pcty-business-model-rev-1",
+      "validation": {"large": "v" * 5_000},
+    },
+    "readback": {
+      "typed_outputs": {
+        "business_model_stage_receipt": {"status": "accepted"},
+        "business_model": {"segments": ["x" * 5_000]},
+      }
+    },
+  }
+  runner, session_log = _result_secret_runner(
+    tmp_path,
+    _LiveResultDispatcher(live_result),
+  )
+
+  live_entry, _tool_name, _extra = _run(
+    runner._execute_single_tool(
+      "tool-fms-terminal",
+      "fms_persist_business_model",
+      {"query": "ordinary"},
+      {"tools": []},
+    )
+  )
+
+  live_projection = json.loads(live_entry["content"])
+  assert "readback" not in live_projection
+  assert live_projection["proposal_id"] == f"proposal-{_RESULT_SECRET}"
+  (durable,) = _durable_complete_events(session_log)
+  (streamed,) = _streamed_complete_events(runner)
+  for event in (durable, streamed):
+    (block, *_rest) = event["final_tool_result_blocks"]
+    projection = json.loads(block["content"])
+    assert block["tool_use_id"] == "tool-fms-terminal"
+    assert "readback" not in projection
+    assert projection["gate_code"] == "PROCEED"
+    assert projection["proposal_id"] == "proposal-<redacted-secret>"
+    assert _RESULT_SECRET not in json.dumps(event)
 
 
 def _workflow_result(delivery_status: str) -> dict[str, Any]:
@@ -2749,9 +3127,11 @@ def test_preparation_rejected_code_execute_emits_tool_call_start_and_grades_hand
   assert fixed["detail"]["calls_examined"] == 482
 
 
-def test_retries_stop_at_two_and_emit_retries_exhausted(
+def test_exhausted_retries_emit_retries_exhausted(
+  monkeypatch: pytest.MonkeyPatch,
   declared_read_effects: None,
 ) -> None:
+  monkeypatch.setattr(runner_tool_execution, "retry_backoff_seconds", lambda _attempt: 0.0)
   dispatcher = _RecordedDispatcher(
     [(None, {"code": "rate_limited", "message": "HTTP 429 Too Many Requests"})]
   )
@@ -2760,25 +3140,24 @@ def test_retries_stop_at_two_and_emit_retries_exhausted(
   _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
 
   event = _complete_event(runner)
-  assert dispatcher.calls == 3
+  assert dispatcher.calls > 1
   assert event["dispatch"]["outcome"] == "error_rate_limited"
-  assert event["dispatch"]["attempts"] == 3
+  assert event["dispatch"]["attempts"] == dispatcher.calls
   assert event["dispatch"]["retries_exhausted"] is True
   assert _start_event_count(runner) == 1
 
 
 @pytest.mark.usefixtures("declared_read_effects")
 @pytest.mark.parametrize(
-  ("failures", "expected_attempts", "expected_outcome"),
+  ("failures", "expected_outcome"),
   [
-    (1, 2, "ok"),
-    (3, 3, "error_transport"),
+    (1, "ok"),
+    (1000, "error_transport"),
   ],
 )
 def test_fred_runner_owns_every_physical_attempt_with_real_dispatcher_manager(
   monkeypatch: pytest.MonkeyPatch,
   failures: int,
-  expected_attempts: int,
   expected_outcome: str,
 ) -> None:
   manager = McpClientManager(config_path=None)
@@ -2838,8 +3217,8 @@ def test_fred_runner_owns_every_physical_attempt_with_real_dispatcher_manager(
   ))
 
   event = _complete_event(runner)
-  assert physical_sends == expected_attempts
-  assert event["dispatch"]["attempts"] == expected_attempts
+  assert physical_sends > 1
+  assert event["dispatch"]["attempts"] == physical_sends
   assert event["dispatch"]["outcome"] == expected_outcome
   assert event["dispatch"]["route_id"] == "mcp:fred-mcp/fred_search"
 

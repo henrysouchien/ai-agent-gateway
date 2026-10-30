@@ -448,7 +448,6 @@ def _construct_fork_runner(
   parent: Any,
   *,
   spawning_turn: _SpawningTurn,
-  max_tokens: int,
   billing_mode: str,
   tenant_id: str | None,
   capability_execution: BoundCapabilityExecution,
@@ -538,7 +537,6 @@ def _construct_fork_runner(
       if child_context is not None else None
     ),
     capability_execution=capability_execution,
-    max_tokens_override=max_tokens,
     stream_stall_timeout=parent._stream_stall_timeout,
     mcp_client=parent._mcp_client,
     mcp_activation_fold=parent._mcp_activation_fold,
@@ -571,7 +569,6 @@ def _construct_fork_runner(
     admitted_self_task=admitted_self_task,
     admitted_self_prior_evidence=None,
     message_inbox=task_entry.message_inbox if task_entry else None,
-    max_resume_chain_depth=parent._max_resume_chain_depth,
     emit_session_recap=False,
     code_execution_spill_dir_provider=child_spill_sink,
     commercial_usage_producer=getattr(
@@ -663,7 +660,6 @@ def _prepare_fork_child(
   constructed = _construct_fork_runner(
     parent,
     spawning_turn=handoff.spawning_turn,
-    max_tokens=handoff.max_tokens,
     billing_mode=handoff.billing_mode,
     tenant_id=handoff.tenant_id,
     capability_execution=capability_execution,
@@ -843,7 +839,6 @@ async def learning_fork_host_runner(
     # spawning turn (ToolDispatcher._executing_context); the spawning root
     # turn is not recorded on the fork's journal and is not read here.
     spawning_turn=_SpawningTurn(context=child_context, root_turn=None),
-    max_tokens=snapshot.max_tokens,
     billing_mode=str(getattr(parent, "_billing_mode", "") or ""),
     tenant_id=(
       execution_identity.tenant_id if execution_identity is not None else None
@@ -1190,10 +1185,8 @@ def spawn_learning_fork(
   execution_snapshot = build_agent_execution_snapshot(
     operation=operation,
     result_instructions=render_result_instructions(result_requirement),
-    max_tokens=handoff.max_tokens,
     cost_observation_threshold_usd=None,
     provider_tool_definitions=provider_tool_definitions,
-    max_resume_chain_depth=parent._max_resume_chain_depth,
     admitted_context=admission.wire,
   )
   admitted = ordinary_admitted_task_factory(

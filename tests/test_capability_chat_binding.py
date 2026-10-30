@@ -55,11 +55,12 @@ def _service_handle(provider: str) -> CredentialHandle:
   )
 
 
-def _session(*, auth_config: dict[str, Any] | None = None):
+def _session(*, auth_config: dict[str, Any] | None = None, risk_user_id: int = 0):
   return SessionStore().create_session(
     api_key_hash="hash",
     user_id="alice",
     owner_user_id="101",
+    risk_user_id=risk_user_id,
     auth_config=(
       {
         "provider": "anthropic",
@@ -96,13 +97,23 @@ def _inputs(
   )
 
 
-def _configure_builder(builder: Any) -> None:
+def _configure_builder(
+  builder: Any,
+  *,
+  materialized_scopes: list[Any] | None = None,
+) -> None:
   service_handles = {
     provider: _service_handle(provider)
     for provider in {"codex", "openai", "xai"}
   }
 
-  def _materialize(handle: CredentialHandle) -> MaterializedCredential:
+  def _materialize(
+    handle: CredentialHandle,
+    *,
+    user_scope: Any = None,
+  ) -> MaterializedCredential:
+    if materialized_scopes is not None:
+      materialized_scopes.append(user_scope)
     assert service_handles[handle.provider] is handle
     return MaterializedCredential(
       handle=handle,
@@ -168,12 +179,14 @@ def test_prepare_accepts_explicit_stable_key_with_service_authority() -> None:
   async def builder(*_args: Any, storage_root: Path | None = None, **_kwargs: Any) -> Any:
     raise AssertionError
 
-  _configure_builder(builder)
+  materialized_scopes: list[Any] = []
+  _configure_builder(builder, materialized_scopes=materialized_scopes)
   prepared = prepare_session_driver_turn(
-    _session(),
+    _session(risk_user_id=7),
     _inputs(model_key="openai.gpt-6-1-sol", effort="xhigh"),
     build_chat_runtime=builder,
   )
+  assert materialized_scopes == [7]
   bind = prepared.request.capability_bind
   assert bind is not None
   assert (

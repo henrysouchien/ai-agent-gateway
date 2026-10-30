@@ -4,6 +4,7 @@ from copy import deepcopy
 
 import pytest
 
+from agent_gateway import ui_blocks_validation
 from agent_gateway.ui_blocks_validation import (
   FailureCode,
   build_payload_submitted,
@@ -39,6 +40,63 @@ def test_all_bundle_fixtures_match_acceptance_and_expected_code() -> None:
       else:
         assert failures, fixture["name"]
         assert fixture["expected_code"] in {failure["code"] for failure in failures}, fixture["name"]
+
+
+@pytest.mark.parametrize("allow_layout_children", [False, True])
+def test_nested_layout_children_follow_bundle_grammar(
+  monkeypatch: pytest.MonkeyPatch, allow_layout_children: bool,
+) -> None:
+  bundle = deepcopy(ui_blocks_validation.manifest())
+  if allow_layout_children:
+    bundle["layout_rules"]["nested"]["allowed_children"].append("layout")
+  monkeypatch.setattr(ui_blocks_validation, "manifest", lambda: bundle)
+  block = {"block": "metric-card", "props": {"label": "Risk", "value": "High"}}
+  payload = _payload({
+    "layout": "stack",
+    "children": [{"layout": "row", "children": [{"layout": "grid", "children": [block]}]}],
+  })
+
+  failures = validate_payload(payload)
+
+  if allow_layout_children:
+    assert failures == []
+  else:
+    assert [failure["code"] for failure in failures] == ["layout_depth_exceeded"]
+
+
+@pytest.mark.parametrize(
+  ("position", "kind", "child", "expected_code"),
+  [
+    ("top_level", "primitive", {"block": "metric-card", "props": {"label": "A", "value": "1"}}, "envelope_invalid"),
+    ("nested", "primitive", {"block": "metric-card", "props": {"label": "A", "value": "1"}}, "envelope_invalid"),
+    (
+      "top_level", "sdk",
+      {"block": "sdk:metric-grid", "props": {"source": "positions", "fields": ["totalPortfolioValue"]}},
+      "envelope_invalid",
+    ),
+    (
+      "nested", "sdk",
+      {"block": "sdk:metric-grid", "props": {"source": "positions", "fields": ["totalPortfolioValue"]}},
+      "envelope_invalid",
+    ),
+    (
+      "top_level", "layout",
+      {"layout": "row", "children": [{"block": "metric-card", "props": {"label": "A", "value": "1"}}]},
+      "layout_depth_exceeded",
+    ),
+  ],
+)
+def test_layout_child_admission_follows_bundle_allowed_children(
+  monkeypatch: pytest.MonkeyPatch, position: str, kind: str, child: dict, expected_code: str,
+) -> None:
+  parent = {"layout": "stack", "children": [child]}
+  payload = _payload(parent if position == "top_level" else {"layout": "grid", "children": [parent]})
+  assert validate_payload(payload) == []
+  bundle = deepcopy(ui_blocks_validation.manifest())
+  bundle["layout_rules"][position]["allowed_children"].remove(kind)
+  monkeypatch.setattr(ui_blocks_validation, "manifest", lambda: bundle)
+
+  assert [failure["code"] for failure in validate_payload(payload)] == [expected_code]
 
 
 @pytest.mark.parametrize(

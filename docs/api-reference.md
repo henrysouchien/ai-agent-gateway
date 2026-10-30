@@ -294,16 +294,15 @@ reader surface and explicit construction types:
 Use the explicit V1 classes only to inspect or test historical records; live
 starts and settlement write V2 exclusively. V1 preserves the authored-summary
 delivery form. V2 removes summary coupling:
-its primary carries an exact `PublishedOutputRef` plus a bounded
-`DeliveryPreview` whose UTF-8 byte interval, total bytes, completeness, and
-omitted bytes are validated. `DeliverySettlement` accepts only matching
-V1/V1 or V2/V2 spec/envelope pairs. Exact output retrieval remains authoritative
-for both versions.
+its primary carries an exact `PublishedOutputRef` plus a `DeliveryPreview`
+whose UTF-8 byte interval, total bytes, completeness, and omitted bytes are
+validated. Current V2 delivery emits the complete exact text. `DeliverySettlement`
+accepts only matching V1/V1 or V2/V2 spec/envelope pairs. Exact output retrieval
+remains authoritative for both versions.
 
-`DELIVERY_PREVIEW_POLICY_VERSION` and `DELIVERY_PREVIEW_MAX_BYTES` identify the
-currently supported deterministic prefix policy. The wheel also includes the
-generated JSON Schemas, TypeScript declarations, frozen historical-v1 golden,
-and complete/truncated v2 goldens under
+`DELIVERY_PREVIEW_POLICY_VERSION` identifies the recorded preview policy. The
+wheel also includes the generated JSON Schemas, TypeScript declarations, frozen
+historical-v1 golden, and complete/truncated v2 goldens under
 `packages/agent-workflow-contracts/agent_workflow_contracts/generated/`.
 
 ### Ordinary agent completion
@@ -382,7 +381,9 @@ Key fields:
   tenant, actor, and capability
 - `service_provider_handles`, `service_auth_config_resolver`,
   `capability_adapter_resolver`: server-owned credential and adapter
-  materialization
+  materialization. The service resolver is called as
+  `resolver(handle, user_scope=<effective run scope>)`; implementations must
+  accept that keyword.
 - `autonomous_capability_binding_resolver`: trusted pre-spawn resolver for
   autonomous start, schedule, and exact resume
 - `dispatch_scope_validator`: optional dispatch-time validator/canonicalizer for redacted structured portfolio scope

@@ -107,8 +107,10 @@ from model_authority.binding import CapabilityResolutionError
 from .capability_execution import CapabilityExecutionResolver, materialize_frozen_bind
 from .child_completion import (
   CompletionTransport,
+  build_own_journal_registration,
   materialize_child_completion_envelope,
-  publish_child_completion,
+  publish_registered_child_completion,
+  publish_registered_child_settlement,
 )
 from .code_execution import (
   CodeExecutionBundle,
@@ -699,6 +701,49 @@ def _foreground_completion_transport_ready(runner: Any) -> bool:
   )
 
 
+async def _journal_foreground_registration(
+  runner: Any, entry: TaskEntry, registration: dict[str, Any],
+) -> None:
+  async def persist() -> None:
+    await runner._append_durable_event(registration)
+    entry.registration_persistence_state = "committed"
+
+  task = asyncio.create_task(persist())
+  try:
+    await asyncio.shield(task)
+  except asyncio.CancelledError:
+    await drain_owned_lifecycle_task(task)
+    raise
+
+
+async def _settle_foreground_attempt(
+  runner: Any, entry: TaskEntry, admitted_task: AdmittedTask,
+  capability_bind_receipt: Mapping[str, str],
+) -> None:
+  result = entry.task_result
+  if result is None:
+    # Dispatch failed before it could return a canonical execution result.
+    failure = cast(dict[str, Any], entry.error)
+    cancelled = failure["code"] == "cancelled"
+    result = terminal_task_result(
+      admitted_task,
+      status="cancelled" if cancelled else "failed",
+      reason="cancelled" if cancelled else f"{failure['code']}: {failure['message']}",
+    )
+  await publish_registered_child_settlement(
+    transport=CompletionTransport(
+      append=runner._append_durable_event,
+      workspace_dir=str(runner._workspace_dir),
+      parent_session_id=runner._gateway_session_id,
+      principal_id=runner._runner_id,
+      role=runner._role,
+      runner_id=runner._runner_id,
+    ),
+    entry=entry, admitted_task=admitted_task, result=result,
+    capability_bind_receipt=capability_bind_receipt,
+  )
+
+
 async def _publish_foreground_completion(
   *,
   runner: Any,
@@ -706,8 +751,7 @@ async def _publish_foreground_completion(
   admitted_task: AdmittedTask,
   agent_name: str,
   capability_bind_receipt: Mapping[str, str],
-  parent_turn_id: str | None,
-  call_index: int,
+  entry: TaskEntry,
 ) -> AgentCompletionEnvelope:
   """Durably publish and normalize one direct foreground delegation result."""
 
@@ -726,32 +770,8 @@ async def _publish_foreground_completion(
       "foreground completion result does not settle the admitted task"
     )
 
-  policy = ordinary_parent_result_policy(result)
   now = datetime.datetime.now(datetime.UTC).timestamp()
-  result_payload = result.model_dump(mode="json")
-  entry = TaskEntry(
-    task_id=result.attempt.physical_task_id,
-    task_type="foreground_agent",
-    agent_name=agent_name,
-    state=task_state_for_result(result),
-    started_at=now,
-    completed_at=now,
-    result=result_payload,
-    metadata={
-      "task_type": "foreground",
-      "owner_runner_id": runner_id,
-      "owner_role": role,
-      "parent_turn_id": parent_turn_id,
-      "call_index": call_index,
-      "admitted_task": admitted_task.model_dump(mode="json"),
-      "parent_result_policy": policy.model_dump(mode="json"),
-    },
-    capability_bind_receipt=dict(capability_bind_receipt),
-    admitted_task=admitted_task,
-    task_result=result,
-    parent_result_policy=policy,
-  )
-  return await publish_child_completion(
+  return await publish_registered_child_completion(
     transport=CompletionTransport(
       append=runner._append_durable_event,
       workspace_dir=str(workspace_dir),
@@ -1833,16 +1853,17 @@ def _claim_child_spawn(
 def _remember_foreground_spawn(
   claim: TaskEntry | None,
   *,
-  result: TaskResult | None,
+  result: TaskResult,
+  admitted_task: AdmittedTask,
+  capability_bind_receipt: dict[str, str],
   envelope: AgentCompletionEnvelope | None,
 ) -> None:
   if claim is None:
     return
-  if result is None:
-    claim.spawn_settled.set()
-    return
   claim.task_result = result
   claim.result = result.model_dump(mode="json")
+  claim.admitted_task = admitted_task
+  claim.capability_bind_receipt = capability_bind_receipt
   if envelope is not None:
     claim.completion_envelope = envelope
   claim.state = task_state_for_result(result)
@@ -1888,7 +1909,6 @@ def make_run_agent_handler(
     Callable[[ParentContext, frozenset[str]], Awaitable[frozenset[str]]] | None
   ) = None,
   excluded_tools: set[str] | None = None,
-  default_max_tokens: int = 64000,
   default_cost_observation_threshold_usd: float | None = (
     DEFAULT_COST_OBSERVATION_THRESHOLD_USD
   ),
@@ -2150,7 +2170,6 @@ def make_run_agent_handler(
       operation_scope = runtime_policy.semantic_scope
       operation_persist_state = runtime_policy.persist_state
       operation_version = operation.operation.version
-      configured_max_tokens = runtime_policy.max_tokens
     elif skill_loader is not None:
       try:
         resolved_operation = skill_loader.resolve_operation(raw_operation)
@@ -2168,7 +2187,6 @@ def make_run_agent_handler(
       operation_scope = profile.scope
       operation_persist_state = profile.persist_state
       operation_version = profile.version
-      configured_max_tokens = profile.max_tokens
     elif raw_operation is not None:
       return None, {
         "code": "not_available",
@@ -2190,7 +2208,6 @@ def make_run_agent_handler(
       operation_scope = profile.scope
       operation_persist_state = profile.persist_state
       operation_version = profile.version
-      configured_max_tokens = profile.max_tokens
     registered_runtime = runtime_policy is not None or named_operation
     agent_name = operation.operation.name
     ticker_required = "ticker" in operation.required_context
@@ -2495,11 +2512,6 @@ def make_run_agent_handler(
         agent_name,
         previous_state,
       )
-    effective_max_tokens = (
-      configured_max_tokens
-      if configured_max_tokens is not None
-      else default_max_tokens
-    )
     operation_private_mcp_tool_ids = (
       (
         frozenset(
@@ -2855,10 +2867,8 @@ def make_run_agent_handler(
       ),
       persisted_methodology_state=previous_state,
       methodology_state_instructions=methodology_state_instructions,
-      max_tokens=effective_max_tokens,
       cost_observation_threshold_usd=cost_observation_threshold_usd,
       provider_tool_definitions=admitted_provider_definitions,
-      max_resume_chain_depth=getattr(runner, "_max_resume_chain_depth", 3),
       admitted_context=admitted_context,
     )
     system_prompt = execution_snapshot.system_prompt
@@ -2919,9 +2929,6 @@ def make_run_agent_handler(
         tool_ctx=tool_ctx,
         durable_appender=durable_skill_event_transport[0],
         durable_confirmer=durable_skill_event_transport[1],
-        declared_terminal_doors=(
-          _sub_agent_skill_state.persist_expectation_doors(admitted_task)
-        ),
       )
       if (
         skill_run_id
@@ -3060,9 +3067,7 @@ def make_run_agent_handler(
             tool_ctx=tool_ctx,
             skill_run_id=skill_run_id,
             skill_name=agent_name,
-            admitted_skill_execution_limits=SkillExecutionLimits(
-              max_tokens=execution_snapshot.max_tokens,
-            ),
+            admitted_skill_execution_limits=SkillExecutionLimits(),
             research_file_id=child_research_file_id,
             user_id=effective_parent_user_id,
             session_id=getattr(runner, "_full_session_id", ""),
@@ -3098,7 +3103,6 @@ def make_run_agent_handler(
           sub_session=sub_session,
           bind_job_runner=_bind_child_runner,
           excluded_tools=child_excluded,
-          max_tokens=execution_snapshot.max_tokens,
           cost_observation_threshold_usd=(
             execution_snapshot.cost_observation_threshold_usd
           ),
@@ -3142,6 +3146,7 @@ def make_run_agent_handler(
       task_type="background_agent" if background else "foreground_agent",
     )
     spawn_kept = False
+    foreground_entry: TaskEntry | None = None
     try:
       if background:
         if outputs_dir is not None and agent_name:
@@ -3234,7 +3239,41 @@ def make_run_agent_handler(
             "granted_tools": list(sorted(admitted_dispatch_tools)),
           }
         return result, error
+      foreground_entry = TaskEntry(
+        task_id=admitted_task.attempt.physical_task_id,
+        task_type="foreground_agent",
+        agent_name=agent_name,
+        started_at=datetime.datetime.now(datetime.UTC).timestamp(),
+        metadata={
+          "task_type": "foreground",
+          "owner_runner_id": getattr(runner, "_runner_id", None),
+          "owner_role": getattr(runner, "_role", "writer"),
+          "parent_turn_id": parent_turn_id,
+          "call_index": call_index,
+          "admitted_task": admitted_task.model_dump(mode="json"),
+        },
+        capability_bind_receipt=execution.bind.to_json(),
+        admitted_task=admitted_task,
+      )
+      foreground_completion_ready = _foreground_completion_transport_ready(runner)
+      if foreground_completion_ready:
+        # Register before the child's attach, not at park/settlement: that
+        # attach is the start of the attempt's reconstructible transcript.
+        registration = build_own_journal_registration(
+          foreground_entry,
+          admitted_task=admitted_task,
+          capability_bind_receipt=execution.bind.to_json(),
+          runner_id=runner._runner_id,
+          gateway_session_id=_derive_sub_agent_id(
+            parent_session if parent_session is not None else runner._full_session_id,
+            call_index,
+          ),
+        )
+        # The task's writer session and its delegating parent are distinct.
+        registration["parent_session_id"] = runner._gateway_session_id
+        await _journal_foreground_registration(runner, foreground_entry, registration)
       result, error = await _dispatch_sub_agent(tool_input, call_index=call_index)
+      foreground_entry.error = error
       if (
         isinstance(error, dict)
         and error.get("code")
@@ -3245,6 +3284,7 @@ def make_run_agent_handler(
       if error is None:
         try:
           canonical_result = TaskResult.model_validate(result)
+          foreground_entry.task_result = canonical_result
         except ValidationError as exc:
           # Our runner returned no TaskResult: a runner defect, raised to the
           # dispatcher (local_tool_failed). The started run still settles; its
@@ -3267,7 +3307,7 @@ def make_run_agent_handler(
       await _persist_skill_state(result, error)
       if (
         canonical_result is not None
-        and _foreground_completion_transport_ready(runner)
+        and foreground_completion_ready
       ):
         try:
           result = await _publish_foreground_completion(
@@ -3276,8 +3316,7 @@ def make_run_agent_handler(
             admitted_task=admitted_task,
             agent_name=agent_name,
             capability_bind_receipt=execution.bind.to_json(),
-            parent_turn_id=parent_turn_id,
-            call_index=call_index,
+            entry=foreground_entry,
           )
         except Exception as exc:
           log.exception("Foreground agent completion publication failed")
@@ -3298,12 +3337,21 @@ def make_run_agent_handler(
         _remember_foreground_spawn(
           claim,
           result=canonical_result,
+          admitted_task=admitted_task,
+          capability_bind_receipt=execution.bind.to_json(),
           envelope=(
             result if isinstance(result, AgentCompletionEnvelope) else None
           ),
         )
         spawn_kept = True
       return result, error
+    except BaseException as exc:
+      if foreground_entry is not None:
+        foreground_entry.error = {
+          "code": "cancelled" if isinstance(exc, asyncio.CancelledError) else type(exc).__name__,
+          "message": str(exc),
+        }
+      raise
     finally:
       if claim is not None and not spawn_kept:
         pending_claim = claim
@@ -3319,6 +3367,13 @@ def make_run_agent_handler(
           init_task.add_done_callback(_release_if_unstarted)
         else:
           _release_spawn_claim(runner, pending_claim)
+      if (
+        foreground_entry is not None
+        and foreground_entry.registration_persistence_state == "committed"
+      ):
+        await _settle_foreground_attempt(
+          runner, foreground_entry, admitted_task, execution.bind.to_json(),
+        )
 
   def _build(scope: JobScope):
     async def _scoped_run_agent(tool_input: dict[str, Any], **kwargs: Any):
@@ -3571,7 +3626,6 @@ def make_resume_handler(
   ) = None,
   fms_rebinder: Callable[[dict[str, Any], int], None] | None = None,
   excluded_tools_resolver: ExcludedToolsResolver | None = None,
-  default_max_tokens: int = 64000,
   capability_execution_resolver: CapabilityExecutionResolver,
   tool_registration_catalog: Any | None = None,
   tool_policy_implementations: Any | None = None,
@@ -4390,11 +4444,6 @@ def make_resume_handler(
       tool_ctx=tool_ctx,
       durable_appender=runner._append_durable_event,
       durable_confirmer=runner._confirm_durable_skill_event,
-      declared_terminal_doors=(
-        _sub_agent_skill_state.persist_expectation_doors(
-          successor_admitted_task
-        )
-      ),
     )
     effective_session_inject_servers = (
       _effective_mcp_session_inject_servers(
@@ -4503,9 +4552,7 @@ def make_resume_handler(
             tool_ctx=tool_ctx,
             skill_run_id=skill_run_id,
             skill_name=agent_name,
-            admitted_skill_execution_limits=SkillExecutionLimits(
-              max_tokens=successor_execution_snapshot.max_tokens,
-            ),
+            admitted_skill_execution_limits=SkillExecutionLimits(),
             research_file_id=context_research_file_id,
             user_id=user_id or getattr(parent_session, "user_id", None),
             session_id=getattr(runner, "_full_session_id", ""),
@@ -4543,7 +4590,6 @@ def make_resume_handler(
           bind_job_runner=_bind_resumed_runner,
           approved_call=approved_call,
           excluded_tools=child_excluded,
-          max_tokens=successor_execution_snapshot.max_tokens,
           skill_run_id=skill_run_id,
           call_index=background_call_index,
           parent_turn_id=parent_turn_id,

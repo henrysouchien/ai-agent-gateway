@@ -58,7 +58,6 @@ def build_auth_config(*, rate_table_version: str) -> dict[str, object]:
     "auth_mode": auth_mode,
     "api_key": api_key,
     "auth_token": auth_token if auth_mode == "oauth" else "",
-    "max_tokens": 16_000,
     "billing_mode": "byok",
     "rate_table_version": rate_table_version,
   }
@@ -205,8 +204,9 @@ def admit_demo_session(session, _api_key, _request) -> None:
 
 
 def materialize_service_credential(
-  handle: CredentialHandle,
+  handle: CredentialHandle, *, user_scope: object = None,
 ) -> MaterializedCredential:
+  del user_scope  # The example's static service config is already resolved.
   if handle is not SERVICE_CREDENTIAL_HANDLE:
     raise RuntimeError("Unknown service credential handle")
   return MaterializedCredential(handle=handle, auth_config=AUTH_CONFIG)

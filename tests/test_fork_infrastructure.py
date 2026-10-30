@@ -601,11 +601,9 @@ class _Provider(ModelProvider):
     return config.get("api_key") == "secret"
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(
-      id=model,
-      provider="anthropic",
-      supports_thinking=True,
-    )
+    return ModelInfo(max_output_tokens=16_384, id=model,
+    provider="anthropic",
+    supports_thinking=True,)
 
 
 class _SpawnRunner:
@@ -686,7 +684,6 @@ def _fork_parent(
   parent._aggregator = None
   parent._containment = containment
   parent._agent_session_log = _ForkSessionLog()
-  parent._max_resume_chain_depth = 0
   parent._spill_dir_provider = None
   parent._workspace_dir = str(tmp_path)
   parent._context_surfaces_provider = None
@@ -1240,12 +1237,10 @@ def test_approval_park_preserves_fork_admission_usage_and_owner(
         self.closed_clients: list[object] = []
 
       def get_model_info(self, model: str) -> ModelInfo:
-        return ModelInfo(
-          id=model, provider=self.name, supports_thinking=True,
-          input_cost_per_mtok=1_000_000,
-          output_cost_per_mtok=1_000_000,
-          cache_read_cost_per_mtok=1_000_000,
-        )
+        return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name, supports_thinking=True,
+        input_cost_per_mtok=1_000_000,
+        output_cost_per_mtok=1_000_000,
+        cache_read_cost_per_mtok=1_000_000,)
 
       def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> object:
         return object()
@@ -1379,7 +1374,6 @@ def test_approval_park_preserves_fork_admission_usage_and_owner(
       user_id="fork-owner", billing_mode="byok", rate_table_version="v1",
       agent_session_log=parent_journal, workspace_dir=tmp_path,
       get_tool_definitions=lambda: definitions,
-      max_tokens_override=4096,
       gateway_session=session,
     )
     parent._task_registry.bind_owner(RegistryOwner(
@@ -1716,7 +1710,7 @@ def test_learning_fork_gains_no_tool_the_parents_effective_policy_excludes(
       event_log=EventLog(), dispatcher=dispatcher, session_id="parent-session",
       capability_execution=parent_execution, user_id="fork-owner",
       billing_mode="byok", rate_table_version="v1",
-      get_tool_definitions=lambda: wire_tools, max_tokens_override=4096,
+      get_tool_definitions=lambda: wire_tools,
       gateway_session=session, excluded_tools={gated},
     )
     parent._task_registry.bind_owner(RegistryOwner(

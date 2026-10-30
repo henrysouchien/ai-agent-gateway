@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+import json
 import logging
 import re
 from typing import Any
@@ -28,6 +29,10 @@ _NON_SECRET_AUTH_CONFIG_FIELDS: frozenset[str] = (
   | POOL_PUBLIC_AUTH_CONFIG_FIELDS
 )
 _MIN_SUBSTRING_SECRET_LENGTH = 8
+_PROJECTED_BLOCK_TYPES = frozenset({"tool_use", "server_tool_use", "tool_result"})
+# A retained tool-result preview keeps this many characters of the serialized,
+# already-sanitized value; the cut never precedes the sanitization.
+_TOOL_RESULT_PREVIEW_CHARS = 150
 # Depth is a stack bound, not a coverage budget: nothing walked here is larger
 # than what the model itself wrote, so an over-deep subtree is dropped where it
 # is found instead of voiding the value around it.
@@ -56,7 +61,7 @@ class SecretBoundary:
   execution.
   """
 
-  __slots__ = ("_exact_values",)
+  __slots__ = ("_exact_values", "_json_escaped_values")
 
   def __init__(self, exact_values: tuple[str, ...] = ()) -> None:
     self._exact_values = tuple(
@@ -66,6 +71,22 @@ class SecretBoundary:
           for value in exact_values
           if isinstance(value, str)
           and value.strip()
+        },
+        key=len,
+        reverse=True,
+      )
+    )
+    # A registered secret also appears in its JSON-string encoding wherever a
+    # tool's payload was serialized to JSON text (a `tool_result` block's
+    # `content`). That is the same secret, not a new credential pattern, and
+    # it follows the same length rule as the raw form.
+    self._json_escaped_values = tuple(
+      sorted(
+        {
+          escaped
+          for secret in self._exact_values
+          if len(secret) >= _MIN_SUBSTRING_SECRET_LENGTH
+          and (escaped := json.dumps(secret)[1:-1]) != secret
         },
         key=len,
         reverse=True,
@@ -195,6 +216,8 @@ class SecretBoundary:
         sanitized = sanitized.replace(secret, REDACTED_SECRET)
       elif sanitized == secret:
         sanitized = REDACTED_SECRET
+    for escaped in self._json_escaped_values:
+      sanitized = sanitized.replace(escaped, REDACTED_SECRET)
     for pattern in _HIGH_CONFIDENCE_PATTERNS:
       sanitized = pattern.sub(REDACTED_SECRET, sanitized)
     return sanitized
@@ -223,6 +246,27 @@ def _observe_sanitization_failure(*, reason: str = "projection_failure") -> None
     "Secret boundary sanitization failed; fixed tombstone emitted",
     extra={"data": {"reason": reason}},
   )
+
+
+def retained_tool_result_preview(
+  result: Any,
+  *,
+  boundary: SecretBoundary | None = None,
+) -> str:
+  """Return the short log rendering of a tool result, safe to retain.
+
+  The whole normalized value is sanitized before it is serialized, and the
+  serialized text is cut afterwards, so no cut can land inside a credential and
+  leave a prefix the patterns no longer recognize. `result` is not mutated.
+  """
+
+  normalized = json.loads(json.dumps(result, default=str))
+  safe = sanitize_boundary_value(
+    normalized,
+    sink="tool_result_preview",
+    boundary=boundary,
+  )
+  return json.dumps(safe)[:_TOOL_RESULT_PREVIEW_CHARS]
 
 
 def sanitize_context_boundary_value(
@@ -372,16 +416,17 @@ def sanitize_tool_event(
   sink: str,
   boundary: SecretBoundary | None = None,
 ) -> dict[str, Any]:
-  """Project the text this process persists, never a tool's returned payload.
+  """Project every text this process retains or streams from an event.
 
-  A settled `result` (and its serialized copy in `final_tool_result_blocks`) is
-  no longer walked. Nothing the gateway hands a tool comes back through one:
-  provider credentials never enter a tool call, an MCP child's environment, or
-  a local child's environment, and the one place unfiltered bytes do appear —
-  a file the model read, a child's stdout — is redacted by the tool that
-  produced it. What stays below is bounded text this process, a server, or the
-  model authored: tool input, the settled error and dispatch record, guard and
-  error prose, resource content, typed assistant blocks.
+  A settled `result` and its serialized copy in `final_tool_result_blocks` are
+  projected like the rest: the live event keeps its raw payload for the model's
+  next turn, while the durable, streamed and replayed copies are new
+  containers with registered credentials and high-confidence credential
+  patterns removed. Public content, types, tool ids and correlation survive.
+  A server or tool can echo a credential it was never handed — a file the
+  model read, a child's stdout, an error body — so no returned payload is
+  assumed clean. Tool input, the settled error and dispatch record, guard and
+  error prose, resource content and typed blocks cross here too.
   """
 
   projected = dict(event)
@@ -414,8 +459,17 @@ def sanitize_tool_event(
   elif event_type == "tool_call_complete":
     # A server authors `error`/`semantic_error`, and `dispatch` carries source
     # URLs this process lifted out of the payload — a token in a query string
-    # is the shape here. Both are bounded records, not the payload itself.
-    fields = ("error", "semantic_error", "dispatch")
+    # is the shape here. `result` and its serialized copy in
+    # `final_tool_result_blocks` are the payload itself, retained verbatim by
+    # the durable and streamed copies, so they cross the owner as well.
+    fields = ("error", "semantic_error", "dispatch", "result")
+    if isinstance(projected.get("final_tool_result_blocks"), list):
+      projected["final_tool_result_blocks"] = _sanitize_typed_blocks(
+        projected["final_tool_result_blocks"],
+        sink=sink,
+        boundary=boundary,
+        every_block=True,
+      )
   elif event_type == "tool_output_chunk":
     fields = ("text", "content")
   elif event_type in {"error", "run_error", "stream_retry"}:
@@ -462,14 +516,23 @@ def _sanitize_typed_blocks(
   *,
   sink: str,
   boundary: SecretBoundary | None,
+  every_block: bool = False,
 ) -> list[Any]:
+  """Project typed content blocks into new containers.
+
+  A `tool_use` block is the model's authorship; a `tool_result` block is a
+  tool's returned payload replayed into the transcript. Both are retained
+  renderings and cross the owner here. Other block types (user text) pass
+  through unchanged unless `every_block` marks the whole list as a settled
+  tool result's rendering.
+  """
+
   projected: list[Any] = []
   for block in blocks:
     block_type = str(block.get("type") or "") if isinstance(block, Mapping) else ""
-    # `tool_result` blocks carry a tool's returned payload, which is projected
-    # by whoever produced it, not here. What this walks is the model's own
-    # authorship: the input it wrote for a tool call.
-    if block_type not in {"tool_use", "server_tool_use"}:
+    if not isinstance(block, Mapping) or not (
+      every_block or block_type in _PROJECTED_BLOCK_TYPES
+    ):
       projected.append(dict(block) if isinstance(block, Mapping) else block)
       continue
 
@@ -486,7 +549,10 @@ def _sanitize_typed_blocks(
       if key in block
     }
     safe_identity = sanitize_boundary_value(identity, sink=sink, boundary=boundary)
-    tombstone = sanitization_failure_tool_block(block_type)
+    if block_type in _PROJECTED_BLOCK_TYPES:
+      tombstone = sanitization_failure_tool_block(block_type)
+    else:
+      tombstone = {"type": block_type or "text", "text": SANITIZATION_FAILED}
     if isinstance(safe_identity, dict):
       tombstone.update(safe_identity)
     projected.append(tombstone)
@@ -498,6 +564,7 @@ __all__ = [
   "SANITIZATION_FAILED",
   "SecretBoundary",
   "sanitize_boundary_value",
+  "retained_tool_result_preview",
   "sanitize_approval_decision_projection",
   "sanitize_context_boundary_value",
   "sanitize_tool_event",

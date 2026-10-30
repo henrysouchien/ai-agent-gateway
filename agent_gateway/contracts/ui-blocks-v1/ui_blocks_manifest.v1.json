@@ -3,11 +3,6 @@
     "contract_version": 1,
     "caps": {
       "canonical_submitted_payload_bytes": 32768,
-      "blocks_per_payload": 24,
-      "layout_children": 12,
-      "layout_depth": 3,
-      "lead_text_chars": 2000,
-      "tail_text_chars": 2000,
       "fallback_output_chars": 8000,
       "data_table_fallback_rows": 20
     }
@@ -335,7 +330,6 @@
     ],
     "top_level": {
       "min_children": 1,
-      "max_children": 12,
       "allowed_children": [
         "primitive",
         "layout",
@@ -344,13 +338,11 @@
     },
     "nested": {
       "min_children": 1,
-      "max_children": 12,
       "allowed_children": [
         "primitive",
         "sdk"
       ]
     },
-    "max_depth": 3,
     "views_top_level_only": true
   },
   "sdk_blocks": {

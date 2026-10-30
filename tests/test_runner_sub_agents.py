@@ -399,7 +399,6 @@ def _parent(
   )
   runner._containment = containment
   runner._agent_session_log = session_log
-  runner._max_resume_chain_depth = 3
   runner._spill_dir_provider = None
   runner._skill_run_id = "skill-run"
   runner._workspace_dir = str(tmp_path)

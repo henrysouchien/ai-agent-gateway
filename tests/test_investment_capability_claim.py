@@ -117,8 +117,8 @@ def _limits_for_skill(
   if skill is None:
     return None
   if skill == "quant-research":
-    return SkillExecutionLimits(32_000)
-  return SkillExecutionLimits(None)
+    return SkillExecutionLimits()
+  return SkillExecutionLimits()
 
 
 def _set_signing_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -397,7 +397,7 @@ def test_claim_grant_is_the_bound_skill_declaration(
     "channel": "excel",
     "request_id": "request-123",
     "jti": "tool-call-declared",
-    "admitted_skill_execution_limits": SkillExecutionLimits(None),
+    "admitted_skill_execution_limits": SkillExecutionLimits(),
     "policy_bundle_hash": _POLICY_BUNDLE_HASH,
   }
 
@@ -538,7 +538,6 @@ def test_claim_is_canonical_signed_short_lived_and_exactly_bound(
   assert payload == {
     "allowed_capability_ids": ["quant_research"],
     "approved_budget": {
-      "max_tokens": 32_000,
       "max_wall_clock_seconds": 5_400,
     },
     "aud": "investment-tools",
@@ -651,7 +650,6 @@ def test_dispatch_injects_claim_bound_to_original_routed_tool(
   assert payload["skill"] == "quant-research"
   assert payload["allowed_capability_ids"] == ["quant_research"]
   assert payload["approved_budget"] == {
-    "max_tokens": 32_000,
     "max_wall_clock_seconds": 5_400,
   }
   assert payload["effect_classes"] == ["read", "research_write", "state_write"]
@@ -919,30 +917,10 @@ def test_quant_dispatch_rejects_malformed_trusted_origin_before_mcp(
   assert mcp.calls == []
 
 
-@pytest.mark.parametrize(
-  ("limits", "approved_budget"),
-  [
-    (
-      SkillExecutionLimits(100_000_001),
-      {
-        "max_tokens": 100_000_001,
-        "max_wall_clock_seconds": 5_400,
-      },
-    ),
-    (
-      SkillExecutionLimits(None),
-      {"max_wall_clock_seconds": 5_400},
-    ),
-    (
-      None,
-      {"max_wall_clock_seconds": 5_400},
-    ),
-  ],
-)
-def test_quant_claim_signs_the_admitted_budget_numbers_present(
+@pytest.mark.parametrize("limits", [SkillExecutionLimits(), None])
+def test_quant_claim_signs_the_containment_bound_only(
   monkeypatch: pytest.MonkeyPatch,
   limits: SkillExecutionLimits | None,
-  approved_budget: dict[str, int | float],
 ) -> None:
   _set_signing_key(monkeypatch)
 
@@ -963,7 +941,7 @@ def test_quant_claim_signs_the_admitted_budget_numbers_present(
   )
 
   _header, payload = _decode_claim(token)
-  assert payload["approved_budget"] == approved_budget
+  assert payload["approved_budget"] == {"max_wall_clock_seconds": 5_400}
   assert payload["exp"] == 1_800_000_060
 
 
@@ -1032,7 +1010,6 @@ def test_parent_readback_claim_is_read_only(
     "fingerprint_screen", "insider_buying", "quality_screen", "quant_research",
   ]
   assert payload["approved_budget"] == {
-    "max_tokens": 32_000,
     "max_wall_clock_seconds": 5_400,
   }
 
@@ -1069,7 +1046,6 @@ def test_parent_readback_dispatch_without_skill_or_skill_run_id(
     "fingerprint_screen", "insider_buying", "quality_screen", "quant_research",
   ]
   assert payload["approved_budget"] == {
-    "max_tokens": 32_000,
     "max_wall_clock_seconds": 5_400,
   }
   assert payload["user_id"] == "42"
@@ -1169,12 +1145,14 @@ def test_parent_readback_claim_authorizes_only_owned_consumer_reads(
     response = facade.list_investment_artifacts(
       task_claim=task_claim,
       run_id=run["run_id"],
+      limit=50,
     )
   else:
     assert tool_name == "get_investment_artifact"
     response = facade.get_investment_artifact(
       task_claim=task_claim,
       artifact_id=artifact["artifact_id"],
+      max_items=50,
     )
 
   if subject == run["requester_subject"]:
@@ -1251,7 +1229,7 @@ def test_conflicting_trusted_skill_contexts_fail_closed(
   _set_signing_key(monkeypatch)
   token = set_current_skill(ActiveSkillAdmission(
     "different-skill",
-    SkillExecutionLimits(32_000),
+    SkillExecutionLimits(),
   ))
   try:
     mcp = _FakeMcpClient(tool_name="get_investment_run")
@@ -1524,7 +1502,7 @@ def test_owner_dispatch_uses_job_principal_with_or_without_active_skill(
   _set_signing_key(monkeypatch)
   configure_investment_capability_grants({})
   skill = (
-    ActiveSkillAdmission("quant-research", SkillExecutionLimits(32_000))
+    ActiveSkillAdmission("quant-research", SkillExecutionLimits())
     if active_skill else None
   )
   token = set_current_skill(skill)

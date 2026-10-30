@@ -69,7 +69,6 @@ class SkillRunEventEmitter:
       Awaitable[dict[str, Any] | None],
     ],
     time_fn: Callable[[], float] = time.time,
-    declared_terminal_doors: Iterable[str] = (),
   ) -> None:
     self._event_log_getter = event_log_getter
     self._tool_ctx = tool_ctx
@@ -97,7 +96,6 @@ class SkillRunEventEmitter:
     self._durable_appender = durable_appender
     self._durable_confirmer = durable_confirmer
     self._time_fn = time_fn
-    self._declared_terminal_doors = frozenset(declared_terminal_doors)
     self._started_task: asyncio.Task[bool] | None = None
     self._started_event: dict[str, Any] | None = None
     self._result_task: asyncio.Task[bool] | None = None
@@ -287,7 +285,6 @@ class SkillRunEventEmitter:
       entries=self._event_log_entries(),
       result=result,
       error=error,
-      declared_terminal_doors=self._declared_terminal_doors,
       duration_s=(
         max(0.0, round(self._time_fn() - float(started_ts), 3))
         if isinstance(started_ts, (int, float))

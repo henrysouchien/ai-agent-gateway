@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 from pathlib import Path
@@ -29,28 +28,13 @@ from agent_gateway.skill_limits import (  # noqa: E402
 
 
 def _limits() -> SkillExecutionLimits:
-  return SkillExecutionLimits(32_000)
+  return SkillExecutionLimits()
 
 
-def test_limits_are_exact_frozen_values() -> None:
-  limits = _limits()
-
-  assert limits == SkillExecutionLimits(max_tokens=32_000)
-  assert [field.name for field in dataclasses.fields(limits)] == ["max_tokens"]
-  with pytest.raises(dataclasses.FrozenInstanceError):
-    limits.max_tokens = 21  # type: ignore[misc]
-
-
-@pytest.mark.parametrize("value", [True, False, 0, -1, 1.0, "1"])
-def test_limits_reject_invalid_max_tokens(value: object) -> None:
-  with pytest.raises((TypeError, ValueError)):
-    SkillExecutionLimits(value)  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize("field", ["max_turns", "max_budget_usd"])
-def test_limits_carry_no_turn_or_cost_ceiling(field: str) -> None:
+@pytest.mark.parametrize("field", ["max_tokens", "max_turns", "max_budget_usd"])
+def test_limits_carry_no_retired_ceiling(field: str) -> None:
   with pytest.raises(TypeError):
-    SkillExecutionLimits(**{"max_tokens": 1, field: 1})
+    SkillExecutionLimits(**{field: 1})
 
 
 def test_closed_codecs_round_trip_fresh_mappings() -> None:
@@ -62,12 +46,17 @@ def test_closed_codecs_round_trip_fresh_mappings() -> None:
   active_payload = active_skill_admission_to_mapping(active)
   policy_payload = autonomous_skill_admission_policy_to_mapping(policy)
 
-  assert limits_payload == {"max_tokens": 32_000}
+  assert limits_payload == {}
   assert skill_execution_limits_from_mapping(limits_payload) == limits
+  assert active_payload == {
+    "skill_name": "quant-research",
+    "execution_limits": {},
+  }
   assert active_skill_admission_from_mapping(active_payload) == active
+  assert policy_payload["execution_limits"] == {}
   assert autonomous_skill_admission_policy_from_mapping(policy_payload) == policy
   limits_payload["max_tokens"] = 99
-  assert limits.max_tokens == 32_000
+  assert skill_execution_limits_to_mapping(limits) == {}
 
 
 def test_limits_codec_reads_legacy_record_and_drops_its_ceilings() -> None:
@@ -75,14 +64,16 @@ def test_limits_codec_reads_legacy_record_and_drops_its_ceilings() -> None:
     "max_turns": 20,
     "max_tokens": 32_000,
     "max_budget_usd": 20.0,
-  }) == SkillExecutionLimits(32_000)
+  }) == SkillExecutionLimits()
+  assert skill_execution_limits_from_mapping({"max_tokens": True}) == (
+    SkillExecutionLimits()
+  )
+  assert skill_execution_limits_from_mapping({}) == SkillExecutionLimits()
 
 
 @pytest.mark.parametrize(
   "payload",
   [
-    {},
-    {"max_turns": None, "max_tokens": None},
     {"max_tokens": None, "extra": None},
     {
       "max_turns": None,
@@ -92,22 +83,18 @@ def test_limits_codec_reads_legacy_record_and_drops_its_ceilings() -> None:
     },
   ],
 )
-def test_limits_codec_rejects_missing_and_extra_fields(payload: object) -> None:
+def test_limits_codec_rejects_extra_fields(payload: object) -> None:
   with pytest.raises(ValueError):
     skill_execution_limits_from_mapping(payload)
 
 
-def test_policy_codec_rejects_bool_coercion_and_malformed_nested_value() -> None:
+def test_policy_codec_rejects_bool_coercion() -> None:
   with pytest.raises(TypeError):
     autonomous_skill_admission_policy_from_mapping({
       "skill_resume_allowed": 1,
       "execution_limits": skill_execution_limits_to_mapping(_limits()),
     })
-  with pytest.raises(ValueError):
-    autonomous_skill_admission_policy_from_mapping({
-      "skill_resume_allowed": True,
-      "execution_limits": {"max_turns": 1},
-    })
+
 
 
 def test_active_admission_requires_exact_nested_type_and_canonical_name() -> None:
@@ -206,7 +193,7 @@ def test_skill_limits_leaf_is_importable_from_built_wheel(tmp_path: Path) -> Non
       (
         "from agent_gateway.skill_limits import "
         "SkillExecutionLimits; "
-        "print(SkillExecutionLimits(3).max_tokens)"
+        "print(list(SkillExecutionLimits().__dataclass_fields__))"
       ),
     ],
     cwd=installed,
@@ -215,4 +202,4 @@ def test_skill_limits_leaf_is_importable_from_built_wheel(tmp_path: Path) -> Non
     capture_output=True,
     text=True,
   )
-  assert result.stdout.strip() == "3"
+  assert result.stdout.strip() == "[]"

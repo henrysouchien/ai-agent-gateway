@@ -1943,7 +1943,7 @@ def test_interactive_root_turn_records_before_tools_in_dispatchers_store(
     prompting = SimpleNamespace(
       skill_application=skill_application, research_turn=None, trusted_research_file_id=None,
       prompt_context={}, profile_composition=SimpleNamespace(config=SimpleNamespace(name="analyst")),
-      execution_policy=None, profile_denied_mcp_servers=set(), skill_catalog_entries=[],
+      profile_denied_mcp_servers=set(), skill_catalog_entries=[],
       workspace_dir=None, local_tool_handlers={"file_read": tool_handler},
       code_execution_extra_env={}, system_prompt="root", approval_fn=lambda *_args: False,
       excluded_tools=set(), profile_deferred_mcp_tools=None, profile_allowed_mcp_tools_by_server=None,

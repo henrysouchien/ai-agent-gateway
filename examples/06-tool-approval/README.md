@@ -2,7 +2,7 @@
 
 This example uses `create_gateway_app()` with a custom `needs_approval` rule. Every `write_note` tool call requires approval.
 
-`create_agent()` only installs built-in approval behavior for unsandboxed `code_execute` calls. Use `create_gateway_app()` when you want approval for arbitrary tools.
+Built-in `code_execute` uses the session's configured local or Docker kernel without an approval card. Use `create_gateway_app()` when you want custom approval for arbitrary tools.
 
 ## Install
 

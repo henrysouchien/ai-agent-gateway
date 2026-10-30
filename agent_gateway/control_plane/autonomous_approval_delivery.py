@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
+import inspect
 import json
+import logging
 import os
 from typing import Any, Mapping, Protocol
 
@@ -32,6 +34,9 @@ from agent_gateway.admission import root_context
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.agent_session_log_records import AgentSessionRef, resolve_agent_session_id
 from agent_gateway.openai_history_fence import scope_provider_session_id
+
+
+log = logging.getLogger("agent_gateway.autonomous_approval_delivery")
 
 
 class _EnsureAutonomousApprovalDeliveryAudited(Protocol):
@@ -572,6 +577,32 @@ def require_matching_autonomous_delivery(
     )
 
 
+async def fail_quarantined_autonomous_approval_owner(
+  registry: AutonomousRegistry,
+  *,
+  task_id: Any,
+  failure: Exception,
+) -> None:
+  """Fail the owner run of a quarantined delivery so it never waits on a decision that cannot arrive."""
+
+  fail_owner = getattr(
+    registry,
+    "fail_autonomous_approval_delivery",
+    None,
+  )
+  if not callable(fail_owner):
+    log.error(
+      "Autonomous approval quarantine could not fail its owner run"
+    )
+    return
+  outcome = fail_owner(
+    task_id,
+    error=f"{type(failure).__name__}: {failure}",
+  )
+  if inspect.isawaitable(outcome):
+    await outcome
+
+
 async def deliver_autonomous_approval_outbox(
   *,
   registry: AutonomousRegistry,
@@ -717,6 +748,7 @@ async def deliver_autonomous_approval_outbox(
 __all__ = [
   "autonomous_approval_authoritative_identity",
   "create_delegated_autonomous_approval",
+  "fail_quarantined_autonomous_approval_owner",
   "autonomous_approval_delivery_context",
   "autonomous_decision_unavailable",
   "autonomous_run_accepts_approval_decisions",

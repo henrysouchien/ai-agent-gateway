@@ -123,18 +123,10 @@ def role_policy_denies_tool(
     "get_forbidden_tools_for_session",
     None,
   )
-  invite_denies_local = getattr(
-    policy_module,
-    "invite_denies_local_tool",
-    None,
-  )
-  if forbidden_for_session is None or (effective_role != "owner" and invite_denies_local is None):
+  if forbidden_for_session is None:
     return True
   if is_local:
-    if effective_role == "owner":
-      return False
-    assert invite_denies_local is not None
-    return bool(invite_denies_local(tool_name))
+    return False
   policy_identity = getattr(policy_module, "policy_tool_identity", None)
   normalized_tool = (
     str(policy_identity(tool_name))

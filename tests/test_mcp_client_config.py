@@ -285,9 +285,8 @@ def test_allowed_tools_parser_rejects_malformed_lists(value) -> None:
 def test_scoped_url_expansion_refuses_unset_or_empty_risk_api_url() -> None:
   """An HTTP url ref to an unset or empty RISK_API_URL is undeclared.
 
-  _scoped_server_env still maps a missing name to "" so a stdio env block
-  keeps its prior substitution. The HTTP url expander refuses that empty
-  value instead of producing a relative URL.
+  An unset name is absent from the scoped env; an empty one is carried as "".
+  The HTTP url expander refuses both instead of producing a relative URL.
   """
   manager = mcp_client_module.McpClientManager(config_path=None)
   config = {
@@ -297,12 +296,12 @@ def test_scoped_url_expansion_refuses_unset_or_empty_risk_api_url() -> None:
     "run_scoped_env": ["RISK_API_URL"],
   }
   for environ in ({}, {"RISK_API_URL": ""}):
-    scoped = manager._scoped_server_env(
+    scoped, _ = manager._scoped_server_env(
       "portfolio-reads-mcp",
       config,
       deployment_environ=environ,
     )
-    assert scoped["RISK_API_URL"] == ""
+    assert scoped.get("RISK_API_URL") == environ.get("RISK_API_URL")
     with pytest.raises(
       McpEnvExpansionError,
       match="undeclared environment variable: RISK_API_URL",
@@ -320,7 +319,7 @@ def test_scoped_url_expansion_refuses_unset_or_empty_risk_api_url() -> None:
     "${RISK_API_URL}",
     environ={"RISK_API_URL": ""},
   ) == ""
-  present = manager._scoped_server_env(
+  present, _ = manager._scoped_server_env(
     "portfolio-reads-mcp",
     config,
     deployment_environ={"RISK_API_URL": "https://risk.example.test"},
@@ -328,3 +327,19 @@ def test_scoped_url_expansion_refuses_unset_or_empty_risk_api_url() -> None:
   assert mcp_client_config.expand_http_template(config["url"], environ=present) == (
     "https://risk.example.test/api/mcp/portfolio-reads-mcp/"
   )
+
+
+def test_scope_run_env_scopes_set_names_and_reports_the_rest_absent() -> None:
+  scoped, absent = mcp_client_config.scope_run_env(
+    ["SET_NAME", "UNSET_NAME", "EMPTY_NAME", "PROJECTED_NAME"],
+    {"SET_NAME": "value", "EMPTY_NAME": "", "UNDECLARED": "ambient"},
+    projected={"PROJECTED_NAME": "projected", "EXTRA": "extra"},
+  )
+
+  assert scoped == {
+    "SET_NAME": "value",
+    "EMPTY_NAME": "",
+    "PROJECTED_NAME": "projected",
+    "EXTRA": "extra",
+  }
+  assert absent == frozenset({"UNSET_NAME"})

@@ -32,7 +32,7 @@ from agent_gateway.autonomous_credential_handoff import (
   read_autonomous_launch_secrets,
 )
 from agent_gateway.autonomous_launch_envelope import (
-  AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+  AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
   AUTONOMOUS_TASK_ID_ENV,
   verify_autonomous_launch_envelope,
 )
@@ -216,7 +216,7 @@ def _registry(
     autonomous_skill_admission_policy_resolver=lambda skill_name: (
       AutonomousSkillAdmissionPolicy(
         False,
-        SkillExecutionLimits(None),
+        SkillExecutionLimits(),
       )
     ),
     claim_signing_authority=GatewayClaimSigningAuthority(_SECRET),
@@ -289,7 +289,7 @@ def test_resolver_is_invoked_once_and_signed_exact_envelope_reaches_spawn(
   assert AUTONOMOUS_TASK_ID_ENV not in captured_env
   envelope = verify_autonomous_launch_envelope(
     _SECRET,
-    captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   )
   assert envelope.task_id == payload["task_id"]
   assert envelope.control_run_id == payload["run_id"]
@@ -361,7 +361,7 @@ def test_registered_autonomous_session_token_uses_private_handoff_and_expires(
     )
     envelope = verify_autonomous_launch_envelope(
       _SECRET,
-      captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+      Path(captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
     )
     launch_secrets = read_autonomous_launch_secrets(
       expected_handle_id=envelope.bind.credential_ref,
@@ -379,7 +379,7 @@ def test_registered_autonomous_session_token_uses_private_handoff_and_expires(
     assert registered.risk_user_id == 42
     assert registered.role == "owner"
     assert token not in json.dumps(captured_env)
-    assert token not in captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV]
+    assert token not in Path(captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8")
     assert token not in (
       tmp_path / f"{payload['task_id']}.task.json"
     ).read_text(encoding="utf-8")
@@ -411,7 +411,7 @@ def test_invite_role_reaches_record_and_signed_child_authority(
   payload = asyncio.run(_start(registry, role="invite"))
   envelope = verify_autonomous_launch_envelope(
     _SECRET,
-    captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   )
 
   assert registry._tasks[payload["task_id"]].role == "invite"
@@ -495,7 +495,7 @@ def test_user_credential_exact_signed_handle_reaches_child_over_stdin(
   assert "parent-user-secret" not in json.dumps(captured_env)
   envelope = verify_autonomous_launch_envelope(
     _SECRET,
-    captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(captured_env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   )
   assert envelope.task_id == payload["task_id"]
   assert envelope.control_run_id == payload["run_id"]
@@ -1004,7 +1004,7 @@ def test_manifest_persists_and_rehydrates_secret_free_exact_handoff(
   )
   assert manifest["capability_bind"] == _bind(run_mode="autonomous").to_json()
   assert _SECRET not in json.dumps(manifest)
-  assert AUTONOMOUS_CAPABILITY_ENVELOPE_ENV not in manifest
+  assert AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV not in manifest
 
   rehydrated = _registry(tmp_path)
   record = rehydrated._tasks[payload["task_id"]]
@@ -1088,7 +1088,7 @@ def test_resume_reuses_persisted_exact_bind(
 
   async def fake_exec(*args, **kwargs):
     _ = args
-    envelopes.append(kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV])
+    envelopes.append(Path(kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"))
     return _FakeProcess()
 
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", _SECRET)
@@ -1309,7 +1309,7 @@ def test_schedule_user_bind_uses_secret_free_cron_envelope_and_exact_resume_hand
     captured_stdin,
     strict=True,
   ):
-    envelope_json = env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV]
+    envelope_json = Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8")
     envelope = verify_autonomous_launch_envelope(
       _SECRET,
       envelope_json,
@@ -1521,7 +1521,7 @@ def test_admitted_node_binding_signs_projects_persists_and_resumes(monkeypatch, 
   assert requests[1].required_bind == bind
   assert requests[1].model_preset is None
   for environment in environments:
-    envelope = verify_autonomous_launch_envelope(_SECRET, environment[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV])
+    envelope = verify_autonomous_launch_envelope(_SECRET, Path(environment[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"))
     assert envelope.admitted == (admitted.wire, admitted.tool_authority)
     assert envelope.bind == bind
     assert "FMP_API_KEY" not in environment

@@ -16,6 +16,13 @@ from .approval_audit import APPROVAL_AUDIT_RETENTION_DAYS, ApprovalAuditEntry
 from .artifact_paths import user_data_dir
 
 
+# Resource containment, not a seam cap. The segment is scanned line by line
+# under flock on every append (duplicate-entry_id check), so one record's size
+# bounds that scan's read buffer (`readline(MAX_RECORD_BYTES + 1)`), and
+# MAX_FILE_BYTES/MAX_RECORDS bound the per-append rescan cost. A full segment
+# rolls over to the next part (`_append_to_segment` returns False), so no
+# audit entry is refused for volume; only a single record above MAX_RECORD_BYTES
+# is refused. Retention policy is owned by approval_audit.py, not here.
 APPROVAL_AUDIT_MAX_FILE_BYTES = 16 * 1024 * 1024
 APPROVAL_AUDIT_MAX_RECORD_BYTES = 512 * 1024
 APPROVAL_AUDIT_MAX_RECORDS = 32_768

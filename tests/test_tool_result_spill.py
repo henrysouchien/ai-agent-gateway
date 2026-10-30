@@ -116,7 +116,7 @@ class _RecordingProvider(ModelProvider):
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(id=model, provider=self.name, max_output_tokens=16_384)
 
   def build_request_params(
     self,
@@ -1540,6 +1540,41 @@ def test_streamed_projection_of_a_wide_nested_result_fits_the_frame() -> None:
 
   snapshot_autonomous_event(streamed)
   assert extract_fms_results([streamed])[0]["status"] == "staged"
+
+
+def test_streamed_projection_copies_no_live_text_into_an_already_projected_event() -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-TOOL-RESULT-8f21d7"
+  raw_result = {"status": "ok", "blob": "p" * 1_990 + secret + "q" * (2 * 1024 * 1024)}
+  projected_result = {
+    "status": "ok",
+    "blob": "p" * 1_990 + "<redacted-secret>" + "q" * (2 * 1024 * 1024),
+  }
+  result_entry = {"type": "tool_result", "tool_use_id": "tool-1", "content": json.dumps(raw_result)}
+  # The model's raw preview carries the secret's prefix and the spill pointer.
+  live_content = json.dumps({
+    "_runner_truncated": True,
+    "content_projection": {"status": "ok", "blob": "p" * 1_990 + secret[:10] + "...<elided chars=1>"},
+    "spill_ref": "spill:v1:lookup_x.json:" + "a" * 64,
+    "spill_summary": {"payload_kind": "json"},
+  })
+  event = {"type": "tool_call_complete", "tool_name": "lookup", "result": projected_result}
+
+  streamed = project_tool_call_complete_for_stream(
+    event,
+    result_entry=result_entry,
+    live_entry=dict(result_entry, content=live_content),
+  )
+
+  snapshot_autonomous_event(streamed)
+  assert streamed["result"]["_runner_truncated"] is True
+  assert streamed["result"]["original_chars"] == len(result_entry["content"])
+  assert streamed["result"]["spill_ref"].startswith("spill:v1:")
+  assert secret[:10] not in json.dumps(streamed)
+  assert project_tool_call_complete_for_stream(
+    event,
+    result_entry=result_entry,
+    live_entry=result_entry,
+  ) is event
 
 
 def test_streamed_code_execute_event_projects_when_its_images_outgrow_the_frame(

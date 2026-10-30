@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException
 
 
 from .agent_session_log import _atomic_write_sidecar
-from .approval_subsystem import build_approval_subsystem
+from .approval_subsystem import build_runtime_approval_subsystem
 from model_authority.binding import (
   AuthContext,
   CapabilityId,
@@ -81,7 +81,7 @@ from .server_models import (
   MaterializedCredential,
   PreparedChatTurn,
   RequestApproval,
-  SessionExecutionPolicy,
+  ServiceAuthConfigResolver,
   _ACTIVE_TURN_GRACE_SECONDS,
   _ACTIVE_TURN_SETTLE_WAIT_SECONDS,
   _STREAM_SUBSCRIBER_DONE,
@@ -1025,10 +1025,7 @@ def _materialize_credential(
   *,
   session: GatewaySession,
   handle: CredentialHandle,
-  service_auth_config_resolver: Callable[
-    [CredentialHandle],
-    MaterializedCredential,
-  ] | None,
+  service_auth_config_resolver: ServiceAuthConfigResolver | None,
 ) -> MaterializedCredential:
   if handle is session.session_credential_handle:
     if session.auth_config is None:
@@ -1046,7 +1043,7 @@ def _materialize_credential(
     raise RuntimeError(
       f"service credential materializer is missing for provider {handle.provider}"
     )
-  materialized = service_auth_config_resolver(handle)
+  materialized = service_auth_config_resolver(handle, user_scope=session.risk_user_id)
   if not isinstance(materialized, MaterializedCredential):
     raise RuntimeError(
       "service credential materializer must return MaterializedCredential"
@@ -1322,29 +1319,6 @@ def prepare_session_driver_turn(
       else None
     ),
   )
-  execution_policy_resolver = getattr(
-    build_chat_runtime,
-    "_gateway_session_execution_policy_resolver",
-    None,
-  )
-  try:
-    execution_policy = (
-      execution_policy_resolver(context)
-      if callable(execution_policy_resolver)
-      else None
-    )
-  except Exception as exc:
-    raise HTTPException(
-      status_code=400,
-      detail=f"Invalid session execution policy: {exc}",
-    ) from exc
-  if execution_policy is not None and not isinstance(
-    execution_policy, SessionExecutionPolicy
-  ):
-    raise RuntimeError(
-      "session_execution_policy_resolver must return "
-      "SessionExecutionPolicy or None"
-    )
   explicit_intent = (
     ModelSelectionIntent(
       model_key=request.model_key,
@@ -1366,7 +1340,6 @@ def prepare_session_driver_turn(
     saved_preference=saved_preference,
     selection_snapshot=selection_snapshot,
   )
-  request._bind_session_execution_policy(execution_policy)
   request._bind_session_driver(
     capability_execution=capability_execution,
     capability_execution_resolver=capability_execution_resolver,
@@ -1861,7 +1834,7 @@ async def _dispatch_chat_turn_body(
 
 
 def _init_approval_subsystem(app: FastAPI, config: GatewayServerConfig) -> None:
-  subsystem = build_approval_subsystem(
+  subsystem = build_runtime_approval_subsystem(
     audit_hmac_secret=config.audit_hmac_secret_resolver(),
     audit_hmac_key_id=config.audit_hmac_key_id_resolver(),
     tool_input_redactor=config.tool_input_redactor,
@@ -1870,3 +1843,4 @@ def _init_approval_subsystem(app: FastAPI, config: GatewayServerConfig) -> None:
   app.state.gateway_approval_audit_emitter = subsystem.audit_emitter
   app.state.gateway_approval_store = subsystem.store
   app.state.gateway_approval_policy = subsystem.policy
+  app.state.gateway_approval_remote = subsystem.remote

@@ -94,7 +94,7 @@ class _StubProvider(ModelProvider):
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(id=model, provider=self.name, max_output_tokens=16_384)
 
   def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
     return dict(kwargs)
@@ -1026,7 +1026,7 @@ def test_run_autonomous_binds_trusted_top_level_skill_identity(
   monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
   authority = _bound_execution()
   authority["admitted_skill_execution_limits"] = (
-    SkillExecutionLimits(None)
+    SkillExecutionLimits()
   )
   authority["session"].approval_policy = type(
     "TrustedPolicy",
@@ -1052,163 +1052,6 @@ def test_run_autonomous_binds_trusted_top_level_skill_identity(
   assert authority["session"].run_context.skill == "market-scan"
   assert authority["session"].run_context.run_id == "run-skill-market-scan-test"
   assert authority["session"].run_context.policy_bundle_hash == "a" * 64
-
-
-def test_run_autonomous_without_credential_max_tokens_uses_admitted_skill_limit(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  """A credential config with no max_tokens used to refuse before any call.
-
-  The admitted skill limit is the run budget AgentRunner receives as
-  max_tokens_override.
-  """
-  skill_limit = 32_000
-  captured: dict[str, Any] = {}
-
-  async def _fake_run_session(
-    runner: Any,
-    _event_log: EventLog,
-    **_kwargs: Any,
-  ) -> autonomous.RunOutput:
-    captured["override"] = runner._max_tokens_override
-    return autonomous.RunOutput("ok", [], {}, None, False)
-
-  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
-  authority = _bound_execution(auth_config={
-    "provider": "stub",
-    "auth_mode": "api",
-    "api_key": "test-key",
-  })
-  authority["admitted_skill_execution_limits"] = SkillExecutionLimits(
-    max_tokens=skill_limit,
-  )
-  authority["session"].approval_policy = type(
-    "TrustedPolicy",
-    (),
-    {"policy_bundle_hash": "a" * 64},
-  )()
-
-  output = _run(
-    autonomous.run_autonomous(
-      "System",
-      "Hello",
-      **authority,
-      top_level_skill_name="market-scan",
-      skill_run_id="run-skill-market-scan-test",
-      user_id="alice",
-      billing_mode="byok",
-      rate_table_version="unknown",
-    )
-  )
-
-  assert output.response == "ok"
-  assert "max_tokens" not in authority["capability_execution"].auth_config
-  assert captured["override"] == skill_limit
-
-
-def test_undeclared_skill_max_tokens_override_is_none_for_select_run_max_tokens(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  """select_run_max_tokens requests the bound model's registry max_output_tokens
-  when the admitted skill declares no max_tokens, so the override stays None.
-  """
-  from agent_gateway.runner_state import (
-    normalized_run_config,
-    select_run_max_tokens,
-  )
-  from model_authority.registry import ProductModelRegistry
-
-  registry_ceiling = 96_000
-  provider = _StubProvider()
-  bind = _autonomous_bind(provider=provider.name)
-  base_registry = _registry_for_bind(bind)
-  entry = replace(
-    base_registry.require(bind.model_key),
-    compat=base_registry.require(bind.model_key).compat.model_copy(
-      update={"max_output_tokens": registry_ceiling},
-    ),
-  )
-  registry = ProductModelRegistry(
-    schema=base_registry.schema,
-    revision=base_registry.revision,
-    models={bind.model_key: entry},
-  )
-
-  class _RegistryCeilingProvider(_StubProvider):
-    def get_model_info(self, model: str) -> ModelInfo:
-      bound = registry.require(bind.model_key)
-      return ModelInfo(
-        id=model,
-        provider=self.name,
-        max_output_tokens=bound.compat.max_output_tokens,
-      )
-
-  provider = _RegistryCeilingProvider()
-  auth_config = {
-    "provider": bind.provider,
-    "auth_mode": "api",
-    "api_key": "test-key",
-  }
-  authority = _bound_execution(
-    provider=provider,
-    bind=bind,
-    auth_config=auth_config,
-  )
-  authority["capability_execution"] = BoundCapabilityExecution(
-    bind=bind,
-    registry=registry,
-    adapter=provider,
-    auth_config=auth_config,
-  )
-  authority["admitted_skill_execution_limits"] = SkillExecutionLimits(None)
-  authority["session"].approval_policy = type(
-    "TrustedPolicy",
-    (),
-    {"policy_bundle_hash": "a" * 64},
-  )()
-  captured: dict[str, Any] = {}
-
-  async def _fake_run_session(
-    runner: Any,
-    _event_log: EventLog,
-    **_kwargs: Any,
-  ) -> autonomous.RunOutput:
-    captured["override"] = runner._max_tokens_override
-    return autonomous.RunOutput("ok", [], {}, None, False)
-
-  monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
-  output = _run(
-    autonomous.run_autonomous(
-      "System",
-      "Hello",
-      **authority,
-      top_level_skill_name="market-scan",
-      skill_run_id="run-skill-market-scan-undeclared",
-      user_id="alice",
-      billing_mode="byok",
-      rate_table_version="unknown",
-    )
-  )
-  execution = authority["capability_execution"]
-  model_info = provider.get_model_info(bind.upstream_model)
-  config = normalized_run_config(
-    execution.auth_config,
-    upstream_model=bind.upstream_model,
-    effort=bind.effort,
-  )
-  selection = select_run_max_tokens(
-    config,
-    max_tokens_override=captured["override"],
-    model_info=model_info,
-  )
-  bound_ceiling = execution.registry.require(bind.model_key).compat.max_output_tokens
-
-  assert output.response == "ok"
-  assert captured["override"] is None
-  assert model_info.max_output_tokens == bound_ceiling
-  assert selection.value == bound_ceiling
-  assert selection.value != config["max_tokens"]
-  assert selection.clamped is False
 
 
 def test_run_autonomous_top_level_skill_exposes_every_supplied_tool(
@@ -1268,7 +1111,7 @@ def test_run_autonomous_top_level_skill_exposes_every_supplied_tool(
   monkeypatch.setattr(autonomous, "run_session", _fake_run_session)
   authority = _bound_execution()
   authority["admitted_skill_execution_limits"] = (
-    SkillExecutionLimits(None)
+    SkillExecutionLimits()
   )
   authority["session"].approval_policy = type(
     "TrustedPolicy",

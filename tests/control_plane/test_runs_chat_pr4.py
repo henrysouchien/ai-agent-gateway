@@ -56,7 +56,7 @@ def _test_gateway_config(**kwargs: Any) -> GatewayServerConfig:
     model_registry=INITIAL_MODEL_REGISTRY,
     model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
     service_provider_handles={"anthropic": _TEST_SERVICE_HANDLE},
-    service_auth_config_resolver=lambda handle: MaterializedCredential(
+    service_auth_config_resolver=lambda handle, *, user_scope=None: MaterializedCredential(
       handle=handle,
       auth_config={
         "provider": "anthropic",

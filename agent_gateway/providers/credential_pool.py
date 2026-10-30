@@ -20,6 +20,7 @@ import logging
 import os
 from pathlib import Path, PurePosixPath
 import secrets
+import shutil
 import time
 from typing import Any, Callable, Generator, Mapping, Sequence
 
@@ -46,8 +47,6 @@ POOL_PUBLIC_AUTH_CONFIG_FIELDS: frozenset[str] = frozenset({
   "project_id",
   "token_expires_at",
 })
-UNDECLARED_LIMIT_BLOCK_SECONDS = 300.0
-REFRESH_FAILURE_BLOCK_SECONDS = 300.0
 _HOSTED_EXTERNAL_PLACEMENT: Placement = "hosted_external"
 
 
@@ -217,6 +216,95 @@ def resolve_provider_store_paths(
   if user_path == org_path:
     return None, org_path
   return user_path, org_path
+
+
+STATIC_ORG_STORE_SPECS: tuple[tuple[str, str], ...] = (
+  ("google_antigravity", "oauth.json"),
+  ("google", "oauth.json"),
+  ("google", "credentials.json"),
+  ("copilot", "oauth.json"),
+  ("kimi_code", "credentials.json"),
+  ("muse", "credentials.json"),
+  ("ollama_cloud", "credentials.json"),
+  ("xai", "credentials.json"),
+)
+
+
+def first_org_credential_source(
+  source_bases: Sequence[Path],
+  family: str,
+  filename: str,
+) -> Path | None:
+  """Return the first existing `<base>/<family>/<filename>` across ordered `source_bases`."""
+  for base in source_bases:
+    candidate = Path(base) / family / filename
+    if candidate.is_file():
+      return candidate
+  return None
+
+
+def _is_operator_personal_record(family: str, record: Mapping[str, Any]) -> bool:
+  """True when `record` classifies as an operator personal subscription seat.
+
+  Pool OAuth records carry `access_token`/`refresh_token` rather than the
+  `auth_token` the shared derivation reads, so bearer material is presented
+  under that key; API-key material classifies on its own.
+  """
+  raw: dict[str, Any] = {**record, "provider": family}
+  if not str(raw.get("api_key") or "").strip():
+    bearer = str(raw.get("access_token") or raw.get("refresh_token") or "").strip()
+    if bearer:
+      raw["auth_token"] = bearer
+  _, kind = derive_auth_mechanism_and_entitlement(raw, is_user_store=False)
+  return kind == "operator_personal_subscription"
+
+
+def _seed_non_owner_store(source: Path, target: Path, family: str) -> bool:
+  """Write `source`'s non-personal records to `target`; False when none remain."""
+  with store_read_lock(source):
+    records = _load_pool_accounts_unlocked(source)
+  kept = [record for record in records if not _is_operator_personal_record(family, record)]
+  if not kept:
+    return False
+  write_pool_accounts_unlocked(target, kept)
+  return True
+
+
+def seed_org_credential_stores(
+  source_bases: Sequence[Path],
+  target_base: Path,
+  *,
+  user_scope: Any = None,
+  environ: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+  """Copy each static org store spec into `target_base` when the target is absent.
+
+  The first base holding a spec wins per file; existing targets are never
+  overwritten. Returns the seeded `<family>/<filename>` paths relative to
+  `target_base`. A `user_scope` that is not a deployment owner
+  (`scope_admits_operator_seats`) receives only the non-personal records of
+  each store, so no operator personal subscription seat is copied; owners get
+  the files byte for byte.
+  """
+  owner = scope_admits_operator_seats(user_scope, environ=environ)
+  seeded: list[str] = []
+  for family, filename in STATIC_ORG_STORE_SPECS:
+    target = Path(target_base) / family / filename
+    if target.exists():
+      continue
+    source = first_org_credential_source(source_bases, family, filename)
+    if source is None:
+      continue
+    if owner:
+      target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+      target.parent.chmod(0o700)
+      shutil.copy2(source, target)
+      target.chmod(0o600)
+    elif not _seed_non_owner_store(source, target, family):
+      continue
+    seeded.append(f"{family}/{filename}")
+  return tuple(seeded)
+
 
 @contextlib.contextmanager
 def store_write_lock(path: Path) -> Generator[None, None, None]:
@@ -574,7 +662,7 @@ class PoolAccountCandidate:
 
 
 class ProviderCredentialPool:
-  """Process-wide usage-limit and refresh-failure cooldown tracker for one provider."""
+  """Process-wide cooldown tracker for one provider, keyed to provider-declared resets."""
 
   def __init__(self) -> None:
     self._blocked_until: dict[str, float] = {}
@@ -621,21 +709,27 @@ def _exclude_operator_seats(
   user_scope: Any,
   environ: Mapping[str, str] | None,
 ) -> Sequence[PoolAccountCandidate]:
-  """Drop operator personal seats unless the run scope is a deployment owner.
+  """Drop operator personal seats unless their owner is the run owner.
 
   The owner roster is consulted only when a seat is actually in the pool, so
-  PAYG/API-key selection never depends on roster health.
+  PAYG/API-key selection never depends on roster health. Anthropic's resolver
+  may instead carry its producer admission stamp through a rebind; that stamp
+  is provider-specific and never admits another provider's seat.
   """
   if not any(
     candidate.entitlement_kind == "operator_personal_subscription"
     for candidate in candidates
   ):
     return candidates
-  if scope_admits_operator_seats(user_scope, environ=environ):
-    return candidates
+  scope_admitted = scope_admits_operator_seats(user_scope, environ=environ)
   return [
     candidate for candidate in candidates
     if candidate.entitlement_kind != "operator_personal_subscription"
+    or scope_admitted
+    or (
+      candidate.provider == "anthropic"
+      and candidate.record.get("operator_seats_admitted") is True
+    )
   ]
 
 
@@ -677,12 +771,10 @@ def select_pool_candidate(
       try:
         return refresh_fn(candidate)
       except Exception as exc:
-        pool.block(candidate.key, until=moment + REFRESH_FAILURE_BLOCK_SECONDS)
         LOGGER.warning(
-          "%s credential refresh failed for %s; parking for %.0fs: %s",
+          "%s credential refresh failed for %s; skipping it for this selection: %s",
           candidate.provider,
           candidate.account_identity,
-          REFRESH_FAILURE_BLOCK_SECONDS,
           exc,
         )
         continue
@@ -694,14 +786,18 @@ def rotate_pool_candidate(
   candidates: Sequence[PoolAccountCandidate],
   *,
   current_key: str,
-  until: float,
+  until: float | None,
   pool: ProviderCredentialPool,
   refresh_fn: Callable[[PoolAccountCandidate], PoolAccountCandidate] | None = None,
   now: float | None = None,
   user_scope: Any = None,
   environ: Mapping[str, str] | None = None,
 ) -> PoolAccountCandidate | None:
-  """Park `current_key` until `until` and return the next unblocked sibling, or `None`."""
+  """Return the next unblocked sibling of `current_key`, or `None`.
+
+  `current_key` is parked only when the provider declared a reset (`until`);
+  without one it is excluded from this rotation alone.
+  """
   moment = time.time() if now is None else now
   norm_current = str(current_key or "").strip()
   matched_key = norm_current
@@ -710,7 +806,8 @@ def rotate_pool_candidate(
       matched_key = candidate.key
       break
   if matched_key:
-    pool.block(matched_key, until=until)
+    if until is not None:
+      pool.block(matched_key, until=until)
   siblings = _exclude_operator_seats(
     candidates, user_scope=user_scope, environ=environ,
   )
@@ -723,12 +820,10 @@ def rotate_pool_candidate(
       try:
         return refresh_fn(candidate)
       except Exception as exc:
-        pool.block(candidate.key, until=moment + REFRESH_FAILURE_BLOCK_SECONDS)
         LOGGER.warning(
-          "%s credential refresh failed during rotation for %s; parking for %.0fs: %s",
+          "%s credential refresh failed during rotation for %s; skipping it for this rotation: %s",
           candidate.provider,
           candidate.account_identity,
-          REFRESH_FAILURE_BLOCK_SECONDS,
           exc,
         )
         continue
@@ -796,14 +891,11 @@ def rotate_provider_credential(
   if not current_key:
     return None
   moment = time.time() if now is None else now
-  blocked_until = (
-    reset_at if reset_at is not None else moment + UNDECLARED_LIMIT_BLOCK_SECONDS
-  )
   pool = get_provider_credential_pool(norm_provider)
   selected = rotate_pool_candidate(
     candidates,
     current_key=current_key,
-    until=blocked_until,
+    until=reset_at,
     pool=pool,
     refresh_fn=refresh_fn,
     now=moment,
@@ -828,8 +920,6 @@ __all__ = [
   "PoolCandidateMaterializer",
   "PoolCandidateResolver",
   "ProviderCredentialPool",
-  "REFRESH_FAILURE_BLOCK_SECONDS",
-  "UNDECLARED_LIMIT_BLOCK_SECONDS",
   "USER_CREDENTIAL_STORE_FILENAMES",
   "USER_SCOPE_FIELD",
   "atomic_write_json",

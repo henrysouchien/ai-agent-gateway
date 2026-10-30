@@ -581,7 +581,6 @@ def test_create_agent_uses_explicit_api_key() -> None:
     "auth_mode": "api",
     "api_key": "sk-123",
     "auth_token": "",
-    "max_tokens": 16000,
   }
 
 
@@ -601,7 +600,6 @@ def test_create_agent_uses_explicit_auth_token() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "tok-123",
-    "max_tokens": 16000,
   }
 
 
@@ -616,7 +614,6 @@ def test_create_agent_with_credentials_resolver_skips_env_bootstrap(monkeypatch:
           "billing_mode": "byok",
           "api_key": "resolver-key",
           "model": DEFAULT_UPSTREAM_MODEL,
-          "max_tokens": 16000,
         }
       ),
       credential_principal="service",
@@ -633,7 +630,6 @@ def test_create_agent_with_credentials_resolver_skips_env_bootstrap(monkeypatch:
     "auth_mode": "api",
     "api_key": "",
     "auth_token": "",
-    "max_tokens": 16000,
   }
 
 
@@ -643,7 +639,6 @@ def test_create_agent_accepts_model_free_credential_material(monkeypatch: pytest
     return AnthropicProvider(), "anthropic", {
       "auth_mode": "api",
       "api_key": "resolver-key",
-      "max_tokens": 16000,
     }
 
   monkeypatch.setattr("agent_gateway.easy._resolve_provider", _fake_resolve_provider)
@@ -652,7 +647,6 @@ def test_create_agent_accepts_model_free_credential_material(monkeypatch: pytest
   assert _service_auth_config(app) == {
     "auth_mode": "api",
     "api_key": "resolver-key",
-    "max_tokens": 16000,
   }
   _session, runtime = _build_runtime(app)
   assert runtime.capability_bind.model_key == DEFAULT_MODEL_KEY
@@ -713,7 +707,6 @@ def test_create_agent_refuses_unsupported_configured_effort() -> None:
       model_key="anthropic.claude-opus-5-5",
       effort="none",
       api_key="test-key",
-      max_tokens=1024,
     )
 
 
@@ -812,9 +805,7 @@ def test_create_agent_openai_provider_string_uses_openai_defaults() -> None:
 
   config = app.state.gateway_config
   assert isinstance(config.default_provider, OpenAIProvider)
-  assert _service_auth_config(app) == {
-    "max_tokens": 16000,
-  }
+  assert _service_auth_config(app) == {}
   assert _capability_models(app) == {"gpt-6.1-sol"}
 
 
@@ -827,9 +818,7 @@ def test_create_agent_codex_provider_string_uses_codex_defaults() -> None:
 
   config = app.state.gateway_config
   assert isinstance(config.default_provider, CodexProvider)
-  assert _service_auth_config(app) == {
-    "max_tokens": 16000,
-  }
+  assert _service_auth_config(app) == {}
   assert _capability_models(app) == {"gpt-6.1-sol"}
 
 
@@ -849,7 +838,6 @@ def test_create_agent_xai_provider_string_uses_xai_defaults(monkeypatch: pytest.
     "auth_mode": "api",
     "api_key": "xai-test-key",
     "auth_token": "",
-    "max_tokens": 16000,
   }
   assert _capability_models(app) == {"grok-4.7"}
 
@@ -864,9 +852,7 @@ def test_create_agent_accepts_provider_instance_when_model_is_explicit() -> None
 
   config = app.state.gateway_config
   assert config.default_provider is provider
-  assert _service_auth_config(app) == {
-    "max_tokens": 16000,
-  }
+  assert _service_auth_config(app) == {}
   assert _capability_models(app) == {"gpt-6.1-sol"}
 
 
@@ -896,7 +882,6 @@ def test_create_agent_openai_snapshots_env_api_key(monkeypatch: pytest.MonkeyPat
     "auth_mode": "api",
     "api_key": "env-openai-key",
     "auth_token": "",
-    "max_tokens": 16000,
   }
 
 
@@ -916,7 +901,6 @@ def test_create_agent_openai_uses_explicit_api_key_and_provider_config() -> None
     "auth_mode": "api",
     "api_key": "sk-openai",
     "auth_token": "",
-    "max_tokens": 16000,
     "base_url": "https://custom.example/v1",
     "compat": {"streaming": True},
   }
@@ -934,7 +918,6 @@ def test_create_agent_openai_uses_explicit_auth_token() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "oat-xxx",
-    "max_tokens": 16000,
   }
 
 
@@ -950,7 +933,6 @@ def test_create_agent_codex_uses_explicit_auth_token() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "oat-codex",
-    "max_tokens": 16000,
   }
 
 
@@ -968,7 +950,6 @@ def test_resolve_provider_openai_auth_config_with_oauth() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "tok",
-    "max_tokens": 16000,
   }
 
 
@@ -986,7 +967,6 @@ def test_resolve_provider_openai_auth_config_infers_mode() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "tok",
-    "max_tokens": 16000,
   }
 
 
@@ -1004,7 +984,6 @@ def test_resolve_provider_openai_auth_config_plain_passthrough() -> None:
     "auth_mode": "api",
     "api_key": "sk-x",
     "auth_token": "",
-    "max_tokens": 16000,
   }
 
 
@@ -1022,7 +1001,6 @@ def test_resolve_provider_codex_auth_config_with_oauth() -> None:
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "tok",
-    "max_tokens": 16000,
   }
 
 
@@ -1623,7 +1601,6 @@ def test_create_agent_first_handle_read_and_root_message(
         "provider": "anthropic",
         "billing_mode": "byok",
         "api_key": "test-key",
-        "max_tokens": 16000,
       }),
       credential_principal="service",
       allow_service_for_interactive=True,

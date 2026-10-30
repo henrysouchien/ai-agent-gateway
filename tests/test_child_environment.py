@@ -95,3 +95,14 @@ def test_child_inherits_the_spend_ledger_paths_and_attribution() -> None:
   projected = filter_child_environment(env, purpose=AUTONOMOUS_CHILD_ENVIRONMENT)
 
   assert projected == {name: f"value-of-{name}" for name in names}
+
+
+def test_child_inherits_the_audit_hmac_secret() -> None:
+  env = {
+    "GATEWAY_AUDIT_HMAC_SECRET": "deployment-audit-secret",
+    "FMS_UNDO_HMAC_SECRET": "must-not-be-inherited",
+  }
+
+  projected = filter_child_environment(env, purpose=AUTONOMOUS_CHILD_ENVIRONMENT)
+
+  assert projected == {"GATEWAY_AUDIT_HMAC_SECRET": "deployment-audit-secret"}

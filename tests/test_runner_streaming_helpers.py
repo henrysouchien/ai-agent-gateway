@@ -31,8 +31,8 @@ def test_thinking_level_maps_boolean_to_provider_enum() -> None:
 
 
 def test_effective_stream_stall_timeout_respects_override_and_thinking_defaults() -> None:
-  thinking_model = ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True)
-  plain_model = ModelInfo(id="gpt-test", provider="openai", supports_thinking=False)
+  thinking_model = ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True, max_output_tokens=16_384)
+  plain_model = ModelInfo(id="gpt-test", provider="openai", supports_thinking=False, max_output_tokens=16_384)
 
   assert (
     effective_stream_stall_timeout(None, config={"thinking": True}, model_info=thinking_model, max_tokens=4096)
@@ -64,7 +64,7 @@ def test_effective_stream_stall_timeout_respects_override_and_thinking_defaults(
 
 
 def test_observed_thinking_in_messages_is_scoped_to_current_model() -> None:
-  model_info = ModelInfo(id="claude-sonnet-5", provider="anthropic", supports_thinking=True)
+  model_info = ModelInfo(id="claude-sonnet-5", provider="anthropic", supports_thinking=True, max_output_tokens=16_384)
   matching = {
     "role": "assistant",
     "provider": "anthropic",

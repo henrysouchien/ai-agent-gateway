@@ -1,5 +1,6 @@
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
+import dataclasses
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,7 @@ from agent_gateway.providers import ModelInfo, ModelProvider
 from model_authority.thinking import ThinkingLevel
 from agent_gateway.providers.base import StreamEvent  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
+import agent_gateway.runner_stream_turn as runner_stream_turn  # noqa: E402
 from agent_gateway.runner_stream_turn import RunnerStreamTurnMixin  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from model_authority.thinking import EffortResolution
@@ -34,6 +36,14 @@ from gateway_test_support.capability_execution_test_support import (  # noqa: E4
   stub_bound_capability_execution,
   stub_runner_capability_execution,
 )
+
+
+def _set_retry_policy(monkeypatch, **changes) -> None:
+  monkeypatch.setattr(
+    runner_stream_turn,
+    "TRANSPORT_RETRY_POLICY",
+    dataclasses.replace(runner_stream_turn.TRANSPORT_RETRY_POLICY, **changes),
+  )
 
 
 @pytest.mark.parametrize(
@@ -106,7 +116,7 @@ def test_anthropic_stream_request_measurement_wait_and_retry_isolation(
     return 1.234
 
   monkeypatch.setattr(adapter, "get_global_token_bucket", lambda: SimpleNamespace(acquire=acquire))
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0)
+  _set_retry_policy(monkeypatch, base_delay_seconds=0.0)
   provider = AnthropicProvider()
   # Only SDK client construction is replaced; request building and stream normalization are real.
   monkeypatch.setattr(provider, "create_client", lambda *_args, **_kwargs: client)
@@ -188,7 +198,7 @@ def test_stream_turn_helpers_resolve_parent_module_aliases(monkeypatch) -> None:
   monkeypatch.setattr(gateway_runner, "effective_stream_stall_timeout", _effective_stream_stall_timeout)
   monkeypatch.setattr(gateway_runner, "classify_guard_outcome", _classify_guard_outcome)
 
-  model_info = ModelInfo(id="model", provider="stub", supports_thinking=True)
+  model_info = ModelInfo(max_output_tokens=16_384, id="model", provider="stub", supports_thinking=True)
 
   assert AgentRunner._thinking_level(True) == "patched-True"
   assert (
@@ -238,7 +248,7 @@ def test_tool_history_preserves_a_semantic_copy_without_changing_execution_input
     def has_active_credential(self, config):
       return bool(config.get("api_key"))
     def get_model_info(self, model):
-      return ModelInfo(id=model, provider=self.name, supports_thinking=True)
+      return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name, supports_thinking=True)
 
 
     def resolve_effort(self, **kwargs):
@@ -305,7 +315,7 @@ def test_tool_history_preserves_a_semantic_copy_without_changing_execution_input
       "effort": "none",
       "auth_mode": "api_key",
     },
-    model_info=ModelInfo(id="model", provider="stub"),
+    model_info=ModelInfo(max_output_tokens=16_384, id="model", provider="stub"),
     system_prompt=None,
     current_messages=[],
     base_kwargs={"tools": []},
@@ -352,7 +362,7 @@ def test_stream_turn_cancellation_preserves_primary_when_internal_close_fails(
     def has_active_credential(self, config):
       return bool(config.get("api_key"))
     def get_model_info(self, model):
-      return ModelInfo(id=model, provider=self.name, supports_thinking=True)
+      return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name, supports_thinking=True)
 
 
     def resolve_effort(self, **kwargs):
@@ -422,7 +432,7 @@ def test_stream_turn_cancellation_preserves_primary_when_internal_close_fails(
           "effort": "none",
           "auth_mode": "api_key",
         },
-        model_info=ModelInfo(id="model", provider="stub"),
+        model_info=ModelInfo(max_output_tokens=16_384, id="model", provider="stub"),
         system_prompt=None,
         current_messages=[],
         base_kwargs={"tools": []},
@@ -464,7 +474,7 @@ def test_stream_guard_appends_heartbeat_while_tool_input_streams(
   monkeypatch.setattr(stream_turn_module, "STREAM_PROGRESS_LOG_INTERVAL", 0.02)
   monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", 0.02)
   # A stall would fail the turn outright instead of retrying behind a delay.
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 0)
+  _set_retry_policy(monkeypatch, max_retries=0)
 
   tool_input = {"body": "x" * 20}
   tool_block = {"type": "tool_use", "id": "call-1", "name": "write_memo"}
@@ -476,7 +486,7 @@ def test_stream_guard_appends_heartbeat_while_tool_input_streams(
       return bool(config.get("api_key"))
 
     def get_model_info(self, model):
-      return ModelInfo(id=model, provider=self.name, supports_thinking=True)
+      return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name, supports_thinking=True)
 
     def resolve_effort(self, **kwargs):
       requested = kwargs["requested"]
@@ -543,7 +553,7 @@ def test_stream_guard_appends_heartbeat_while_tool_input_streams(
       "effort": "none",
       "auth_mode": "api_key",
     },
-    model_info=ModelInfo(id="model", provider="stub"),
+    model_info=ModelInfo(max_output_tokens=16_384, id="model", provider="stub"),
     system_prompt=None,
     current_messages=[],
     base_kwargs={"tools": []},
@@ -609,7 +619,7 @@ class _RefusingProvider(ModelProvider):
     _ = client, timeout
 
   def get_model_info(self, model):
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
   def build_request_params(self, **_kwargs):
     self.requests += 1
@@ -675,8 +685,7 @@ def _refusal_runner(
 def test_provider_defaults_survive_initial_auth_and_stream_retry(monkeypatch) -> None:
   from agent_gateway.auth import ProviderCredentialFailure
 
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 2)
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0)
+  _set_retry_policy(monkeypatch, max_retries=2, base_delay_seconds=0.0)
 
   class Provider(_RefusingProvider):
     def __init__(self):
@@ -770,7 +779,7 @@ def test_stream_guard_excludes_local_queue_but_bounds_peer_silence(
   monkeypatch.setattr(gateway_runner, "asyncio", SimpleNamespace(
     **{**vars(asyncio), "sleep": guard_sleep},
   ))
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 0)
+  _set_retry_policy(monkeypatch, max_retries=0)
   monkeypatch.setattr(stream_module, "locally_queued", is_queued)
   monkeypatch.setattr(stream_module, "local_queue_left_at", lambda task: left_at[0])
 
@@ -790,7 +799,7 @@ def test_stream_guard_excludes_local_queue_but_bounds_peer_silence(
   result = asyncio.run(runner._stream_turn(
     client=object(),
     config={"model": "claude-opus-5", "effort": "none", "auth_mode": "api_key", "api_key": "k"},
-    model_info=ModelInfo(id="claude-opus-5", provider="stub"),
+    model_info=ModelInfo(max_output_tokens=16_384, id="claude-opus-5", provider="stub"),
     system_prompt=None, current_messages=[], base_kwargs={"tools": []},
     max_tokens=128, turn_count=1, turn_t0=0.0, turn_t0_mono=0.0,
     system_chars=0, tools_chars=0,
@@ -824,7 +833,7 @@ def test_queued_child_heartbeats_preserve_parent_liveness_and_peer_stall(
 
   monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", 0.01)
   monkeypatch.setattr(stream_turn_module, "STREAM_PROGRESS_LOG_INTERVAL", 0.03)
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 0)
+  _set_retry_policy(monkeypatch, max_retries=0)
   monkeypatch.setattr(children, "STREAM_GUARD_POLL_INTERVAL", 0.01)
 
   async def case():
@@ -865,7 +874,7 @@ def test_queued_child_heartbeats_preserve_parent_liveness_and_peer_stall(
       results.append(await runner._stream_turn(
         client=object(),
         config={"model": "claude-opus-5", "effort": "none", "auth_mode": "api_key", "api_key": "k"},
-        model_info=ModelInfo(id="claude-opus-5", provider="stub"),
+        model_info=ModelInfo(max_output_tokens=16_384, id="claude-opus-5", provider="stub"),
         system_prompt=None, current_messages=[], base_kwargs={"tools": []},
         max_tokens=128, turn_count=1, turn_t0=time.time(),
         turn_t0_mono=started, system_chars=0, tools_chars=0,
@@ -1239,7 +1248,7 @@ def _types(events: list[dict[str, object]], *wanted: str) -> list[object]:
 
 @pytest.fixture(autouse=True)
 def _no_retry_delay(monkeypatch) -> None:
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0)
+  _set_retry_policy(monkeypatch, base_delay_seconds=0.0)
 
 
 @pytest.mark.parametrize(
@@ -1407,8 +1416,9 @@ def test_quota_429_on_one_account_rotates_to_the_next_and_succeeds() -> None:
   assert _types(events, "error") == []
 
 
-def test_every_account_limited_backs_off_on_the_last_account_without_cycling() -> None:
-  attempts = 3 + gateway_runner.STREAM_RETRY_MAX
+def test_every_account_limited_backs_off_on_the_last_account_without_cycling(monkeypatch) -> None:
+  _set_retry_policy(monkeypatch, max_retries=2)
+  attempts = 5
   provider = _AccountProvider(
     ("A", "B", "C"), [_Quota429("usage limit") for _ in range(attempts)],
   )
@@ -1418,7 +1428,7 @@ def test_every_account_limited_backs_off_on_the_last_account_without_cycling() -
 
   # Each sibling is visited once, then the original bounded retry budget
   # stays on C even though preparation would rerank an all-blocked pool to A.
-  expected = ["A", "B"] + ["C"] * (1 + gateway_runner.STREAM_RETRY_MAX)
+  expected = ["A", "B", "C", "C", "C"]
   assert provider.streamed == expected
   assert provider.clients == expected
   assert [call[0] for call in provider.prepared] == ["A"]
@@ -1432,7 +1442,7 @@ def test_every_account_limited_backs_off_on_the_last_account_without_cycling() -
 
 
 def test_concurrency_429_backs_off_on_the_same_account_without_rotating(monkeypatch) -> None:
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.25)
+  _set_retry_policy(monkeypatch, base_delay_seconds=0.25)
   slept: list[float] = []
 
   async def record_sleep(delay: float, result=None):

@@ -44,7 +44,6 @@ from .runner_limits import (
 )
 from .runner_run_loop_defaults import (
   MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFICATIONS_PER_TURN,  # noqa: F401 - compatibility alias
-  MAX_TOKENS_CONTINUATIONS as _MAX_TOKENS_CONTINUATIONS,  # noqa: F401 - compatibility alias
   MAX_TOKENS_NUDGE as _MAX_TOKENS_NUDGE,  # noqa: F401 - compatibility alias
 )
 from .runner_background_lifecycle import RunnerBackgroundLifecycleMixin
@@ -170,11 +169,6 @@ kill_background_tasks_for_asyncio_tasks = _kill_background_tasks_for_asyncio_tas
 
 log = logging.getLogger("agent_gateway.runner")
 STREAM_GUARD_POLL_INTERVAL = 2.0
-# Liveness is guarded by event-gap stall detection (retryable), NOT wall clock:
-# thinking-turn duration is unpredictable. See ACUI-25.
-STREAM_RETRY_MAX = 3
-STREAM_RETRY_DELAY = 2.0
-STREAM_RETRY_BACKOFF = 2.0
 _ACTIVE_SKILL_ALLOW_RESULT_KEY = "_active_skill_allow"
 _SKILL_RUN_ID_RESULT_KEY = "_skill_run_id"
 
@@ -265,7 +259,6 @@ class AgentRunner(
     *,
     capability_execution: BoundCapabilityExecution,
     allow_stub_response: bool = False,
-    max_tokens_override: int | None = None,
     stream_stall_timeout: float | None = None,
     mcp_client: McpClientManager | None = None,
     mcp_activation_fold: McpActivationFold | None = None,
@@ -302,7 +295,6 @@ class AgentRunner(
     admitted_self_prior_evidence: SubAgentResultEvidence | None = None,
     message_inbox: asyncio.Queue[ParentMessage] | None = None,
     coordinator: CoordinatorConfig | None = None,
-    max_resume_chain_depth: int = 3,
     operator_pause_event: asyncio.Event | None = None,
     shutdown_signal_provider: ShutdownSignalProvider | None = None,
     started_at: float | None = None,
@@ -351,8 +343,6 @@ class AgentRunner(
         "AgentRunner requires a BoundCapabilityExecution"
       )
     capability_execution.validate()
-    if max_resume_chain_depth <= 0:
-      raise ValueError("max_resume_chain_depth must be positive")
     if (
       context_research_file_id is not None
       and (
@@ -513,7 +503,6 @@ class AgentRunner(
     self._auth_config = dict(capability_execution.auth_config)
     self._allow_stub_response = bool(allow_stub_response)
     self._effort_resolution: EffortResolution | None = None
-    self._max_tokens_override = max_tokens_override
     self._stream_stall_timeout = stream_stall_timeout
     self._mcp_client = mcp_client
     # Pass-through only: the runner neither reads nor writes this fold. It
@@ -588,7 +577,6 @@ class AgentRunner(
     )
     self._last_reported_cost = 0.0
     self._coordinator = coordinator
-    self._max_resume_chain_depth = max_resume_chain_depth
     # A snapshot of the setting when this runner is built (the registry's
     # retention operand); the children semaphore is sized from the live
     # setting when it is first created.
@@ -1039,6 +1027,7 @@ class AgentRunner(
     tool_name: str,
     on_spill_publication: Callable[[SpillPublication], None] | None = None,
     max_chars: int | None = None,
+    retained_entry: Dict[str, Any] | None = None,
   ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     return _compact_model_tool_result_entry(
       result_entry,
@@ -1049,6 +1038,7 @@ class AgentRunner(
       uuid_factory=uuid.uuid4,
       on_spill_publication=on_spill_publication,
       max_chars=max_chars,
+      retained_entry=retained_entry,
     )
 
   @staticmethod

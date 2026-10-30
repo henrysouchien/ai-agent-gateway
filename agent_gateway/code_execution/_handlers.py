@@ -97,9 +97,17 @@ def _code_job_model_result(runner: Any, task_id: str, result: Dict[str, Any]) ->
   The projection a foreground cell's result entry gets — runner annotation,
   image bytes stripped, bulk spilled through the runner's sink — bounded by
   what the registry delivers inline.
+
+  This value is the model's result and is also stored on the job, so the whole
+  serialized content crosses the runner's secret boundary before compaction:
+  the model cut and the spill write are then taken from redacted text, and
+  neither the returned preview nor a spill file can carry a secret or a prefix.
   """
-  content = strip_code_execute_base64_content(
-    json.dumps(runner._annotate_result(result, tool_name="code_execute"), default=str),
+  boundary = getattr(runner, "_secret_boundary", None) or SecretBoundary()
+  content = boundary.redact_text(
+    strip_code_execute_base64_content(
+      json.dumps(runner._annotate_result(result, tool_name="code_execute"), default=str),
+    )
   )
   live_entry, _ = runner._compact_model_tool_result_entry(
     {"type": "tool_result", "tool_use_id": task_id, "content": content},
@@ -178,7 +186,10 @@ def build_code_execution(
 
   `job_runner()` answers the `AgentRunner` that owns this request's task
   registry, or None, at call time: runners are built after their bundles.
-  A `background=true` cell is a `code` job on that registry, inspected,
+  The bound accessor keeps the last runner a call returned, so a continuation
+  whose accessor answers None still reaches that registry. The approval
+  qualifier and registered preparation both ask it before a kernel approval
+  park. A `background=true` cell is a `code` job on that registry, inspected,
   waited on and killed through the registry; without a runner it is refused.
   """
   cfg = config or CodeExecutionConfig()
@@ -223,7 +234,23 @@ def build_code_execution(
       tenant=admitted_tenant,
     )
   frame_reader = session.code_execution_frame_reader
-  frame_reader.bind_job_runner(job_runner)
+  remembered_runner: Any | None = None
+
+  def _cached_job_runner() -> Any | None:
+    """The request runner, kept when a continuation's accessor answers None.
+
+    Each call asks the supplied accessor. A runner it returns replaces the
+    cache; None returns the last runner seen. A kernel approval park that
+    clears the live turn therefore still leaves that runner for background
+    cells and `hank.wait`.
+    """
+    nonlocal remembered_runner
+    current = job_runner() if job_runner is not None else None
+    if current is not None:
+      remembered_runner = current
+    return remembered_runner
+
+  frame_reader.bind_job_runner(_cached_job_runner)
 
   def _ensure_code_execution_work_dir() -> str:
     if session.code_execution_work_dir:
@@ -358,7 +385,7 @@ def build_code_execution(
       _, error = _host_wait_ms_input(tool_input, cfg)
       if error is not None:
         return None, error
-      runner = job_runner() if job_runner is not None else None
+      runner = _cached_job_runner()
       if runner is None:
         return None, {
           "code": "code_execution_unavailable",
@@ -495,9 +522,15 @@ def build_code_execution(
     return _redact_execution_output(result, redact), error
 
   def _approval_qualifier(tool_name: str, tool_input: Dict[str, Any]) -> str:
+    # Capture the runner before a kernel approval park clears the live turn.
+    _cached_job_runner()
     return backend.name if tool_name == "code_execute" else ""
 
   def _prepare_call(raw_input: Dict[str, Any]) -> PreparedToolCall:
+    # Registered kernel approval prepares here before the park, and that
+    # path does not call the qualifier. Ask now so the continuation keeps
+    # the runner the live turn still holds.
+    _cached_job_runner()
     if not isinstance(raw_input, dict):
       raise ToolInputPreparationError({
         "code": "invalid_input",

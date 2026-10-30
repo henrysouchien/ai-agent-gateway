@@ -126,7 +126,6 @@ def _canonical_admitted_task(task_id: str = "bg_7") -> AdmittedTask:
   payload["operation"]["execution_class"] = task.model_bind.capability_id
   payload["operation"]["resumable"] = True
   payload["execution_snapshot"]["resume_mechanics"]["resumable"] = True
-  payload["execution_snapshot"]["resume_mechanics"]["max_chain_depth"] = 3
   payload["execution_snapshot"]["provider_tool_definitions"] = [
     {"definition": {
       "name": "web_search",

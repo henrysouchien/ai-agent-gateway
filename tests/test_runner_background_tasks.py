@@ -417,7 +417,6 @@ def test_runner_background_registration_resolves_parent_module_helpers(monkeypat
   runner = object.__new__(AgentRunner)
   runner._task_registry = Registry(max_inflight=3)
   runner._max_background_tasks = 3
-  runner._max_resume_chain_depth = 3
   runner._provider = Provider()
   runner._auth_config = {"model": "stub-model"}
   runner._runner_id = "runner-1"

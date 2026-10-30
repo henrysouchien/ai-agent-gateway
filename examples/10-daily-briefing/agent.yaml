@@ -17,4 +17,3 @@ mcp_servers:
       - "@modelcontextprotocol/server-filesystem"
       - .
 code_execution: false
-max_tokens: 16000

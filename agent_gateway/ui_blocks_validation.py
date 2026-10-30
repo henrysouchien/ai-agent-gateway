@@ -141,15 +141,15 @@ def _schema_issues(
   return issues
 
 
-def _walk_blocks(blocks: Iterable[Any]) -> Iterable[tuple[int, Any, int, bool]]:
+def _walk_blocks(blocks: Iterable[Any]) -> Iterable[tuple[int, Any, bool]]:
   for top_index, block in enumerate(blocks):
-    stack = [(block, 0, False)]
+    stack = [(block, False)]
     while stack:
-      current, layout_depth, in_layout = stack.pop()
-      yield top_index, current, layout_depth, in_layout
+      current, in_layout = stack.pop()
+      yield top_index, current, in_layout
       if isinstance(current, dict) and isinstance(current.get("children"), list):
         for child in reversed(current["children"]):
-          stack.append((child, layout_depth + 1, True))
+          stack.append((child, True))
 
 
 def _stage_one(payload: Any, bundle: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
@@ -171,14 +171,16 @@ def _stage_one(payload: Any, bundle: dict[str, Any]) -> list[tuple[int, dict[str
     value = payload.get(key)
     if key in payload and not (value is None or isinstance(value, str)):
       failures.append(_failure(1, None, FailureCode.ENVELOPE_INVALID, f"$.{key}: expected string or null"))
-    elif isinstance(value, str) and len(value) > 2000:
-      failures.append(_failure(1, None, FailureCode.ENVELOPE_INVALID, f"$.{key}: exceeds 2000 characters"))
   blocks = payload.get("blocks")
-  if not isinstance(blocks, list) or not 1 <= len(blocks) <= 24:
-    failures.append(_failure(1, None, FailureCode.ENVELOPE_INVALID, "$.blocks: expected 1 to 24 blocks"))
+  if not isinstance(blocks, list) or not blocks:
+    failures.append(_failure(1, None, FailureCode.ENVELOPE_INVALID, "$.blocks: expected a non-empty list of blocks"))
     return failures
-  known_blocks = set(bundle["primitive_blocks"]) | set(bundle["sdk_blocks"])
-  for index, block, depth, in_layout in _walk_blocks(blocks):
+  block_kinds = {
+    name: group.removesuffix("_blocks")
+    for group, definitions in bundle.items() if group.endswith("_blocks")
+    for name in definitions
+  }
+  for index, block, in_layout in _walk_blocks(blocks):
     path = f"$.blocks[{index}]" + (".children" if in_layout else "")
     if not isinstance(block, dict):
       failures.append(_failure(1, index, FailureCode.ENVELOPE_INVALID, f"{path}: expected object"))
@@ -189,15 +191,22 @@ def _stage_one(payload: Any, bundle: dict[str, Any]) -> list[tuple[int, dict[str
       elif set(block) != {"view", "scope"} or not isinstance(block.get("view"), str) or not isinstance(block.get("scope"), dict):
         failures.append(_failure(1, index, FailureCode.ENVELOPE_INVALID, f"{path}: invalid view envelope"))
     elif "layout" in block:
-      if depth >= 2:
-        failures.append(_failure(1, index, FailureCode.LAYOUT_DEPTH_EXCEEDED, f"{path}.children: layout depth exceeds contract schema"))
       if set(block) != {"layout", "children"} or block.get("layout") not in bundle["layout_rules"]["layouts"]:
         failures.append(_failure(1, index, FailureCode.ENVELOPE_INVALID, f"{path}: invalid layout envelope"))
       children = block.get("children")
-      if not isinstance(children, list) or not 1 <= len(children) <= 12:
-        failures.append(_failure(1, index, FailureCode.ENVELOPE_INVALID, f"{path}.children: expected 1 to 12 children"))
+      if not isinstance(children, list) or not children:
+        failures.append(_failure(1, index, FailureCode.ENVELOPE_INVALID, f"{path}.children: expected a non-empty list of children"))
+      else:
+        position = "nested" if in_layout else "top_level"
+        allowed_children = bundle["layout_rules"][position]["allowed_children"]
+        for child_index, child in enumerate(children):
+          if isinstance(child, dict):
+            kind = "layout" if "layout" in child else block_kinds.get(child.get("block"))
+            if kind is not None and kind not in allowed_children:
+              code = FailureCode.LAYOUT_DEPTH_EXCEEDED if kind == "layout" else FailureCode.ENVELOPE_INVALID
+              failures.append(_failure(1, index, code, f"{path}.children[{child_index}]: {position} layout children do not admit {kind}"))
     elif "block" in block:
-      if block.get("block") not in known_blocks:
+      if block.get("block") not in block_kinds:
         failures.append(_failure(1, index, FailureCode.UNKNOWN_BLOCK, f"{path}.block: unknown block {block.get('block')!r}"))
       elif set(block) != {"block", "props"} or not isinstance(block.get("props"), dict):
         failures.append(_failure(1, index, FailureCode.ENVELOPE_INVALID, f"{path}: invalid block envelope"))
@@ -254,7 +263,7 @@ def _stage_two(payload: dict[str, Any], bundle: dict[str, Any]) -> list[tuple[in
     return failures
   admitted_views = {key: value for key, value in bundle["views"]["views"].items() if value.get("status") == "admitted"}
   visible_sources = {key for key, value in bundle["data_sources"]["sources"].items() if value.get("status") == "agent-visible"}
-  for index, block, _depth, in_layout in _walk_blocks(blocks):
+  for index, block, in_layout in _walk_blocks(blocks):
     if not isinstance(block, dict) or in_layout and "view" in block:
       continue
     if "view" in block:
@@ -285,7 +294,7 @@ def _stage_three(payload: dict[str, Any], bundle: dict[str, Any]) -> list[tuple[
   failures: list[tuple[int, dict[str, Any]]] = []
   definitions = bundle["views"]
   views = definitions["views"]
-  for index, block, _depth, in_layout in _walk_blocks(payload.get("blocks", [])):
+  for index, block, in_layout in _walk_blocks(payload.get("blocks", [])):
     if in_layout or not isinstance(block, dict) or "view" not in block:
       continue
     descriptor = views.get(block.get("view"))

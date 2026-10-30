@@ -9,7 +9,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -22,8 +22,13 @@ import uuid
 
 import httpx
 
-from .runtime_placement import RuntimePlacement, RuntimePlacementAuthority, _storage_id
-from .runtime_tunnel import Handler, TunnelClosed, TunnelEndpoint, TunnelResponse
+from pydantic import BaseModel, ConfigDict
+
+from .runtime_placement import (
+  DESK_LEASE_SECONDS, DeskLeaseRefused, RuntimePlacement, RuntimePlacementAuthority,
+  WriterRecord, _storage_id,
+)
+from .runtime_tunnel import Handler, TunnelClosed, TunnelEndpoint, TunnelRequest, TunnelResponse
 from .user_runtime_credentials import (
   DeskReplica, USER_RUNTIME_CREDENTIALS_FILE_ENV,
   UserRuntimeIdentity, bundle_to_json, load_user_runtime_credentials,
@@ -31,7 +36,7 @@ from .user_runtime_credentials import (
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
-EgressFactory = Callable[[UserRuntimeIdentity, str, Mapping[str, str]], Handler]
+EgressFactory = Callable[[UserRuntimeIdentity, str, int, Mapping[str, str]], Handler]
 
 
 def _default_aws_session(region: str) -> Any:
@@ -46,19 +51,54 @@ def _default_websocket_connect() -> Any:
   return connect
 
 
-def desk_session_policy(bucket: str, storage_id: str) -> dict[str, Any]:
-  """The desk STS session can address only this user's replica objects."""
+def _lease_deadline(expires_at: float) -> str:
+  return datetime.fromtimestamp(expires_at, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def desk_session_policy(bucket: str, storage_id: str, expires_at: float) -> dict[str, Any]:
+  """Replica writes expire at the won writer lease, not the STS session expiry."""
   _storage_id(storage_id)
   prefix = f"users/{storage_id}"
+  deadline = {"DateLessThan": {"aws:CurrentTime": _lease_deadline(expires_at)}}
   return {
     "Version": "2012-10-17",
     "Statement": [
       {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-       "Resource": f"arn:aws:s3:::{bucket}/{prefix}/*"},
+       "Resource": f"arn:aws:s3:::{bucket}/{prefix}/*", "Condition": deadline},
       {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{bucket}",
        "Condition": {"StringLike": {"s3:prefix": [f"{prefix}/*", f"{prefix}/"]}}},
     ],
   }
+
+
+def desk_prelease_policy(bucket: str, storage_id: str, expires_at: float) -> dict[str, Any]:
+  """Restore can read the desk and CAS writer.json, but cannot write its data."""
+  _storage_id(storage_id)
+  prefix = f"users/{storage_id}"
+  deadline = {"DateLessThan": {"aws:CurrentTime": _lease_deadline(expires_at)}}
+  return {
+    "Version": "2012-10-17",
+    "Statement": [
+      {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
+       "Resource": f"arn:aws:s3:::{bucket}/{prefix}/writer.json", "Condition": deadline},
+      {"Effect": "Allow", "Action": "s3:GetObject",
+       "Resource": f"arn:aws:s3:::{bucket}/{prefix}/*", "Condition": deadline},
+      {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{bucket}",
+       "Condition": {"StringLike": {"s3:prefix": [f"{prefix}/*", f"{prefix}/"]}}},
+    ],
+  }
+
+
+class _RuntimeReady(BaseModel):
+  model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+  generation: int
+
+
+class _RuntimeFailure(BaseModel):
+  model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+  error: str
+  finding: str | None = None
+  writer: WriterRecord | None = None
 
 
 def generate_ws_connection(
@@ -86,9 +126,13 @@ def generate_ws_connection(
 
 @dataclass
 class _Session:
-  placement: RuntimePlacement
-  bootstrap: dict[str, Any]
-  handler: Handler | None
+  storage_id: str
+  identity: UserRuntimeIdentity
+  handle: str
+  placement: RuntimePlacement | None = None
+  bootstrap: dict[str, Any] = field(default_factory=dict)
+  handler: Handler | None = None
+  lease: WriterRecord | None = None
   ready: asyncio.Event = field(default_factory=asyncio.Event)
   endpoint: TunnelEndpoint | None = None
   socket: Any = None
@@ -171,6 +215,8 @@ class AgentCoreRuntimeBackend(RuntimePlacementAuthority):
     return asyncio.run_coroutine_threadsafe(coroutine, self._loop)
 
   def _environment(self) -> dict[str, str]:
+    from .approval_remote import APPROVALS_EGRESS_URL, APPROVALS_EGRESS_URL_ENV
+
     # Projection, not scrubbing: new edge secrets cannot accidentally enter a VM.
     names = ("GATEWAY_SUBJECT_ASSERTION_ED25519_PUBLIC_KEYS",)
     environ = {name: self._extra_env[name] for name in names if name in self._extra_env}
@@ -180,80 +226,150 @@ class AgentCoreRuntimeBackend(RuntimePlacementAuthority):
     ):
       environ[name] = f"http://127.0.0.1:8090/egress/{service}"
     environ["RISK_MODULE_RESOLVER_URL"] = "http://127.0.0.1:8090/egress/resolver/api/internal/resolve-credential"
+    environ[APPROVALS_EGRESS_URL_ENV] = APPROVALS_EGRESS_URL
+    environ["HANK_APPROVAL_TRANSPORT"] = "agentcore"
     return environ
 
-  def _desk_credentials(self, storage_id: str, generation: int) -> dict[str, str]:
+  def _desk_credentials(
+    self, storage_id: str, expires_at: float, generation: int | None = None,
+  ) -> dict[str, str]:
+    policy = (
+      desk_prelease_policy(self._desk_bucket, storage_id, expires_at) if generation is None
+      else desk_session_policy(self._desk_bucket, storage_id, expires_at)
+    )
+    suffix = "prelease" if generation is None else f"g{generation}"
     response = self._sts.assume_role(
-      RoleArn=self._desk_role_arn, RoleSessionName=f"hank-desk-{storage_id}-g{generation}",
-      DurationSeconds=3600, Policy=json.dumps(desk_session_policy(self._desk_bucket, storage_id)),
+      RoleArn=self._desk_role_arn, RoleSessionName=f"hank-desk-{storage_id}-{suffix}",
+      DurationSeconds=900, Policy=json.dumps(policy),
     )
     credentials = response["Credentials"]
-    expiration = credentials["Expiration"]
     return {
       "AccessKeyId": credentials["AccessKeyId"], "SecretAccessKey": credentials["SecretAccessKey"],
       "SessionToken": credentials["SessionToken"],
-      "Expiration": expiration.isoformat() if isinstance(expiration, datetime) else str(expiration),
+      "Expiration": _lease_deadline(expires_at),
     }
 
-  async def _renew(self, state: _Session) -> None:
-    while True:
-      expiration = datetime.fromisoformat(state.bootstrap["desk"]["credentials"]["Expiration"].replace("Z", "+00:00"))
-      await asyncio.sleep(max(1, expiration.timestamp() - time.time() - 300))
-      try:
-        credentials = await asyncio.to_thread(self._desk_credentials, state.placement.storage_id, state.placement.generation)
-        state.bootstrap["desk"]["credentials"] = credentials
-        if state.endpoint is not None and not state.endpoint.closed:
-          await state.endpoint.control("credentials", {"desk": credentials})
-      except Exception as exc:
-        log.warning("Desk credential renewal storage_id=%s error=%s", state.placement.storage_id, type(exc).__name__)
-        await asyncio.sleep(5)
+  async def _accept_lease(self, state: _Session, record: WriterRecord) -> None:
+    if record.state != "held":
+      raise DeskLeaseRefused("runtime no longer holds its desk writer lease", record=record)
+    if state.placement is not None and record.epoch != state.placement.generation:
+      raise DeskLeaseRefused("runtime lease epoch no longer matches its placement", record=record)
+    if state.lease is not None and record.holder != state.lease.holder:
+      raise DeskLeaseRefused("runtime lease holder changed", record=record)
+    credentials = await asyncio.to_thread(
+      self._desk_credentials, state.storage_id, record.expires_at, record.epoch,
+    )
+    # Stop may win while STS is running; it must not resurrect a placement.
+    if self._sessions.get(state.handle) is not state:
+      raise TunnelClosed("runtime session stopped while minting desk credentials")
+    if state.placement is not None:
+      current = self.store.get(state.storage_id)
+      if current is None or current.state not in ("starting", "ready") or current.handle != state.handle or current.generation != record.epoch:
+        raise TunnelClosed("placement no longer owns this runtime session")
+    update: dict[str, Any] = {"desk": credentials}
+    if state.placement is None:
+      scoped_desk = DeskReplica(f"s3://{self._desk_bucket}", None, None, None, None)
+      bundle_path = self._mint_bundle(state.storage_id, state.identity, scoped_desk, record.epoch)
+      bundle = load_user_runtime_credentials({USER_RUNTIME_CREDENTIALS_FILE_ENV: str(bundle_path)})
+      assert bundle is not None
+      state.handler = self._egress_factory(state.identity, state.storage_id, record.epoch, self._extra_env) if self._egress_factory else None
+      timestamp = time.time()
+      state.placement = self.store.upsert(RuntimePlacement(
+        state.storage_id, f"agentcore://{state.handle}", "starting", "agentcore", state.handle,
+        str(bundle_path), record.epoch, timestamp, timestamp,
+      ))
+      update["bundle"] = bundle_to_json(bundle)
+    state.lease = record
+    state.bootstrap["desk"]["credentials"] = credentials
+    assert state.endpoint is not None
+    await state.endpoint.control("credentials", update)
 
   async def _maintain(self, state: _Session) -> None:
-    renewal = asyncio.create_task(self._renew(state))
-    try:
-      while True:
-        try:
-          credentials = await asyncio.to_thread(self._aws.get_credentials)
-          if credentials is None:
-            raise RuntimeError("edge AWS credentials unavailable")
-          url, headers = await asyncio.to_thread(
-            generate_ws_connection, self._runtime_arn, str(state.placement.handle), self._region, credentials,
-          )
-          # websockets supplies Host from the same signed URL; a second Host
-          # header makes the HTTP upgrade invalid.
-          upgrade_headers = {key: value for key, value in headers.items() if key.lower() != "host"}
-          async with self._connect(url, additional_headers=upgrade_headers, max_size=None, proxy=None) as socket:
-            state.socket = socket
+    while True:
+      try:
+        credentials = await asyncio.to_thread(self._aws.get_credentials)
+        if credentials is None:
+          raise RuntimeError("edge AWS credentials unavailable")
+        url, headers = await asyncio.to_thread(
+          generate_ws_connection, self._runtime_arn, state.handle, self._region, credentials,
+        )
+        # websockets supplies Host from the same signed URL.
+        upgrade_headers = {key: value for key, value in headers.items() if key.lower() != "host"}
+        async with self._connect(url, additional_headers=upgrade_headers, max_size=None, proxy=None) as socket:
+          state.socket = socket
 
-            async def control(kind: str, body: dict[str, Any]) -> None:
-              if kind == "ready" and body.get("generation") == state.placement.generation:
+          async def control(kind: str, body: dict[str, Any]) -> None:
+            try:
+              if kind == "lease":
+                await self._accept_lease(state, WriterRecord.model_validate(body))
+              elif kind == "ready":
+                ready = _RuntimeReady.model_validate(body)
+                if state.placement is None or ready.generation != state.placement.generation:
+                  raise DeskLeaseRefused("runtime became ready without its placement lease epoch", record=state.lease)
                 state.ready.set()
               elif kind == "failed":
-                state.error = RuntimeError("user runtime failed to boot")
-                state.ready.set()
+                failure = _RuntimeFailure.model_validate(body)
+                detail = failure.error if failure.finding is None else failure.finding
+                if failure.error == "DeskLeaseRefused":
+                  raise DeskLeaseRefused(f"user runtime failed to boot: {detail}", record=failure.writer)
+                raise RuntimeError(f"user runtime failed to boot: {detail}")
+            except Exception as exc:
+              state.error = exc
+              state.ready.set()
+              raise
 
-            endpoint = TunnelEndpoint(send=socket.send, handler=state.handler, on_control=control, odd_ids=False)
-            state.endpoint = endpoint
-            await endpoint.control("bootstrap", state.bootstrap)
-            async for frame in socket:
-              await endpoint.feed(frame.decode() if isinstance(frame, bytes) else frame)
-        except asyncio.CancelledError:
-          raise
-        except Exception as exc:
-          # No exception text: upstream errors may contain signed URLs or secrets.
-          log.warning("AgentCore tunnel reconnect storage_id=%s error=%s", state.placement.storage_id, type(exc).__name__)
-        finally:
-          if state.error is None:
-            state.ready.clear()
-          if state.endpoint is not None:
-            state.endpoint.close()
-          state.socket = None
-        if state.error is not None:
-          return
-        await asyncio.sleep(1)
-    finally:
-      renewal.cancel()
-      await asyncio.gather(renewal, return_exceptions=True)
+          async def egress(request: TunnelRequest) -> TunnelResponse:
+            if state.handler is None:
+              raise TunnelClosed("runtime has not acquired its desk writer lease")
+            return await state.handler(request)
+
+          endpoint = TunnelEndpoint(send=socket.send, handler=egress, on_control=control, odd_ids=False)
+          state.endpoint = endpoint
+          if state.lease is None:
+            # Opening the websocket may cold-start the container. Its startup
+            # time must not consume the prelease's bounded restore authority.
+            credentials = await asyncio.to_thread(
+              self._desk_credentials, state.storage_id, time.time() + DESK_LEASE_SECONDS,
+            )
+            if self._sessions.get(state.handle) is not state:
+              raise TunnelClosed("runtime session stopped before bootstrap")
+            state.bootstrap["desk"]["credentials"] = credentials
+          await endpoint.control("bootstrap", state.bootstrap)
+          async for frame in socket:
+            await endpoint.feed(frame.decode() if isinstance(frame, bytes) else frame)
+      except asyncio.CancelledError:
+        raise
+      except Exception as exc:
+        # No exception text: upstream errors may contain signed URLs or secrets.
+        log.warning("AgentCore tunnel reconnect storage_id=%s error=%s", state.storage_id, type(exc).__name__)
+      finally:
+        if state.error is None:
+          state.ready.clear()
+        if state.endpoint is not None:
+          state.endpoint.close()
+        state.socket = None
+      if state.error is not None:
+        return
+      await asyncio.sleep(1)
+
+  async def _launch_session(self, state: _Session) -> None:
+    self._sessions[state.handle] = state
+    state.bootstrap = {
+      "storage_id": state.storage_id,
+      "desk": {"url": f"s3://{self._desk_bucket}"},
+      "env": self._environment(), "lease_seconds": DESK_LEASE_SECONDS,
+    }
+    state.task = asyncio.create_task(self._maintain(state))
+
+  async def _wait_ready(self, state: _Session) -> _Session:
+    await asyncio.wait_for(state.ready.wait(), timeout=self._ready_timeout)
+    if state.error is not None:
+      raise state.error
+    return state
+
+  async def _start_session(self, state: _Session) -> _Session:
+    await self._launch_session(state)
+    return await self._wait_ready(state)
 
   async def _ensure_session(self, placement: RuntimePlacement) -> _Session:
     if placement.handle is None:
@@ -263,23 +379,10 @@ class AgentCoreRuntimeBackend(RuntimePlacementAuthority):
       if state is None:
         bundle = load_user_runtime_credentials({USER_RUNTIME_CREDENTIALS_FILE_ENV: placement.bundle_path})
         assert bundle is not None
-        credentials = await asyncio.to_thread(self._desk_credentials, placement.storage_id, placement.generation)
-        # STS is an await boundary: stop/replacement may have won while it ran.
-        current = self.store.get(placement.storage_id)
-        if current is None or current.state not in ("starting", "ready") or current.handle != placement.handle or current.generation != placement.generation:
-          raise TunnelClosed("placement no longer owns this runtime session")
-        handler = self._egress_factory(bundle.user, placement.storage_id, self._extra_env) if self._egress_factory else None
-        state = _Session(placement, {
-          "bundle": bundle_to_json(bundle),
-          "desk": {"url": f"s3://{self._desk_bucket}", "credentials": credentials},
-          "env": self._environment(), "generation": placement.generation,
-        }, handler)
-        self._sessions[placement.handle] = state
-        state.task = asyncio.create_task(self._maintain(state))
-    await asyncio.wait_for(state.ready.wait(), timeout=self._ready_timeout)
-    if state.error is not None:
-      raise state.error
-    return state
+        state = _Session(placement.storage_id, bundle.user, placement.handle, placement=placement)
+        state.handler = self._egress_factory(bundle.user, placement.storage_id, placement.generation, self._extra_env) if self._egress_factory else None
+        await self._launch_session(state)
+    return await self._wait_ready(state)
 
   async def _request(
     self, placement: RuntimePlacement, method: str, path: str,
@@ -313,26 +416,25 @@ class AgentCoreRuntimeBackend(RuntimePlacementAuthority):
       existing = self.store.get(storage_id)
       if existing and existing.state == "ready":
         running = load_user_runtime_credentials({USER_RUNTIME_CREDENTIALS_FILE_ENV: existing.bundle_path})
-        if self._bundle_serves(running, identity) and self.health(existing):
+        if self._bundle_serves(running, identity, existing) and self.health(existing):
           return existing
       if existing:
         self.stop(existing)
-      generation = existing.generation + 1 if existing else 1
-      # Bundle carries identity/derived claim authority; rotating STS material
-      # belongs to the credentials control channel, not a persisted provider file.
-      scoped_desk = DeskReplica(f"s3://{self._desk_bucket}", None, None, None, None)
-      bundle_path = self._mint_bundle(storage_id, identity, scoped_desk)
-      session_id = f"hank-u{storage_id}-g{generation}-{uuid.uuid4().hex}"
-      timestamp = time.time()
-      placement = self.store.upsert(RuntimePlacement(
-        storage_id, f"agentcore://{session_id}", "starting", "agentcore", session_id,
-        str(bundle_path), generation, timestamp, timestamp,
-      ))
+      # The runtime's restore CAS chooses the epoch. Until its lease event there
+      # is no placement row, bundle, handler, or locally allocated generation.
+      state = _Session(storage_id, identity, f"hank-u{storage_id}-{uuid.uuid4().hex}")
       try:
-        self._submit(self._ensure_session(placement)).result(timeout=self._ready_timeout + 30)
-        return self.store.upsert(replace(placement, state="ready", updated_at=time.time()))
+        self._submit(self._start_session(state)).result(timeout=self._ready_timeout + 30)
+        assert state.placement is not None
+        ready = self.store.upsert(replace(state.placement, state="ready", updated_at=time.time()))
+        state.placement = ready
+        return ready
       except BaseException:
-        self.stop(placement)
+        if state.placement is not None:
+          self.stop(state.placement)
+        else:
+          self._submit(self._disconnect(state.handle)).result()
+          self._stop_runtime_session(state.handle)
         raise
 
   async def _disconnect(self, handle: str) -> None:
@@ -346,6 +448,18 @@ class AgentCoreRuntimeBackend(RuntimePlacementAuthority):
         state.endpoint.close()
       state.ready.set()
 
+  def _stop_runtime_session(self, handle: str) -> None:
+    from botocore.exceptions import ClientError
+
+    try:
+      self._agentcore.stop_runtime_session(
+        agentRuntimeArn=self._runtime_arn, runtimeSessionId=handle, qualifier="DEFAULT",
+      )
+    except ClientError as exc:
+      # Idle-terminated or never-created sessions are already stopped.
+      if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
+        raise
+
   def stop(self, placement: RuntimePlacement) -> RuntimePlacement:
     with self._lock(placement.storage_id):
       stored = self.store.get(placement.storage_id)
@@ -356,17 +470,7 @@ class AgentCoreRuntimeBackend(RuntimePlacementAuthority):
       self.store.mark(placement.storage_id, "stopped")
       if placement.handle is not None:
         self._submit(self._disconnect(placement.handle)).result()
-        from botocore.exceptions import ClientError
-
-        try:
-          self._agentcore.stop_runtime_session(
-            agentRuntimeArn=self._runtime_arn, runtimeSessionId=placement.handle, qualifier="DEFAULT",
-          )
-        except ClientError as exc:
-          # AWS reports an idle-terminated or never-created session as missing:
-          # that is already the stopped state this operation owns.
-          if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
-            raise
+        self._stop_runtime_session(placement.handle)
       return self.store.upsert(replace(placement, state="stopped", handle=None, updated_at=time.time()))
 
   def replace(self, placement: RuntimePlacement) -> RuntimePlacement:

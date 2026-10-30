@@ -1,5 +1,6 @@
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
+import dataclasses
 import hashlib
 import json
 import sys
@@ -56,6 +57,7 @@ from agent_gateway.selected_content import SelectedContentBinding  # noqa: E402
 from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
+import agent_gateway.runner_stream_turn as runner_stream_turn  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_runner_capability_execution,
 )
@@ -196,7 +198,7 @@ class _ScriptedProvider(ModelProvider):
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
   def build_request_params(
     self,
@@ -1437,8 +1439,11 @@ def test_stream_retry_and_terminal_error_are_durable(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 2)
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
+  monkeypatch.setattr(
+    runner_stream_turn,
+    "TRANSPORT_RETRY_POLICY",
+    dataclasses.replace(runner_stream_turn.TRANSPORT_RETRY_POLICY, max_retries=2, base_delay_seconds=0.0),
+  )
   provider = _RetryableFailingProvider()
   log = AgentSessionLog(path=tmp_path / "sessions" / "stream-retry.jsonl")
   event_log = EventLog()
@@ -1498,9 +1503,16 @@ def _patch_retry_policy(
 ) -> _RetrySleepRecorder:
   guard_poll_interval = 300.0
   recorder = _RetrySleepRecorder(guard_poll_interval)
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", retry_max)
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", delay)
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_BACKOFF", backoff)
+  monkeypatch.setattr(
+    runner_stream_turn,
+    "TRANSPORT_RETRY_POLICY",
+    dataclasses.replace(
+      runner_stream_turn.TRANSPORT_RETRY_POLICY,
+      max_retries=retry_max,
+      base_delay_seconds=delay,
+      backoff_factor=backoff,
+    ),
+  )
   monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", guard_poll_interval)
   monkeypatch.setattr(gateway_runner, "asyncio", recorder)
   return recorder

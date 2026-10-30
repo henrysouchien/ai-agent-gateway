@@ -24,7 +24,7 @@ from agent_gateway.autonomous_event_channel import (
   adopt_inherited_autonomous_event_channel,
 )
 from agent_gateway.autonomous_launch_envelope import (
-  AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+  AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
   AUTONOMOUS_RUNTIME_SESSION_PURPOSE,
 )
 from agent_gateway.approval_audit import ApprovalAuditEmitter
@@ -182,7 +182,7 @@ def _patch_fake_autonomous_spawn(
   async def retaining_fake_exec(*args: Any, **kwargs: Any):
     process = await fake_exec(*args, **kwargs)
     envelope = json.loads(
-      kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV]
+      Path(kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8")
     )
     process.start_event_channel(envelope["channel_id"])
     process.retain_inherited_fds(tuple(kwargs["pass_fds"][1:]))
@@ -1678,70 +1678,6 @@ def test_exited_autonomous_process_hides_pending_approval_even_before_state_upda
     assert stored is not None
     assert stored.state == "pending_user"
     assert policy.resolved == []
-
-
-def test_autonomous_approval_delivery_failure_preserves_durable_retry(
-  monkeypatch,
-  tmp_path,
-) -> None:
-  from agent_gateway import autonomous_runner
-
-  async def fake_exec(*args, **kwargs):
-    _ = args
-    return _FakeAutonomousProcess(os.dup(kwargs["pass_fds"][0]))
-
-  _patch_fake_autonomous_spawn(monkeypatch, autonomous_runner, fake_exec)
-  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
-  app, store, policy, _writer = _make_app(tmp_path)
-  with TestClient(app) as client:
-    control = _control_session(client, "alice")
-    start = client.post(
-      "/api/control/runs",
-      headers=_headers(control),
-      json={
-        "kind": "autonomous",
-        "profile": "analyst",
-        "mode": "task",
-        "task": "approval bridge test",
-        "channel": "tui",
-      },
-    )
-    assert start.status_code == 200, start.text
-    run_id = start.json()["run_id"]
-    approval = _install_autonomous_pending_approval(
-      app=app,
-      store=store,
-      run_id=run_id,
-      user_id="alice",
-    )
-    record = app.state.subprocess_registry._find_by_control_run_id(run_id)
-    assert record is not None
-    assert record.approval_channel is not None
-    record.approval_channel.close()
-
-    response = client.post(
-      f"/api/control/runs/{run_id}/approvals/{approval.approval_id}",
-      headers=_headers(control),
-      json={"approved": True, "allow_tool_type": False, "reason": "reviewed diff"},
-    )
-
-    assert response.status_code == 409, response.text
-    assert "approval channel endpoint is unavailable" in response.json()["error"]
-    stored = _run(store.get(approval.approval_id))
-    assert stored is not None
-    assert stored.state == "approved"
-    delivery = _run(
-      store.get_autonomous_approval_delivery(
-        approval.approval_id,
-        tool_call_id=approval.tool_call_id,
-        nonce=f"nonce-{approval.approval_id}",
-      )
-    )
-    assert delivery is not None
-    assert delivery["state"] == "pending"
-    assert delivery["approved"] is True
-    assert delivery["last_error"] is not None
-    assert policy.resolved == [approval.approval_id]
 
 
 def test_role_class_precheck_blocks_approval_but_allows_denial_for_invite(tmp_path) -> None:

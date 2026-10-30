@@ -480,6 +480,24 @@ class ApprovalPolicy(Protocol):
   def role_authorized_for_class(self, *, decider_role: str | None, tool_class: ToolClass) -> bool: ...
 
 
+@dataclass(frozen=True)
+class ApprovalIdentity:
+  """The additive approval-row identity a planned write carries.
+
+  Parsed once at the `build_approval_request` entry: the schema is the field
+  set, so a producer key outside it is a TypeError from the constructor rather
+  than a hand-kept allow-list.
+  """
+
+  identity_source: ApprovalIdentitySource | None = None
+  change_set_id: str | None = None
+  change_hash: str | None = None
+  base_vector_hash: str | None = None
+  reviewed_change_binding_digest: str | None = None
+  review_reference: dict[str, Any] | None = None
+  execution_semantics_digest: str | None = None
+
+
 def build_approval_request(
   *,
   tool_call_id: str,
@@ -496,21 +514,7 @@ def build_approval_request(
   approval_reuse_mode: ApprovalReuseMode = "legacy",
   approval_reuse_key: str | None = None,
 ) -> ApprovalRequest:
-  identity = dict(approval_identity or {})
-  allowed_identity_fields = {
-    "identity_source",
-    "change_set_id",
-    "change_hash",
-    "base_vector_hash",
-    "reviewed_change_binding_digest",
-    "review_reference",
-    "execution_semantics_digest",
-  }
-  unexpected = set(identity).difference(allowed_identity_fields)
-  if unexpected:
-    raise ValueError(
-      f"unsupported approval identity fields: {sorted(unexpected)!r}"
-    )
+  identity = ApprovalIdentity(**(approval_identity or {}))
   approval_id = new_approval_id()
   parent_id = run_context.parent_approval_id
   return ApprovalRequest(
@@ -540,15 +544,13 @@ def build_approval_request(
     required_owner_user_id=required_owner_user_id,
     approval_reuse_mode=approval_reuse_mode,
     approval_reuse_key=approval_reuse_key,
-    identity_source=identity.get("identity_source"),
-    change_set_id=identity.get("change_set_id"),
-    change_hash=identity.get("change_hash"),
-    base_vector_hash=identity.get("base_vector_hash"),
-    reviewed_change_binding_digest=identity.get(
-      "reviewed_change_binding_digest"
-    ),
-    review_reference=copy.deepcopy(identity.get("review_reference")),
-    execution_semantics_digest=identity.get("execution_semantics_digest"),
+    identity_source=identity.identity_source,
+    change_set_id=identity.change_set_id,
+    change_hash=identity.change_hash,
+    base_vector_hash=identity.base_vector_hash,
+    reviewed_change_binding_digest=identity.reviewed_change_binding_digest,
+    review_reference=copy.deepcopy(identity.review_reference),
+    execution_semantics_digest=identity.execution_semantics_digest,
   )
 
 

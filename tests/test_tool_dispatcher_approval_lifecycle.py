@@ -284,6 +284,7 @@ def test_durable_interactive_approval_event_carries_stable_id_and_cleans_up() ->
       "status": "approval_pending",
       "tool_name": "place_order",
       "resolved_qualifier": "qual-1",
+      "durable_approval": False,
     }
     approval_event = event_log.entries[0].event
     assert approval_event["type"] == "tool_approval_request"
@@ -1181,7 +1182,7 @@ class _NativeChildCaptureProvider(ModelProvider):
     return None
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(id=model, provider=self.name, max_output_tokens=16_384)
 
   def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
     return kwargs

@@ -59,7 +59,7 @@ from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_
 def _skill_admission(name: str) -> ActiveSkillAdmission:
   return ActiveSkillAdmission(
     name,
-    SkillExecutionLimits(None),
+    SkillExecutionLimits(),
   )
 
 
@@ -225,7 +225,6 @@ def _make_runner(
   on_tool_result: Any | None = None,
   run_context: RunContext | None = None,
   skill_run_id: str | None = None,
-  max_tokens_override: int | None = None,
   api_key: str = "test-secret",
   approval_store_path: Path | None = None,
 ) -> AgentSDKRunner:
@@ -281,7 +280,6 @@ def _make_runner(
     on_tool_result=on_tool_result,
     run_context=run_context,
     skill_run_id=skill_run_id,
-    max_tokens_override=max_tokens_override,
     **route_kwargs,
   )
 
@@ -706,11 +704,10 @@ def test_sdk_post_tool_failure_blocks_raw_secret_from_model_continuation() -> No
   assert "<redacted-secret>" in serialized
 
 
-def test_sdk_runner_projects_max_tokens_override_to_pinned_sdk_environment() -> None:
-  runner = _make_runner(max_tokens_override=32000)
+def test_sdk_runner_requests_registry_ceiling_not_override() -> None:
+  runner = _make_runner()
 
-  assert runner._max_tokens_override == 32000
-  assert runner._credential_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32000"
+  assert runner._credential_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "64000"
 
 
 def test_sdk_runner_hands_the_excluded_set_to_the_sdk_and_callback_does_not_recheck(

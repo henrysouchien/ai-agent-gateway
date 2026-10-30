@@ -20,7 +20,7 @@ from .base import (
   _response_text,
   _status_code_from_exception,
 )
-from .ollama import OllamaLocalProvider
+from .ollama import OllamaLocalProvider, _is_usage_limit_only
 from .api_key_store import resolve_api_key_store_paths
 from .credential_pool import (
   PoolAccountCandidate,
@@ -49,26 +49,10 @@ _REASONING_BLOCK_TYPES = frozenset({
   "redacted_thinking",
   "reasoning",
 })
-_USAGE_LIMIT_RE = re.compile(
-  r"\b(?:rate(?:\s+limit(?:ed|ing)?|\s+limited)|too many requests"
-  r"|usage(?:\s+limit|\s+exhausted)|quota(?:\s+exhausted|\s+exceeded))\b",
-  re.IGNORECASE,
-)
 _CONTENT_REFUSAL_RE = re.compile(
   r"\b(?:content[_\s-]*filter|content[_\s-]*policy|safety[_\s-]*violation|refused to)\b",
   re.IGNORECASE,
 )
-_BILLING_NOT_USAGE_RE = re.compile(
-  r"\b(?:payment|credit(?:s)?|subscription|billing|insufficient[_\s-]+quota|monthly\s+(?:usage\s+)?limit)\b",
-  re.IGNORECASE,
-)
-_MONTHLY_LIMIT_RE = re.compile(
-  r"\b(?:monthly\s+(?:usage\s+)?limit|add\s+usage\s+credits)\b",
-  re.IGNORECASE,
-)
-# Monthly usage-limit 429s from ollama.com carry no Retry-After header; park
-# the exhausted credential for 24h rather than the 5-minute burst default.
-_MONTHLY_LIMIT_COOLDOWN_SECONDS = 86_400.0
 _CONTENT_REFUSAL_CODES = frozenset({"content_filter", "refusal"})
 
 
@@ -183,20 +167,6 @@ def _is_content_refusal(exc: Exception) -> bool:
   code = str(_error_code_from_exception(exc) or "")
   searchable = f"{_exception_text(exc)} {code}"
   return bool(_CONTENT_REFUSAL_RE.search(searchable) or code in _CONTENT_REFUSAL_CODES)
-
-
-def _is_usage_limit_only(exc: Exception) -> bool:
-  """True when the body is only a rate, usage, or quota-exhausted limit."""
-
-  status = _status_code_from_exception(exc)
-  if status in {400, 401, 403}:
-    return False
-  if _is_context_length_exception(exc) or _is_content_refusal(exc):
-    return False
-  searchable = _exception_text(exc)
-  if _USAGE_LIMIT_RE.search(searchable) is None:
-    return False
-  return _BILLING_NOT_USAGE_RE.search(searchable) is None
 
 
 def _header_text(headers: object, name: str) -> str:
@@ -350,15 +320,12 @@ class OllamaCloudProvider(OllamaLocalProvider):
     if status == 400 or _is_context_length_exception(exc) or _is_content_refusal(exc):
       return None
     if status == 429:
-      reset_at = _retry_after_reset_at(exc)
-      if reset_at is None and _MONTHLY_LIMIT_RE.search(_exception_text(exc)):
-        reset_at = time.time() + _MONTHLY_LIMIT_COOLDOWN_SECONDS
       return _credential_failure(
         self.name,
         exc,
         kind="rate_limit",
         status_code=status,
-        reset_at=reset_at,
+        reset_at=_retry_after_reset_at(exc),
       )
     if status == 401:
       return _credential_failure(self.name, exc, kind="auth", status_code=status)

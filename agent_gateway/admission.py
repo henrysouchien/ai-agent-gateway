@@ -64,6 +64,7 @@ from .providers.anthropic_oauth import is_anthropic_generation_ref
 
 log = logging.getLogger("agent_gateway.admission")
 
+# The closed refusal vocabulary is the typed schema of ``Refusal.reason``; every refusal this module returns names one of these.
 RefusalReason = Literal[
   "session_unauthenticated",
   "tenant_mismatch",
@@ -588,6 +589,7 @@ def _admit_spawn(
   admission adds no refusal around it.
   """
 
+  # B1 spawn depth: this is the one enforcement for launches that carry no run_agent grant (workflow, fork, autonomous); the grant projection below uses the same setting.
   max_spawn_depth = owners.containment.max_spawn_depth
   if max_spawn_depth >= 0 and parent.depth >= max_spawn_depth:
     return Refusal(
@@ -777,7 +779,7 @@ def _admit_spawn(
       continue
     if tool_id == RUN_AGENT_TOOL_NAME and (
       not children
-      or (max_spawn_depth >= 0 and child_depth >= max_spawn_depth)
+      or (max_spawn_depth >= 0 and child_depth >= max_spawn_depth)  # B1 grant projection: same owner and setting as the admit() depth_exceeded arm
     ):
       continue
     granted.append(tool_id)

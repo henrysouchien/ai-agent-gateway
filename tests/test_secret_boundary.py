@@ -21,6 +21,7 @@ from agent_gateway.secret_boundary import (  # noqa: E402
   SANITIZATION_FAILED,
   UNSUPPORTED_VALUE,
   SecretBoundary,
+  retained_tool_result_preview,
   sanitize_boundary_value,
   sanitize_tool_event,
 )
@@ -125,7 +126,7 @@ def test_high_confidence_material_is_removed_without_scanning_prose_or_key_names
   assert sanitized["secret_value"] == REDACTED_SECRET
 
 
-def test_typed_event_policy_projects_authored_text_and_leaves_results_alone() -> None:
+def test_typed_event_policy_projects_authored_text_and_returned_tool_payloads() -> None:
   canary = "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"
   ordinary = {
     "type": "user_message",
@@ -157,8 +158,28 @@ def test_typed_event_policy_projects_authored_text_and_leaves_results_alone() ->
   projected = sanitize_tool_event(authored, sink="replay")
   assert canary not in json.dumps(projected)
   assert REDACTED_SECRET in json.dumps(projected)
-  # A returned payload is projected by the tool that produced it, not again here.
+  # A replayed tool_result block is a retained rendering of the payload, so a
+  # credential it echoes is removed and its call identity is kept.
   assert sanitize_tool_event(returned, sink="replay") == returned
+  leaked = {
+    "type": "user_message",
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "tool-1",
+        "content": json.dumps({"stdout": f"key={canary}"}),
+      },
+      {"type": "text", "text": "user prose is not a tool payload"},
+    ],
+  }
+  leaked_projection = sanitize_tool_event(leaked, sink="replay")
+  assert canary not in json.dumps(leaked_projection)
+  assert leaked_projection["content"][0]["tool_use_id"] == "tool-1"
+  assert json.loads(leaked_projection["content"][0]["content"]) == {
+    "stdout": f"key={REDACTED_SECRET}",
+  }
+  assert leaked_projection["content"][1] == leaked["content"][1]
+  assert canary in json.dumps(leaked)
 
 
 @pytest.mark.parametrize("sink", ["durable_event", "stream_event"])
@@ -220,11 +241,15 @@ def test_sanitizer_failure_returns_fixed_tombstone(monkeypatch: pytest.MonkeyPat
   ) == SANITIZATION_FAILED
 
 
-def test_settled_tool_result_crosses_the_boundary_unprojected(
+def test_settled_tool_result_and_final_blocks_cross_the_boundary_without_mutating_the_live_event(
   caplog: pytest.LogCaptureFixture,
 ) -> None:
   # fetch_financials emitted 42,606 value records in the buyer live cohort, and
-  # walking them blanked the whole result. Nothing walks a settled result now.
+  # an earlier size-budgeted walk blanked the whole result. The walk is bounded
+  # by depth only, so a payload that large is projected, not tombstoned.
+  registered = "CUSTOM-ACTIVE-SETTLED-CREDENTIAL-8f21d7"
+  pattern_canary = "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"
+  boundary = SecretBoundary.from_auth_config({"api_key": registered})
   value = {
     "result_key": "income",
     "row_index": 0,
@@ -234,25 +259,175 @@ def test_settled_tool_result_crosses_the_boundary_unprojected(
     "concept": "Revenue",
     "period": "2025",
   }
+  values = [dict(value) for _ in range(42_606)]
+  values[21_303]["concept"] = f"echoed {registered} here"
+  values[40_000]["period"] = pattern_canary
+  result = {
+    "lineage_descriptor": {"values": values},
+    "hint": "Financial data is available by reference.",
+  }
+  blocks = [
+    {
+      "type": "tool_result",
+      "tool_use_id": "tool-fin",
+      "content": json.dumps({"stdout": f"token={registered}", "rows": 3}),
+      "is_error": False,
+    },
+    {"type": "text", "text": f"cited [S1] {pattern_canary}"},
+  ]
   event = {
     "type": "tool_call_complete",
+    "tool_call_id": "tool-fin",
     "tool_name": "fetch_financials",
-    "result": {
-      "lineage_descriptor": {"values": [dict(value) for _ in range(42_606)]},
-      "hint": "Financial data is available by reference.",
-    },
+    "result": result,
+    "final_tool_result_blocks": blocks,
     "error": None,
     "dispatch": {"outcome": "ok", "sources": []},
   }
+  live_result_json = json.dumps(result)
+  live_blocks_json = json.dumps(blocks)
 
-  projected = sanitize_tool_event(event, sink="tool_complete")
+  projected = sanitize_tool_event(event, sink="tool_complete", boundary=boundary)
 
-  assert projected == event
-  assert projected["result"] is event["result"]
+  retained = json.dumps(projected)
+  assert registered not in retained
+  assert pattern_canary not in retained
+  assert retained.count(REDACTED_SECRET) == 4
+  # Public content and identity survive; the record count is not blanked.
+  assert len(projected["result"]["lineage_descriptor"]["values"]) == 42_606
+  assert projected["result"]["hint"] == result["hint"]
+  assert projected["result"]["lineage_descriptor"]["values"][0] == value
+  assert projected["tool_call_id"] == "tool-fin"
+  assert projected["tool_name"] == "fetch_financials"
+  assert projected["dispatch"] == {"outcome": "ok", "sources": []}
+  tool_result, text = projected["final_tool_result_blocks"]
+  assert tool_result["type"] == "tool_result"
+  assert tool_result["tool_use_id"] == "tool-fin"
+  assert tool_result["is_error"] is False
+  assert json.loads(tool_result["content"]) == {
+    "stdout": f"token={REDACTED_SECRET}",
+    "rows": 3,
+  }
+  assert text == {"type": "text", "text": f"cited [S1] {REDACTED_SECRET}"}
+  # The projection is new containers; the live event still holds the raw payload.
+  assert projected["result"] is not event["result"]
+  assert projected["final_tool_result_blocks"] is not event["final_tool_result_blocks"]
+  assert event["result"] is result
+  assert event["final_tool_result_blocks"] is blocks
+  assert json.dumps(result) == live_result_json
+  assert json.dumps(blocks) == live_blocks_json
   assert not [
     record for record in caplog.records
     if record.name == "agent_gateway.secret_boundary"
   ]
+
+
+def test_settled_result_without_credentials_projects_to_equal_public_content() -> None:
+  event = {
+    "type": "tool_call_complete",
+    "tool_call_id": "tool-lookup",
+    "tool_name": "lookup",
+    "result": {"answer": 42, "rows": [{"k": "v"}], "note": None},
+    "final_tool_result_blocks": [
+      {"type": "tool_result", "tool_use_id": "tool-lookup", "content": '{"answer": 42}'},
+    ],
+  }
+
+  assert sanitize_tool_event(event, sink="durable_event") == event
+
+
+def test_json_text_content_redacts_the_registered_secret_in_its_json_escaped_form() -> None:
+  secret = 'CUSTOM-ACTIVE-"QUOTED"-\\SLASH-8f21d7'
+  short = 'a"b'
+  boundary = SecretBoundary((secret, short))
+  assert json.dumps(secret)[1:-1] != secret
+
+  event = {
+    "type": "tool_call_complete",
+    "tool_call_id": "tool-1",
+    "tool_name": "run_bash",
+    "result": {"stdout": secret},
+    "final_tool_result_blocks": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "tool-1",
+        "content": json.dumps({"stdout": secret, "short": f"keep {short} text"}),
+      },
+    ],
+  }
+
+  projected = sanitize_tool_event(event, sink="durable_event", boundary=boundary)
+
+  content = projected["final_tool_result_blocks"][0]["content"]
+  assert json.dumps(secret)[1:-1] not in content
+  assert secret not in content
+  # Valid JSON survives, and a registered secret below the substring length
+  # keeps its whole-value-only semantics in the escaped form too.
+  assert json.loads(content) == {
+    "stdout": REDACTED_SECRET,
+    "short": f"keep {short} text",
+  }
+  assert projected["result"] == {"stdout": REDACTED_SECRET}
+
+
+def test_retained_preview_cannot_leak_a_credential_split_by_the_150_char_cut() -> None:
+  pattern_canary = "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"
+  registered = "CUSTOM-ACTIVE-PREVIEW-CREDENTIAL-8f21d7"
+  boundary = SecretBoundary.from_auth_config({"api_key": registered})
+  head, middle = '{"pad": "', '", "key": "'
+
+  for secret in (pattern_canary, registered):
+    # Ten characters of the credential fall inside the first 150.
+    pad = "x" * (140 - len(head) - len(middle))
+    result = {"pad": pad, "key": secret}
+    unsafe = json.dumps(result)[:150]
+    assert secret[:10] in unsafe  # the old cut would have retained a prefix
+
+    preview = retained_tool_result_preview(result, boundary=boundary)
+
+    assert len(preview) <= 150
+    assert secret[:10] not in preview
+    assert REDACTED_SECRET[:10] in preview
+    assert preview == json.dumps(
+      {"pad": pad, "key": REDACTED_SECRET},
+    )[:150]
+    assert result == {"pad": pad, "key": secret}
+
+
+def test_retained_preview_redacts_json_escaped_and_nested_secrets_and_keeps_public_shape() -> None:
+  secret = 'CUSTOM-ACTIVE-"QUOTED"-CREDENTIAL-8f21d7'
+  boundary = SecretBoundary((secret,))
+
+  as_object = retained_tool_result_preview({"stdout": secret}, boundary=boundary)
+  as_json_text = retained_tool_result_preview(
+    json.dumps({"stdout": secret}),
+    boundary=boundary,
+  )
+  public = retained_tool_result_preview({"answer": 42, "rows": [1, 2]}, boundary=boundary)
+
+  for preview in (as_object, as_json_text):
+    assert "CUSTOM-ACTIVE" not in preview
+    assert REDACTED_SECRET in preview
+  assert public == '{"answer": 42, "rows": [1, 2]}'
+  assert retained_tool_result_preview(None) == "null"
+  assert retained_tool_result_preview({"when": Path("a/b")}) == '{"when": "a/b"}'
+
+
+def test_retained_preview_failure_returns_tombstone_not_the_raw_value(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  canary = "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7"
+
+  def _raise(self, value, *, sink):
+    del self, value, sink
+    raise RuntimeError("canary must not be returned")
+
+  monkeypatch.setattr(SecretBoundary, "sanitize", _raise)
+
+  preview = retained_tool_result_preview({"value": canary})
+
+  assert preview == json.dumps(SANITIZATION_FAILED)
+  assert "sk-ant" not in preview
 
 
 def test_over_deep_model_input_drops_only_the_unreadable_subtree() -> None:
@@ -305,7 +480,7 @@ def test_replayed_tool_result_blocks_keep_their_call_identity() -> None:
       ]},
       {"role": "user", "content": replay},
     ],
-    ModelInfo(id="test-model", provider="anthropic"),
+    ModelInfo(id="test-model", provider="anthropic", max_output_tokens=16_384),
   )
 
   assert projected["tool_call_id"] == "tool-lookup"

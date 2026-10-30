@@ -1,5 +1,7 @@
-from pathlib import Path
+import os
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -19,14 +21,24 @@ def _isolated_gateway_state(monkeypatch, tmp_path_factory):
   state = tmp_path_factory.mktemp("package-state")
   (state / "gateway").mkdir(parents=True, mode=0o700)
   (state / "spend").mkdir(parents=True, mode=0o700)
-  monkeypatch.setenv("USER_DATA_DIR", str(state))
-  monkeypatch.setenv("AGENT_SESSION_LOG_BASE_DIR", str(state / "sessions"))
-  monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(state / "autonomous"))
-  monkeypatch.setenv("HANK_SPEND_LEDGER_PATH", str(state / "spend" / "api_spend.sqlite"))
-  monkeypatch.setenv("HANK_SPEND_SETTINGS_PATH", str(state / "spend-settings.json"))
-  monkeypatch.setenv("HANK_RUN_SETTINGS_PATH", str(state / "run-settings.json"))
-  monkeypatch.setenv("HANK_KEY_POOL_DIR", str(state / "credentials"))
-  monkeypatch.setenv("HANK_KEY_POOL_STATE_DIR", str(state / "credentials"))
+  host_home = Path.home()
+  if not os.environ.get("DOCKER_HOST") and not os.environ.get("DOCKER_CONFIG"):
+    monkeypatch.setenv("DOCKER_CONFIG", str(host_home / ".docker"))
+  # Docker tests bind-mount below Path.home(); an OS-temp HOME is not shared by
+  # Colima. Keep each fresh credential home under the host-visible Hank root.
+  host_root = host_home / ".local" / "state" / "hank" / "pytest-homes"
+  host_root.mkdir(parents=True, exist_ok=True)
+  with tempfile.TemporaryDirectory(prefix="package-home-", dir=host_root) as home:
+    monkeypatch.setenv("HOME", home)
+    monkeypatch.setenv("USER_DATA_DIR", str(state))
+    monkeypatch.setenv("AGENT_SESSION_LOG_BASE_DIR", str(state / "sessions"))
+    monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(state / "autonomous"))
+    monkeypatch.setenv("HANK_SPEND_LEDGER_PATH", str(state / "spend" / "api_spend.sqlite"))
+    monkeypatch.setenv("HANK_SPEND_SETTINGS_PATH", str(state / "spend-settings.json"))
+    monkeypatch.setenv("HANK_RUN_SETTINGS_PATH", str(state / "run-settings.json"))
+    monkeypatch.setenv("HANK_KEY_POOL_DIR", str(state / "credentials"))
+    monkeypatch.setenv("HANK_KEY_POOL_STATE_DIR", str(state / "credentials"))
+    yield
 
 
 @pytest.fixture(autouse=True)

@@ -162,7 +162,9 @@ def test_broker_serves_past_the_retired_request_ceiling() -> None:
   runtime = _broker_runtime()
   try:
     for _index in range(served):
-      claim = runtime.claim_signer.sign_claim(ttl_seconds=1)
+      # A 1-second claim can expire between mint and verify at an integer
+      # second boundary; 60 s keeps the check on the count, not the clock.
+      claim = runtime.claim_signer.sign_claim(ttl_seconds=60)
       assert _verify_agent_claim_headers(
         _SECRET,
         _claim_headers(claim),
@@ -806,7 +808,7 @@ def test_signer_constructor_closes_owned_fd_on_socket_setup_failure(
   not Path("/proc/self/environ").exists(),
   reason="Linux /proc regression",
 )
-def test_exec_child_never_receives_global_key_in_proc_environ() -> None:
+def test_exec_child_never_receives_global_key_in_proc_environ(tmp_path: Path) -> None:
   runtime = _broker_runtime()
   broker = AutonomousClaimBroker(
     GatewayClaimSigningAuthority(_SECRET),
@@ -816,18 +818,20 @@ def test_exec_child_never_receives_global_key_in_proc_environ() -> None:
   child_env = dict(os.environ)
   child_env.pop("AGENT_API_USER_CLAIM_HMAC_KEY", None)
   child_env[AUTONOMOUS_CLAIM_BROKER_FD_ENV] = str(child_fd)
-  child_env["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"] = (
-    runtime.envelope_json
-  )
+  envelope_path = tmp_path / "launch-envelope.json"
+  with os.fdopen(os.open(envelope_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as envelope_file:
+    envelope_file.write(runtime.envelope_json)
+  child_env["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE"] = str(envelope_path)
   package_root = Path(__file__).resolve().parents[1]
   child_env["PYTHONPATH"] = str(package_root)
   source = r"""
 import json
 import os
+from pathlib import Path
 from agent_gateway.autonomous_claim_broker import AutonomousClaimSigner
 
 fd = int(os.environ.pop("AGENT_AUTONOMOUS_CLAIM_BROKER_FD"))
-envelope = os.environ.pop("AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE")
+envelope = Path(os.environ.pop("AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE")).read_text(encoding="utf-8")
 signer = AutonomousClaimSigner(fd, envelope_json=envelope)
 raw = open("/proc/self/environ", "rb").read()
 claim = signer.sign_claim(ttl_seconds=30)

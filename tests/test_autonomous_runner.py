@@ -472,7 +472,7 @@ def _registry(
     def admission_policy(skill_name: str) -> AutonomousSkillAdmissionPolicy:
       return AutonomousSkillAdmissionPolicy(
         skill_resume_allowed=skill_resume_allowed_resolver(skill_name),
-        execution_limits=SkillExecutionLimits(None),
+        execution_limits=SkillExecutionLimits(),
       )
   else:
     admission_policy = autonomous_skill_admission_policy_resolver
@@ -1222,7 +1222,6 @@ def test_autonomous_runner_command_helper_preserves_profile_normalization_seam(m
     mode="skill",
     task=None,
     skill="patched-skill",
-    context=" context ",
     ticker="msft",
   )
 
@@ -1236,8 +1235,6 @@ def test_autonomous_runner_command_helper_preserves_profile_normalization_seam(m
     "patched-skill",
     "--ticker",
     "MSFT",
-    "--context",
-    "context",
   ]
   assert checks == ["profile:Analyst"]
 
@@ -1377,6 +1374,36 @@ async def _start_and_capture_env(
   return captured
 
 
+def test_autonomous_large_context_uses_private_file_not_argv(monkeypatch, tmp_path) -> None:
+  from agent_gateway.autonomous_launch_envelope import AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV
+
+  context = "résumé context\n" * 150_000
+  assert len(context.encode("utf-8")) > 2_000_000
+  context = context.strip()
+  env = asyncio.run(_start_and_capture_env(
+    monkeypatch,
+    tmp_path,
+    start_overrides={
+      "mode": "skill",
+      "task": None,
+      "skill": "risk.scan",
+      "context": context,
+    },
+  ))
+
+  manifest = _read_manifest(tmp_path)
+  cmd = manifest["cmd"]
+  assert "--context" not in cmd
+  assert "--context-file" not in cmd
+  assert sum(len(argument.encode("utf-8")) + 1 for argument in cmd) < 4096
+  assert sum(len(key.encode("utf-8")) + len(value.encode("utf-8")) for key, value in env.items()) < 65536
+  envelope_path = Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV])
+  assert envelope_path == tmp_path / "bg_0.launch-envelope.json"
+  assert stat.S_IMODE(envelope_path.stat().st_mode) == 0o600
+  envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+  assert envelope["workload"]["context"] == context
+
+
 def test_autonomous_manifest_fixture_omits_unconfigured_approval_bridge(
   tmp_path: Path,
 ) -> None:
@@ -1417,7 +1444,7 @@ def test_autonomous_start_signs_operator_inbox_without_env_fallback(
   tmp_path,
 ) -> None:
   from agent_gateway.autonomous_launch_envelope import (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     verify_autonomous_launch_envelope,
   )
 
@@ -1426,7 +1453,7 @@ def test_autonomous_start_signs_operator_inbox_without_env_fallback(
   assert "AGENT_AUTONOMOUS_OPERATOR_INBOX_PATH" not in env
   authority = verify_autonomous_launch_envelope(
     HMAC_KEY,
-    env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   ).control_authority
   assert authority.operator_inbox_path is not None
   assert authority.operator_inbox_path.endswith(
@@ -1440,7 +1467,7 @@ def test_autonomous_start_omits_unconfigured_approval_bridge(
   tmp_path,
 ) -> None:
   from agent_gateway.autonomous_launch_envelope import (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     verify_autonomous_launch_envelope,
   )
 
@@ -1451,7 +1478,7 @@ def test_autonomous_start_omits_unconfigured_approval_bridge(
   assert "AGENT_AUTONOMOUS_CONTROL_RUN_ID" not in env
   verify_autonomous_launch_envelope(
     HMAC_KEY,
-    env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   ).control_authority
 
 
@@ -1465,7 +1492,7 @@ def test_autonomous_start_keeps_approval_store_parent_only_and_inherits_channel(
     AUTONOMOUS_APPROVAL_CHANNEL_FD_ENV,
   )
   from agent_gateway.autonomous_launch_envelope import (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     verify_autonomous_launch_envelope,
   )
   from agent_gateway.autonomous_runner import AutonomousRegistry
@@ -1529,7 +1556,7 @@ def test_autonomous_start_keeps_approval_store_parent_only_and_inherits_channel(
   assert approval_channel_fd in pass_fds
   verify_autonomous_launch_envelope(
     HMAC_KEY,
-    env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   ).control_authority
   assert str(approval_store_path) not in json.dumps(env, sort_keys=True)
 
@@ -1645,7 +1672,7 @@ def test_autonomous_start_signs_exact_session_authority_only(
   tmp_path,
 ) -> None:
   from agent_gateway.autonomous_launch_envelope import (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     verify_autonomous_launch_envelope,
   )
 
@@ -1673,7 +1700,7 @@ def test_autonomous_start_signs_exact_session_authority_only(
   assert "AGENT_AUTONOMOUS_DISPATCH_SCOPE_JSON" not in env
   envelope = verify_autonomous_launch_envelope(
     HMAC_KEY,
-    env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   )
   authority = envelope.session_authority.ordinary_authority
   assert authority is not None
@@ -1692,7 +1719,7 @@ def test_autonomous_session_authority_ttl_observes_each_owner(
   tmp_path,
 ) -> None:
   from agent_gateway.autonomous_launch_envelope import (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     verify_autonomous_launch_envelope,
   )
   from agent_gateway.ttl_policy import AUTONOMOUS_SESSION_AUTHORITY_TTL
@@ -1718,7 +1745,7 @@ def test_autonomous_session_authority_ttl_observes_each_owner(
     )
     authority = verify_autonomous_launch_envelope(
       HMAC_KEY,
-      env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+      Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
     ).session_authority.ordinary_authority
     assert authority is not None
     assert authority.user_id == owner
@@ -1739,7 +1766,7 @@ def test_autonomous_session_authority_ttl_none_keeps_default(
   configured_resolver,
 ) -> None:
   from agent_gateway.autonomous_launch_envelope import (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     verify_autonomous_launch_envelope,
   )
   from agent_gateway.ttl_policy import AUTONOMOUS_SESSION_AUTHORITY_TTL
@@ -1759,7 +1786,7 @@ def test_autonomous_session_authority_ttl_none_keeps_default(
   )
   authority = verify_autonomous_launch_envelope(
     HMAC_KEY,
-    env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   ).session_authority.ordinary_authority
   assert authority is not None
   assert authority.user_id == USER_ID
@@ -1851,7 +1878,7 @@ def test_autonomous_start_signs_exact_executable_workload(
   expected_workload,
 ) -> None:
   from agent_gateway.autonomous_launch_envelope import (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     verify_autonomous_launch_envelope,
   )
 
@@ -1864,7 +1891,7 @@ def test_autonomous_start_signs_exact_executable_workload(
   )
   envelope = verify_autonomous_launch_envelope(
     HMAC_KEY,
-    env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   )
 
   workload_receipt = envelope.workload.receipt()
@@ -1877,7 +1904,7 @@ def test_autonomous_start_signs_exact_executable_workload(
   assert workload_receipt.pop("approval_continuation") is None
   assert workload_receipt == expected_workload
   assert admitted_limits == (
-    {"max_tokens": None}
+    {}
     if expected_workload["mode"] == "skill"
     else None
   )
@@ -1892,7 +1919,7 @@ def test_autonomous_start_signs_dispatch_scope_without_unsigned_copy(
   tmp_path,
 ) -> None:
   from agent_gateway.autonomous_launch_envelope import (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     verify_autonomous_launch_envelope,
   )
 
@@ -1914,7 +1941,7 @@ def test_autonomous_start_signs_dispatch_scope_without_unsigned_copy(
   assert "AGENT_AUTONOMOUS_DISPATCH_SCOPE_JSON" not in env
   envelope = verify_autonomous_launch_envelope(
     HMAC_KEY,
-    env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   )
   assert envelope.session_authority.dispatch_scope is not None
   assert envelope.session_authority.dispatch_scope.receipt() == dispatch_scope
@@ -2245,7 +2272,7 @@ def test_missing_v7_admission_siblings_resolve_once_and_freeze_together(
   manifest.pop("admitted_skill_execution_limits")
   old_bytes = _replace_manifest_payload(tmp_path, manifest)
   calls: list[str] = []
-  expected_limits = SkillExecutionLimits(32_000)
+  expected_limits = SkillExecutionLimits()
 
   def resolver(skill_name: str) -> AutonomousSkillAdmissionPolicy:
     calls.append(skill_name)
@@ -2262,7 +2289,7 @@ def test_missing_v7_admission_siblings_resolve_once_and_freeze_together(
   assert record.admitted_skill_execution_limits == expected_limits
   frozen = _read_manifest(tmp_path)
   assert frozen["skill_resume_allowed"] is True
-  assert frozen["admitted_skill_execution_limits"] == {"max_tokens": 32_000}
+  assert frozen["admitted_skill_execution_limits"] == {}
   assert _manifest_path(tmp_path).read_bytes() != old_bytes
 
   second = _registry(
@@ -2288,7 +2315,7 @@ def test_missing_v7_limits_preserves_present_resume_sibling(tmp_path) -> None:
   manifest.pop("admitted_skill_execution_limits")
   _replace_manifest_payload(tmp_path, manifest)
   calls: list[str] = []
-  expected_limits = SkillExecutionLimits(900)
+  expected_limits = SkillExecutionLimits()
 
   registry = _registry(
     tmp_path,
@@ -2308,11 +2335,7 @@ def test_missing_v7_limits_preserves_present_resume_sibling(tmp_path) -> None:
   "value",
   [
     None,
-    {},
-    {"max_turns": None, "max_tokens": None},
-    {"max_tokens": True},
-    {"max_tokens": 0},
-    {"max_tokens": None, "max_budget_usd": None},
+    {"extra": 1},
   ],
 )
 def test_present_v7_skill_limits_are_strict_and_never_rederived(
@@ -2332,6 +2355,39 @@ def test_present_v7_skill_limits_are_strict_and_never_rederived(
   )
 
   assert registry._tasks == {}
+
+
+@pytest.mark.parametrize(
+  "value",
+  [
+    {},
+    {"max_turns": None, "max_tokens": None},
+    {"max_tokens": True},
+    {"max_tokens": 0},
+    {"max_tokens": None, "max_budget_usd": None},
+  ],
+)
+def test_retired_skill_limit_keys_are_dropped_and_not_rederived(
+  tmp_path,
+  value,
+) -> None:
+  from agent_gateway.skill_limits import SkillExecutionLimits
+
+  _write_manifest(
+    tmp_path,
+    admitted_skill_execution_limits=value,
+  )
+
+  registry = _registry(
+    tmp_path,
+    autonomous_skill_admission_policy_resolver=lambda skill_name: (
+      _ for _ in ()
+    ).throw(AssertionError("dropped limit keys must not be rederived")),
+  )
+
+  assert registry._tasks["bg_0"].admitted_skill_execution_limits == (
+    SkillExecutionLimits()
+  )
 
 
 def test_missing_v7_non_skill_limits_freeze_null_without_resolver(
@@ -2509,9 +2565,7 @@ def test_missing_v7_resume_freeze_post_replace_failure_aborts_then_rehydrates(
     _registry(tmp_path, skill_resume_allowed_resolver=lambda _skill: True)
 
   assert _read_manifest(tmp_path)["skill_resume_allowed"] is True
-  assert _read_manifest(tmp_path)["admitted_skill_execution_limits"] == {
-    "max_tokens": None,
-  }
+  assert _read_manifest(tmp_path)["admitted_skill_execution_limits"] == {}
   monkeypatch.setattr(autonomous_runner_state.os, "fsync", original_fsync)
   registry = _registry(
     tmp_path,
@@ -2594,7 +2648,7 @@ Do writer work.
 
   assert resolver("read-only").skill_resume_allowed is True
   assert resolver("read-only").execution_limits == (
-    SkillExecutionLimits(None)
+    SkillExecutionLimits()
   )
   assert resolver("writer").skill_resume_allowed is False
   with pytest.raises(FileNotFoundError):
@@ -2649,7 +2703,7 @@ def test_initial_direct_and_scheduled_skill_starts_freeze_resolver_fact(
     return FakeProcess()
 
   calls: list[str] = []
-  expected_limits = SkillExecutionLimits(32_000)
+  expected_limits = SkillExecutionLimits()
   monkeypatch.setattr(
     autonomous_runner.asyncio,
     "create_subprocess_exec",
@@ -2683,7 +2737,7 @@ def test_initial_direct_and_scheduled_skill_starts_freeze_resolver_fact(
       ] is True
       assert _read_manifest(tmp_path, record.task_id)[
         "admitted_skill_execution_limits"
-      ] == {"max_tokens": 32_000}
+      ] == {}
       assert record.capability_bind is not None
       assert record.capability_bind.run_mode == (
         "cron" if schedule_id is not None else "autonomous"
@@ -2770,14 +2824,14 @@ def test_resumed_start_inherits_frozen_resume_fact_without_source_resolution(
       resumed = registry._tasks[payload["task_id"]]
       assert resumed.skill_resume_allowed is True
       assert resumed.admitted_skill_execution_limits == (
-        SkillExecutionLimits(32_000)
+        SkillExecutionLimits()
       )
       assert _read_manifest(tmp_path, resumed.task_id)[
         "skill_resume_allowed"
       ] is True
       assert _read_manifest(tmp_path, resumed.task_id)[
         "admitted_skill_execution_limits"
-      ] == {"max_tokens": 32_000}
+      ] == {}
     finally:
       await registry.cancel(payload["task_id"])
       await registry.shutdown(grace_sec=0.1)
@@ -3703,7 +3757,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
   async def _case() -> None:
     from agent_gateway import autonomous_runner
     from agent_gateway.autonomous_launch_envelope import (
-      AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+      AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
       verify_autonomous_launch_envelope,
     )
 
@@ -3715,7 +3769,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       assert kwargs["env"]["AGENT_AUTONOMOUS_TOOL_RESULT_SPILL_DIR"] == starting["tool_result_spill_dir"]
       envelope = verify_autonomous_launch_envelope(
         HMAC_KEY,
-        kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+        Path(kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
       )
       assert envelope.control_run_id == starting["control_run_id"]
       return SlowFakeProcess()
@@ -3832,7 +3886,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       assert manifest["pack"] is None
       assert manifest["deliver"] is True
       assert manifest["skill_resume_allowed"] is False
-      assert manifest["admitted_skill_execution_limits"] == {"max_tokens": None}
+      assert manifest["admitted_skill_execution_limits"] == {}
       assert manifest["context"] == "inspect current book"
       assert manifest["ticker"] == "MSFT"
       assert manifest["channel"] == "tui"
@@ -4916,6 +4970,83 @@ def test_autonomous_manifest_updates_on_cancel(monkeypatch, tmp_path) -> None:
   asyncio.run(_case())
 
 
+def test_approval_delivery_quarantine_fails_the_active_run_and_finalisation_keeps_it(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  async def _case() -> None:
+    from agent_gateway import autonomous_runner
+
+    process = SlowFakeProcess()
+
+    async def fake_exec(*args, **kwargs):
+      _ = args, kwargs
+      return process
+
+    class RecordingApprovalChannel:
+      def __init__(self) -> None:
+        self.close_calls = 0
+
+      def close(self) -> None:
+        self.close_calls += 1
+
+    monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+    registry = _registry(tmp_path)
+    payload = await registry.start(
+      role="owner",
+      profile="analyst",
+      mode="task",
+      task="summarize",
+      user_id=USER_ID,
+      user_email=USER_EMAIL,
+    )
+    task_id = payload["task_id"]
+    record = registry._tasks[task_id]
+    channel = RecordingApprovalChannel()
+    record.approval_channel = channel  # type: ignore[assignment]
+    assert process.returncode is None
+
+    failed = await registry.fail_autonomous_approval_delivery(
+      task_id,
+      error="PermanentAutonomousApprovalDeliveryError: owner is gone",
+    )
+
+    expected_error = (
+      "approval_delivery_quarantined: "
+      "PermanentAutonomousApprovalDeliveryError: owner is gone"
+    )
+    assert failed is True
+    assert channel.close_calls == 1
+    assert record.approval_channel is None
+    assert process.returncode == -15
+    assert record.state == "failed"
+    assert record.approval_delivery_quarantined is True
+    assert record.error == expected_error
+    assert _read_manifest(tmp_path)["state"] == "failed"
+
+    reaper_task = record.reaper_task
+    assert reaper_task is not None
+    await asyncio.wait_for(reaper_task, timeout=1)
+
+    assert record.state == "failed"
+    assert record.approval_delivery_quarantined is True
+    assert record.error == expected_error
+    manifest = _read_manifest(tmp_path)
+    assert manifest["state"] == "failed"
+    assert manifest["error"] == expected_error
+
+    assert await registry.fail_autonomous_approval_delivery(
+      task_id,
+      error="again",
+    ) is False
+    assert record.error == expected_error
+
+    await registry.shutdown(grace_sec=0.1)
+
+  asyncio.run(_case())
+
+
 def test_autonomous_cancel_manifest_failure_does_not_suppress_process_kill(
   monkeypatch,
   tmp_path,
@@ -5199,50 +5330,6 @@ def test_autonomous_operator_message_idempotency_is_concurrent_safe(monkeypatch,
   asyncio.run(_case())
 
 
-def test_autonomous_parent_operator_message_quota_rejects_before_append(
-  tmp_path: Path,
-) -> None:
-  async def _case() -> None:
-    from agent_gateway.autonomous_control_contract import (
-      AUTONOMOUS_OPERATOR_MESSAGE_LIMIT,
-    )
-
-    _write_manifest(
-      tmp_path,
-      state="completed",
-      channel="tui",
-    )
-    registry = _registry(tmp_path)
-    record = registry._tasks["bg_0"]
-    record.state = "running"
-    record.proc = SlowFakeProcess()
-
-    for index in range(AUTONOMOUS_OPERATOR_MESSAGE_LIMIT):
-      await registry.send_operator_message(
-        record.control_run_id,
-        user_id=USER_ID,
-        channel="tui",
-        message=f"message-{index}",
-        message_id=f"message-{index}",
-      )
-
-    with pytest.raises(RuntimeError, match="message quota"):
-      await registry.send_operator_message(
-        record.control_run_id,
-        user_id=USER_ID,
-        channel="tui",
-        message="one too many",
-        message_id="message-overflow",
-      )
-
-    assert record.operator_inbox_path is not None
-    assert len(
-      record.operator_inbox_path.read_text(encoding="utf-8").splitlines()
-    ) == AUTONOMOUS_OPERATOR_MESSAGE_LIMIT
-
-  asyncio.run(_case())
-
-
 def test_autonomous_parent_operator_byte_quota_rejects_before_append(
   monkeypatch,
   tmp_path: Path,
@@ -5423,7 +5510,7 @@ def test_autonomous_start_signs_identity_without_unsigned_aliases(
   tmp_path,
 ) -> None:
   from agent_gateway.autonomous_launch_envelope import (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     verify_autonomous_launch_envelope,
   )
 
@@ -5438,7 +5525,7 @@ def test_autonomous_start_signs_identity_without_unsigned_aliases(
     assert key not in env
   authority = verify_autonomous_launch_envelope(
     HMAC_KEY,
-    env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   ).session_authority.ordinary_authority
   assert authority is not None
   assert authority.user_id == USER_ID
@@ -5449,7 +5536,7 @@ def test_autonomous_start_signs_identity_without_unsigned_aliases(
 
 def test_autonomous_start_resolves_slug_metadata_to_canonical_owner(monkeypatch, tmp_path) -> None:
   from agent_gateway.autonomous_launch_envelope import (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     verify_autonomous_launch_envelope,
   )
 
@@ -5480,7 +5567,7 @@ def test_autonomous_start_resolves_slug_metadata_to_canonical_owner(monkeypatch,
 
   authority = verify_autonomous_launch_envelope(
     HMAC_KEY,
-    env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   ).session_authority.ordinary_authority
   assert authority is not None
   assert authority.user_id == "1"
@@ -5516,7 +5603,7 @@ def test_autonomous_skill_start_seals_session_authority_from_admitted_identity(
   )
   from agent_gateway.approval_route import NO_APPROVAL_ROUTE
   from agent_gateway.autonomous_launch_envelope import (
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     verify_autonomous_launch_envelope,
   )
   from agent_gateway.containment_settings import ContainmentSettings
@@ -5615,7 +5702,7 @@ def test_autonomous_skill_start_seals_session_authority_from_admitted_identity(
   assert requests[0].role == "owner"
   authority = verify_autonomous_launch_envelope(
     HMAC_KEY,
-    captured[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+    Path(captured[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
   ).session_authority.ordinary_authority
   assert authority is not None
   assert (

@@ -10,7 +10,7 @@ from typing import Any
 from agent_gateway import AgentRunner
 from agent_gateway.autonomous_capability_handoff import AutonomousCapabilityBinding
 from agent_gateway.autonomous_event_channel import adopt_inherited_autonomous_event_channel
-from agent_gateway.autonomous_launch_envelope import AUTONOMOUS_CAPABILITY_ENVELOPE_ENV
+from agent_gateway.autonomous_launch_envelope import AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
 from agent_gateway.capability_execution import MaterializedCredential
@@ -178,7 +178,7 @@ def _make_app(
       if control_skills_dir is not None
       else lambda skill_name: AutonomousSkillAdmissionPolicy(
         False,
-        SkillExecutionLimits(None),
+        SkillExecutionLimits(),
       )
     )
   else:
@@ -226,7 +226,7 @@ def _install_fake_spawn(
   async def fake_exec(*args, **kwargs):
     _ = args
     envelope = json.loads(
-      kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV]
+      Path(kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8")
     )
     process = _FakeAutonomousProcess(
       os.dup(kwargs["pass_fds"][0]),

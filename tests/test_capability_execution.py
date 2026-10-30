@@ -444,6 +444,21 @@ def test_send_prompt_refuses_unqualified_rebind() -> None:
   assert refused.value.code == "capability_model_not_allowed"
 
 
+@pytest.mark.parametrize("legacy", [None, 1, 4096, 10**9, True, "4096"])
+def test_send_prompt_selects_registry_ceiling_regardless_of_auth_config_max_tokens(
+  legacy: object,
+) -> None:
+  resolved = _resolver().resolve("session.driver")
+  config = dict(resolved.auth_config)
+  if legacy is not None:
+    config["max_tokens"] = legacy
+  execution = replace(resolved, auth_config=config)
+
+  _config, max_tokens, _effort = _prepare_bound_execution(execution)
+
+  assert max_tokens == 64_000
+
+
 def test_batch_derivation_preserves_exact_bind_and_scopes_user_handle() -> None:
   resolver = _resolver()
   interactive = resolver.resolve("session.driver")

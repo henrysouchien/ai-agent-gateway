@@ -371,17 +371,48 @@ def test_openai_env_auth_token_admitted_only_for_deployment_owner(
   denied = resolve_auth_config(provider="openai", user_scope=13)
   assert denied.get("auth_token", "") != "openai-env-seat"
   assert "openai-env-seat" not in denied.values()
+  assert "auth_mode" not in denied
 
   unscoped = resolve_auth_config(provider="openai")
   assert unscoped.get("auth_token", "") != "openai-env-seat"
   assert "openai-env-seat" not in unscoped.values()
+  assert "auth_user_scope" not in unscoped
 
   owner = resolve_auth_config(provider="openai", user_scope=1)
   assert owner == {
     "auth_mode": "oauth",
     "api_key": "",
     "auth_token": "openai-env-seat",
+    "auth_user_scope": "1",
   }
+
+
+@pytest.mark.parametrize("provider", ["openai", "xai"])
+def test_standalone_resolver_stamps_normalized_run_scope_on_owner_seat(
+  monkeypatch: pytest.MonkeyPatch,
+  provider: str,
+) -> None:
+  monkeypatch.delenv("HANK_USER_RUNTIME_CREDENTIALS_FILE", raising=False)
+  monkeypatch.setenv(f"{provider.upper()}_AUTH_TOKEN", f"{provider}-env-seat")
+  monkeypatch.delenv(f"{provider.upper()}_API_KEY", raising=False)
+
+  for raw_scope in (1, "1", " 01 "):
+    owner = resolve_auth_config(provider=provider, user_scope=raw_scope)
+    assert owner["auth_mode"] == "oauth"
+    assert owner["auth_token"] == f"{provider}-env-seat"
+    assert owner["auth_user_scope"] == "1"
+
+  denied = resolve_auth_config(provider=provider, user_scope=13)
+  assert denied.get("auth_token", "") == ""
+  assert "auth_mode" not in denied
+
+
+def test_standalone_resolver_stamps_run_scope_on_explicit_api_key() -> None:
+  resolved = resolve_auth_config(provider="openai", api_key="sk-openai", user_scope="13")
+
+  assert resolved["auth_mode"] == "api"
+  assert resolved["api_key"] == "sk-openai"
+  assert resolved["auth_user_scope"] == "13"
 
 
 def test_resolve_auth_config_openai_whitespace_token_ignored() -> None:

@@ -36,6 +36,14 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_XAI_OAUTH_ISSUER = "https://auth.x.ai"
 DEFAULT_XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 DEFAULT_XAI_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+XAI_AUTH_STORE_PATH_ENV = "XAI_AUTH_STORE_PATH"
+XAI_AUTH_TOKEN_ENV = "XAI_AUTH_TOKEN"
+XAI_REFRESH_TOKEN_ENV = "XAI_REFRESH_TOKEN"
+# Environment names that carry one person's xAI OAuth identity (store path and
+# tokens); a non-owner placement must not inherit them.
+XAI_PERSONAL_OAUTH_ENV_NAMES = frozenset(
+  {XAI_AUTH_STORE_PATH_ENV, XAI_AUTH_TOKEN_ENV, XAI_REFRESH_TOKEN_ENV}
+)
 DEVICE_CODE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 DEFAULT_DEVICE_TIMEOUT_SECONDS = 300
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
@@ -112,7 +120,7 @@ def resolve_xai_oauth_settings(
   ).strip()
   store_path = resolve_provider_store_path(
     "xai", "oauth.json", cfg, environ=env, user_scope=user_scope,
-    override_config_keys=("auth_store_path",), override_env_vars=("XAI_AUTH_STORE_PATH",),
+    override_config_keys=("auth_store_path",), override_env_vars=(XAI_AUTH_STORE_PATH_ENV,),
   )
   if not issuer or not client_id or not scope:
     raise ValueError("xAI OAuth issuer, client ID, and scopes must not be blank")
@@ -128,7 +136,7 @@ def resolve_xai_store_paths(
 ) -> tuple[Path | None, Path]:
   return resolve_provider_store_paths(
     "xai", "oauth.json", config, environ=environ, user_scope=user_scope,
-    override_config_keys=("auth_store_path",), override_env_vars=("XAI_AUTH_STORE_PATH",),
+    override_config_keys=("auth_store_path",), override_env_vars=(XAI_AUTH_STORE_PATH_ENV,),
   )
 
 
@@ -400,8 +408,8 @@ def oauth_record_from_config(
   settings = resolve_xai_oauth_settings(cfg, environ=env)
   identity = str(cfg.get("account_identity") or "").strip()
   stored = _selected_xai_record(_load_xai_raw_store(settings.store_path), identity) or {}
-  access_token = str(cfg.get("auth_token") or env.get("XAI_AUTH_TOKEN") or stored.get("access_token") or "").strip()
-  refresh_token = str(cfg.get("refresh_token") or env.get("XAI_REFRESH_TOKEN") or stored.get("refresh_token") or "").strip()
+  access_token = str(cfg.get("auth_token") or env.get(XAI_AUTH_TOKEN_ENV) or stored.get("access_token") or "").strip()
+  refresh_token = str(cfg.get("refresh_token") or env.get(XAI_REFRESH_TOKEN_ENV) or stored.get("refresh_token") or "").strip()
   record = {
     **stored,
     "access_token": access_token,
@@ -830,7 +838,7 @@ def resolve_xai_pool_candidates(
             provider="xai", key=key, record=record, store_path=path,
             is_user_store=index == 0, auth_mode=auth_mode,
           ))
-  for auth_mode, name in (("oauth", "XAI_AUTH_TOKEN"), ("api", "XAI_API_KEY")):
+  for auth_mode, name in (("oauth", XAI_AUTH_TOKEN_ENV), ("api", "XAI_API_KEY")):
     token = str(env.get(name) or "").strip()
     if token and (not mode or mode == auth_mode):
       record: dict[str, Any] = {
@@ -839,7 +847,7 @@ def resolve_xai_pool_candidates(
       }
       if auth_mode == "oauth":
         record.update(
-          refresh_token=str(env.get("XAI_REFRESH_TOKEN") or "").strip(),
+          refresh_token=str(env.get(XAI_REFRESH_TOKEN_ENV) or "").strip(),
           expires_at=env.get("XAI_TOKEN_EXPIRES_AT") or 0,
         )
       key = str(record["identity"])

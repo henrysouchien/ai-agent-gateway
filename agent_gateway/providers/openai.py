@@ -33,6 +33,11 @@ from .openai_responses_helpers import (
 
 log = logging.getLogger(__name__)
 
+OPENAI_AUTH_TOKEN_ENV = "OPENAI_AUTH_TOKEN"
+# Environment names that carry one person's OpenAI bearer token; a non-owner
+# placement must not inherit them. `OPENAI_API_KEY` is the org's key, not personal.
+OPENAI_PERSONAL_OAUTH_ENV_NAMES = frozenset({OPENAI_AUTH_TOKEN_ENV})
+
 
 _BASE_URL_KEYS = ("base_url", "baseURL", "api_base_url", "api_base")
 _OFFICIAL_OPENAI_HOST = "api.openai.com"
@@ -394,4 +399,9 @@ class OpenAIProvider(ModelProvider):
     return any(pattern.search(searchable) for pattern in _OPENAI_CONTEXT_LENGTH_PATTERNS)
 
 
-__all__ = ["OpenAIConfigurationError", "OpenAIProvider"]
+__all__ = [
+  "OPENAI_AUTH_TOKEN_ENV",
+  "OPENAI_PERSONAL_OAUTH_ENV_NAMES",
+  "OpenAIConfigurationError",
+  "OpenAIProvider",
+]

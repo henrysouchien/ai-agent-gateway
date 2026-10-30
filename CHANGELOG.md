@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Changed
+
+- Fixed the publish-before-park approval race: original-token votes for durable parks use durable continuation even before pending cleanup, preserving exactly-once execution of the original call.
+- BREAKING: `GatewayServerConfig.service_auth_config_resolver` is called as `resolver(handle, user_scope=<effective run scope>)`. Implementations must accept the keyword; static already-resolved service configs may ignore it. Chat and authenticated or standalone batch runs pass their actual session/user scope, and startup-bound service materialization keeps the startup owner scope established at registration.
+
+- BREAKING: `SkillProfile.max_structured_reads` and `OperationRuntimePolicy.max_structured_reads` are removed, and `max_structured_reads` skill frontmatter is no longer a declaration (an unknown key now lands in `metadata`). The structured-read counter still reports `structured_reads` on the session recap; nothing warns or refuses past a planned count.
+- BREAKING: `skill_result_captured` no longer settles a succeeded child as `blocked`/`no_gate_produced` for a declared `result_requires_persist`; classification reads only the doors that answered. `build_skill_result_captured_event`, `SkillRunEventEmitter` and `sub_agent_skill_state` lose the `declared_terminal_doors` persist-expectation argument and `persist_expectation_doors`; `result_requires_persist` itself stays a declared field.
+### Removed
+
+- BREAKING: no run, child, fork or skill carries a per-call output-token cap; the bound model's registry `max_output_tokens` is the one ceiling. `select_run_max_tokens` requests it (credential `config["max_tokens"]` applies only when the provider reports no ceiling, and `normalized_run_config` no longer invents `16000`). This supersedes the 0.30.0 `run_autonomous` entry that made the admitted skill limit own `AgentRunner.max_tokens_override`: `run_autonomous` passes no override and `auth_config["max_tokens"]` is still not required.
+- BREAKING: `max_tokens_override` is gone from `AgentRunner`, `AgentSDKRunner`, `spawn_sub_agent`, `resume_sub_agent` and the fork runner; `OperationRuntimePolicy.max_tokens` is removed. `make_run_agent_handler(default_max_tokens=...)` and `make_resume_handler(default_max_tokens=...)` are removed (the `64000` default is gone); the child run and a resumed child request the registry ceiling through `select_run_max_tokens`, and a fork handoff reads its last request or the same selector.
+- BREAKING: a skill declares no output budget. `SkillExecutionLimits` has no `max_tokens` field (it carries no fields), and `skill_execution_limits_to_mapping` writes `{}`. The retired keys `max_tokens`, `max_turns` and `max_budget_usd` stay readable on persisted admission records and are dropped on read, never written back; skill frontmatter that still declares `max_tokens` is dropped, not refused.
+- BREAKING: the quant research capability claim no longer signs `max_tokens`: `approved_budget` is `{"max_wall_clock_seconds": 5400}` and the verifier reads only that field. The claim wire is one-way, so deploy the worker before or with the issuer.
+- BREAKING: the hand-written transport retry constants are gone, and one `RetryPolicy` owns both retries. `runner.STREAM_RETRY_MAX`, `STREAM_RETRY_DELAY` and `STREAM_RETRY_BACKOFF`, `tool_dispatch_classification.DEFAULT_MAX_TOOL_RETRIES` and `DEFAULT_TOOL_RETRY_POLICY`, and `RetryPolicy.max_delay_seconds` are removed. `tool_dispatch_classification.TRANSPORT_RETRY_POLICY` (`max_retries=3`, `base_delay_seconds=2.0`, `backoff_factor=2.0`) is the only value: the provider stream retry loop in `runner_stream_turn` and tool dispatch retry both read it, `retry_backoff_seconds(attempt, policy)` is plain exponential with no jitter, and a runner can no longer override the stream count or delay by attribute. Tool dispatch retries now make 3 further attempts after the first (was 2) and wait 2 s, 4 s, 8 s between them (was a random delay up to 0.5 s, then up to 1 s). Retry eligibility is unchanged: only reads, never an approval round-trip.
+- BREAKING: `max_tokens` continuation is unbounded. `runner_run_loop_defaults.MAX_TOKENS_CONTINUATIONS` and `runner._MAX_TOKENS_CONTINUATIONS`, `runner_state.max_tokens_continuation_decision`, `MaxTokensContinuationDecision` and `NoToolUseTurnOutcome.max_tokens_decision` are removed, with the `max_tokens_terminal` outcome and `max_tokens_exhausted` failure: a run whose turn stops on `max_tokens` always appends the continuation nudge and goes on. `max_tokens_continuations` still counts them and `max_tokens_stops` still measures them.
+- BREAKING: `AUTONOMOUS_OPERATOR_MESSAGE_LIMIT` (64) is removed from `autonomous_control_contract`: an autonomous run's operator-message queue is unbounded and the writer no longer refuses the 65th message. `AUTONOMOUS_OPERATOR_AGGREGATE_BYTES_LIMIT` (1 MiB of operator-inbox bytes) still bounds the inbox file.
+- BREAKING: `agent_result_content.AGENT_RESULT_CONTENT_PAGE_MAX_BYTES` is removed with its re-measure-and-raise of a page; the page is already sized by `CHUNK_MAX_BYTES`.
+- `providers/credential_pool.UNDECLARED_LIMIT_BLOCK_SECONDS` and `REFRESH_FAILURE_BLOCK_SECONDS` are removed. A pooled credential is parked only until the reset its provider declared; a limit with no declared reset, or a failed refresh, skips that credential for the current selection or rotation without parking it. Ollama Cloud's 24-hour monthly-quota park is removed with them.
+- An autonomous resume's context carries the prior run's events, log, operator messages and tool results in full: the tail counts, the per-block clips and the 12 000-character total clip are removed.
+- `AgentRunner` no longer raises when `max_resume_chain_depth` is not positive; the resume-depth counter stays.
+
+### Fixed
+
+- Foreground child approval continuations retain pre-park assistant tool calls: the shared journal registers the exact child session before its first model turn, and settlement no longer emits a late registration that cuts off the original call's lineage.
+
+- Restored retained-input lineage in code cells: sourced dict/list results keep parent-issued references across sticky cells, `hank.input` selects operands, and `hank.derive` publishes expressions, exact selected observations and unsourced-input Findings without minting primary citations or refetching inputs. Native computation provenance and the flat source union remain unchanged. This supersedes the 0.30.0 derive-removal entry below.
+
+- Exact Anthropic lookup no longer reconstructs an environment-owned operator token as caller-held transient material before environment reconciliation. Unscoped requests cannot bypass seat admission, and exact lookup remains read-only.
+
+- Configured durable Usage V3 transport now meters ordinary authenticated turns with `COMMERCIAL_GATEWAY_ENABLED=false`; the flag selects commercial work authorization only. Observation-only events identify the authenticated session owner through `authenticated_subject`, preserve the exact capability bind and reported model, and carry null commercial lineage without reservation stops or settlement authority. Commercial payloads and digests remain unchanged. Requires `hank-contracts>=1.6,<2`.
+- Fresh child runners sharing an authenticated execution resolver no longer repeat an Anthropic usage-limited primary and a denied Codex hop before reaching a valid Muse entry. The fallback owner carries failed chain positions only in resolver memory, keyed by the exact frozen selection, role and capability; reset expiry and genuine credential rotation revive earlier entries without cross-tenant or durable state, while selecting another account to serve a fallback hop leaves the failed entry's progress intact.
+- Observation-only Usage V3 rounds estimated and provider-reported USD costs to eight decimal places with `ROUND_HALF_UP` before hashing and persistence, matching Risk intake precision. Unreported costs remain null; existing commercial cost bytes are unchanged.
+- Funded approval continuations look up the session's consumed work-start context and spend ledger by their exact admitted root turn ID, restoring commercial lineage, irreversible rechecks and MCP restrictions before runtime assembly. Intervening funded turns retain separate contexts and ledgers; ordinary turns and their approval continuations remain observation-only without discarding parked funded authority.
+- Retained and logged tool results now cross the secret boundary before preview, compaction and stream truncation: settled `result`, `final_tool_result_blocks`, runner previews and error logs, and new spill files no longer retain registered secrets or high-confidence credential patterns. `compact_model_tool_result_entry` gains optional `retained_entry` so the live model result keeps its prior content while durable previews and spill writes use the boundary projection.
+- Anthropic environment reconciliation no longer retires generations when a process observes a subset or empty `ANTHROPIC_AUTH_TOKENS` / single-token value. Exact lookup reports `unobservable` for an absent or empty source and `superseded` for non-empty changed material; restoring the original value restores its original generation.
+
 ## 0.30.0 (2026-10-27)
 
 ### Changed
@@ -12,7 +48,7 @@
 
 ### Removed
 
-- BREAKING: `hank.derive` and the `derived` rows it published. `HankBridge.derive` and the `derive` request frame are gone (`hank.derive` raises `AttributeError`, like `hank.input`), cells return plain `dict`/`list` values, and the cell result carries no `derived` key. A computed figure's lineage flows through `model_document` formulas and `fms_persist_*` doors; the issued source rows a cell read still arrive as `sources`.
+- Removed `hank.derive`, its request frame and `derived` rows, along with sourced result carriers and `hank.input`. **Superseded by the Unreleased retained-input lineage repair:** those APIs and rows are restored; explicit derived arithmetic is not restricted to model-document/FMS workflows.
 
 ### Fixed
 

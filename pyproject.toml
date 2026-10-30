@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-agent-gateway"
-version = "0.30.0"
+version = "0.31.0"
 description = "Generic AI agent gateway with MCP tool support and streaming"
 readme = "README.md"
 license = "MIT"
@@ -19,7 +19,7 @@ dependencies = [
   "fastmcp>=4,<5",
   "hank-model-authority>=1.7.12,<2",
   "agent-workflow-contracts>=1,<2",
-  "hank-contracts>=1.3,<2",
+  "hank-contracts>=1.6,<2",
   "httpx>=0.28.1",
   "httpx2>=2.5,<3",
   "pydantic",

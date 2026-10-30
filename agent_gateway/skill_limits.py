@@ -10,10 +10,9 @@ from typing import Protocol, runtime_checkable
 log = logging.getLogger(__name__)
 
 
-_LIMIT_FIELDS = frozenset({"max_tokens"})
-# Records persisted before the declared turn/cost ceilings were retired carry
-# these two extra keys; their values are dropped on read.
-_LEGACY_LIMIT_FIELDS = frozenset({"max_turns", "max_tokens", "max_budget_usd"})
+# Records persisted before token, turn, and cost ceilings were retired carry
+# these keys; their values are dropped on read.
+_DROPPED_LIMIT_FIELDS = frozenset({"max_turns", "max_tokens", "max_budget_usd"})
 _ACTIVE_FIELDS = frozenset({"skill_name", "execution_limits"})
 _AUTONOMOUS_POLICY_FIELDS = frozenset({
   "skill_resume_allowed",
@@ -50,16 +49,6 @@ def _closed_mapping(
   return payload
 
 
-def _optional_positive_int(value: object, *, field_name: str) -> int | None:
-  if value is None:
-    return None
-  if type(value) is not int:
-    raise TypeError(f"{field_name} must be an exact integer or None")
-  if value <= 0:
-    raise ValueError(f"{field_name} must be positive")
-  return value
-
-
 def _canonical_skill_name(value: object, *, field_name: str) -> str:
   if type(value) is not str:
     raise TypeError(f"{field_name} must be an exact string")
@@ -70,14 +59,7 @@ def _canonical_skill_name(value: object, *, field_name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class SkillExecutionLimits:
-  max_tokens: int | None
-
-  def __post_init__(self) -> None:
-    object.__setattr__(
-      self,
-      "max_tokens",
-      _optional_positive_int(self.max_tokens, field_name="max_tokens"),
-    )
+  """Admitted skill execution facts. No token, turn, or cost ceiling is admitted."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,10 +129,10 @@ def reconcile_skill_admission(
 
 def skill_execution_limits_to_mapping(
   value: SkillExecutionLimits,
-) -> dict[str, int | None]:
+) -> dict[str, object]:
   if type(value) is not SkillExecutionLimits:
     raise TypeError("value must be exact SkillExecutionLimits")
-  return {"max_tokens": value.max_tokens}
+  return {}
 
 
 def skill_execution_limits_from_mapping(
@@ -158,14 +140,9 @@ def skill_execution_limits_from_mapping(
 ) -> SkillExecutionLimits:
   field_name = "admitted skill execution limits"
   payload = _readable_mapping(value, field_name=field_name)
-  if frozenset(payload) not in (_LIMIT_FIELDS, _LEGACY_LIMIT_FIELDS):
+  if not frozenset(payload) <= _DROPPED_LIMIT_FIELDS:
     raise ValueError(f"{field_name} has invalid fields")
-  return SkillExecutionLimits(
-    max_tokens=_optional_positive_int(
-      payload["max_tokens"],
-      field_name="max_tokens",
-    ),
-  )
+  return SkillExecutionLimits()
 
 
 def active_skill_admission_to_mapping(

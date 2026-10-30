@@ -243,6 +243,27 @@ def test_delegated_money_boundary_asks_and_portfolio_config_does_not() -> None:
   _run(_case())
 
 
+def test_compute_asks_at_the_existing_approval_door() -> None:
+  async def _case() -> None:
+    policy = SingleUserApprovalPolicy()
+    run_context = _run_context()
+    request, payload = _request_and_payload(
+      run_context=run_context,
+      tool_class="pure_transform",
+      tool_name="code_execute",
+    )
+
+    decision = await policy.decide(
+      payload=payload,
+      request=request,
+      run_context=run_context,
+    )
+
+    assert decision.outcome == "request_user_approval"
+
+  _run(_case())
+
+
 def test_build_request_and_store_round_trip_delegation_id(tmp_path: Path) -> None:
   async def _case() -> None:
     store = _store(tmp_path)

@@ -10,10 +10,8 @@ if str(GATEWAY_DIR) not in sys.path:
   sys.path.insert(0, str(GATEWAY_DIR))
 
 from agent_gateway.tool_dispatch_classification import (  # noqa: E402
-  DEFAULT_TOOL_RETRY_POLICY,
   RETRYABLE_OUTCOMES,
   DispatchEntry,
-  RetryPolicy,
   build_dispatch_record,
   build_dispatch_record_for_outcome,
   build_dispatch_record_from_sources,
@@ -22,7 +20,6 @@ from agent_gateway.tool_dispatch_classification import (  # noqa: E402
   classify_tool_outcome,
   extract_source_identities,
   resolve_dispatch_entry,
-  retry_backoff_seconds,
   retry_decision,
   retry_eligible,
 )
@@ -416,18 +413,11 @@ def test_undeclared_tools_never_retry() -> None:
   assert retry_decision(entry, "error_transport", 1) == "settle"
 
 
-def test_retries_are_bounded_at_two() -> None:
-  entry = _entry()
-
-  assert retry_decision(entry, "error_transport", 1) == "retry"
-  assert retry_decision(entry, "error_transport", 2) == "retry"
-  assert retry_decision(entry, "error_transport", 3) == "settle"
-
+def test_tools_with_no_declared_effect_never_retry() -> None:
   for name in ("fred_list_series", "fred_search"):
     unavailable = _entry(name, effect=None, idempotent=True)
     assert unavailable.effect is None
     assert retry_decision(unavailable, "error_transport", 1) == "settle"
-  assert DEFAULT_TOOL_RETRY_POLICY.max_retries == 2
 
 
 def test_approval_gated_calls_never_retry() -> None:
@@ -438,14 +428,6 @@ def test_approval_gated_calls_never_retry() -> None:
 
 def test_abort_between_attempts_settles() -> None:
   assert retry_decision(_entry(), "error_transport", 1, aborted=True) == "settle"
-
-
-def test_backoff_is_jittered_and_bounded() -> None:
-  policy = RetryPolicy(base_delay_seconds=1.0, max_delay_seconds=4.0)
-
-  for attempt in (1, 2, 3, 9):
-    delay = retry_backoff_seconds(attempt, policy)
-    assert 0.0 <= delay <= 4.0
 
 
 # --- the declaration table -------------------------------------------------

@@ -22,6 +22,7 @@ from agent_gateway.code_execution import (
   docker_backend_unavailable_reason,
 )
 from agent_gateway.code_execution._backends._kernel import KernelBackend
+from agent_gateway.code_execution._handlers import _code_job_model_result
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.event_log import EventLog
 from agent_gateway.runner import ToolResultContext
@@ -655,7 +656,7 @@ class _StubProvider:
   name = "stub"
 
 
-def _job_runner(spill_dir: Path | None = None) -> AgentRunner:
+def _job_runner(spill_dir: Path | None = None, auth_config: dict[str, Any] | None = None) -> AgentRunner:
   """A real runner whose task registry owns the session's background cells."""
   event_log = EventLog()
   return AgentRunner(
@@ -672,6 +673,7 @@ def _job_runner(spill_dir: Path | None = None) -> AgentRunner:
       provider=_StubProvider(),
       model="stub-model",
       effort="none",
+      auth_config=auth_config,
     ),
     user_id="alice",
     billing_mode="byok",
@@ -832,6 +834,25 @@ def test_code_execute_background_result_is_the_bounded_model_projection(tmp_path
     assert "iVBORw0KGgo" not in json.dumps(plot)
 
   asyncio.run(_run_test())
+
+
+def test_code_job_model_result_and_spill_never_carry_the_runner_secret(tmp_path: Path) -> None:
+  secret = "CUSTOM-ACTIVE-CREDENTIAL-CODE-JOB-8f21d7"
+  runner = _job_runner(spill_dir=tmp_path, auth_config={"api_key": secret})
+  # Repeated copies leave the 32 KiB model cut inside a secret wherever it falls.
+  result = {"status": "ok", "stdout": "public-marker " + (secret + " ") * 2_000}
+
+  model_result = _code_job_model_result(runner, "ce_secret", result)
+
+  assert model_result["_runner_truncated"] is True
+  assert model_result["spill_ref"].startswith("spill:v1:")
+  assert "public-marker" in json.dumps(model_result)
+  assert secret[:10] not in json.dumps(model_result)
+  spills = [path.read_text(encoding="utf-8") for path in tmp_path.rglob("*") if path.is_file()]
+  assert spills
+  assert all(secret[:10] not in text for text in spills)
+  assert any(REDACTED_SECRET in text for text in spills)
+  assert result["stdout"].count(secret) == 2_000
 
 
 def test_code_execute_background_without_a_job_runner_is_unavailable() -> None:

@@ -20,7 +20,6 @@ from agent_gateway.approval_route import (
   DurableLocalApprovalRoute,
   bind_session_approval_route,
 )
-from agent_gateway.approval_policy import ApprovalRequest
 from agent_gateway.approvals import (
   ApprovalActionError,
   _cancel_pending_approval_and_unblock,
@@ -35,7 +34,7 @@ from agent_gateway.batch_approval_projection import (
   bind_batch_approval_scope,
 )
 from model_authority.bind import CapabilityBind
-from model_authority.binding import AuthContext, CredentialHandle
+from model_authority.binding import AuthContext, CapabilityResolutionError, CredentialHandle
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from agent_gateway.capability_execution import (
   BoundCapabilityExecution,
@@ -123,51 +122,6 @@ class _PublishBatchTerminalEvent(Protocol):
     control_run_id: str,
     event: dict[str, Any],
   ) -> bool: ...
-
-class BatchCancellationStore(Protocol):
-  """Durable lookup called by the batch cancellation authorization gate."""
-
-  async def get(
-    self,
-    approval_id: str,
-  ) -> ApprovalRequest | None: ...
-
-
-class BatchCancellationPolicy(Protocol):
-  """Role check called by the batch cancellation authorization gate."""
-
-  def role_authorized_for_class(
-    self,
-    *,
-    decider_role: str | None,
-    tool_class: str,
-  ) -> bool: ...
-
-
-class _BatchCancellationProjection(Protocol):
-  @property
-  def approval_id(self) -> str: ...
-
-  @property
-  def run_id(self) -> str: ...
-
-  @property
-  def owner_user_id(self) -> str: ...
-
-  @property
-  def channel(self) -> str | None: ...
-
-  @property
-  def tool_call_id(self) -> str: ...
-
-  @property
-  def session_id(self) -> str: ...
-
-  @property
-  def store(self) -> BatchCancellationStore | None: ...
-
-  @property
-  def policy(self) -> BatchCancellationPolicy | None: ...
 
 
 @dataclass
@@ -471,7 +425,6 @@ class BatchTaskRegistry:
             authenticated=None,
             app_state=None,
             reason="gateway_shutdown",
-            trusted_lifecycle_authority=True,
           )
           if approval_error is None:
             approval_error = warning
@@ -664,7 +617,6 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
       try:
         await _preflight_batch_approval_cancellation(
           projections=cancellation_fence.authorization_subjects,
-          authenticated=authenticated,
         )
       except ApprovalActionError as exc:
         task_registry.abort_batch_cancellation(
@@ -917,7 +869,10 @@ def _batch_capability_execution_context(
       raise RuntimeError(
         f"batch service credential materializer is missing for {handle.provider}"
       )
-    materialized = service_materializer(handle)
+    materialized = service_materializer(
+      handle,
+      user_scope=authenticated_session.risk_user_id if authenticated_session is not None else user_id,
+    )
     if not isinstance(materialized, MaterializedCredential):
       raise RuntimeError(
         "batch service credential materializer must return MaterializedCredential"
@@ -1217,6 +1172,10 @@ async def dispatch_batch_in_process(
       authenticated_session=authenticated_session,
       required_bind=required_bind,
     )
+  except CapabilityResolutionError as exc:
+    if exc.code == "credential_unavailable":
+      raise _BatchDispatchNotAdmitted(503, str(exc)) from exc
+    raise _BatchDispatchNotAdmitted(422, str(exc)) from exc
   except ValueError as exc:
     raise _BatchDispatchNotAdmitted(422, str(exc)) from exc
   except RuntimeError as exc:
@@ -1681,7 +1640,6 @@ async def _complete_authorized_batch_cancellation(
       authenticated=authenticated,
       app_state=app_state,
       reason="batch_cancelled",
-      trusted_lifecycle_authority=False,
     )
     if approval_error is None:
       approval_error = warning
@@ -1745,7 +1703,6 @@ async def _complete_authorized_batch_cancellation(
         authenticated=None,
         app_state=app_state,
         reason="batch_cancelled",
-        trusted_lifecycle_authority=True,
       )
       if approval_error is None:
         approval_error = warning
@@ -1828,7 +1785,6 @@ async def _deny_batch_pending_approvals_for_cancel(
   authenticated: Any | None,
   app_state: Any,
   reason: str,
-  trusted_lifecycle_authority: bool,
 ) -> ApprovalActionError | None:
   run_id = f"batch_{int(batch_id)}"
   processed: dict[str, tuple[Any, dict[str, Any]]] = {}
@@ -1904,24 +1860,12 @@ async def _deny_batch_pending_approvals_for_cancel(
         expected_run_id=expected_run_id,
         expected_session_id=projection.session_id,
         expected_channel=projection.channel,
-        system_override=trusted_lifecycle_authority,
-        role_authorization_prechecked=(
-          authenticated is not None and not trusted_lifecycle_authority
-        ),
         release_queue=False,
       )
     except asyncio.CancelledError:
       release_processed()
       raise
     except ApprovalActionError as exc:
-      if exc.status_code == 403 and authenticated is not None:
-        exc = ApprovalActionError(
-          503,
-          {
-            "error": "Batch approval authorization changed after preflight",
-            "approval_id": projection.approval_id,
-          },
-        )
       if first_error is None:
         first_error = exc
       continue
@@ -1952,60 +1896,14 @@ async def _deny_batch_pending_approvals_for_cancel(
 async def _preflight_batch_approval_cancellation(
   *,
   projections: tuple[Any, ...],
-  authenticated: Any,
 ) -> None:
-  """Authorize user-driven lifecycle teardown before mutating live state."""
-  first_error: BaseException | None = None
+  """Require the approval subsystem for every projection before mutating live state."""
   for projection in projections:
-    try:
-      await _authorize_batch_projection_for_user_cancellation(
-        projection=projection,
-        authenticated=authenticated,
+    if projection.store is None or projection.policy is None:
+      raise ApprovalActionError(
+        503,
+        {"error": "Approval subsystem unavailable", "approval_id": projection.approval_id},
       )
-    except asyncio.CancelledError:
-      raise
-    except ApprovalActionError as exc:
-      if exc.status_code == 403:
-        raise
-      if first_error is None:
-        first_error = exc
-    except Exception as exc:
-      if first_error is None:
-        first_error = exc
-  if first_error is not None:
-    raise first_error
-
-
-async def _authorize_batch_projection_for_user_cancellation(
-  *,
-  projection: _BatchCancellationProjection,
-  authenticated: Any,
-) -> None:
-  if projection.store is None or projection.policy is None:
-    raise ApprovalActionError(
-      503,
-      {"error": "Approval subsystem unavailable", "approval_id": projection.approval_id},
-    )
-  request_record = await projection.store.get(projection.approval_id)
-  if request_record is None:
-    request_record = getattr(projection, "request", None)
-  if request_record is None or not approval_record_matches_projection(
-    request_record,
-    projection,
-  ):
-    return
-  if not projection.policy.role_authorized_for_class(
-    decider_role=getattr(authenticated, "role", None),
-    tool_class=request_record.tool_class,
-  ):
-    raise ApprovalActionError(
-      403,
-      {
-        "error": "Role is not authorized to cancel this approval",
-        "approval_id": projection.approval_id,
-        "tool_class": request_record.tool_class,
-      },
-    )
 
 
 def _authenticated_batch_auth_config(authenticated: Any) -> dict[str, Any] | None:

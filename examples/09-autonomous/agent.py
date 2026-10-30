@@ -75,7 +75,6 @@ if __name__ == "__main__":
     adapter=AnthropicProvider(),
     auth_config={
       "provider": capability_bind.provider,
-      "max_tokens": 16_000,
       "auth_mode": "api",
       "api_key": api_key,
       "credential_handle_id": credential_handle.handle_id,

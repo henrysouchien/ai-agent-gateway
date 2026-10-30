@@ -2,6 +2,7 @@ from __future__ import annotations
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
+import dataclasses
 import json
 import logging
 import socket
@@ -15,7 +16,7 @@ from typing import Any, AsyncIterator, Mapping
 import httpx
 import pytest
 
-import agent_gateway.runner as gateway_runner
+import agent_gateway.runner_stream_turn as runner_stream_turn
 import agent_gateway.server as gateway_server
 import agent_gateway.server_chat_helpers as chat_helpers
 import agent_gateway.server_models as server_models
@@ -23,7 +24,7 @@ from agent_gateway.event_log import EventLog, LogEntry
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.providers import AnthropicProvider, OpenAIProvider
 from agent_gateway.providers.agent_sdk import AgentSDKConfig, SDK_PINNED_VERSION
-from agent_gateway.providers.base import ModelInfo, ModelProvider, StreamEvent
+from agent_gateway.providers.base import ModelInfo, ModelProvider, StreamEvent, stream_error
 from agent_gateway.runner import AgentRunner
 from agent_gateway.runner_auth import merge_refreshed_auth_config
 from agent_gateway.sdk_runner import AgentSDKRunner
@@ -169,7 +170,7 @@ class _DisconnectTrackingProvider(ModelProvider):
     self.closed_clients.append(client)
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
   def build_request_params(
     self,
@@ -245,7 +246,7 @@ class _HangingProvider(ModelProvider):
     client.release.set()
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
   def build_request_params(
     self,
@@ -292,7 +293,7 @@ class _CompletingProvider(ModelProvider):
     client.closed = True
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
   def build_request_params(
     self,
@@ -380,7 +381,7 @@ class _CredentialFailureProvider(ModelProvider):
     client.closed = True
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
   def build_request_params(
     self,
@@ -408,7 +409,7 @@ class _CredentialFailureProvider(ModelProvider):
     _ = client, params
     self.stream_calls += 1
     if self.stream_calls == 1:
-      raise RuntimeError("429 Too Many Requests: rate limit exceeded")
+      raise stream_error("rate limit exceeded", "rate_limit_exceeded")
     yield StreamEvent(type="message_start", input_tokens=1)
     yield StreamEvent(type="text_delta", text="rotated")
     yield StreamEvent(type="text_end", raw_block={"type": "text", "text": "rotated"})
@@ -431,7 +432,7 @@ class _ToolCallProvider(ModelProvider):
     client.closed = True
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
   def build_request_params(
     self,
@@ -2366,7 +2367,11 @@ def test_subscribe_uses_sse_comment_keepalive_without_event_log_heartbeat(make_t
 
 def test_credential_rotation_retries_stream_with_new_auth_config(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
-    monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
+    monkeypatch.setattr(
+      runner_stream_turn,
+      "TRANSPORT_RETRY_POLICY",
+      dataclasses.replace(runner_stream_turn.TRANSPORT_RETRY_POLICY, base_delay_seconds=0.0),
+    )
     provider = _CredentialFailureProvider()
     event_log = EventLog()
     _dispatcher_execution_1556 = _native_execution(
@@ -2445,7 +2450,7 @@ def test_merge_refreshed_auth_config_drops_selection_and_keeps_bound_values() ->
     "auth_token": "",
     "auth_mode": "api",
     "provider": "anthropic",
-    "max_tokens": 256,
+    "max_tokens": 9,
   }
 
 

@@ -23,6 +23,7 @@ from .base import (
   ModelInfo,
   ModelProvider,
   StreamEvent,
+  stream_error,
   _classify_provider_credential_failure,
   _error_code_from_exception,
   _is_context_length_exception,
@@ -72,6 +73,8 @@ def _rate_table_for(provider: str, override: RateTable | None) -> RateTable:
 # This class does not. One wire: OpenAI Responses at ``{base}/responses``.
 
 DEFAULT_COPILOT_BASE_URL = "https://api.githubcopilot.com"
+# Typed HTTP transport retry classification at provider entry (with 5xx in is_retryable_error);
+# 408/409 are transient request-timeout/conflict statuses, not usage-limit signals.
 _RETRYABLE_STATUSES = frozenset({408, 409})
 _USAGE_LIMIT_CODES = frozenset({
   "insufficient_quota",
@@ -81,17 +84,6 @@ _USAGE_LIMIT_CODES = frozenset({
   "too_many_requests",
   "usage_limit",
 })
-_USAGE_LIMIT_RE = re.compile(
-  r"\b("
-  r"rate[\s_-]*limit(?:ed|ing)?"
-  r"|too many requests"
-  r"|quota[\s_-]*(?:exhausted|exceeded|limit)"
-  r"|usage[\s_-]*limit"
-  r"|monthly[\s_-]*quota"
-  r"|premium[\s_-]*interactions?"
-  r")\b",
-  re.IGNORECASE,
-)
 _CONTENT_REFUSAL_RE = re.compile(
   r"\b("
   r"content[\s_-]*(?:filter|policy)"
@@ -146,20 +138,6 @@ def _searchable(exc: Exception) -> str:
 
 def _is_content_refusal(exc: Exception) -> bool:
   return _CONTENT_REFUSAL_RE.search(_searchable(exc)) is not None
-
-
-def _is_usage_limit_only(exc: Exception) -> bool:
-  """True when the body is a rate/usage/quota exhaustion and nothing else."""
-
-  status = _status_code_from_exception(exc)
-  if status in {400, 401, 403}:
-    return False
-  if _is_context_length_exception(exc) or _is_content_refusal(exc):
-    return False
-  code = str(_error_code_from_exception(exc) or "").strip().lower()
-  if code in _USAGE_LIMIT_CODES:
-    return True
-  return _USAGE_LIMIT_RE.search(_searchable(exc)) is not None
 
 
 def _retry_after_raw(exc: Exception) -> str | None:
@@ -221,14 +199,19 @@ def _rate_limit_failure(exc: Exception, status: int | None) -> ProviderCredentia
 
 
 def _map_copilot_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[StreamEvent]:
-  try:
-    return map_event(event, state)
-  except RuntimeError as exc:
-    message = str(exc)
-    # The reused mapper names xAI. This wire is Copilot.
-    if message.startswith("xAI "):
-      raise RuntimeError(f"copilot {message[4:]}") from exc
-    raise
+  """The shared Responses mapper, with in-band failures named for Copilot and typed by their own code."""
+  event_type = event.get("type")
+  if event_type == "error":
+    detail = str(event.get("message") or event.get("code") or json.dumps(event, separators=(",", ":")))
+    raise stream_error(f"copilot error: {detail}", event.get("code"))
+  if event_type == "response.failed":
+    response_value = event.get("response")
+    response = response_value if isinstance(response_value, dict) else {}
+    error_value = response.get("error")
+    error = error_value if isinstance(error_value, dict) else {}
+    detail = str(error.get("message") or "unknown error")
+    raise stream_error(f"copilot response failed: {detail}", error.get("code"))
+  return map_event(event, state)
 
 
 async def _error_message(response: httpx.Response) -> str:
@@ -485,7 +468,7 @@ class CopilotResponsesProvider(ModelProvider):
     # A 400, a content refusal, and a context-length error are not a hop.
     if status == 400 or _is_context_length_exception(exc) or _is_content_refusal(exc):
       return None
-    if _is_usage_limit_only(exc):
+    if str(_error_code_from_exception(exc) or "").strip().lower() in _USAGE_LIMIT_CODES:
       return _rate_limit_failure(exc, status)
     return _classify_provider_credential_failure(provider=self.name, exc=exc)
 

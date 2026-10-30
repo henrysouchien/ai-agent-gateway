@@ -1515,6 +1515,7 @@ class ToolDispatcher:
         ApprovalPredicateCall(
           declaration.identity,
           prepared_call.prepared_input,
+          exact_backend=prepared_call.exact_backend,
         ),
       )
     if not approval_required or policy.cache_key is None:

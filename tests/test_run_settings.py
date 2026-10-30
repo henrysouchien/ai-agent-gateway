@@ -35,7 +35,6 @@ def test_without_an_operator_file_the_packaged_defaults_apply(operator_file: Pat
   assert not operator_file.exists()
   assert settings_path() == operator_file
   assert load_run_settings().to_dict() == PACKAGED
-  assert len(PACKAGED) == 14
   assert operator_overrides() == {}
 
 

@@ -7,7 +7,8 @@ from typing import Any, BinaryIO
 
 AUTONOMOUS_CONTROL_RECORD_VERSION = 1
 AUTONOMOUS_CONTROL_RECORD_MAX_BYTES = 256 * 1024
-AUTONOMOUS_OPERATOR_MESSAGE_LIMIT = 64
+# Resource containment: bounds durable growth of one run's operator-inbox file,
+# which the writer appends to and the child tails from offset 0.
 AUTONOMOUS_OPERATOR_AGGREGATE_BYTES_LIMIT = 1024 * 1024
 AUTONOMOUS_CONTROL_RECORDS_PER_DRAIN = 16
 
@@ -158,7 +159,6 @@ __all__ = [
   "AUTONOMOUS_CONTROL_RECORD_VERSION",
   "AUTONOMOUS_CONTROL_RECORDS_PER_DRAIN",
   "AUTONOMOUS_OPERATOR_AGGREGATE_BYTES_LIMIT",
-  "AUTONOMOUS_OPERATOR_MESSAGE_LIMIT",
   "AUTONOMOUS_OPERATOR_RECORD_FIELDS",
   "decode_closed_control_record",
   "encode_closed_control_record",

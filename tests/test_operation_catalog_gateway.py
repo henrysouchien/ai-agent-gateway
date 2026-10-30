@@ -180,10 +180,8 @@ Explore the admitted question.
       "reference": "/tmp/admitted-methodology.json",
     },
     methodology_state_instructions="Use the exact persisted methodology state.",
-    max_tokens=64_000,
     cost_observation_threshold_usd=50,
     provider_tool_definitions=(),
-    max_resume_chain_depth=3,
   )
   first = ordinary_admitted_task_factory(
     operation=operation,

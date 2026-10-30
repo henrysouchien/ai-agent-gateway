@@ -18,7 +18,6 @@ from agent_gateway.runner_state import (
   execute_single_tool_call_step,
   execute_tool_use_loop,
   gather_run_agent_batch_results,
-  max_tokens_continuation_decision,
   model_visible_extra_blocks,
   no_tool_use_turn_outcome,
   normalized_run_config,
@@ -244,27 +243,6 @@ def test_completed_assistant_content_blocks_filters_tool_use_blocks() -> None:
   ]
 
 
-def test_max_tokens_continuation_decision_increments_and_checks_bound() -> None:
-  first = max_tokens_continuation_decision(current_attempts=0, max_attempts=2)
-  second = max_tokens_continuation_decision(current_attempts=1, max_attempts=2)
-  terminal = max_tokens_continuation_decision(current_attempts=2, max_attempts=2)
-
-  assert first.attempts == 1
-  assert first.should_continue is True
-  assert second.attempts == 2
-  assert second.should_continue is True
-  assert terminal.attempts == 3
-  assert terminal.should_continue is False
-
-  unbounded = max_tokens_continuation_decision(
-    current_attempts=200,
-    max_attempts=2,
-    unbounded=True,
-  )
-  assert unbounded.attempts == 201
-  assert unbounded.should_continue is True
-
-
 def test_no_tool_use_turn_outcome_continues_pause_and_compaction() -> None:
   content = [{"type": "text", "text": "paused"}]
 
@@ -275,7 +253,6 @@ def test_no_tool_use_turn_outcome_continues_pause_and_compaction() -> None:
     stop_reason="pause_turn",
     pending_notification_count=0,
     max_tokens_continuations=4,
-    max_tokens_max_attempts=5,
     max_tokens_nudge="nudge",
   )
   compaction = no_tool_use_turn_outcome(
@@ -285,7 +262,6 @@ def test_no_tool_use_turn_outcome_continues_pause_and_compaction() -> None:
     stop_reason="compaction",
     pending_notification_count=0,
     max_tokens_continuations=4,
-    max_tokens_max_attempts=5,
     max_tokens_nudge="nudge",
   )
 
@@ -318,15 +294,12 @@ def test_no_tool_use_turn_outcome_max_tokens_continues_with_guard_and_nudge() ->
     stop_reason="max_tokens",
     pending_notification_count=3,
     max_tokens_continuations=0,
-    max_tokens_max_attempts=2,
     max_tokens_nudge="continue please",
   )
 
   assert outcome.action == "continue"
   assert outcome.reason == "max_tokens_continue"
   assert outcome.max_tokens_continuations == 1
-  assert outcome.max_tokens_decision is not None
-  assert outcome.max_tokens_decision.should_continue is True
   assert outcome.runtime_guard == ("max_tokens_truncation", "continue please")
   assert outcome.messages == [
     {
@@ -340,27 +313,6 @@ def test_no_tool_use_turn_outcome_max_tokens_continues_with_guard_and_nudge() ->
   ]
 
 
-def test_no_tool_use_turn_outcome_max_tokens_terminal_breaks_before_notifications() -> None:
-  outcome = no_tool_use_turn_outcome(
-    content_blocks=[{"type": "text", "text": "partial"}],
-    provider="stub",
-    model="model-1",
-    stop_reason="max_tokens",
-    pending_notification_count=3,
-    max_tokens_continuations=2,
-    max_tokens_max_attempts=2,
-    max_tokens_nudge="continue please",
-  )
-
-  assert outcome.action == "break"
-  assert outcome.reason == "max_tokens_terminal"
-  assert outcome.max_tokens_continuations == 3
-  assert outcome.max_tokens_decision is not None
-  assert outcome.max_tokens_decision.should_continue is False
-  assert outcome.messages == []
-  assert outcome.runtime_guard is None
-
-
 def test_no_tool_use_turn_outcome_continues_for_pending_notifications() -> None:
   content = [{"type": "text", "text": "done"}]
 
@@ -371,7 +323,6 @@ def test_no_tool_use_turn_outcome_continues_for_pending_notifications() -> None:
     stop_reason="end_turn",
     pending_notification_count=1,
     max_tokens_continuations=1,
-    max_tokens_max_attempts=2,
     max_tokens_nudge="nudge",
   )
 
@@ -406,7 +357,6 @@ def test_no_tool_use_turn_outcome_breaks_default_terminal_turn() -> None:
     stop_reason="end_turn",
     pending_notification_count=0,
     max_tokens_continuations=1,
-    max_tokens_max_attempts=2,
     max_tokens_nudge="nudge",
   )
 
@@ -1393,56 +1343,32 @@ def test_stream_turn_log_summary_handles_empty_text_and_missing_first_token() ->
   assert summary.text_preview == ""
 
 
-def test_select_run_max_tokens_without_override_requests_model_ceiling() -> None:
+def test_select_run_max_tokens_requests_model_ceiling() -> None:
   selection = select_run_max_tokens(
     {"max_tokens": 16000},
-    max_tokens_override=None,
     model_info=SimpleNamespace(max_output_tokens=128_000),
   )
 
   assert selection.value == 128_000
   assert selection.clamped is False
+  assert selection.model_max_output == 128_000
 
 
-def test_select_run_max_tokens_uses_override_and_config_without_ceiling() -> None:
-  model_info = SimpleNamespace(max_output_tokens=0)
-
-  assert select_run_max_tokens(
-    {"max_tokens": 16000},
-    max_tokens_override=None,
-    model_info=model_info,
-  ).value == 16000
+def test_select_run_max_tokens_uses_config_without_ceiling() -> None:
   selection = select_run_max_tokens(
     {"max_tokens": 16000},
-    max_tokens_override=32000,
-    model_info=model_info,
+    model_info=SimpleNamespace(max_output_tokens=0),
   )
 
-  assert selection.value == 32000
-  assert selection.requested == 32000
+  assert selection.value == 16000
+  assert selection.requested == 16000
   assert selection.model_max_output == 0
   assert selection.clamped is False
 
 
-def test_select_run_max_tokens_clamps_override_to_model_max_output() -> None:
-  selection = select_run_max_tokens(
-    {"max_tokens": 16000},
-    max_tokens_override=64000,
-    model_info=SimpleNamespace(max_output_tokens=16384),
-  )
-
-  assert selection.value == 16384
-  assert selection.requested == 64000
-  assert selection.model_max_output == 16384
-  assert selection.clamped is True
-
-
-def test_select_run_max_tokens_keeps_override_below_model_ceiling() -> None:
-  selection = select_run_max_tokens(
-    {"max_tokens": 16000},
-    max_tokens_override=24000,
-    model_info=SimpleNamespace(max_output_tokens=128_000),
-  )
-
-  assert selection.value == 24000
-  assert selection.clamped is False
+def test_select_run_max_tokens_without_ceiling_or_config_has_no_default() -> None:
+  with pytest.raises(KeyError):
+    select_run_max_tokens(
+      {},
+      model_info=SimpleNamespace(max_output_tokens=0),
+    )

@@ -28,6 +28,7 @@ from model_authority.capabilities import (
 )
 from model_authority.registry import ProductModelRegistry
 from model_authority.selection import (
+  FallbackModel,
   ProductModelSelectionPolicy,
   SelectionSnapshot,
   TierDefault,
@@ -108,6 +109,26 @@ class ModelFallbackHop:
   primary_model_key: str
 
 
+
+@dataclass(frozen=True, slots=True)
+class _ModelFallbackFailure:
+  provider: str
+  credential_ref: str
+  reset_at: float | None
+
+
+@dataclass(slots=True)
+class _ModelFallbackProgress:
+  """Runtime-only failures in one authenticated resolver's exact frozen chain."""
+
+  selection_snapshot: SelectionSnapshot
+  capability_id: str
+  role: str
+  primary_model_key: str
+  selection_source: str
+  failures: dict[int, _ModelFallbackFailure] = field(default_factory=dict)
+  positions: dict[tuple[str, str, str | None, str], int] = field(default_factory=dict)
+
 @dataclass(frozen=True, slots=True)
 class BoundCapabilityExecution:
   """One immutable binding paired with adapter code and secret material."""
@@ -183,6 +204,11 @@ class CapabilityExecutionResolver:
   # processes (Risk, Investment workers) that designate their own executable
   # sets at their own boundaries.
   executable_capability_ids: frozenset[str] | None = None
+  # Runtime-only and authenticated-resolver-scoped: never serialized or shared
+  # across tenants. Fresh children use the same resolver as their parent.
+  _fallback_progress: list[_ModelFallbackProgress] = field(
+    default_factory=list, repr=False, compare=False,
+  )
 
   def __post_init__(self) -> None:
     if not callable(self.credential_materializer):
@@ -225,6 +251,187 @@ class CapabilityExecutionResolver:
         str(self.trusted_channel).strip() or None,
       )
 
+  @staticmethod
+  def _fallback_position(bind: CapabilityBind) -> tuple[str, str, str | None, str]:
+    return bind.model_key, bind.credential_ref, bind.effort, bind.selection_source
+
+  def _fallback_progress_for(
+    self,
+    selection_snapshot: SelectionSnapshot,
+    capability_id: str,
+    role: str,
+    primary_model_key: str,
+    selection_source: str,
+    *,
+    create: bool = False,
+  ) -> _ModelFallbackProgress | None:
+    for progress in self._fallback_progress:
+      if (
+        progress.selection_snapshot == selection_snapshot
+        and progress.capability_id == capability_id
+        and progress.role == role
+        and progress.primary_model_key == primary_model_key
+        and progress.selection_source == selection_source
+      ):
+        return progress
+    if not create:
+      return None
+    progress = _ModelFallbackProgress(
+      selection_snapshot, capability_id, role, primary_model_key, selection_source,
+    )
+    self._fallback_progress.append(progress)
+    return progress
+
+  def _fallback_position_for_bind(
+    self,
+    selection_snapshot: SelectionSnapshot,
+    bind: CapabilityBind,
+    role: str,
+  ) -> tuple[_ModelFallbackProgress, int] | None:
+    position = self._fallback_position(bind)
+    for progress in reversed(self._fallback_progress):
+      if (
+        progress.selection_snapshot == selection_snapshot
+        and progress.capability_id == bind.capability_id
+        and progress.role == role
+        and position in progress.positions
+      ):
+        return progress, progress.positions[position]
+    return None
+
+  def _fallback_role(
+    self,
+    bind: CapabilityBind,
+    selection_snapshot: SelectionSnapshot,
+    requested_role: str | None,
+  ) -> str:
+    if requested_role is not None:
+      return requested_role
+    defaults = selection_snapshot.frozen_slot(bind.capability_id)
+    channel = str(self.trusted_channel or "").strip()
+    slot_default = defaults.by_channel.get(channel, defaults.default)
+    if slot_default.kind != "tier" or slot_default.tier is None:
+      raise TierProjectionError(
+        "capability_selection_invalid", "a concrete default has no fallback role",
+      )
+    return slot_default.tier
+
+  @staticmethod
+  def _fallback_credential_changed(provider: str, previous: str, current: str) -> bool:
+    if previous == current:
+      return False
+    if provider != "anthropic":
+      return True
+    from .providers.anthropic_oauth import is_anthropic_generation_ref
+
+    # A secret-free pool bind and its materialized generation name the same
+    # account; two distinct generations or pool handles are a real change.
+    return is_anthropic_generation_ref(previous) == is_anthropic_generation_ref(current)
+
+  @staticmethod
+  def _fallback_position_shared(bind: CapabilityBind) -> bool:
+    return bind.selection_source in ("channel_default", "capability_default", "internal_policy")
+
+  @staticmethod
+  def _fallback_failure_active(
+    progress: _ModelFallbackProgress,
+    index: int,
+    bind: CapabilityBind,
+    *,
+    now: float,
+  ) -> bool:
+    failure = progress.failures.get(index)
+    if failure is None:
+      return False
+    credential_changed = CapabilityExecutionResolver._fallback_credential_changed(
+      failure.provider, failure.credential_ref, bind.credential_ref,
+    )
+    if credential_changed or (failure.reset_at is not None and failure.reset_at <= now):
+      progress.failures.pop(index, None)
+      return False
+    return True
+
+  def _clear_fallback_provider(self, provider: str) -> None:
+    for progress in self._fallback_progress:
+      progress.failures = {
+        index: failure for index, failure in progress.failures.items()
+        if failure.provider != provider
+      }
+
+
+  def _resolve_fallback_bind(
+    self,
+    bind: CapabilityBind,
+    role: str,
+    entry: FallbackModel,
+  ) -> CapabilityBind | None:
+    effort = entry.effort or bind.effort
+    resolved = resolve_capability_model(
+      bind.capability_id,
+      registry=self.registry,
+      selection_policy=self.selection_policy,
+      auth=self.auth_context,
+      trusted_channel=self.trusted_channel,
+      requested_effort=effort,
+      requested_role=role,
+      role_map={role: TierModelsDefault((entry.model_key,), effort)},
+      role_map_source="internal_policy",
+    )
+    if (
+      resolved.credential_principal != bind.credential_principal
+      or resolved.run_mode != bind.run_mode
+    ):
+      return None
+    return CapabilityBind.model_validate({
+      **resolved.to_json(), "selection_source": bind.selection_source,
+    })
+
+  def _select_fallback_bind(
+    self,
+    bind: CapabilityBind,
+    selection_snapshot: SelectionSnapshot,
+    requested_role: str | None,
+  ) -> CapabilityBind:
+    """Resume at the first entry not failed in this resolver's exact chain."""
+
+    try:
+      role = self._fallback_role(bind, selection_snapshot, requested_role)
+      progress = self._fallback_progress_for(
+        selection_snapshot, bind.capability_id, role, bind.model_key, bind.selection_source,
+      )
+      if progress is None:
+        return bind
+      progress.positions[self._fallback_position(bind)] = -1
+      now = time.time()
+      if not self._fallback_failure_active(progress, -1, bind, now=now):
+        return bind
+      chain = project_fallback_chain(
+        self.registry, self.selection_policy, bind.capability_id, role,
+        selection_snapshot=selection_snapshot,
+      )
+    except TierProjectionError:
+      return bind
+    placement = placement_for_channel(self.trusted_channel)
+    placement_eligible = {
+      entry.model_key for entry in filter_fallback_entries_for_placement(
+        chain.entries, self.registry, placement=placement,
+      )
+    }
+    for index, entry in enumerate(chain.entries):
+      if entry.model_key == bind.model_key or entry.model_key not in placement_eligible:
+        continue
+      try:
+        candidate = self._resolve_fallback_bind(bind, role, entry)
+      except CapabilityResolutionError:
+        continue
+      if candidate is None:
+        continue
+      progress.positions[self._fallback_position(candidate)] = index
+      if self._fallback_failure_active(progress, index, candidate, now=now):
+        continue
+      return candidate
+    return bind
+
   def _require_executable_here(self, capability_id: str) -> None:
     """Refuse capabilities designated as executed by another serving process."""
 
@@ -260,7 +467,7 @@ class CapabilityExecutionResolver:
     """
 
     self._require_executable_here(str(capability_id or "").strip())
-    return resolve_capability_model(
+    bind = resolve_capability_model(
       capability_id,
       registry=self.registry,
       selection_policy=self.selection_policy,
@@ -274,6 +481,15 @@ class CapabilityExecutionResolver:
       requested_role=role,
       selection_snapshot=selection_snapshot,
     )
+    if (
+      selection_snapshot is None
+      or explicit_intent is not None
+      or saved_preference is not None
+      or parent_bind is not None
+      or capability_id in self.authenticated_run_overrides
+    ):
+      return bind
+    return self._select_fallback_bind(bind, selection_snapshot, role)
 
   def resolve(
     self,
@@ -314,8 +530,9 @@ class CapabilityExecutionResolver:
     rotated_auth_config: Mapping[str, Any],
     *,
     merged_auth_config: Mapping[str, Any],
+    revive_fallback_entries: bool = True,
   ) -> BoundCapabilityExecution | None:
-    """Reauthorize a sibling generation; never put it under the previous bind."""
+    """Reauthorize a sibling generation; revive failures only for real rotation."""
     from .providers.anthropic_oauth import is_anthropic_generation_ref
 
     source = rotated_auth_config.get("credential_source")
@@ -324,11 +541,15 @@ class CapabilityExecutionResolver:
       if is_anthropic_generation_ref(execution.bind.credential_ref):
         return None
       # Providers without generation handles retain their per-session identity.
+      if revive_fallback_entries and execution.resolver is not None:
+        execution.resolver._clear_fallback_provider(execution.bind.provider)
       return replace(execution, auth_config=merged_auth_config)
 
     resolver = execution.resolver
     if resolver is None:
       return None
+    if revive_fallback_entries:
+      resolver._clear_fallback_provider(execution.bind.provider)
     # CapabilityBind is a validated Pydantic value, not a dataclass. Its wire
     # fields are the identity; there is no separately cached bind digest.
     bind = CapabilityBind.model_validate({
@@ -336,6 +557,52 @@ class CapabilityExecutionResolver:
       "credential_ref": generation_ref,
     })
     return resolver.with_frozen_credential(bind, merged_auth_config).materialize_bind(bind)
+
+  def _record_model_fallback_failure(
+    self,
+    execution: BoundCapabilityExecution,
+    selection_snapshot: SelectionSnapshot,
+    *,
+    selection_provenance: SelectionProvenance | None,
+    previous: ModelFallbackHop | None,
+    reason: Literal["usage_limit", "credential_denied", "provider_outage"],
+    reset_at: float | None,
+  ) -> None:
+    """Remember a provider failure at its exact frozen-chain position."""
+
+    if reason not in ("usage_limit", "credential_denied"):
+      return
+    bind = execution.bind
+    try:
+      if previous is None:
+        if selection_provenance is None:
+          return
+        role = self._fallback_role(bind, selection_snapshot, selection_provenance.role)
+        positioned = (
+          self._fallback_position_for_bind(selection_snapshot, bind, role)
+          if self._fallback_position_shared(bind) else None
+        )
+        if positioned is None:
+          primary_model_key = bind.model_key
+          failed_index = -1
+        else:
+          progress, failed_index = positioned
+          primary_model_key = progress.primary_model_key
+      else:
+        role = previous.role
+        primary_model_key = previous.primary_model_key
+        failed_index = previous.chain_index
+    except TierProjectionError:
+      return
+    progress = self._fallback_progress_for(
+      selection_snapshot, bind.capability_id, role, primary_model_key,
+      bind.selection_source, create=True,
+    )
+    assert progress is not None
+    progress.positions[self._fallback_position(bind)] = failed_index
+    progress.failures[failed_index] = _ModelFallbackFailure(
+      bind.provider, bind.credential_ref, reset_at,
+    )
 
   @staticmethod
   def rebind_model_fallback(
@@ -377,17 +644,20 @@ class CapabilityExecutionResolver:
       if previous is None:
         if selection_provenance is None:
           return None
-        if selection_provenance.role is not None:
-          role = selection_provenance.role
+        role = resolver._fallback_role(
+          bind, selection_snapshot, selection_provenance.role,
+        )
+        positioned = (
+          resolver._fallback_position_for_bind(selection_snapshot, bind, role)
+          if resolver._fallback_position_shared(bind) else None
+        )
+        if positioned is None:
+          primary_model_key = bind.model_key
+          start = 0
         else:
-          defaults = selection_snapshot.frozen_slot(bind.capability_id)
-          channel = str(resolver.trusted_channel or "").strip()
-          slot_default = defaults.by_channel.get(channel, defaults.default)
-          if slot_default.kind != "tier" or slot_default.tier is None:
-            return None
-          role = slot_default.tier
-        primary_model_key = bind.model_key
-        start = 0
+          progress, selected_index = positioned
+          primary_model_key = progress.primary_model_key
+          start = selected_index + 1
       else:
         role = previous.role
         primary_model_key = previous.primary_model_key
@@ -401,6 +671,9 @@ class CapabilityExecutionResolver:
       )
     except TierProjectionError:
       return None
+    progress = resolver._fallback_progress_for(
+      selection_snapshot, bind.capability_id, role, primary_model_key, bind.selection_source,
+    )
     skipped: list[FallbackSkip] = [] if previous is not None else [
       FallbackSkip(omitted.entry.models[0], omitted.code)
       for omitted in chain.omitted
@@ -420,30 +693,13 @@ class CapabilityExecutionResolver:
       if entry.model_key not in placement_eligible:
         skipped.append(FallbackSkip(entry.model_key, "placement_ineligible"))
         continue
-      effort = entry.effort or bind.effort
       try:
-        resolved = resolve_capability_model(
-          bind.capability_id,
-          registry=resolver.registry,
-          selection_policy=resolver.selection_policy,
-          auth=resolver.auth_context,
-          trusted_channel=resolver.trusted_channel,
-          requested_effort=effort,
-          requested_role=role,
-          role_map={role: TierModelsDefault((entry.model_key,), effort)},
-          role_map_source="internal_policy",
-        )
-        if (
-          resolved.credential_principal != bind.credential_principal
-          or resolved.run_mode != bind.run_mode
-        ):
+        resolved = resolver._resolve_fallback_bind(bind, role, entry)
+        if resolved is None:
           skipped.append(FallbackSkip(entry.model_key, "credential_principal_changed"))
           continue
         hop_execution = CapabilityExecutionResolver._rebind_unparked_account(
-          resolver.materialize_bind(CapabilityBind.model_validate({
-            **resolved.to_json(),
-            "selection_source": bind.selection_source,
-          })),
+          resolver.materialize_bind(resolved),
           placement=placement,
           route=resolved.route,
         )
@@ -461,6 +717,8 @@ class CapabilityExecutionResolver:
         # an entry whose context cannot hold this transcript is not used.
         skipped.append(FallbackSkip(entry.model_key, "context_window_exceeded"))
         continue
+      if progress is not None:
+        progress.positions[resolver._fallback_position(hop_execution.bind)] = index
       return ModelFallbackHop(hop_execution, role, index, tuple(skipped), primary_model_key)
     if skipped_out is not None:
       skipped_out.extend(skipped)
@@ -524,6 +782,7 @@ class CapabilityExecutionResolver:
             return execution
           return CapabilityExecutionResolver.rebind_rotated_credential(
             execution, account, merged_auth_config={**config, **account},
+            revive_fallback_entries=False,
           )
       # Direct credentials have no enrolled pool or cooldown state; admit the
       # supplied material through the same selector as a pool of one below.
@@ -555,6 +814,7 @@ class CapabilityExecutionResolver:
         }
         rebound = CapabilityExecutionResolver.rebind_rotated_credential(
           execution, account, merged_auth_config={**config, **account},
+          revive_fallback_entries=False,
         )
         if rebound is None:
           raise CapabilityResolutionError(
@@ -607,6 +867,10 @@ class CapabilityExecutionResolver:
         return materialized
       return self.credential_materializer(handle)
 
+    if self._fallback_credential_changed(
+      bind.provider, current_handle.handle_id, bind.credential_ref,
+    ):
+      self._clear_fallback_provider(bind.provider)
     return replace(
       self,
       auth_context=replace(
@@ -1002,13 +1266,6 @@ async def execute_leaf_model_call(
     role=effective_role,
     effort=effective_effort,
   )
-  if bound_execution.auth_config.get("max_tokens") is None:
-    model_info = getattr(bound_execution.adapter, "get_model_info", lambda _m: None)(
-      bound_execution.bind.upstream_model
-    )
-    default_max = getattr(model_info, "max_output_tokens", 4096) if model_info else 4096
-    config = {**bound_execution.auth_config, "max_tokens": int(default_max or 4096)}
-    bound_execution = replace(bound_execution, auth_config=MappingProxyType(config))
 
   handles = tuple(str(h) for h in evidence_handles if str(h).strip())
   if op.kind == "completion":

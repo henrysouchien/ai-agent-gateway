@@ -762,9 +762,9 @@ async def run_autonomous(
   No turn, cost, or wall-clock ceiling bounds the run; cost is measured through
   `on_usage` / `on_session_summary`.
   Supplied execution limits pass through to the session's RunContext
-  unchanged, whether or not this is a named skill run. When admitted, their
-  max_tokens is this run's max_tokens_override; a missing admission or an
-  undeclared limit leaves that override unset.
+  unchanged, whether or not this is a named skill run. They do not set the
+  provider request size; `select_run_max_tokens` requests the bound model's
+  registry ceiling.
   `containment` is the process's `ContainmentSettings`; `None` constructs the
   live one (the run settings file) here, at this standalone entry point.
   Standalone top-level skill callers must bind both `top_level_skill_name` and
@@ -1100,21 +1100,12 @@ async def run_autonomous(
       capability_execution = replace(
         capability_execution, resolver=capability_execution_resolver,
       )
-    # No admitted limits (a non-skill run) or an undeclared skill max_tokens
-    # both leave the override unset. select_run_max_tokens then requests the
-    # bound model's registry ceiling.
-    max_tokens_override = (
-      None
-      if admitted_skill_execution_limits is None
-      else admitted_skill_execution_limits.max_tokens
-    )
     runner = AgentRunner(
       event_log=event_log,
       dispatcher=dispatcher,
       session_id=sid,
       capability_execution=capability_execution,
       allow_stub_response=False,
-      max_tokens_override=max_tokens_override,
       mcp_client=mcp_client,
       mcp_activation_fold=session.mcp_activation_fold,
       excluded_tools=excluded_tools,

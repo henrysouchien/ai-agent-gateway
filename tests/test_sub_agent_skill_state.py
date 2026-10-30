@@ -222,7 +222,6 @@ def test_classify_awaiting_approval_is_nonfinal_without_an_error() -> None:
   classification = skill_state.classify_child_outcome(
     result,
     None,
-    declared_terminal_doors={"fms_propose_demo"},
     door_results=({
       "tool_name": "fms_propose_demo",
       "status": "error",
@@ -281,7 +280,6 @@ def test_lifecycle_without_a_door_result_keeps_the_child_disposition() -> None:
   classification = skill_state.classify_child_outcome(
     result,
     None,
-    declared_terminal_doors=frozenset({"fms_report_build_model", "build_model"}),
   )
 
   assert classification.succeeded is True
@@ -298,7 +296,6 @@ def test_lifecycle_records_the_terminal_door_refusal_as_its_error() -> None:
   classification = skill_state.classify_child_outcome(
     result,
     None,
-    declared_terminal_doors=frozenset({"fms_persist_postcompile_valuation"}),
     door_results=({
       "tool_name": "fms_persist_postcompile_valuation",
       "status": "error",
@@ -447,21 +444,12 @@ def _sealed_task(**overrides: Any) -> Any:
   )
 
 
-def test_persist_expectation_doors_are_empty_unless_the_operation_declares_one() -> None:
-  # A coordinator carries its children's writer doors on its grant but owes no
-  # persist of its own: it keeps its narrative outcome.
-  coordinator = _sealed_task()
-  assert skill_state.terminal_result_doors(coordinator) == frozenset({"fms_report_demo"})
-  assert skill_state.persist_expectation_doors(coordinator) == frozenset()
-  assert skill_state.persist_expectation_doors(None) == frozenset()
-
-
-def test_persist_expectation_doors_are_the_terminal_doors_of_a_declared_operation() -> None:
-  writer = _sealed_task(result_requires_persist=True)
-  assert skill_state.persist_expectation_doors(writer) == frozenset({"fms_report_demo"})
-  # A declared operation that persists several units has no terminal door to owe.
-  multi_unit = _sealed_task(result_requires_persist=True, terminal_on_persist=False)
-  assert skill_state.persist_expectation_doors(multi_unit) == frozenset()
+def test_terminal_result_doors_are_the_admitted_grants_terminal_doors() -> None:
+  assert skill_state.terminal_result_doors(_sealed_task()) == frozenset({"fms_report_demo"})
+  assert skill_state.terminal_result_doors(None) == frozenset()
+  # An operation that persists several units has no terminal door that ends the run.
+  multi_unit = _sealed_task(terminal_on_persist=False)
+  assert skill_state.terminal_result_doors(multi_unit) == frozenset()
 
 
 @pytest.mark.parametrize(

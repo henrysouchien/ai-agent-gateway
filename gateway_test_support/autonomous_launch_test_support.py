@@ -61,7 +61,7 @@ def _workload(
   admitted_skill_execution_limits: SkillExecutionLimits | None = None,
 ) -> AutonomousLaunchWorkload:
   if mode == "skill" and admitted_skill_execution_limits is None:
-    admitted_skill_execution_limits = SkillExecutionLimits(32_000)
+    admitted_skill_execution_limits = SkillExecutionLimits()
   return AutonomousLaunchWorkload(
     profile=profile,
     mode=mode,

@@ -83,6 +83,7 @@ class _RecordingProvider(ModelProvider):
       output_cost_per_mtok=0.0,
       cache_read_cost_per_mtok=0.0,
       cache_write_cost_per_mtok=0.0,
+      max_output_tokens=16_384,
     )
 
   def build_request_params(

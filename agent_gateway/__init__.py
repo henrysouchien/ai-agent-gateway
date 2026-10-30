@@ -34,7 +34,7 @@ if TYPE_CHECKING:
   from .autonomous_launch_envelope import (
     AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE,
     AUTONOMOUS_CAPABILITY_ENVELOPE_CLOCK_SKEW_SECONDS,
-    AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
     AUTONOMOUS_CAPABILITY_ENVELOPE_TTL_SECONDS,
     AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION,
     AUTONOMOUS_TASK_ID_ENV,
@@ -249,7 +249,6 @@ if TYPE_CHECKING:
       RequestContext,
       create_gateway_app,
     )
-  from .server_models import SessionExecutionPolicy
 
 # Public exports stay discoverable without importing application dependencies.
 _EXPORTS = {
@@ -276,7 +275,7 @@ _EXPORTS = {
   "resolve_autonomous_capability_binding": ("agent_gateway.autonomous_capability_handoff", "resolve_autonomous_capability_binding"),
   "AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE": ("agent_gateway.autonomous_launch_envelope", "AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE"),
   "AUTONOMOUS_CAPABILITY_ENVELOPE_CLOCK_SKEW_SECONDS": ("agent_gateway.autonomous_launch_envelope", "AUTONOMOUS_CAPABILITY_ENVELOPE_CLOCK_SKEW_SECONDS"),
-  "AUTONOMOUS_CAPABILITY_ENVELOPE_ENV": ("agent_gateway.autonomous_launch_envelope", "AUTONOMOUS_CAPABILITY_ENVELOPE_ENV"),
+  "AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV": ("agent_gateway.autonomous_launch_envelope", "AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV"),
   "AUTONOMOUS_CAPABILITY_ENVELOPE_TTL_SECONDS": ("agent_gateway.autonomous_launch_envelope", "AUTONOMOUS_CAPABILITY_ENVELOPE_TTL_SECONDS"),
   "AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION": ("agent_gateway.autonomous_launch_envelope", "AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION"),
   "AUTONOMOUS_TASK_ID_ENV": ("agent_gateway.autonomous_launch_envelope", "AUTONOMOUS_TASK_ID_ENV"),
@@ -473,10 +472,6 @@ _LAZY_EXPORTS = {
   "ChatTurnResult": ("agent_gateway.server", "ChatTurnResult"),
   "GatewayServerConfig": ("agent_gateway.server", "GatewayServerConfig"),
   "RequestContext": ("agent_gateway.server", "RequestContext"),
-  "SessionExecutionPolicy": (
-    "agent_gateway.server_models",
-    "SessionExecutionPolicy",
-  ),
   "create_agent": ("agent_gateway.easy", "create_agent"),
   "create_gateway_app": ("agent_gateway.server", "create_gateway_app"),
 }
@@ -527,7 +522,7 @@ __all__ = [
   "AnthropicProvider",
   "AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE",
   "AUTONOMOUS_CAPABILITY_ENVELOPE_CLOCK_SKEW_SECONDS",
-  "AUTONOMOUS_CAPABILITY_ENVELOPE_ENV",
+  "AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV",
   "AUTONOMOUS_CAPABILITY_ENVELOPE_TTL_SECONDS",
   "AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION",
   "AUTONOMOUS_TASK_ID_ENV",
@@ -618,7 +613,6 @@ __all__ = [
   "RecapFailure",
   "RecapVerdict",
   "RequestContext",
-  "SessionExecutionPolicy",
   "PersistentGrant",
   "PolicyApprovalDecision",
   "PolicyApprovalRequest",

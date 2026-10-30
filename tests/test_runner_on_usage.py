@@ -43,6 +43,7 @@ from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa:
 from agent_gateway.commercial_usage import CommercialUsageProducer  # noqa: E402
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
+import agent_gateway.runner_stream_turn as runner_stream_turn  # noqa: E402
 from agent_gateway.multi_user.billing import (  # noqa: E402
   SessionUsageSummary,
   UsageEvent,
@@ -296,14 +297,12 @@ class _UsageProvider(ModelProvider):
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(
-      id=model,
-      provider=self.name,
-      input_cost_per_mtok=1.0,
-      output_cost_per_mtok=2.0,
-      cache_read_cost_per_mtok=0.5,
-      cache_write_cost_per_mtok=0.75,
-    )
+    return ModelInfo(max_output_tokens=16_384, id=model,
+    provider=self.name,
+    input_cost_per_mtok=1.0,
+    output_cost_per_mtok=2.0,
+    cache_read_cost_per_mtok=0.5,
+    cache_write_cost_per_mtok=0.75,)
 
   def build_request_params(
     self,
@@ -363,8 +362,11 @@ def test_retry_emits_failed_billable_delta_before_success(monkeypatch: pytest.Mo
         usage_state,
       ))
 
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 1)
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
+  monkeypatch.setattr(
+    runner_stream_turn,
+    "TRANSPORT_RETRY_POLICY",
+    replace(runner_stream_turn.TRANSPORT_RETRY_POLICY, max_retries=1, base_delay_seconds=0.0),
+  )
   event_log = EventLog()
   provider = _RetryAfterUsageProvider()
   runner = AgentRunner(
@@ -400,7 +402,11 @@ def test_terminal_watchdog_emits_accumulated_failed_billable_usage(
     async def emit(self, event, *, usage_state="succeeded"):
       states.append((event.input_tokens, event.output_tokens, usage_state))
 
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 0)
+  monkeypatch.setattr(
+    runner_stream_turn,
+    "TRANSPORT_RETRY_POLICY",
+    replace(runner_stream_turn.TRANSPORT_RETRY_POLICY, max_retries=0),
+  )
   monkeypatch.setattr(gateway_runner, "STREAM_GUARD_POLL_INTERVAL", 0.001)
   event_log = EventLog()
   provider = HangingProvider()
@@ -438,7 +444,11 @@ def test_disconnect_on_retry_persists_canceled_partial_delta_first(
     async def emit(self, event, *, usage_state="succeeded"):
       states.append((event.input_tokens, event.output_tokens, usage_state))
 
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 1)
+  monkeypatch.setattr(
+    runner_stream_turn,
+    "TRANSPORT_RETRY_POLICY",
+    replace(runner_stream_turn.TRANSPORT_RETRY_POLICY, max_retries=1),
+  )
   event_log = EventLog()
   provider = DisconnectingProvider()
   runner = AgentRunner(

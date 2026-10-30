@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 from typing import Any, Protocol, TypedDict
 
@@ -14,6 +13,7 @@ from agent_gateway.autonomous_runner import (
 from .autonomous_approval_delivery import (
   autonomous_run_accepts_approval_decisions,
   deliver_autonomous_approval_outbox,
+  fail_quarantined_autonomous_approval_owner,
   require_matching_autonomous_delivery,
 )
 
@@ -21,10 +21,8 @@ from .autonomous_approval_delivery import (
 log = logging.getLogger(
   "agent_gateway.autonomous_approval_drainer"
 )
-AUTONOMOUS_APPROVAL_DRAIN_BATCH_LIMIT = 64
+AUTONOMOUS_APPROVAL_DRAIN_FAILURE_BACKOFF_SECONDS = 1.0
 AUTONOMOUS_APPROVAL_DRAIN_SHUTDOWN_SECONDS = 5.0
-AUTONOMOUS_APPROVAL_FALLBACK_RETRY_MAX_ATTEMPTS = 5
-AUTONOMOUS_APPROVAL_FALLBACK_RETRY_WINDOW_SECONDS = 60.0
 
 class _AutonomousApprovalDelivery(TypedDict):
   delivery_sequence: int
@@ -37,7 +35,6 @@ class _AutonomousApprovalDelivery(TypedDict):
   channel_id: str
   approved: bool
   decided_at_ns: int
-  next_attempt_ns: int
   last_attempt_ns: int | None
   state: str
   attempt_count: int
@@ -51,7 +48,6 @@ class _SelectPendingAutonomousApprovalDeliveries(Protocol):
   async def __call__(
     self,
     *,
-    limit: int,
     after_sequence: int,
     through_sequence: int | None,
   ) -> list[_AutonomousApprovalDelivery]: ...
@@ -109,61 +105,26 @@ class AutonomousApprovalDeliveryCoordinator:
     *,
     store: Any,
     registry: AutonomousRegistry,
-    batch_limit: int = AUTONOMOUS_APPROVAL_DRAIN_BATCH_LIMIT,
     shutdown_timeout_seconds: float = (
       AUTONOMOUS_APPROVAL_DRAIN_SHUTDOWN_SECONDS
     ),
-    fallback_retry_base_seconds: float = 1.0,
   ) -> None:
-    if (
-      isinstance(batch_limit, bool)
-      or not isinstance(batch_limit, int)
-      or not 1 <= batch_limit <= 256
-    ):
-      raise ValueError(
-        "autonomous approval drain batch_limit must be 1..256"
-      )
-    if (
-      isinstance(fallback_retry_base_seconds, bool)
-      or not isinstance(fallback_retry_base_seconds, (int, float))
-      or not 0 < fallback_retry_base_seconds <= 5
-    ):
-      raise ValueError(
-        "autonomous approval fallback retry base must be >0 and <=5"
-      )
-    if (
-      isinstance(shutdown_timeout_seconds, bool)
-      or not isinstance(shutdown_timeout_seconds, (int, float))
-      or not 0 < shutdown_timeout_seconds <= 30
-    ):
-      raise ValueError(
-        "autonomous approval drain shutdown timeout must be >0 and <=30"
-      )
     self._store = store
     self._registry = registry
-    self._batch_limit = batch_limit
     self._shutdown_timeout_seconds = float(
       shutdown_timeout_seconds
-    )
-    self._fallback_retry_base_seconds = float(
-      fallback_retry_base_seconds
     )
     self._wake_event = asyncio.Event()
     self._wake_generation = 0
     self._task: asyncio.Task[None] | None = None
     self._retry_handle: asyncio.TimerHandle | None = None
-    self._fallback_failures: dict[
-      tuple[object, object, object],
-      tuple[int, float],
-    ] = {}
     self._drain_failure_count = 0
-    self._drain_first_failure_at: float | None = None
     self._fatal_error: str | None = None
     self._closing = False
 
   @property
   def fatal_error(self) -> str | None:
-    """The latest drain error once drains have kept failing; None after a success."""
+    """The latest drain error; None after a successful drain."""
     return self._fatal_error
 
   def start(self) -> None:
@@ -231,7 +192,6 @@ class AutonomousApprovalDeliveryCoordinator:
         self._record_drain_failure(exc)
       else:
         self._drain_failure_count = 0
-        self._drain_first_failure_at = None
         if self._fatal_error is not None:
           log.info("Autonomous approval delivery drain recovered")
           self._fatal_error = None
@@ -242,31 +202,17 @@ class AutonomousApprovalDeliveryCoordinator:
         self._wake_event.set()
 
   def _record_drain_failure(self, failure: Exception) -> None:
-    loop = asyncio.get_running_loop()
-    now = loop.time()
-    if self._drain_first_failure_at is None:
-      self._drain_first_failure_at = now
     self._drain_failure_count += 1
-    sustained = (
-      self._drain_failure_count
-      >= AUTONOMOUS_APPROVAL_FALLBACK_RETRY_MAX_ATTEMPTS
-      or now - self._drain_first_failure_at
-      >= AUTONOMOUS_APPROVAL_FALLBACK_RETRY_WINDOW_SECONDS
+    # Reported, never latched: the durable outbox still holds every row, so
+    # the drainer keeps retrying with backoff and health clears on success.
+    self._fatal_error = (
+      "autonomous approval recovery failing after "
+      f"{self._drain_failure_count} attempts: "
+      f"{type(failure).__name__}: {failure}"
     )
-    if sustained:
-      # Reported, never latched: the durable outbox still holds every row, so
-      # the drainer keeps retrying with backoff and health clears on success.
-      first_report = self._fatal_error is None
-      self._fatal_error = (
-        "autonomous approval recovery failing after "
-        f"{self._drain_failure_count} attempts: "
-        f"{type(failure).__name__}: {failure}"
-      )
-      if first_report:
-        log.critical(self._fatal_error)
     self._arm_retry(
       min(
-        self._fallback_retry_base_seconds
+        AUTONOMOUS_APPROVAL_DRAIN_FAILURE_BACKOFF_SECONDS
         * (2 ** min(self._drain_failure_count - 1, 16)),
         16.0,
       )
@@ -312,20 +258,16 @@ class AutonomousApprovalDeliveryCoordinator:
       )
     after_sequence = 0
     attempted = 0
-    retry_delays: list[float] = []
+    unrecorded: Exception | None = None
+    undelivered: Exception | None = None
     while after_sequence < high_water and not self._closing:
       deliveries = await selector(
-        limit=self._batch_limit,
         after_sequence=after_sequence,
         through_sequence=high_water,
       )
       if not isinstance(deliveries, list):
         raise RuntimeError(
           "autonomous approval pending selector returned invalid data"
-        )
-      if len(deliveries) > self._batch_limit:
-        raise RuntimeError(
-          "autonomous approval pending selector exceeded its bound"
         )
       if not deliveries:
         break
@@ -345,72 +287,48 @@ class AutonomousApprovalDeliveryCoordinator:
             "autonomous approval pending selector broke ordering"
           )
         after_sequence = delivery_sequence
-        next_attempt_ns = delivery.get("next_attempt_ns")
-        if type(next_attempt_ns) is not int or next_attempt_ns < 1:
-          raise RuntimeError(
-            "autonomous approval pending retry time is invalid"
-          )
-        if next_attempt_ns > observed_at_ns:
-          retry_delays.append(
-            (next_attempt_ns - observed_at_ns) / 1_000_000_000
-          )
-          continue
         attempted += 1
         try:
           await self._deliver_one(delivery)
-          self._clear_fallback_failure(delivery)
         except asyncio.CancelledError:
           raise
         except PermanentAutonomousApprovalDeliveryError as exc:
-          quarantined = await self._quarantine_failure(
-            delivery,
-            exc,
-          )
-          if quarantined is not None:
-            self._clear_fallback_failure(delivery)
-            await self._fail_quarantined_owner(
-              quarantined,
-              exc,
+          # A row that can never be delivered is quarantined by the store, and
+          # only then does its owner run fail, so it never waits on a decision
+          # that cannot arrive. A quarantine the store did not take is
+          # reported at drain level and fails nothing.
+          if await self._quarantine_failure(delivery, exc) is None:
+            unrecorded = exc
+          else:
+            await fail_quarantined_autonomous_approval_owner(
+              self._registry,
+              task_id=delivery.get("task_id"),
+              failure=exc,
             )
-          else:
-            await self._fallback_retry_or_fail(delivery, exc)
         except Exception as exc:
-          outcome = await self._record_failure(delivery, exc)
-          if outcome is not None:
-            if outcome.get("state") == "quarantined":
-              self._clear_fallback_failure(delivery)
-              await self._fail_quarantined_owner(outcome, exc)
-            elif outcome.get("state") == "pending":
-              last_attempt_ns = outcome.get("last_attempt_ns")
-              retry_at_ns = outcome.get("next_attempt_ns")
-              if (
-                type(last_attempt_ns) is int
-                and type(retry_at_ns) is int
-                and retry_at_ns > last_attempt_ns
-              ):
-                retry_delays.append(
-                  (retry_at_ns - last_attempt_ns)
-                  / 1_000_000_000
-                )
-                self._clear_fallback_failure(delivery)
-              else:
-                await self._fallback_retry_or_fail(
-                  delivery,
-                  exc,
-                )
-            elif outcome.get("state") in {
-              "published",
-              "acknowledged",
-            }:
-              self._clear_fallback_failure(delivery)
-            else:
-              await self._fallback_retry_or_fail(delivery, exc)
-          else:
-            await self._fallback_retry_or_fail(delivery, exc)
-      if len(deliveries) < self._batch_limit:
-        break
-    if retry_delays and not self._closing:
-      self._arm_retry(min(retry_delays))
+          # A failed publish is recorded by the store and the row stays
+          # pending, so the drain retries it; a failure the store did not
+          # record is reported at drain level.
+          try:
+            outcome = await self._record_failure(delivery, exc)
+          except asyncio.CancelledError:
+            raise
+          except Exception as record_exc:
+            log.exception(
+              "Autonomous approval delivery failure could not be recorded"
+            )
+            unrecorded = record_exc
+            continue
+          if outcome is not None and outcome.get("state") == "pending":
+            undelivered = exc
+    if unrecorded is not None:
+      raise RuntimeError(
+        "autonomous approval delivery failure was not recorded by the store"
+      ) from unrecorded
+    if undelivered is not None:
+      raise RuntimeError(
+        "autonomous approval delivery failed and remains pending"
+      ) from undelivered
     return attempted
 
   def _arm_retry(self, delay_seconds: float) -> None:
@@ -436,58 +354,6 @@ class AutonomousApprovalDeliveryCoordinator:
   def _retry_wake(self) -> None:
     self._retry_handle = None
     self.wake()
-
-  @staticmethod
-  def _delivery_identity(
-    delivery: _AutonomousApprovalDelivery,
-  ) -> tuple[str, str, str]:
-    return (
-      delivery.get("approval_id"),
-      delivery.get("tool_call_id"),
-      delivery.get("nonce"),
-    )
-
-  def _clear_fallback_failure(
-    self,
-    delivery: _AutonomousApprovalDelivery,
-  ) -> None:
-    self._fallback_failures.pop(
-      self._delivery_identity(delivery),
-      None,
-    )
-
-  async def _fallback_retry_or_fail(
-    self,
-    delivery: _AutonomousApprovalDelivery,
-    failure: Exception,
-  ) -> None:
-    identity = self._delivery_identity(delivery)
-    now = asyncio.get_running_loop().time()
-    prior_count, first_failure_at = self._fallback_failures.get(
-      identity,
-      (0, now),
-    )
-    failure_count = prior_count + 1
-    self._fallback_failures[identity] = (
-      failure_count,
-      first_failure_at,
-    )
-    exhausted = (
-      failure_count
-      >= AUTONOMOUS_APPROVAL_FALLBACK_RETRY_MAX_ATTEMPTS
-      or now - first_failure_at
-      >= AUTONOMOUS_APPROVAL_FALLBACK_RETRY_WINDOW_SECONDS
-    )
-    if exhausted:
-      self._fallback_failures.pop(identity, None)
-      await self._fail_quarantined_owner(delivery, failure)
-      return
-    delay = min(
-      self._fallback_retry_base_seconds
-      * (2 ** (failure_count - 1)),
-      16.0,
-    )
-    self._arm_retry(delay)
 
   async def _deliver_one(
     self,
@@ -590,55 +456,51 @@ class AutonomousApprovalDeliveryCoordinator:
     delivery: _AutonomousApprovalDelivery,
     failure: Exception,
   ) -> _AutonomousApprovalDelivery | None:
-    if not isinstance(delivery, dict):
-      log.error(
-        "Malformed autonomous approval pending row could not be recorded"
-      )
-      return None
+    """Record one delivery failure; None means the row is gone, so there is nothing to retry.
+
+    A recording failure raises to the caller, which reports it at drain level.
+    """
     record_failure: _WriteAutonomousApprovalDeliveryFailure | None = getattr(
       self._store,
       "record_autonomous_approval_delivery_failure",
       None,
     )
     if not callable(record_failure):
-      log.error(
-        "Autonomous approval delivery failure recorder unavailable"
+      raise RuntimeError(
+        "autonomous approval delivery failure recorder is unavailable"
       )
-      return None
-    try:
-      get_delivery: _GetAutonomousApprovalDelivery | None = getattr(
-        self._store,
-        "get_autonomous_approval_delivery",
-        None,
-      )
-      if callable(get_delivery):
-        current = await get_delivery(
-          delivery.get("approval_id"),
-          tool_call_id=delivery.get("tool_call_id"),
-          nonce=delivery.get("nonce"),
-        )
-        if current is None or current.get("state") == "acknowledged":
-          return current
-        prior_attempt_count = delivery.get("attempt_count")
-        current_attempt_count = current.get("attempt_count")
-        if (
-          type(prior_attempt_count) is int
-          and type(current_attempt_count) is int
-          and current_attempt_count > prior_attempt_count
-        ):
-          return current
-      outcome = await record_failure(
+    get_delivery: _GetAutonomousApprovalDelivery | None = getattr(
+      self._store,
+      "get_autonomous_approval_delivery",
+      None,
+    )
+    if callable(get_delivery):
+      current = await get_delivery(
         delivery.get("approval_id"),
         tool_call_id=delivery.get("tool_call_id"),
         nonce=delivery.get("nonce"),
-        error=f"{type(failure).__name__}: {failure}",
       )
-      return outcome if isinstance(outcome, dict) else None
-    except Exception:
-      log.exception(
-        "Autonomous approval delivery failure could not be recorded"
+      if current is None or current.get("state") == "acknowledged":
+        return current
+      prior_attempt_count = delivery.get("attempt_count")
+      current_attempt_count = current.get("attempt_count")
+      if (
+        type(prior_attempt_count) is int
+        and type(current_attempt_count) is int
+        and current_attempt_count > prior_attempt_count
+      ):
+        return current
+    outcome = await record_failure(
+      delivery.get("approval_id"),
+      tool_call_id=delivery.get("tool_call_id"),
+      nonce=delivery.get("nonce"),
+      error=f"{type(failure).__name__}: {failure}",
+    )
+    if not isinstance(outcome, dict):
+      raise RuntimeError(
+        "autonomous approval delivery failure recorder returned invalid data"
       )
-      return None
+    return outcome
 
   async def _quarantine_failure(
     self,
@@ -671,34 +533,9 @@ class AutonomousApprovalDeliveryCoordinator:
       )
       return None
 
-  async def _fail_quarantined_owner(
-    self,
-    delivery: _AutonomousApprovalDelivery,
-    failure: Exception,
-  ) -> None:
-    fail_owner = getattr(
-      self._registry,
-      "fail_autonomous_approval_delivery",
-      None,
-    )
-    if not callable(fail_owner):
-      log.error(
-        "Autonomous approval quarantine could not fail its owner run"
-      )
-      return
-    outcome = fail_owner(
-      delivery.get("task_id"),
-      error=f"{type(failure).__name__}: {failure}",
-    )
-    if inspect.isawaitable(outcome):
-      await outcome
-
 
 __all__ = [
-  "AUTONOMOUS_APPROVAL_DRAIN_BATCH_LIMIT",
   "AUTONOMOUS_APPROVAL_DRAIN_SHUTDOWN_SECONDS",
-  "AUTONOMOUS_APPROVAL_FALLBACK_RETRY_MAX_ATTEMPTS",
-  "AUTONOMOUS_APPROVAL_FALLBACK_RETRY_WINDOW_SECONDS",
   "AutonomousApprovalDeliveryCoordinator",
   "PermanentAutonomousApprovalDeliveryError",
   "wake_autonomous_approval_delivery",

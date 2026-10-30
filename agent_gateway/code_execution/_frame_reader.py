@@ -21,9 +21,11 @@ Frames, one JSON object per line. Child -> host, every frame carries
 
 - `catalog{parent_call_id, request: "search", query}` -> list of `{name, description}`
 - `catalog{parent_call_id, request: "describe", operation}` -> `{name, description, input_schema}`
+- `derive{parent_call_id, name, value, expression, inputs}` -> the published derived row
 
-A successful `tool_result` also carries `source_refs`, the issued keys of the
-rows the call recorded.
+A successful producer reply carries `nested_call_id` and `source_refs`, the
+issued keys of the source rows recorded by that call. Derivations resolve those
+keys against this session's retained source rows, including earlier cells.
 
 Host -> child replies echo `type` and `call_id` and carry `ok` plus `result` or
 `error{code, message, next_call?}`.
@@ -57,10 +59,10 @@ import secrets
 import threading
 import time
 import weakref
-from typing import AbstractSet, Any, Callable, Dict, List, Mapping, Optional
+from typing import AbstractSet, Any, Callable, Dict, List, Literal, Mapping, Optional
 from agent_workflow_contracts.models import AdmittedTenant
 from agent_workflow_contracts.next_call import NextCall, next_call as build_next_call
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, ValidationError
 
 from ..claim_signing_authority import configured_gateway_claim_signing_authority
 from ..policy_imports import load_server_policy_helpers, resolve_server_policy_tool_class
@@ -99,6 +101,32 @@ CodeCallable = Callable[[str], bool]
 # Catalog previews are presentation only; source identities are never capped.
 _DESCRIPTION_PREVIEW_CHARS = 300
 
+class _SlicePath(BaseModel):
+  model_config = ConfigDict(extra="forbid", strict=True)
+  slice: list[StrictInt]
+
+
+class _DerivedInput(BaseModel):
+  model_config = ConfigDict(extra="forbid", strict=True)
+  nested_call_id: StrictStr | None
+  source_refs: list[StrictStr]
+  path: list[StrictStr | StrictInt | _SlicePath]
+  value: Any
+
+
+class _DeriveFrame(BaseModel):
+  """The one parse boundary for cell-authored derived rows."""
+  model_config = ConfigDict(extra="forbid", strict=True)
+  type: Literal["derive"]
+  call_id: Any
+  cell_token: StrictStr
+  parent_call_id: StrictStr | None = None
+  name: StrictStr
+  value: Any
+  expression: StrictStr
+  inputs: list[_DerivedInput]
+
+
 RUN_AGENT_OPERATION = "run_agent"
 
 
@@ -124,7 +152,7 @@ def _delegation_operation_rows() -> list[Dict[str, Any]]:
 # frame per registered delegation operation. A backend's frame reader routes
 # exactly these to the bridge, so a new operation needs no reader edit.
 REQUEST_FRAME_TYPES: frozenset[str] = frozenset(
-  {"catalog", "tool_call", *(str(row["name"]) for row in CODE_EXECUTION_DELEGATION_TOOL_DEFS)}
+  {"catalog", "tool_call", "derive", *(str(row["name"]) for row in CODE_EXECUTION_DELEGATION_TOOL_DEFS)}
 )
 DEFAULT_WAIT_TIMEOUT_S = 600.0
 # `jobs.wait` reads the executing runner's task registry; the product binds
@@ -242,10 +270,13 @@ class FrameReader:
     self._grant_hint: Callable[[str], str | None] | None = None
     self._host_tools: frozenset[str] = CODE_EXECUTION_TOOL_NAMES
     self._cells: Dict[str, CellChannel] = {}
-    # Settled per-cell summaries (`nested_calls`, `sources`) keyed by
+    # Settled per-cell summaries (`nested_calls`, `sources`, `derived`) keyed by
     # `outer_call_id` (and `task_id` for background `code` jobs). Lifetime owner:
     # `FrameReader.aclose()` / `cleanup_code_execution(session)`.
     self._cell_records: Dict[str, Dict[str, Any]] = {}
+    # Source rows outlive cells alongside the sticky kernel's original carriers.
+    self._issued_sources: Dict[str, Dict[str, Any]] = {}
+    self._lineage_lock = threading.RLock()
     self._closed = False
     self._closing_cells: tuple[CellChannel, ...] = ()
     self._principal = dict(principal or {})
@@ -342,6 +373,8 @@ class FrameReader:
     await asyncio.gather(*job_tasks, return_exceptions=True)
     await asyncio.gather(*(cell.aclose() for cell in self._closing_cells))
     self._cell_records.clear()
+    with self._lineage_lock:
+      self._issued_sources.clear()
 
   def is_registered(self, cell: "CellChannel") -> bool:
     return self._cells.get(cell.token) is cell and cell._active and not self._closed
@@ -427,6 +460,7 @@ class CellChannel:
     self._ordinal = 0
     self.ledger: List[Dict[str, Any]] = []
     self._sources: Dict[Any, Dict[str, Any]] = {}
+    self.derived: List[Dict[str, Any]] = []
     self._inflight: set[asyncio.Task[Any]] = set()
 
   # --- backend-facing (`_backends._base.CellBridge`) -------------------------
@@ -489,12 +523,14 @@ class CellChannel:
       await asyncio.gather(*tasks, return_exceptions=True)
 
   def summary(self) -> Dict[str, Any]:
-    """`nested_calls` and `sources` for the outer result; empty when nothing was called."""
+    """Publish nested calls, flat primary sources and derived rows independently."""
     summary: Dict[str, Any] = {}
     with self._lock:
       if self.ledger:
         summary["nested_calls"] = [dict(entry) for entry in self.ledger]
         summary["sources"] = list(self._sources.values())
+      if self.derived:
+        summary["derived"] = [dict(row) for row in self.derived]
     return summary
 
   # --- frame handling --------------------------------------------------------
@@ -581,6 +617,12 @@ class CellChannel:
       return await self._workpool(frame)
     if frame_type == "judge_batch":
       return await self._judge_batch(frame)
+    if frame_type == "derive":
+      try:
+        derived_frame = _DeriveFrame.model_validate(frame)
+      except ValidationError as exc:
+        return _error_reply("derive_result", call_id, "protocol_error", str(exc))
+      return self._derive(derived_frame)
     return _error_reply(frame_type, call_id, "protocol_error", f"unknown frame type {frame_type!r}")
 
   def _loaded_granted(self) -> Dict[str, Dict[str, Any]]:
@@ -845,9 +887,7 @@ class CellChannel:
     entry["duration_ms"] = _elapsed_ms(started)
     entry["ok"] = True
     entry["error_code"] = None
-    reply = _ok_reply("completion_result", call_id, launched)
-    reply["nested_call_id"] = entry["nested_call_id"]
-    return reply
+    return self._producer_reply("completion_result", call_id, launched, entry)
 
   async def _judge(self, frame: Dict[str, Any]) -> Dict[str, Any]:
     """`hank.judge`: leaf judgment under a registered judgment operation."""
@@ -908,9 +948,7 @@ class CellChannel:
     entry["duration_ms"] = _elapsed_ms(started)
     entry["ok"] = True
     entry["error_code"] = None
-    reply = _ok_reply("judge_result", call_id, launched)
-    reply["nested_call_id"] = entry["nested_call_id"]
-    return reply
+    return self._producer_reply("judge_result", call_id, launched, entry)
 
   async def _workpool(self, frame: Dict[str, Any]) -> Dict[str, Any]:
     """`hank.workpool`: one P4 `controller` job drawing from the runner's queue.
@@ -1193,9 +1231,7 @@ class CellChannel:
       "keys": [k for k, _ in items_seq],
       "jobs": child_jobs,
     }
-    reply = _ok_reply("workpool_result", call_id, result_payload)
-    reply["nested_call_id"] = nested_call_id
-    return reply
+    return self._producer_reply("workpool_result", call_id, result_payload, entry)
 
   async def _judge_batch(self, frame: Dict[str, Any]) -> Dict[str, Any]:
     """`hank.judge_batch`: applied questions across keyed states under a model-call op."""
@@ -1319,24 +1355,30 @@ class CellChannel:
       entry["duration_ms"] = _elapsed_ms(started)
       entry["ok"] = all_settled
       entry["error_code"] = None if all_settled else "timed_out"
-      reply = _ok_reply("judge_batch_result", call_id, {
+      return self._producer_reply("judge_batch_result", call_id, {
         "operation": op_name,
         "status": batch_status,
         "judgments": judgments,
-      })
-      reply["nested_call_id"] = nested_call_id
-      return reply
+      }, entry)
     else:
       entry["duration_ms"] = _elapsed_ms(started)
       entry["ok"] = True
       entry["error_code"] = None
-      reply = _ok_reply("judge_batch_result", call_id, {
+      return self._producer_reply("judge_batch_result", call_id, {
         "operation": op_name,
         "status": "running",
         "jobs": {k: {"task_id": tid, "status": "running"} for k, tid in task_id_by_key.items()},
-      })
-      reply["nested_call_id"] = nested_call_id
-      return reply
+      }, entry)
+  def _producer_reply(
+    self, reply_type: str, call_id: Any, result: Any, entry: Dict[str, Any],
+  ) -> Dict[str, Any]:
+    """Every producer returns its parent-issued reference, even without sources."""
+    return {
+      **_ok_reply(reply_type, call_id, result),
+      "nested_call_id": entry["nested_call_id"],
+      "source_refs": entry.setdefault("source_refs", []),
+    }
+
   async def _dispatch_granted(
     self,
     reply_type: str,
@@ -1410,14 +1452,9 @@ class CellChannel:
     # unchanged; the ledger records it as the failed call it is.
     entry["ok"] = semantic_error is None
     entry["error_code"] = str(semantic_error["code"]) if semantic_error is not None else None
-    refs: List[str] | None = None
     if settlement.outcome == "ok":
-      refs = entry["source_refs"] = self._record_sources(operation, nested_call_id, result, settlement.sources)
-    reply = _ok_reply(reply_type, call_id, result)
-    reply["nested_call_id"] = nested_call_id
-    if refs is not None:
-      reply["source_refs"] = refs
-    return reply
+      entry["source_refs"] = self._record_sources(operation, nested_call_id, result, settlement.sources)
+    return self._producer_reply(reply_type, call_id, result, entry)
 
   def _record_sources(self, operation: str, nested_call_id: str, result: Any, settled_sources: Any) -> List[str]:
     # Settlement owns identity; the extractor only enriches those rows with
@@ -1466,12 +1503,47 @@ class CellChannel:
       # nested operation's partial, not `code_execute`'s.
       ref = _issued_ref(key)
       with self._lock:
-        self._sources.setdefault(
+        row = self._sources.setdefault(
           key, {**handle, "produced_by_tool": canonical_dispatch_tool_name(operation)},
         )
+      with self._reader._lineage_lock:
+        self._reader._issued_sources.setdefault(ref, row)
       if ref not in refs:
         refs.append(ref)
     return refs
+
+  def _derive(self, frame: _DeriveFrame) -> Dict[str, Any]:
+    """Publish selected observations; missing issuance is a finding, not refusal."""
+    resolved: List[Dict[str, Any]] = []
+    findings: List[Dict[str, Any]] = []
+    with self._reader._lineage_lock:
+      issued = self._reader._issued_sources
+      for index, reference in enumerate(frame.inputs):
+        refs = list(dict.fromkeys(reference.source_refs))
+        sources = [issued[ref] for ref in refs if ref in issued]
+        path = [part.model_dump() if isinstance(part, _SlicePath) else part for part in reference.path]
+        row = {
+          "nested_call_id": reference.nested_call_id, "path": path,
+          "value": reference.value, "sources": sources,
+        }
+        resolved.append(row)
+        reason = None
+        if not refs:
+          reason = "the input carries no source reference; select it from a producer result with hank.input"
+        elif len(sources) != len(refs):
+          reason = "the input's source references were not issued by this session"
+        if reason is not None:
+          findings.append({
+            "code": "input_unsourced", "input": index,
+            "nested_call_id": reference.nested_call_id, "path": path, "message": reason,
+          })
+    published = {
+      "name": frame.name, "value": frame.value, "expression": frame.expression,
+      "status": "derived", "inputs": resolved, "findings": findings,
+    }
+    with self._lock:
+      self.derived.append(published)
+    return _ok_reply("derive_result", frame.call_id, published)
 
   def _catalog(self, frame: Dict[str, Any]) -> Dict[str, Any]:
     call_id = frame.get("call_id")

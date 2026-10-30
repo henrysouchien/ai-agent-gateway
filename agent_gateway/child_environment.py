@@ -29,17 +29,7 @@ _PROCESS_RUNTIME_ENV_NAMES = frozenset(
   }
 )
 
-_SIGNED_AGENT_CLAIM_ENV_NAMES = frozenset(
-  {
-    "AGENT_API_CLAIM_AUDIENCE",
-    "AGENT_API_CLAIM_EXPIRY",
-    "AGENT_API_CLAIM_ISSUED_AT",
-    "AGENT_API_CLAIM_NONCE",
-    "AGENT_API_CLAIM_SIGNATURE",
-    "AGENT_API_CLAIM_USER_EMAIL",
-    "AGENT_API_CLAIM_USER_ID",
-  }
-)
+
 
 _AGENT_CORRELATION_ENV_NAMES = frozenset(
   {
@@ -148,6 +138,10 @@ _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES = frozenset({
   "GATEWAY_SURFACE_CONTENT_CAPTURE_ENABLED",
   "GATEWAY_SURFACE_CONTENT_PATH",
   "AUTONOMOUS_GATEWAY_READY_TIMEOUT_SECONDS",
+  # The child signs its own tool-call audit records
+  # (`agent.shared.tool_redaction.get_audit_hmac_secret`); without the
+  # deployment's secret it keys them on the public dev constant.
+  "GATEWAY_AUDIT_HMAC_SECRET",
   # The operator file the child's live ``ContainmentSettings`` reads.
   SETTINGS_PATH_ENV,
 })
@@ -205,7 +199,6 @@ _AUTONOMOUS_CHILD_TOOL_ENV_NAMES = frozenset({
 CHILD_ENVIRONMENT_ALLOWLISTS = {
   RUN_BASH_ENVIRONMENT: (
     _PROCESS_RUNTIME_ENV_NAMES
-    | _SIGNED_AGENT_CLAIM_ENV_NAMES
     | _AGENT_CORRELATION_ENV_NAMES
     | _AGENT_API_ENV_NAMES
   ),

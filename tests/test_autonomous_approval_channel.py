@@ -404,7 +404,7 @@ class _ContinuationProvider(ModelProvider):
     return None
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(id=model, provider=self.name, max_output_tokens=16_384)
 
   def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
     return dict(kwargs)

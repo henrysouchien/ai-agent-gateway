@@ -17,7 +17,6 @@ def test_skill_command_carries_delivery_suppression() -> None:
     mode="skill",
     skill="thesis-review",
     ticker="foo",
-    context="context",
     deliver=False,
   ) == [
     "/usr/bin/python3",
@@ -30,8 +29,6 @@ def test_skill_command_carries_delivery_suppression() -> None:
     "thesis-review",
     "--ticker",
     "FOO",
-    "--context",
-    "context",
   ]
 
 

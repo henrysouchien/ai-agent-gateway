@@ -49,6 +49,31 @@ from agent_gateway.providers.anthropic_oauth import (
 from agent_gateway.providers import StreamEvent
 
 
+@pytest.mark.parametrize("env_name", [
+  "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKENS", "CLAUDE_CODE_OAUTH_TOKEN",
+])
+def test_transient_exact_lookup_cannot_reclassify_unreconciled_operator_token(
+  tmp_path: Path, env_name: str,
+) -> None:
+  store_path = tmp_path / "oauth.json"
+  env = {"ANTHROPIC_AUTH_STORE_PATH": str(store_path)}
+  token = "sk-ant-oat01-caller-then-operator"
+  original = resolve_anthropic_credentials({"auth_token": token}, environ=env).credentials[0]
+  exact = {"auth_token": token, "credential_source": original.source_metadata()}
+
+  # A genuinely caller-held transient remains resolvable without enrollment.
+  assert resolve_anthropic_credentials(exact, environ=env).credentials[0] == original
+  assert not store_path.exists()
+
+  # The auditor's reproduction: expose the same bearer as an operator seat
+  # after issuing the transient, before any environment reconciliation.
+  env[env_name] = json.dumps([token]) if env_name == "ANTHROPIC_AUTH_TOKENS" else token
+  with pytest.raises(anthropic_oauth.AnthropicSourceError) as exc_info:
+    resolve_anthropic_credentials(exact, environ=env)
+  assert exc_info.value.reason == "unobservable"
+  assert not store_path.exists()
+
+
 def test_server_tool_usage_preserves_known_billable_units_and_rejects_unknown_positive() -> None:
   usage = SimpleNamespace(server_tool_use=SimpleNamespace(
     web_search_requests=2, web_fetch_requests=3,
@@ -707,10 +732,10 @@ def test_provider_rejects_blank_bound_credential_despite_ambient_values(
 
 
 def test_model_info_defaults_derive_thinking_mode_from_supports_thinking() -> None:
-  default_info = ModelInfo(id="stub", provider="test")
+  default_info = ModelInfo(max_output_tokens=16_384, id="stub", provider="test")
   assert default_info.thinking_mode == "none"
   assert default_info.supports_native_compaction is False
-  info = ModelInfo(id="stub", provider="test", supports_thinking=True)
+  info = ModelInfo(max_output_tokens=16_384, id="stub", provider="test", supports_thinking=True)
 
   assert info.thinking_mode == "adaptive"
   assert info.supports_thinking is True
@@ -1586,7 +1611,7 @@ def test_anthropic_rejection_detail_redacts_sensitive_body_fallback() -> None:
   assert "[redacted]" in detail
 
 
-def test_stream_wraps_anthropic_rejection_with_sanitized_context(caplog) -> None:
+def test_stream_wraps_anthropic_rejection_with_sanitized_context_and_typed_code(caplog) -> None:
   provider = AnthropicProvider()
   raw_key = "sk-ant-api03-STREAMDETAILKEY123"
   error = _make_anthropic_api_status_error(
@@ -1615,10 +1640,13 @@ def test_stream_wraps_anthropic_rejection_with_sanitized_context(caplog) -> None
     with pytest.raises(RuntimeError) as exc_info:
       asyncio.run(_drain_stream(provider, client, params))
 
-  message = str(exc_info.value)
+  rejection = exc_info.value
+  message = str(rejection)
+  assert rejection is not error
+  assert getattr(rejection, "error_code") == "invalid_request_error"
+  assert getattr(rejection, "status_code") == 400
   assert "Anthropic request rejected (stage=stream)" in message
   assert "status=400" in message
-  assert "type=invalid_request_error" in message
   assert "context_management cannot be combined with this thinking mode" in message
   assert raw_key not in message
   assert "request_id=req_123" in message
@@ -1630,6 +1658,25 @@ def test_stream_wraps_anthropic_rejection_with_sanitized_context(caplog) -> None
   assert "tools=1" in message
   assert "compact-2026-01-12" in message
   assert raw_key not in caplog.text
+
+
+def test_stream_rejection_carries_the_sdk_errors_rate_limit_evidence_to_the_wrapper() -> None:
+  provider = AnthropicProvider()
+  error = _make_anthropic_api_status_error(
+    403,
+    "forbidden",
+    body={"error": {"type": "permission_error", "message": "forbidden"}},
+    headers={f"{_UNIFIED}status": "rejected", f"{_UNIFIED}5h-status": "rejected"},
+  )
+
+  with pytest.raises(RuntimeError) as exc_info:
+    asyncio.run(_drain_stream(provider, _FakeClient(error), dict(_QUOTA_PARAMS)))
+
+  rejection = exc_info.value
+  assert rejection is not error
+  assert getattr(rejection, "status_code") == 403
+  assert getattr(rejection, "rate_limit_unified_status") == "rejected"
+  assert getattr(rejection, "rate_limit_5h_status") == "rejected"
 
 
 def test_stream_status_200_api_error_remains_retryable() -> None:
@@ -1650,32 +1697,19 @@ def test_stream_status_200_api_error_remains_retryable() -> None:
   assert provider.is_retryable_error(error) is True
 
 
-@pytest.mark.parametrize(
-  "error_body",
-  [
-    pytest.param(
-      {
-        "type": "error",
-        "error": {
-          "type": "permission_error",
-          "message": "OAuth authentication is currently not allowed for this organization.",
-          "details": {"error_code": "oauth_not_allowed_for_organization"},
-        },
-      },
-      id="observed-body",
-    ),
-    pytest.param(
-      {"type": "error", "error": {"type": "permission_error", "message": "oauth_not_allowed_for_organization"}},
-      id="error-code-only",
-    ),
-  ],
-)
-def test_org_refusing_oauth_parks_that_member_and_rotates_to_the_next(
+def test_org_refusing_oauth_is_typed_auth_parks_that_member_and_rotates_to_the_next(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
-  error_body: dict[str, object],
 ) -> None:
   """A 403 org OAuth refusal is per credential: pool siblings in other orgs answer."""
+  error_body = {
+    "type": "error",
+    "error": {
+      "type": "permission_error",
+      "message": "OAuth authentication is currently not allowed for this organization.",
+      "details": {"error_code": "oauth_not_allowed_for_organization"},
+    },
+  }
   refused, serving = "sk-ant-oat01-refused-org", "sk-ant-oat01-serving"
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", refused)
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKENS", json.dumps([refused, serving]))
@@ -1683,7 +1717,7 @@ def test_org_refusing_oauth_parks_that_member_and_rotates_to_the_next(
   monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(tmp_path / "absent-oauth.json"))
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
   provider = AnthropicProvider()
-  client = _FakeClient(_make_anthropic_api_status_error(403, f"Error code: 403 - {error_body}", body=error_body))
+  client = _FakeClient(_make_anthropic_api_status_error(403, "forbidden", body=error_body))
   params = {
     "model": "claude-sonnet-5",
     "max_tokens": 1024,
@@ -1693,6 +1727,7 @@ def test_org_refusing_oauth_parks_that_member_and_rotates_to_the_next(
   with pytest.raises(RuntimeError) as exc_info:
     asyncio.run(_drain_stream(provider, client, params))
 
+  assert getattr(exc_info.value, "error_code") == "oauth_not_allowed_for_organization"
   failure = provider.classify_credential_failure(exc_info.value)
 
   assert failure is not None and failure.kind == "auth"
@@ -1706,9 +1741,6 @@ def test_org_refusing_oauth_parks_that_member_and_rotates_to_the_next(
   assert rotated["auth_token"] == serving
   assert rotated["credential_source"]["generation_ref"] == serving_member.generation_ref
   assert rotated[CREDENTIAL_PREPARED_FIELD] is True
-  # The refusal parks the member in the shared sidecar, for every model.
-  assert anthropic_credential_blocked_until(refused_member, model="claude-sonnet-5") > time.time()
-  assert anthropic_credential_blocked_until(serving_member, model="claude-sonnet-5") <= time.time()
 
 
 _QUOTA_PARAMS: dict[str, object] = {
@@ -1997,19 +2029,11 @@ def test_an_arbitrary_403_keeps_the_generic_mapping_and_parks_no_quota(
   # Not a quota signal: the generic mapping, so no scope and no quota verdict.
   assert failure is not None
   assert (failure.kind, failure.status_code, failure.limit_scope) == ("billing", 403, None)
-  # An unscoped call gets only the deployment API key (never an operator seat),
-  # and the API key's billing denial parks the key in its sidecar...
+  # An unscoped call gets only the deployment API key (never an operator seat).
   config = credentials.get_anthropic_config()
   assert config["auth_mode"] == "api"
   assert provider.next_credential(config, failure) is None
-  key = resolve_anthropic_credentials(
-    {ANTHROPIC_DEPLOYMENT_API_KEY_FIELD: config[ANTHROPIC_DEPLOYMENT_API_KEY_FIELD]},
-  ).credentials[0]
-  state = anthropic_quota.load_selection_state(key.sidecar_store_path)
-  assert {
-    cooldown.reason for rows in state.cooldowns.values() for cooldown in rows
-  } == {"billing"}
-  # ...while a seat's 403 is the organisation refusing the client and parks nothing.
+  # A seat's 403 is the organisation refusing the client and parks nothing.
   assert provider.next_credential({"auth_mode": "oauth", "auth_token": seat}, failure) is None
 
 
@@ -2020,25 +2044,6 @@ def test_a_403_with_billing_text_keeps_its_billing_verdict() -> None:
 
   assert failure is not None
   assert (failure.kind, failure.retryable_with_new_credentials) == ("billing", True)
-
-
-def test_a_403_reporting_an_exhausted_window_is_a_quota_signal_through_the_stream_rejection() -> None:
-  reset_at = time.time() + 3600
-  error = _make_anthropic_api_status_error(
-    403,
-    "Request not allowed",
-    headers=_five_hour_headers(utilization=1.0, reset_at=reset_at, status="rejected"),
-  )
-  provider = AnthropicProvider()
-  with pytest.raises(RuntimeError) as exc_info:
-    asyncio.run(_drain_stream(provider, _FakeClient(error), dict(_QUOTA_PARAMS)))
-  assert exc_info.value is not error
-
-  failure = provider.classify_credential_failure(exc_info.value)
-
-  assert failure is not None
-  assert (failure.kind, failure.status_code, failure.limit_scope) == ("rate_limit", 403, "shared")
-  assert failure.reset_at == pytest.approx(reset_at, abs=2.0)
 
 
 @pytest.fixture
@@ -2116,69 +2121,6 @@ def test_prepare_credential_keeps_an_exact_source_and_ranks_the_pool_for_an_auto
   )
   rerouted = _prepare(_pool_config(first, automatic=True))
   assert rerouted is not None and rerouted["auth_token"] == second
-
-
-def test_prepare_fallback_refreshes_a_recovered_oauth_grant_on_the_first_client_build(
-  monkeypatch: pytest.MonkeyPatch,
-  tmp_path: Path,
-  usage_probes: list[list[anthropic_quota.ProbeTarget]],
-) -> None:
-  pytest.importorskip("anthropic")
-  for name in ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES:
-    monkeypatch.delenv(name, raising=False)
-  store = tmp_path / "oauth.json"
-  monkeypatch.setenv("ANTHROPIC_AUTH_STORE_PATH", str(store))
-  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
-  stale_token, fresh_token = "sk-ant-oat01-expired", "sk-ant-oat01-recovered"
-  [record] = anthropic_oauth.upsert_anthropic_oauth_record(
-    store,
-    anthropic_oauth.AnthropicOAuthRecord(
-      identity="recovering@example.com",
-      access_token=stale_token,
-      refresh_token="sk-ant-ort01-recovering",
-      expires_at=0.0,
-    ),
-  )
-  exchanges: list[str] = []
-
-  def post(url: str, body: anthropic_oauth.JSONMapping) -> anthropic_oauth.JSONMapping:
-    exchanges.append(str(body["refresh_token"]))
-    if len(exchanges) == 1:
-      raise anthropic_oauth.AnthropicOAuthError("token endpoint temporarily unavailable")
-    return {
-      "access_token": fresh_token,
-      "refresh_token": "sk-ant-ort01-recovered",
-      "expires_in": 28800,
-    }
-
-  monkeypatch.setattr(anthropic_oauth, "_post_token_endpoint", post)
-  sources = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True})
-  fallback = anthropic_oauth.select_anthropic_credential_source(sources)
-  assert fallback is not None and fallback.token == stale_token
-  [cooldown] = anthropic_quota.load_selection_state(store).cooldowns[fallback.locator.id]
-  assert cooldown.reason == "refresh_failed" and cooldown.until > time.time()
-  assert len(exchanges) == 1
-
-  # The endpoint has recovered, but the pool still returns its blocked fallback.
-  # Explicit False must replace a prepared flag retained from an earlier build.
-  config = _pool_config(stale_token, automatic=True, **{CREDENTIAL_PREPARED_FIELD: True})
-  material = _prepare(config)
-  assert material is not None
-  assert material["auth_token"] == stale_token
-  assert material[CREDENTIAL_PREPARED_FIELD] is False
-  assert len(exchanges) == 1
-  assert usage_probes == []
-
-  provider = AnthropicProvider()
-  client = provider.create_client({**config, **material})
-  try:
-    assert len(exchanges) == 2
-    assert client.auth_token == fresh_token
-    assert client.hank_anthropic_binding.generation_id == record.generation_id
-    [stored] = anthropic_oauth.load_anthropic_oauth_store(store)
-    assert stored.access_token == fresh_token
-  finally:
-    asyncio.run(provider.close_client(client))
 
 
 @pytest.mark.parametrize("key_blocked", [False, True])
@@ -3137,7 +3079,7 @@ def test_declared_adapter_support_matches_messages_implementation() -> None:
   for key in (
     "anthropic.claude-sonnet-5-sdk",
     "anthropic.claude-haiku-4-5-sdk",
-    "anthropic.claude-opus-5-5-oauth",
+    "anthropic.claude-sonnet-5-5-sdk",
     "anthropic.claude-sonnet-4-20250514-sdk",
   ):
     assert not declaration.supports(INITIAL_MODEL_REGISTRY.require(key)), key

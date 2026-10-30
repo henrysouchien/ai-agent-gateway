@@ -21,7 +21,6 @@ from agent_workflow_contracts import (
   ContentReadGrant,
   ContinuationState,
   ContractRef,
-  DELIVERY_PREVIEW_MAX_BYTES,
   DELIVERY_PREVIEW_POLICY_VERSION,
   DeliveryEnvelopeV1,
   DeliveryEnvelopeV2,
@@ -40,7 +39,6 @@ from agent_workflow_contracts import (
   ParentResultPolicy,
   PhaseOutputSelector,
   ProjectionRequirement,
-  PUBLISHED_OUTPUT_INLINE_MAX_BYTES,
   PublishedInlineView,
   PublishedOutput,
   PublishedOutputRef,
@@ -87,13 +85,11 @@ def test_all_exports_every_module_model() -> None:
     and value is not models.WireModel
   ]
   assert models.__all__ == module_models + [
-    "DELIVERY_PREVIEW_MAX_BYTES",
+    "PreviewDigest",
     "DELIVERY_PREVIEW_POLICY_VERSION",
     "DeliveryEnvelope",
-    "PUBLISHED_OUTPUT_INLINE_MAX_BYTES",
     "SELECTED_CONTENT_UTF8_CONTRACT",
     "WORKFLOW_CONTENT_MAX_SEQUENCE",
-    "WORKFLOW_CONTENT_PAGE_MAX_BYTES",
     "WorkflowContentError",
     "WorkflowContentIntegrityError",
     "WorkflowContentNotFoundError",
@@ -483,20 +479,6 @@ def test_attachment_spec_requires_summary_but_inline_does_not() -> None:
   assert inline.summary_selector is None
 
 
-def test_delivery_spec_serializes_the_exact_code_owned_presentation_bound() -> None:
-  spec = WorkflowDeliverySpecV1(presentation="inline", primary_selector="primary")
-  assert spec.summary_inline_max_bytes == PUBLISHED_OUTPUT_INLINE_MAX_BYTES
-  assert spec.model_dump(mode="json")["summary_inline_max_bytes"] == (
-    PUBLISHED_OUTPUT_INLINE_MAX_BYTES
-  )
-  with pytest.raises(ValidationError, match="code-owned presentation bound"):
-    WorkflowDeliverySpecV1(
-      presentation="inline",
-      primary_selector="primary",
-      summary_inline_max_bytes=PUBLISHED_OUTPUT_INLINE_MAX_BYTES + 1,
-    )
-
-
 def test_delivery_without_authored_summary_requires_explicit_warning() -> None:
   primary_text = "Lossless report"
   primary_output = PublishedOutput(
@@ -647,7 +629,7 @@ def test_delivery_spec_reader_keeps_absent_version_v1_exact_and_requires_v2_vers
       "presentation": "attachment",
       "primary_selector": "report",
       "preview_policy_version": DELIVERY_PREVIEW_POLICY_VERSION,
-      "preview_max_bytes": DELIVERY_PREVIEW_MAX_BYTES,
+      "preview_max_bytes": None,
     })
 
   v2 = parse_workflow_delivery_spec({
@@ -656,7 +638,7 @@ def test_delivery_spec_reader_keeps_absent_version_v1_exact_and_requires_v2_vers
     "primary_selector": "report",
     "additional_selectors": [],
     "preview_policy_version": DELIVERY_PREVIEW_POLICY_VERSION,
-    "preview_max_bytes": DELIVERY_PREVIEW_MAX_BYTES,
+    "preview_max_bytes": None,
   })
   assert isinstance(v2, WorkflowDeliverySpecV2)
 
@@ -679,16 +661,6 @@ def test_v2_delivery_preview_is_a_bounded_exact_utf8_interval() -> None:
       source_total_bytes=2,
       complete=False,
       omitted_bytes=1,
-    )
-  with pytest.raises(ValidationError, match="version-2 byte bound"):
-    DeliveryPreview(
-      kind="deterministic_text_preview",
-      text="x" * (DELIVERY_PREVIEW_MAX_BYTES + 1),
-      source_start_byte=0,
-      source_end_byte=DELIVERY_PREVIEW_MAX_BYTES + 1,
-      source_total_bytes=DELIVERY_PREVIEW_MAX_BYTES + 1,
-      complete=True,
-      omitted_bytes=0,
     )
   with pytest.raises(ValidationError, match="omitted bytes"):
     DeliveryPreview(
@@ -746,7 +718,7 @@ def test_v2_delivery_pairing_uses_the_recorded_preview_policy() -> None:
     presentation="attachment",
     primary_selector="primary_report",
     preview_policy_version=DELIVERY_PREVIEW_POLICY_VERSION,
-    preview_max_bytes=DELIVERY_PREVIEW_MAX_BYTES,
+    preview_max_bytes=None,
   )
   settlement = DeliverySettlement(
     status="complete",
@@ -828,7 +800,7 @@ def test_complete_v2_preview_rejects_mismatched_non_string_exact_inline_value() 
     presentation="attachment",
     primary_selector="primary_report",
     preview_policy_version=DELIVERY_PREVIEW_POLICY_VERSION,
-    preview_max_bytes=DELIVERY_PREVIEW_MAX_BYTES,
+    preview_max_bytes=None,
   )
   with pytest.raises(ValidationError, match="conflicts with exact inline primary"):
     WorkflowResult(

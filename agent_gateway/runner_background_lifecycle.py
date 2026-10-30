@@ -88,7 +88,6 @@ from .sub_agent_result_evidence import (
 )
 from .sub_agent_skill_state import (
   latest_successful_declared_terminal_tool_result,
-  persist_expectation_doors,
   terminal_result_doors,
 )
 from .tool_result_compaction import model_tool_result_max_chars
@@ -157,6 +156,12 @@ RequiredSkillResultProjector = Callable[
 
 log = logging.getLogger("agent_gateway.runner")
 
+# Resource containment, not a request deadline. `_shutdown_background_tasks`
+# runs on runner teardown: grace-wait and kill-drain are the only bounds on how
+# long a still-pending background task (a child process or coroutine) may hold
+# the shutdown open before it is killed and reconciled, so a wedged task cannot
+# hang the runner. Same family as `force_close` and the child-silence watchdog
+# in the containment owner; they refuse no work and bound no result.
 _BACKGROUND_COMPLETION_PERSIST_TIMEOUT_SECONDS = 5.0
 _BACKGROUND_CANCEL_DRAIN_TIMEOUT_SECONDS = 5.0
 _BACKGROUND_GRACE_WAIT_TIMEOUT_SECONDS = 30.0
@@ -1128,9 +1133,6 @@ class RunnerBackgroundLifecycleMixin:
         result=result,
         error=error,
         canonical_result_evidence_authoritative=True,
-        declared_terminal_doors=persist_expectation_doors(
-          bg_task.admitted_task
-        ),
       )
     if event is None:
       return None

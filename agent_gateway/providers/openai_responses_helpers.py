@@ -10,7 +10,13 @@ from model_authority.registry import AdapterRouteSupport
 from model_authority.schema import OpenAIResponsesCompat
 from ..tool_result_compaction import make_error_result
 from ..openai_history_fence import REASONING_SIGNATURE_MARKER, TEXT_SIGNATURE_MARKER
-from .base import ModelInfo, StreamEvent, admitted_entry, model_info_from_entry
+from .base import (
+  ModelInfo,
+  StreamEvent,
+  admitted_entry,
+  model_info_from_entry,
+  stream_error,
+)
 
 
 _TOOL_ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
@@ -424,15 +430,19 @@ def map_event(event_value: Any, state: _ResponsesStreamState) -> list[StreamEven
   if service_tier is not None:
     state.service_tier = service_tier
   if event_type == "error":
-    raise RuntimeError(f"OpenAI Responses error: {event.get('message') or event.get('code') or 'unknown error'}")
+    raise stream_error(
+      f"OpenAI Responses error: {event.get('message') or event.get('code') or 'unknown error'}",
+      event.get("code"),
+    )
   if event_type == "response.failed":
     raw_error = response.get("error")
     error = raw_error if isinstance(raw_error, dict) else {}
     if "status" not in response:
       response = {**response, "status": "failed"}
     terminal_events = _terminal_events(response, state)
-    state.terminal_error = RuntimeError(
-      f"OpenAI Responses failed: {error.get('message') or 'unknown error'}"
+    state.terminal_error = stream_error(
+      f"OpenAI Responses failed: {error.get('message') or 'unknown error'}",
+      error.get("code"),
     )
     return terminal_events
   if event_type in {"response.completed", "response.incomplete", "response.done"}:

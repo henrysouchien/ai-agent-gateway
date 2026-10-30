@@ -14,7 +14,7 @@ import stat
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, TYPE_CHECKING
+from typing import Any, Callable, ContextManager, Iterator, Literal, Mapping, Protocol, TYPE_CHECKING
 from uuid import uuid4
 
 from agent_workflow_contracts import AgentCompletionEnvelope, TaskResult
@@ -43,6 +43,7 @@ from .approval_policy import (
   revalidate_approval_request,
   utc_now,
 )
+from .approval_remote import ApprovalRemoteReservationActive, ApprovalStoreAuditEmitter
 from .tool_policy_registry import PreparedToolCall as CanonicalPreparedToolCall
 
 if TYPE_CHECKING:
@@ -83,8 +84,6 @@ _AUTONOMOUS_APPROVAL_DELIVERY_OUTBOX_COLUMNS = frozenset({
   "approved",
   "allow_tool_type",
   "decided_at_ns",
-  "retry_deadline_ns",
-  "next_attempt_ns",
   "last_attempt_ns",
   "state",
   "audit_state",
@@ -111,12 +110,6 @@ _AUTONOMOUS_APPROVAL_DELIVERY_CONTEXT_FIELDS = frozenset({
   "nonce",
 })
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm")
-AUTONOMOUS_APPROVAL_DELIVERY_MAX_ATTEMPTS = 5
-AUTONOMOUS_APPROVAL_DELIVERY_RETRY_WINDOW_NS = (
-  5 * 60 * 1_000_000_000
-)
-AUTONOMOUS_APPROVAL_DELIVERY_RETRY_BASE_NS = 1_000_000_000
-AUTONOMOUS_APPROVAL_DELIVERY_RETRY_MAX_NS = 16_000_000_000
 _SQLITE_MAX_INTEGER = (1 << 63) - 1
 
 
@@ -477,8 +470,6 @@ def _autonomous_approval_delivery_projection(
     "approved": bool(approved),
     "allow_tool_type": False,
     "decided_at_ns": int(row["decided_at_ns"]),
-    "retry_deadline_ns": int(row["retry_deadline_ns"]),
-    "next_attempt_ns": int(row["next_attempt_ns"]),
     "last_attempt_ns": (
       int(row["last_attempt_ns"])
       if row["last_attempt_ns"] is not None
@@ -642,20 +633,7 @@ def _insert_autonomous_approval_delivery_in_transaction(
     source_id=vote.vote_id if vote is not None else "cancellation",
     event_at_ns=decided_at_ns,
   )
-  delivery_now_ns, delivery_now_dt = _trusted_utc_now(conn)
-  if (
-    delivery_now_ns
-    > _SQLITE_MAX_INTEGER
-    - AUTONOMOUS_APPROVAL_DELIVERY_RETRY_WINDOW_NS
-  ):
-    raise RuntimeError(
-      "autonomous approval delivery retry deadline overflow"
-    )
-  retry_deadline_ns = (
-    delivery_now_ns
-    + AUTONOMOUS_APPROVAL_DELIVERY_RETRY_WINDOW_NS
-  )
-  delivery_now = _dt_to_text(delivery_now_dt)
+  delivery_now = _dt_to_text(_trusted_utc_now(conn)[1])
   sequence_row = conn.execute(
     """
     SELECT next_value
@@ -696,7 +674,7 @@ def _insert_autonomous_approval_delivery_in_transaction(
       delivery_sequence, approval_id, tool_call_id, nonce,
       task_id, control_run_id,
       session_id, channel_id, approved, allow_tool_type,
-      decided_at_ns, retry_deadline_ns, next_attempt_ns,
+      decided_at_ns,
       last_attempt_ns, state, audit_state,
       triggering_vote_id,
       vote_audit_entry_id, terminal_audit_entry_id,
@@ -704,7 +682,7 @@ def _insert_autonomous_approval_delivery_in_transaction(
       audit_ready_at, published_at, acknowledged_at, quarantined_at
     ) VALUES (
       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
     )
     """,
     (
@@ -719,8 +697,6 @@ def _insert_autonomous_approval_delivery_in_transaction(
       1 if approved else 0,
       0,
       decided_at_ns,
-      retry_deadline_ns,
-      delivery_now_ns,
       None,
       "pending",
       "pending",
@@ -1183,6 +1159,8 @@ _json_loads = _rows.json_loads
 
 
 class ApprovalRequestStore(Protocol):
+  @property
+  def audit_emitter(self) -> ApprovalStoreAuditEmitter | None: ...
   async def create(self, request: ApprovalRequest) -> ApprovalRequest: ...
   async def create_or_get_by_tool_call_id(
     self,
@@ -1257,8 +1235,14 @@ class ApprovalRequestStore(Protocol):
     claim_token: str,
     tool_result: ToolResult,
   ) -> None: ...
-  async def get(self, approval_id: str) -> ApprovalRequest | None: ...
-  async def get_by_tool_call_id(self, tool_call_id: str) -> ApprovalRequest | None: ...
+  async def get(
+    self, approval_id: str, *,
+    owner_user_id: str | tuple[str, ...] | list[str] | set[str] | None = None,
+  ) -> ApprovalRequest | None: ...
+  async def get_by_tool_call_id(
+    self, tool_call_id: str, *,
+    owner_user_id: str | tuple[str, ...] | list[str] | set[str] | None = None,
+  ) -> ApprovalRequest | None: ...
   async def update_request(self, request: ApprovalRequest) -> ApprovalRequest: ...
   async def transition_state(
     self,
@@ -1341,12 +1325,6 @@ class ApprovalRequestStore(Protocol):
     now: datetime | None = None,
   ) -> DelegationGrant | None: ...
   async def revoke_delegation_grant(self, delegation_id: str, *, revoked_at: datetime | None = None) -> None: ...
-  async def maintain_pending(
-    self,
-    *,
-    prepared_cursor: PreparedReconciliationCursor | None = None,
-    prepared_page_size: int = 100,
-  ) -> ApprovalMaintenanceResult: ...
   async def reconcile_prepared_business_model_change(
     self,
     *,
@@ -1354,6 +1332,116 @@ class ApprovalRequestStore(Protocol):
     user_scope: str,
     idempotency_locator: str,
   ) -> TargetedPreparedReconciliationResult: ...
+  async def create_raw_patch_authorization(
+    self, request: ApprovalRequest, *, prepared_payload: bytes,
+  ) -> ApprovalRequest: ...
+  async def create_or_get_with_prepared_business_model_change(
+    self, request: ApprovalRequest, record: _prepared_bm.PreparedBusinessModelChange,
+  ) -> tuple[ApprovalRequest, _prepared_bm.PreparedBusinessModelChange, bool]: ...
+  async def record_vote_with_autonomous_delivery(
+    self, approval_id: str, vote: ApprovalVote, *, delivery: Mapping[str, Any],
+  ) -> ApprovalRequest: ...
+  async def list_parked_requests(self, tenant_storage_id: str) -> list[ApprovalRequest]: ...
+  async def record_policy_generation(
+    self, *, policy_id: str, policy_version: str, policy_bundle_hash: str,
+    make_current: bool = True,
+  ) -> PolicyGeneration: ...
+  async def record_root_turn(
+    self, *, job_id: str, turn_id: str, tenant_storage_id: str,
+    capability_bind: Mapping[str, object], credential_generation_ref: str | None,
+    effective_grant: Mapping[str, object], research_binding: Mapping[str, object] | None,
+    selection_snapshot: Mapping[str, object], approval_route_kind: str,
+    policy_generation_ref: str, created_at: datetime | None = None,
+  ) -> None: ...
+  async def _read_root_turn_for_executor(
+    self, *, job_id: str, turn_id: str, tenant_storage_id: str,
+  ) -> RootTurnRecord | None: ...
+  async def _locate_root_turn_for_approval(
+    self, *, approval_id: str, tenant_storage_id: str,
+  ) -> tuple[str, str, str, str] | None: ...
+  async def link_root_turn_executable_binding(
+    self, *, job_id: str, turn_id: str, tool_call_id: str, nonce: str,
+    tenant_storage_id: str,
+  ) -> None: ...
+  async def reissue_parked_approval(
+    self, *, approval_id: str, job_id: str, tool_call_id: str, nonce: str,
+    turn_id: str, tenant_storage_id: str, generation: PolicyGeneration,
+  ) -> tuple[ApprovalRequest, str, str, bool]: ...
+  async def get_prepared_business_model_change(
+    self, *, caller_kind: str, user_scope: str, idempotency_locator: str,
+  ) -> _prepared_bm.PreparedBusinessModelChange | None: ...
+  async def transition_prepared_business_model_change(
+    self, *, caller_kind: str, user_scope: str, idempotency_locator: str,
+    expected: _prepared_bm.PreparedBusinessModelLifecycle,
+    target: _prepared_bm.PreparedBusinessModelLifecycle,
+    approval_id: str | None = None, approval_chain_id: str | None = None,
+    execution_receipt: bytes | None = None, restoration_digest: str | None = None,
+    checkpoint_id: str | None = None, consumed_at: str | None = None,
+  ) -> _prepared_bm.PreparedBusinessModelChange: ...
+  async def enqueue_pending_approval_notification(
+    self, request: ApprovalRequest,
+  ) -> dict[str, Any] | None: ...
+  async def get_autonomous_approval_delivery(
+    self, approval_id: str, *, tool_call_id: str, nonce: str,
+  ) -> dict[str, Any] | None: ...
+  async def ensure_autonomous_approval_delivery_audited(
+    self, approval_id: str, *, tool_call_id: str, nonce: str,
+  ) -> dict[str, Any]: ...
+  async def acknowledge_autonomous_approval_delivery(
+    self, approval_id: str, *, task_id: str, control_run_id: str, session_id: str,
+    channel_id: str, tool_call_id: str, nonce: str, approved: bool, decided_at_ns: int,
+  ) -> dict[str, Any]: ...
+  async def record_autonomous_approval_delivery_failure(
+    self, approval_id: str, *, tool_call_id: str, nonce: str, error: str,
+  ) -> dict[str, Any]: ...
+  async def quarantine_autonomous_approval_delivery(
+    self, approval_id: str, *, tool_call_id: str, nonce: str, error: str,
+  ) -> dict[str, Any]: ...
+  async def list_pending_autonomous_approval_deliveries(
+    self, *, after_sequence: int = 0, through_sequence: int | None = None,
+  ) -> list[dict[str, Any]]: ...
+  async def autonomous_approval_delivery_recovery_window(self) -> dict[str, int]: ...
+  def autonomous_approval_delivery_append_transaction(
+    self, approval_id: str, *, tool_call_id: str, nonce: str, approved: bool,
+  ) -> ContextManager[None]: ...
+  def autonomous_approval_delivery_duplicate_transaction(
+    self, approval_id: str, *, tool_call_id: str, nonce: str, approved: bool,
+  ) -> ContextManager[None]: ...
+  async def retry_failed_approval_notifications(self, approval_id: str) -> dict[str, Any]: ...
+  async def resolve_raw_patch_authorization_reference(
+    self, reference: str,
+  ) -> ApprovalRequest | None: ...
+  async def get_raw_patch_prepared_authorization(
+    self, *, approval_id: str,
+  ) -> _raw_patch_auth.RawPatchPreparedAuthorization | None: ...
+  async def consume_raw_patch_authorization(
+    self, *, approval_id: str, approval_chain_id: str, authorization_mode: str,
+    grant_reference: str | None, cache_reference: str | None, user_id: str,
+    tool_name: str, args_hash: str, change_set_id: str, change_hash: str,
+    base_vector_hash: str, reviewed_change_binding_digest: str,
+    execution_semantics_digest: str, prepared_payload_digest: str,
+    claim_token: str, receipt: bytes,
+  ) -> tuple[_raw_patch_auth.RawPatchAuthorizationConsumption, bool]: ...
+  async def claim_raw_patch_authorization(
+    self, *, approval_id: str, approval_chain_id: str, authorization_mode: str,
+    grant_reference: str | None, cache_reference: str | None, user_id: str,
+    tool_name: str, args_hash: str, change_set_id: str, change_hash: str,
+    base_vector_hash: str, reviewed_change_binding_digest: str,
+    execution_semantics_digest: str, prepared_payload_digest: str,
+  ) -> _raw_patch_auth.RawPatchAuthorizationClaim: ...
+  async def release_raw_patch_authorization_claim(
+    self, *, approval_id: str, approval_chain_id: str, authorization_mode: str,
+    grant_reference: str | None, cache_reference: str | None, user_id: str,
+    tool_name: str, args_hash: str, change_set_id: str, change_hash: str,
+    base_vector_hash: str, reviewed_change_binding_digest: str,
+    execution_semantics_digest: str, prepared_payload_digest: str, claim_token: str,
+  ) -> None: ...
+  async def heartbeat_raw_patch_authorization_claim(
+    self, *, approval_id: str, claim_token: str, lease_seconds: float = 120.0,
+  ) -> _raw_patch_auth.RawPatchAuthorizationClaim: ...
+  async def get_raw_patch_authorization_consumption(
+    self, *, approval_id: str,
+  ) -> _raw_patch_auth.RawPatchAuthorizationConsumption | None: ...
 
 
 class SQLiteApprovalStore:
@@ -1411,6 +1499,26 @@ class SQLiteApprovalStore:
   @property
   def audit_emitter(self) -> _ApprovalAuditEmitter | None:
     return self._audit_emitter
+
+  def pending_approval_count(self) -> int:
+    """Count undecided user approvals for an explicit placement migration."""
+    with self._connection() as conn:
+      return int(conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE state = 'pending_user'"
+      ).fetchone()[0])
+
+  def checkpoint_for_migration(self) -> None:
+    """Checkpoint the unchanged ledger after its placement generation stops.
+
+    The connection is closed on return, before the placement owner moves the
+    database. A busy reader means the ledger is not ready to move.
+    """
+    with self._connection() as conn:
+      busy, _log_frames, _checkpointed_frames = conn.execute(
+        "PRAGMA wal_checkpoint(TRUNCATE)"
+      ).fetchone()
+      if busy:
+        raise RuntimeError("approval store checkpoint is busy")
 
   def _require_bound_file(self) -> os.stat_result:
     _require_secure_sqlite_parent(self.path)
@@ -1490,6 +1598,41 @@ class SQLiteApprovalStore:
     finally:
       os.close(parent_fd)
 
+  @staticmethod
+  def _autonomous_publication_reserved(
+    conn: sqlite3.Connection,
+    approval_id: str,
+    *,
+    tool_call_id: str | None = None,
+    nonce: str | None = None,
+  ) -> bool:
+    # The edge owns reservation lifecycle and generation cleanup. Every active
+    # generation conflicts; committed receipts never block later writers.
+    return conn.execute(
+      """
+      SELECT 1 FROM autonomous_publication_reservations
+      WHERE decision_id = ? AND state = 'active'
+        AND (? IS NULL OR tool_call_id = ?)
+        AND (? IS NULL OR nonce = ?)
+      LIMIT 1
+      """,
+      (approval_id, tool_call_id, tool_call_id, nonce, nonce),
+    ).fetchone() is not None
+
+  @classmethod
+  def _require_unreserved_autonomous_publication(
+    cls,
+    conn: sqlite3.Connection,
+    approval_id: str,
+    *,
+    tool_call_id: str | None = None,
+    nonce: str | None = None,
+  ) -> None:
+    if cls._autonomous_publication_reserved(
+      conn, approval_id, tool_call_id=tool_call_id, nonce=nonce,
+    ):
+      raise ApprovalRemoteReservationActive()
+
   def _init_schema(self) -> None:
     with self._connection() as conn:
       existing_outbox_columns = {
@@ -1498,6 +1641,20 @@ class SQLiteApprovalStore:
           "PRAGMA table_info(autonomous_approval_delivery_outbox)"
         ).fetchall()
       }
+      retired_outbox_columns = ("retry_deadline_ns", "next_attempt_ns")
+      if existing_outbox_columns == (
+        _AUTONOMOUS_APPROVAL_DELIVERY_OUTBOX_COLUMNS
+        | set(retired_outbox_columns)
+      ):
+        # Delivery retry scheduling is gone; rows keep every other column.
+        for retired_column in retired_outbox_columns:
+          conn.execute(
+            "ALTER TABLE autonomous_approval_delivery_outbox "
+            f"DROP COLUMN {retired_column}"
+          )
+        existing_outbox_columns = set(
+          _AUTONOMOUS_APPROVAL_DELIVERY_OUTBOX_COLUMNS
+        )
       if (
         existing_outbox_columns
         and existing_outbox_columns
@@ -1733,10 +1890,6 @@ class SQLiteApprovalStore:
           allow_tool_type INTEGER NOT NULL DEFAULT 0
             CHECK (allow_tool_type = 0),
           decided_at_ns INTEGER NOT NULL CHECK (decided_at_ns > 0),
-          retry_deadline_ns INTEGER NOT NULL
-            CHECK (retry_deadline_ns > 0),
-          next_attempt_ns INTEGER NOT NULL
-            CHECK (next_attempt_ns > 0),
           last_attempt_ns INTEGER
             CHECK (last_attempt_ns IS NULL OR last_attempt_ns > 0),
           state TEXT NOT NULL DEFAULT 'pending'
@@ -1802,6 +1955,16 @@ class SQLiteApprovalStore:
           ON autonomous_approval_delivery_outbox(
             state, audit_state, updated_at
           );
+
+        CREATE TABLE IF NOT EXISTS autonomous_publication_reservations (
+          decision_id TEXT NOT NULL,
+          tool_call_id TEXT NOT NULL,
+          nonce TEXT NOT NULL,
+          approved INTEGER NOT NULL CHECK (approved IN (0, 1)),
+          placement_generation INTEGER NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('active', 'committed')),
+          PRIMARY KEY (decision_id, tool_call_id, nonce, placement_generation)
+        );
         """
       )
       root_columns = {
@@ -3753,6 +3916,7 @@ class SQLiteApprovalStore:
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        self._require_unreserved_autonomous_publication(conn, approval_id)
         current_row = conn.execute(
           "SELECT * FROM approval_requests WHERE approval_id = ?",
           (approval_id,),
@@ -4657,6 +4821,10 @@ class SQLiteApprovalStore:
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        self._require_unreserved_autonomous_publication(
+          conn, normalized_approval_id,
+          tool_call_id=authority["tool_call_id"], nonce=authority["nonce"],
+        )
         _acknowledged_at_ns, acknowledged_at = (
           _trusted_utc_now(conn)
         )
@@ -4770,24 +4938,16 @@ class SQLiteApprovalStore:
   async def list_pending_autonomous_approval_deliveries(
     self,
     *,
-    limit: int = 64,
     after_sequence: int = 0,
     through_sequence: int | None = None,
   ) -> list[dict[str, Any]]:
-    if type(limit) is not int or not 1 <= limit <= 256:
-      raise ValueError(
-        "autonomous approval delivery limit must be 1..256"
-      )
-    if type(after_sequence) is not int or after_sequence < 0:
+    if type(after_sequence) is not int:
       raise ValueError(
         "autonomous approval delivery after_sequence is invalid"
       )
     if (
       through_sequence is not None
-      and (
-        type(through_sequence) is not int
-        or through_sequence < after_sequence
-      )
+      and type(through_sequence) is not int
     ):
       raise ValueError(
         "autonomous approval delivery through_sequence is invalid"
@@ -4801,13 +4961,11 @@ class SQLiteApprovalStore:
             AND delivery_sequence > ?
             AND (? IS NULL OR delivery_sequence <= ?)
           ORDER BY delivery_sequence ASC
-          LIMIT ?
           """,
           (
             after_sequence,
             through_sequence,
             through_sequence,
-            limit,
           ),
         ).fetchall()
     return [
@@ -4875,6 +5033,10 @@ class SQLiteApprovalStore:
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        self._require_unreserved_autonomous_publication(
+          conn, normalized_approval_id,
+          tool_call_id=normalized_tool_call_id, nonce=normalized_nonce,
+        )
         row = conn.execute(
           """
           SELECT * FROM autonomous_approval_delivery_outbox
@@ -4897,55 +5059,26 @@ class SQLiteApprovalStore:
           return current
         now_ns, now = _trusted_utc_now(conn)
         now_text = _dt_to_text(now)
-        next_attempt_count = int(current["attempt_count"]) + 1
-        quarantined = (
-          current["state"] == "pending"
-          and (
-            next_attempt_count
-            >= AUTONOMOUS_APPROVAL_DELIVERY_MAX_ATTEMPTS
-            or now_ns >= int(current["retry_deadline_ns"])
-          )
-        )
-        next_state = (
-          "quarantined" if quarantined else current["state"]
-        )
-        retry_delay_ns = min(
-          AUTONOMOUS_APPROVAL_DELIVERY_RETRY_BASE_NS
-          * (1 << min(max(next_attempt_count - 1, 0), 30)),
-          AUTONOMOUS_APPROVAL_DELIVERY_RETRY_MAX_NS,
-        )
-        if now_ns > _SQLITE_MAX_INTEGER - retry_delay_ns:
-          conn.rollback()
-          raise RuntimeError(
-            "autonomous approval delivery retry time overflow"
-          )
-        next_attempt_ns = (
-          now_ns
-          if quarantined or current["state"] == "published"
-          else now_ns + retry_delay_ns
-        )
+        # A failed publish is recorded and leaves the row in its state: a
+        # pending row stays pending for a later drain and a published row
+        # stays published. Quarantine is only for a row that can never be
+        # delivered (quarantine_autonomous_approval_delivery).
         cursor = conn.execute(
           """
           UPDATE autonomous_approval_delivery_outbox SET
-            state = ?,
             attempt_count = ?,
             last_error = ?,
             updated_at = ?,
-            next_attempt_ns = ?,
-            last_attempt_ns = ?,
-            quarantined_at = ?
+            last_attempt_ns = ?
           WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
             AND state = ?
             AND attempt_count = ?
           """,
           (
-            next_state,
-            next_attempt_count,
+            int(current["attempt_count"]) + 1,
             normalized_error,
             now_text,
-            next_attempt_ns,
             now_ns,
-            now_text if quarantined else None,
             normalized_approval_id,
             normalized_tool_call_id,
             normalized_nonce,
@@ -5009,6 +5142,10 @@ class SQLiteApprovalStore:
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        self._require_unreserved_autonomous_publication(
+          conn, normalized_approval_id,
+          tool_call_id=normalized_tool_call_id, nonce=normalized_nonce,
+        )
         row = conn.execute(
           """
           SELECT * FROM autonomous_approval_delivery_outbox
@@ -5043,7 +5180,6 @@ class SQLiteApprovalStore:
             attempt_count = attempt_count + 1,
             last_error = ?,
             updated_at = ?,
-            next_attempt_ns = ?,
             last_attempt_ns = ?,
             quarantined_at = ?
           WHERE approval_id = ? AND tool_call_id = ? AND nonce = ?
@@ -5053,7 +5189,6 @@ class SQLiteApprovalStore:
           (
             normalized_error,
             now_text,
-            _now_ns,
             _now_ns,
             now_text,
             normalized_approval_id,
@@ -5286,6 +5421,7 @@ class SQLiteApprovalStore:
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        self._require_unreserved_autonomous_publication(conn, approval_id)
         current_row = conn.execute(
           "SELECT * FROM approval_requests WHERE approval_id = ?",
           (approval_id,),
@@ -6370,7 +6506,7 @@ class SQLiteApprovalStore:
     return _rows.row_to_delegation_grant(row)
 
 
-async def maintain_pending_loop(store: ApprovalRequestStore, *, interval_seconds: float = 30.0) -> None:
+async def maintain_pending_loop(store: SQLiteApprovalStore, *, interval_seconds: float = 30.0) -> None:
   prepared_cursor: PreparedReconciliationCursor | None = None
   while True:
     await asyncio.sleep(interval_seconds)

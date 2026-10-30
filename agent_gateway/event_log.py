@@ -48,8 +48,10 @@ class EventLog:
   """Append-only event buffer for gateway streams.
 
   Runners write structured events here and the HTTP layer consumes them through
-  `iter_from()`. The log closes automatically when a terminal event such as
-  `stream_complete` or `error` is appended.
+  `iter_from()`, whose cursor is an absolute sequence number. ``first_seq``
+  defaults to 1; a continuation supplies its predecessor's ``next_seq``.
+  The log closes automatically when a terminal event such as `stream_complete`
+  or `error` is appended.
   """
 
   def __init__(
@@ -60,6 +62,7 @@ class EventLog:
     defer_terminal_close: bool = False,
     on_event_error: OnEventErrorPolicy = "ignore",
     prepare_event: PrepareEvent | None = None,
+    first_seq: int = 1,
   ) -> None:
     if on_event_error not in {"ignore", "raise"}:
       raise ValueError(
@@ -69,7 +72,8 @@ class EventLog:
     self._closed = False
     self._has_terminal = False
     self._defer_terminal_close = bool(defer_terminal_close)
-    self._next_seq = 1
+    self._first_seq = first_seq
+    self._next_seq = first_seq
     self._version = 0
     self._updated = asyncio.Event()
     self._on_event = on_event
@@ -129,20 +133,22 @@ class EventLog:
       return
 
     if self._has_terminal:
-      self._closed = True
-      self._version += 1
-      self._updated.set()
+      self.close_without_terminal()
       return
 
     reason = error or "stream closed"
     self.append({"type": "error", "error": reason})
     if self._defer_terminal_close:
-      self._closed = True
-      self._version += 1
-      self._updated.set()
+      self.close_without_terminal()
+
+  def close_without_terminal(self) -> None:
+    """Close the buffer without manufacturing another terminal event."""
+    self._closed = True
+    self._version += 1
+    self._updated.set()
 
   async def iter_from(self, after_seq: int = 0) -> AsyncIterator[LogEntry]:
-    index = max(after_seq, 0)
+    index = max(after_seq - self._first_seq + 1, 0)
 
     while True:
       while index < len(self._entries):

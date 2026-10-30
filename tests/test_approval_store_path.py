@@ -1,9 +1,31 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import hmac
 from pathlib import Path
 
 import pytest
+import httpx
+from hank_contracts.agent_api import AGENT_API_CLAIM_HEADERS, canonical_agent_api_claim_bytes
 from fastapi import FastAPI
+from pydantic import ValidationError
+
+from agent_gateway.approval_remote import (
+  APPROVALS_EGRESS_URL, APPROVALS_EGRESS_URL_ENV, encode_operation_result,
+)
+from agent_gateway.approval_remote_store import RemoteApprovalRequestStore
+from agent_gateway.approval_subsystem import (
+  build_runtime_approval_subsystem, load_placed_approval_configuration,
+)
+from agent_gateway.user_runtime_credentials import (
+  USER_RUNTIME_CREDENTIALS_FILE_ENV,
+  DeskReplica,
+  UserRuntimeIdentity,
+  mint_user_runtime_credentials,
+  load_user_runtime_credentials,
+  write_user_runtime_credentials,
+)
 
 from agent_gateway.approval_store import resolve_approval_db_path
 from agent_gateway import server_chat_helpers
@@ -123,3 +145,139 @@ def test_gateway_approval_subsystem_uses_configured_campaign_db(
   server_chat_helpers._init_approval_subsystem(app, config)
 
   assert app.state.gateway_approval_store.path == expected
+
+
+@pytest.fixture
+def placed_approval_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+  path = tmp_path / "credentials.json"
+  write_user_runtime_credentials(
+    mint_user_runtime_credentials(
+      org_claim_key="approval-path-test-org-key-at-least-32-bytes",
+      identity=UserRuntimeIdentity(
+        key="private-api-key", channel="excel", slug="alice",
+        email="alice@example.test", risk_user_id=17, role="analyst",
+        capabilities=("research",),
+      ),
+      storage_id="17",
+      generation=1,
+      desk=DeskReplica("s3://test-desk", None, None, None, None),
+    ),
+    path,
+  )
+  monkeypatch.setenv(USER_RUNTIME_CREDENTIALS_FILE_ENV, str(path))
+  monkeypatch.setenv("HANK_APPROVAL_TRANSPORT", "local")
+  return path
+
+
+@pytest.mark.parametrize("url", [None, "", "not-a-url", "file:///tmp/approvals"])
+def test_placed_approval_entry_requires_http_egress(
+  placed_approval_bundle: Path,
+  url: str | None,
+) -> None:
+  environment = {
+    USER_RUNTIME_CREDENTIALS_FILE_ENV: str(placed_approval_bundle),
+    "HANK_APPROVAL_TRANSPORT": "local",
+  }
+  if url is not None:
+    environment[APPROVALS_EGRESS_URL_ENV] = url
+  with pytest.raises(ValidationError):
+    load_placed_approval_configuration(environment)
+
+
+@pytest.mark.parametrize(
+  "url", [APPROVALS_EGRESS_URL, "http://127.0.0.1:8000/egress/approvals"],
+)
+def test_placed_gateway_composes_remote_without_local_ledger(
+  placed_approval_bundle: Path,
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  url: str,
+) -> None:
+  state_root = tmp_path / "data"
+  monkeypatch.setenv("USER_DATA_DIR", str(state_root))
+  monkeypatch.setenv(APPROVALS_EGRESS_URL_ENV, url)
+  app = FastAPI()
+  server_chat_helpers._init_approval_subsystem(
+    app,
+    GatewayServerConfig(
+      audit_hmac_secret_resolver=lambda: b"secret",
+      audit_hmac_key_id_resolver=lambda: "key-1",
+    ),
+  )
+  assert isinstance(app.state.gateway_approval_store, RemoteApprovalRequestStore)
+  assert app.state.gateway_approval_remote is True
+  assert app.state.gateway_approval_audit_writer is None
+  assert not state_root.exists()
+
+
+@pytest.mark.parametrize("transport", [None, "", "unknown"])
+def test_placed_approval_requires_explicit_transport(
+  placed_approval_bundle: Path, transport: str | None,
+) -> None:
+  environment = {
+    USER_RUNTIME_CREDENTIALS_FILE_ENV: str(placed_approval_bundle),
+    APPROVALS_EGRESS_URL_ENV: APPROVALS_EGRESS_URL,
+  }
+  if transport is not None:
+    environment["HANK_APPROVAL_TRANSPORT"] = transport
+  with pytest.raises(ValidationError):
+    load_placed_approval_configuration(environment)
+
+
+@pytest.mark.parametrize("transport", ["local", "agentcore"])
+def test_placed_approval_http_authentication_uses_transport_not_port(
+  placed_approval_bundle: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  transport: str,
+) -> None:
+  # A LocalProcess edge on 8090 has the same URL as the AgentCore tunnel.
+  monkeypatch.setenv(APPROVALS_EGRESS_URL_ENV, APPROVALS_EGRESS_URL)
+  monkeypatch.setenv("HANK_APPROVAL_TRANSPORT", transport)
+  requests: list[httpx.Request] = []
+
+  def respond(request: httpx.Request) -> httpx.Response:
+    requests.append(request)
+    assert str(request.url) == APPROVALS_EGRESS_URL + "/request.get"
+    return httpx.Response(
+      200, content=encode_operation_result("request.get", None),
+    )
+
+  mock_transport = httpx.MockTransport(respond)
+  sync_client = httpx.Client
+  async_client = httpx.AsyncClient
+  monkeypatch.setattr(
+    httpx, "Client",
+    lambda **kwargs: sync_client(transport=mock_transport, **kwargs),
+  )
+  monkeypatch.setattr(
+    httpx, "AsyncClient",
+    lambda **kwargs: async_client(transport=mock_transport, **kwargs),
+  )
+  subsystem = build_runtime_approval_subsystem()
+  assert asyncio.run(subsystem.store.get("approval-not-found")) is None
+  assert len(requests) == 1
+  headers = requests[0].headers
+  if transport == "agentcore":
+    assert not any(name in headers for name in AGENT_API_CLAIM_HEADERS.values())
+    return
+
+  claim = {key: headers[name] for key, name in AGENT_API_CLAIM_HEADERS.items()}
+  bundle = load_user_runtime_credentials({
+    USER_RUNTIME_CREDENTIALS_FILE_ENV: str(placed_approval_bundle),
+  })
+  assert bundle is not None
+  assert claim["user_id"] == bundle.approval_claim_signing.user_id
+  assert claim["user_email"] == bundle.approval_claim_signing.user_email
+  canonical = canonical_agent_api_claim_bytes(
+    audience=claim["audience"], issued_at=int(claim["issued_at"]),
+    expiry=int(claim["expiry"]), user_id=claim["user_id"],
+    user_email=claim["user_email"], nonce=claim["nonce"],
+  )
+  approval_signature = hmac.new(
+    bundle.approval_claim_signing.key.encode(), canonical, hashlib.sha256,
+  ).hexdigest()
+  risk_signature = hmac.new(
+    bundle.claim_signing.key.encode(), canonical, hashlib.sha256,
+  ).hexdigest()
+  assert claim["signature"] == approval_signature
+  assert claim["signature"] != risk_signature

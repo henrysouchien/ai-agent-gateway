@@ -195,6 +195,7 @@ class ApprovalPredicateCall:
   identity: RegisteredToolIdentity
   prepared_input: Mapping[str, object]
   trusted_context: object | None = None
+  exact_backend: str | None = None
 
   def __post_init__(self) -> None:
     object.__setattr__(
@@ -778,6 +779,7 @@ class ToolPolicyImplementationRegistry:
       call.identity,
       call.prepared_input,
       call.trusted_context,
+      call.exact_backend,
     )
     result = cast(ApprovalPredicateImplementation, entry.implementation)(
       canonical, detached

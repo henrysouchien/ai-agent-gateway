@@ -18,7 +18,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from agent_gateway.autonomous_launch_envelope import (
-  AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+  AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
   verify_autonomous_launch_envelope,
 )
 from model_authority.bind import CapabilityBind
@@ -26,14 +26,6 @@ from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECT
 from agent_gateway.control_plane import runs as runs_module
 from agent_gateway.control_plane import runs_helpers as helpers_module
 from agent_gateway.control_plane import runs_models as models_module
-from agent_gateway.control_plane.runs_helpers import (
-  _AUTONOMOUS_RESUME_CONTEXT_MAX_CHARS,
-  _AUTONOMOUS_RESUME_TOOL_RESULT_BLOCK_MAX_CHARS,
-)
-from agent_gateway.control_plane.runs_resume_helpers import (
-  _completed_tool_result_tail,
-  _render_completed_tool_result_tail,
-)
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.skill_limits import (
   AutonomousSkillAdmissionPolicy,
@@ -236,7 +228,7 @@ def test_injected_control_and_admission_avoid_directory_fallback(
   def resolver(_skill: str) -> AutonomousSkillAdmissionPolicy:
     return AutonomousSkillAdmissionPolicy(
       False,
-      SkillExecutionLimits(None),
+      SkillExecutionLimits(),
     )
 
   app = _make_app(
@@ -544,7 +536,7 @@ def test_autonomous_control_endpoints_spawn_read_logs_cancel_and_enforce_user_sc
 
     envelope = verify_autonomous_launch_envelope(
       HMAC_KEY,
-      envs[0][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+      Path(envs[0][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
     )
     authority = envelope.session_authority.ordinary_authority
     assert authority.user_id == "alice"
@@ -878,7 +870,7 @@ def test_autonomous_runs_are_scoped_by_canonical_owner_alias(monkeypatch, tmp_pa
     assert "max_budget_usd" not in start_run
     envelope = verify_autonomous_launch_envelope(
       HMAC_KEY,
-      envs[0][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+      Path(envs[0][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
     )
     authority = envelope.session_authority.ordinary_authority
     assert authority.user_id == "1"
@@ -958,7 +950,7 @@ def test_autonomous_dispatch_persists_redacted_dispatch_scope(monkeypatch, tmp_p
     assert all("Portfolio:" not in part for part in start_payload["cmd"])
     envelope = verify_autonomous_launch_envelope(
       HMAC_KEY,
-      envs[0][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV],
+      Path(envs[0][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
     )
     assert envelope.session_authority.dispatch_scope is not None
     assert envelope.session_authority.dispatch_scope.receipt() == dispatch_scope
@@ -2136,181 +2128,6 @@ def test_autonomous_resume_context_preserves_recovery_packet_when_original_conte
   assert "Do not repeat durable writes" in resumed_context
 
 
-def test_completed_tool_result_recovery_block_keeps_newest_entries_when_saturated() -> None:
-  events: list[dict[str, Any]] = []
-  for index in range(20):
-    tool_call_id = f"tool-{index}"
-    events.extend(
-      [
-        {
-          "type": "tool_call_start",
-          "tool_call_id": tool_call_id,
-          "tool_name": f"saturated_tool_{index:02d}",
-          "tool_input": {
-            "symbol": "NVDA",
-            "query_marker": f"input_marker_{index:02d}",
-            "large": "x" * 5000,
-          },
-        },
-        {
-          "type": "tool_call_complete",
-          "tool_call_id": tool_call_id,
-          "tool_name": f"saturated_tool_{index:02d}",
-          "result": {
-            "result_marker": f"result_marker_{index:02d}",
-            "large": "y" * 5000,
-          },
-          "duration_ms": index,
-          "server": "fixture",
-          "is_error": False,
-        },
-      ]
-    )
-
-  completed_tools = _completed_tool_result_tail(events)
-  assert completed_tools[0]["tool_name"] == "saturated_tool_04"
-  assert completed_tools[-1]["tool_name"] == "saturated_tool_19"
-
-  rendered = _render_completed_tool_result_tail(completed_tools, max_chars=2200)
-  decoded = json.loads(rendered)
-
-  assert len(rendered) <= 2200
-  assert decoded[0]["tool_name"] == "saturated_tool_19"
-  assert decoded[1]["tool_name"] == "saturated_tool_18"
-  assert "result_marker_19" in rendered
-  assert "input_marker_19" in rendered
-  assert "saturated_tool_04" not in rendered
-
-
-def test_completed_tool_result_recovery_block_preserves_wide_object_tail_fields() -> None:
-  long_key_prefix = "zz_late_marker_" + ("x" * 100)
-  events = [
-    {
-      "type": "tool_call_complete",
-      "tool_call_id": "tool-wide",
-      "tool_name": "wide_object_tool",
-      "result": {
-        **{f"early_{index:02d}": f"value_{index:02d}" for index in range(40)},
-        long_key_prefix + "_a": "late-field-survived-a",
-        long_key_prefix + "_b": "late-field-survived-b",
-      },
-      "is_error": False,
-    }
-  ]
-
-  rendered = _render_completed_tool_result_tail(_completed_tool_result_tail(events))
-  decoded = json.loads(rendered)
-
-  assert decoded[0]["tool_name"] == "wide_object_tool"
-  assert "late-field-survived-a" in rendered
-  assert "late-field-survived-b" in rendered
-  assert "...#" in rendered
-  assert "_truncated_keys" in rendered
-
-
-def test_completed_tool_result_recovery_block_renders_single_oversized_summary_as_valid_json() -> None:
-  rendered = _render_completed_tool_result_tail(
-    [
-      {
-        "tool_name": "huge_tool",
-        "tool_call_id": "tool-huge",
-        "result": "z" * (_AUTONOMOUS_RESUME_TOOL_RESULT_BLOCK_MAX_CHARS * 2),
-        "is_error": False,
-      }
-    ],
-    max_chars=300,
-  )
-  decoded = json.loads(rendered)
-
-  assert len(rendered) <= 300
-  assert decoded[0]["tool_name"] == "huge_tool"
-
-
-def test_autonomous_resume_context_reserves_tail_sections_with_saturated_recovery_packet(
-  monkeypatch,
-  tmp_path,
-) -> None:
-  processes, _envs = _install_fake_spawn(monkeypatch)
-  skills_dir = tmp_path / "skills"
-  _write_resumable_skill(skills_dir)
-  app = _make_app(monkeypatch, tmp_path, control_skills_dir=skills_dir)
-
-  with TestClient(app) as client:
-    alice = _control_session(client, "alice")
-    start = client.post(
-      "/api/control/runs",
-      headers=_headers(alice),
-      json={
-        "kind": "autonomous",
-        "profile": "analyst",
-        "mode": "skill",
-        "skill": "resumable-skill",
-        "context": "ORIGINAL-SATURATED-" + ("x" * 20000),
-      },
-    )
-    assert start.status_code == 200, start.text
-
-    original = app.state.subprocess_registry._tasks["bg_0"]
-    original.state = "failed"
-    original.exit_code = 1
-    original.completed_at = time.time()
-    processes[0].returncode = 1
-    event_lines: list[dict[str, Any]] = []
-    for index in range(20):
-      tool_call_id = f"tool-{index}"
-      event_lines.extend(
-        [
-          {
-            "type": "tool_call_start",
-            "tool_call_id": tool_call_id,
-            "tool_name": f"saturated_tool_{index:02d}",
-            "tool_input": {
-              "symbol": "NVDA",
-              "query_marker": f"input_marker_{index:02d}",
-              "large": "x" * 5000,
-            },
-          },
-          {
-            "type": "tool_call_complete",
-            "tool_call_id": tool_call_id,
-            "tool_name": f"saturated_tool_{index:02d}",
-            "result": {
-              "result_marker": f"result_marker_{index:02d}",
-              "large": "y" * 5000,
-            },
-            "duration_ms": index,
-            "server": "fixture",
-            "is_error": False,
-          },
-        ]
-      )
-    event_lines.extend(
-      {"type": "text_delta", "text": f"recent-event-{index:02d}-" + ("z" * 200)}
-      for index in range(60)
-    )
-    original.event_lines = event_lines
-    original.log_path.write_text(("prior saturated log line\n" * 80), encoding="utf-8")
-
-    resumed = client.post(
-      "/api/control/runs/bg_0/resume",
-      headers=_headers(alice),
-      json={"message": "resume saturated recovery"},
-    )
-    assert resumed.status_code == 200, resumed.text
-
-  resumed_context = app.state.subprocess_registry._tasks["bg_1"].context or ""
-  assert len(resumed_context) <= _AUTONOMOUS_RESUME_CONTEXT_MAX_CHARS
-  assert "Prior completed tool results for recovery" in resumed_context
-  assert "saturated_tool_19" in resumed_context
-  assert "Recent control events" in resumed_context
-  assert "recent-event-59" in resumed_context
-  assert "recent-event-20" not in resumed_context
-  assert "Recent log tail" in resumed_context
-  assert "prior saturated log line" in resumed_context
-  assert "Original context" in resumed_context
-  assert "ORIGINAL-SATURATED" in resumed_context
-
-
 def test_autonomous_resume_rejects_non_resumable_skill(monkeypatch, tmp_path) -> None:
   processes, _envs = _install_fake_spawn(monkeypatch)
   skills_dir = tmp_path / "skills"
@@ -2562,7 +2379,7 @@ def test_autonomous_dispatch_validation_error_returns_422_and_releases_slot(monk
       },
     )
     assert invalid.status_code == 422
-    assert invalid.json()["detail"] == "mode='task' only accepts the task parameter"
+    assert invalid.json()["detail"] == "autonomous launch workload fields are incompatible with its mode"
 
     valid = client.post(
       "/api/control/runs",

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 from typing import Any, Callable, Literal
 
@@ -71,14 +70,11 @@ def _error_response(
   exc: Exception,
   *,
   user_id: str | None = None,
-  timeout_seconds: float | None = None,
 ) -> JSONResponse:
   if isinstance(exc, CredentialsTimeoutError):
     payload: dict[str, Any] = {"error": "credentials_timeout", "message": str(exc)}
     if user_id is not None:
       payload["user_id"] = user_id
-    if timeout_seconds is not None:
-      payload["timeout_seconds"] = timeout_seconds
     return JSONResponse(payload, status_code=504)
 
   if isinstance(exc, MissingUserIdError):
@@ -202,7 +198,6 @@ def build_session_router(
   *,
   auth: AuthManager,
   credentials_resolver: CredentialsResolver | None,
-  resolver_timeout_seconds: float,
   tenant_id: str | None,
   allow_service_credentials_for_interactive: bool,
   identity_resolver: Callable[..., Any] | None = None,
@@ -242,19 +237,7 @@ def build_session_router(
 
     if credentials_resolver is not None:
       try:
-        result = await asyncio.wait_for(
-          credentials_resolver(payload.api_key, payload),
-          timeout=resolver_timeout_seconds,
-        )
-      except asyncio.TimeoutError:
-        return _error_response(
-          CredentialsTimeoutError(
-            f"Credential resolution for user '{resolved_user_id or 'unresolved'}' timed out after "
-            f"{resolver_timeout_seconds:.1f}s. Check the resolver latency or raise resolver_timeout_seconds."
-          ),
-          user_id=resolved_user_id,
-          timeout_seconds=resolver_timeout_seconds,
-        )
+        result = await credentials_resolver(payload.api_key, payload)
       except Exception as exc:
         return _error_response(exc, user_id=resolved_user_id)
 

@@ -24,7 +24,6 @@ def create_control_plane_router(
   *,
   auth: AuthManager,
   credentials_resolver: CredentialsResolver | None,
-  resolver_timeout_seconds: float,
   tenant_id: str | None,
   allow_service_credentials_for_interactive: bool,
   route_prefix: str,
@@ -44,7 +43,6 @@ def create_control_plane_router(
   session_router = build_session_router(
     auth=auth,
     credentials_resolver=credentials_resolver,
-    resolver_timeout_seconds=resolver_timeout_seconds,
     tenant_id=tenant_id,
     identity_resolver=identity_resolver,
     allow_service_credentials_for_interactive=(

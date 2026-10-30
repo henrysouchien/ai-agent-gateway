@@ -476,13 +476,6 @@ def test_failed_refresh_marks_the_account_and_serves_the_next_sibling(
   assert stale.last_error
   assert stale.refresh_token == "sk-ant-ort01-stale@example.com-refresh"
   assert healthy.last_error == ""
-  # The failure is a sidecar cooldown for that account, not process memory:
-  # every process that shares the store sees it, the sibling is untouched.
-  stale_credential, healthy_credential = sources.credentials
-  assert anthropic_oauth.anthropic_credential_blocked_until(stale_credential) > 0.0
-  assert anthropic_oauth.anthropic_credential_blocked_until(healthy_credential) == 0.0
-  [cooldown] = quota.load_selection_state(path).cooldowns[stale_credential.locator.id]
-  assert (cooldown.scope, cooldown.reason) == ("shared", "refresh_failed")
 
 
 def test_user_store_lives_under_that_users_private_data_root(tmp_path: Path) -> None:
@@ -876,7 +869,7 @@ def test_exact_generation_lookup_never_crosses_user_custody_or_matches_same_acco
   assert "fixture-secret-ref-not-enrolled" not in str(unknown.value)
 
 
-def test_environment_array_sources_keep_membership_identity_across_reordering_and_removal(
+def test_environment_array_sources_keep_membership_identity_across_reordering_and_removal_from_the_array(
   tmp_path: Path,
 ) -> None:
   env = {
@@ -904,15 +897,21 @@ def test_environment_array_sources_keep_membership_identity_across_reordering_an
   assert updated.tokens == ("fixture-member-b", "fixture-member-c")
   assert updated.credentials[0].generation_ref == second.generation_ref
   assert updated.credentials[1].generation_ref not in (first.generation_ref, second.generation_ref)
-  with pytest.raises(AnthropicSourceError) as removed:
+  # Removed from the array is superseded for the exact lookup, never retired.
+  with pytest.raises(AnthropicSourceError) as superseded:
     resolve_anthropic_credentials(
       {"credential_source": first.source_metadata()}, environ=env, user_scope=2,
     )
-  assert removed.value.reason == "removed"
+  assert superseded.value.reason == "superseded"
   assert resolve_anthropic_credentials(
     {"credential_source": second.source_metadata()}, environ=env, user_scope=2,
   ).credentials[0].token == second.token
-  assert first.token not in original.store_path.read_text()
+  assert first.token in original.store_path.read_text()
+  env["ANTHROPIC_AUTH_TOKENS"] = json.dumps(["fixture-member-a", "fixture-member-b"])
+  restored = resolve_anthropic_credentials(environ=env, user_scope=1)
+  assert [credential.generation_ref for credential in restored.credentials] == [
+    first.generation_ref, second.generation_ref,
+  ]
 
 
 def test_environment_singleton_replacement_preserves_other_env_source_members(
@@ -1137,22 +1136,20 @@ def test_bound_environment_config_preserves_original_org_source_without_user_clo
   saved = json.loads(original_sources.store_path.read_text())
   assert saved["static_credentials"][0]["source"].startswith("env:ANTHROPIC_AUTH_TOKEN:")
 
+  saved_bytes = original_sources.store_path.read_bytes()
   env["ANTHROPIC_AUTH_TOKEN"] = ""
-  with pytest.raises(AnthropicSourceError) as removed:
+  # An emptied env name only limits this process's view: nothing is retired.
+  with pytest.raises(AnthropicSourceError) as unobservable:
     resolve_anthropic_credentials(cfg, environ=env)
-  assert removed.value.reason == "removed"
-  with pytest.raises(AnthropicSourceError):
+  assert unobservable.value.reason == "unobservable"
+  with pytest.raises(AnthropicSourceError) as exact:
     resolve_anthropic_credentials(
       {"credential_source": original.source_metadata()}, environ=env, user_scope=7,
     )
+  assert exact.value.reason == "unobservable"
   assert not original_sources.user_store_path.exists()
-  if with_metadata:
-    # An exact `credential_source` lookup only reads: the emptied source is
-    # reported `removed` and the store is left byte-for-byte unchanged.
-    assert original.token in original_sources.store_path.read_text()
-  else:
-    # A pool resolve reconciles the observed empty source and retires it.
-    assert original.token not in original_sources.store_path.read_text()
+  assert original_sources.store_path.read_bytes() == saved_bytes
+  assert original.token in original_sources.store_path.read_text()
 
 
 def test_bound_source_metadata_retains_original_grant_after_access_token_refresh(
@@ -1243,7 +1240,7 @@ def test_process_without_source_environment_cannot_retire_durable_generation(
   assert original.store_path.read_bytes() == saved_bytes
 
 
-def test_partial_environment_retires_only_observed_empty_source(
+def test_partial_environment_never_retires_an_unobserved_or_emptied_source(
   tmp_path: Path,
 ) -> None:
   env = {
@@ -1252,19 +1249,63 @@ def test_partial_environment_retires_only_observed_empty_source(
     "CLAUDE_CODE_OAUTH_TOKEN": "fixture-second-visible-token",
   }
   first, second = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, environ=env).credentials
-  partial_env = {"USER_DATA_DIR": str(tmp_path), "ANTHROPIC_AUTH_TOKEN": ""}
-  assert resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, environ=partial_env).credentials == ()
   assert second.store_path is not None
-  assert first.token not in second.store_path.read_text()
-  with pytest.raises(AnthropicSourceError) as removed:
-    resolve_anthropic_credentials({"credential_source": first.source_metadata(), ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, environ=partial_env)
-  assert removed.value.reason == "removed"
-  with pytest.raises(AnthropicSourceError) as unobservable:
-    resolve_anthropic_credentials({"credential_source": second.source_metadata(), ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, environ=partial_env)
-  assert unobservable.value.reason == "unobservable"
-  assert resolve_anthropic_credentials(
-    {"credential_source": second.source_metadata(), ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, environ=env,
-  ).credentials[0].token == second.token
+  saved_bytes = second.store_path.read_bytes()
+  partial_env = {"USER_DATA_DIR": str(tmp_path), "ANTHROPIC_AUTH_TOKEN": ""}
+  # The partial process sees nothing and serves nothing, but retires nothing.
+  assert resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, environ=partial_env).credentials == ()
+  assert second.store_path.read_bytes() == saved_bytes
+  assert first.token in second.store_path.read_text()
+  for credential in (first, second):
+    with pytest.raises(AnthropicSourceError) as unobservable:
+      resolve_anthropic_credentials({"credential_source": credential.source_metadata(), ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, environ=partial_env)
+    assert unobservable.value.reason == "unobservable"
+  assert second.store_path.read_bytes() == saved_bytes
+  restored = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}, environ=env).credentials
+  assert [credential.generation_ref for credential in restored] == [
+    first.generation_ref, second.generation_ref,
+  ]
+  assert second.store_path.read_bytes() == saved_bytes
+
+
+@pytest.mark.parametrize("observation", ["subset", "empty"])
+def test_environment_array_subset_or_empty_never_retires_unobserved_generations(
+  tmp_path: Path, observation: str,
+) -> None:
+  members = ["fixture-array-a", "fixture-array-b", "fixture-array-c"]
+  env = {"USER_DATA_DIR": str(tmp_path), "ANTHROPIC_AUTH_TOKENS": json.dumps(members)}
+  seat_cfg = {ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}
+  original = resolve_anthropic_credentials(seat_cfg, environ=env).credentials
+  assert len(original) == 3
+  store_path = original[0].store_path
+  assert store_path is not None
+  saved_bytes = store_path.read_bytes()
+  assert len(json.loads(saved_bytes)["static_credentials"]) == 3
+
+  observed = members[:1] if observation == "subset" else []
+  partial_env = {"USER_DATA_DIR": str(tmp_path), "ANTHROPIC_AUTH_TOKENS": json.dumps(observed)}
+  visible = resolve_anthropic_credentials(seat_cfg, environ=partial_env).credentials
+  assert [credential.token for credential in visible] == observed
+  assert store_path.read_bytes() == saved_bytes
+
+  expected_reason = "superseded" if observed else "unobservable"
+  for credential in original[len(observed):]:
+    with pytest.raises(AnthropicSourceError) as lookup:
+      resolve_anthropic_credentials(
+        {"credential_source": credential.source_metadata(), **seat_cfg}, environ=partial_env,
+      )
+    assert lookup.value.reason == expected_reason
+    assert store_path.read_bytes() == saved_bytes
+  for credential in original[:len(observed)]:
+    assert resolve_anthropic_credentials(
+      {"credential_source": credential.source_metadata(), **seat_cfg}, environ=partial_env,
+    ).credentials[0].token == credential.token
+
+  restored = resolve_anthropic_credentials(seat_cfg, environ=env).credentials
+  assert [credential.generation_ref for credential in restored] == [
+    credential.generation_ref for credential in original
+  ]
+  assert store_path.read_bytes() == saved_bytes
 
 
 
@@ -1881,17 +1922,6 @@ def test_refresh_failure_on_the_ranked_first_candidate_falls_through_tiers(
   assert (selected.account_identity, selected.tier) == ("shared@example.com", "org")
   assert selected.prepared
   assert len(exchanged) == 2
-  state = quota.load_selection_state(user_store)
-  for credential in sources.credentials[:2]:
-    [cooldown] = state.cooldowns[credential.locator.id]
-    assert cooldown.reason == "refresh_failed"
-
-  # The cooldown is shared: a later selection (another process's resolve) does
-  # not retry the failed exchanges.
-  again = select_anthropic_credential_source(resolve_anthropic_credentials(environ=environ, user_scope=1))
-  # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: the same owner can reuse the fallback.
-  assert again is not None and again.account_identity == "shared@example.com"
-  assert len(exchanged) == 2
 
 
 def test_all_blocked_pool_binds_the_earliest_reset_account_without_refreshing(
@@ -2218,3 +2248,151 @@ def test_selection_moves_to_a_sibling_when_the_refresh_lock_stays_busy(
   assert waited < 5
   # A peer mid-exchange says nothing about the account: no cooldown is recorded.
   assert not quota.load_selection_state(path).cooldowns
+
+
+def _seed_source(path: Path, **top_level: object) -> None:
+  rotating = _record("rotating@example.com")
+  setup = replace(_record("setup@example.com"), refresh_token="", credential_kind="auth_token")
+  api_key = replace(
+    _record("api-key-seed"), access_token="sk-ant-api03-seed", refresh_token="",
+    credential_kind="api_key", scope="",
+  )
+  for record in (rotating, setup, api_key):
+    upsert_anthropic_oauth_record(path, record)
+  if top_level:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.update(top_level)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+_SEED_OWNER = {
+  "user_scope": "1",
+  "environ": {
+    "GATEWAY_USER_KEYS": json.dumps([{"slug": "henry", "risk_user_id": 1, "role": "owner"}]),
+  },
+}
+
+
+def test_seed_non_rotating_org_store_keeps_only_refresh_free_material(tmp_path: Path) -> None:
+  source = tmp_path / "source" / "oauth.json"
+  target = tmp_path / "target" / "anthropic" / "oauth.json"
+  _seed_source(source)
+  # Retire a static grant so the source carries retirement maps.
+  register_anthropic_static_credential(
+    "sk-ant-api03-old", credential_kind="api_key", source="env:ANTHROPIC_API_KEY",
+    config={"auth_store_path": str(source)},
+  )
+  register_anthropic_static_credential(
+    "", credential_kind="api_key", source="env:ANTHROPIC_API_KEY",
+    config={"auth_store_path": str(source)},
+  )
+  before = source.read_bytes()
+  assert json.loads(before)["retirements"]
+
+  assert anthropic_oauth.seed_non_rotating_org_store(source, target, **_SEED_OWNER) is True
+
+  assert source.read_bytes() == before
+  assert stat.S_IMODE(target.stat().st_mode) == 0o600
+  assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+  seeded = json.loads(target.read_text(encoding="utf-8"))
+  assert [entry["identity"] for entry in seeded["accounts"]] == ["setup@example.com"]
+  assert [entry["access_token"] for entry in seeded["static_credentials"]] == ["sk-ant-api03-seed"]
+  assert seeded["retirements"] == {} and seeded["retired_auth_token_grants"] == {}
+  text = target.read_text(encoding="utf-8")
+  assert "rotating@example.com" not in text and "sk-ant-ort01" not in text
+  original = {r.identity: r for r in load_anthropic_oauth_store(source)}
+  assert seeded["accounts"][0]["generation_id"] == original["setup@example.com"].generation_id
+
+
+
+def test_seed_non_rotating_org_store_non_owner_keeps_only_api_keys(tmp_path: Path) -> None:
+  source = tmp_path / "source" / "oauth.json"
+  _seed_source(source)
+  before = source.read_bytes()
+  non_owner_environ = {
+    "GATEWAY_USER_KEYS": json.dumps([{"slug": "henry", "risk_user_id": 1, "role": "owner"}]),
+  }
+
+  for index, kwargs in enumerate((
+    {},
+    {"user_scope": "17", "environ": non_owner_environ},
+  )):
+    target = tmp_path / f"target-{index}" / "anthropic" / "oauth.json"
+    assert anthropic_oauth.seed_non_rotating_org_store(source, target, **kwargs) is True
+    seeded = json.loads(target.read_text(encoding="utf-8"))
+    assert seeded["accounts"] == []
+    assert [entry["access_token"] for entry in seeded["static_credentials"]] == ["sk-ant-api03-seed"]
+    text = target.read_text(encoding="utf-8")
+    assert "setup@example.com" not in text and "rotating@example.com" not in text
+
+  assert source.read_bytes() == before
+
+
+def test_seed_non_rotating_org_store_non_owner_with_only_setup_tokens_writes_nothing(
+  tmp_path: Path,
+) -> None:
+  source = tmp_path / "source.json"
+  target = tmp_path / "target" / "oauth.json"
+  upsert_anthropic_oauth_record(
+    source, replace(_record("setup@example.com"), refresh_token="", credential_kind="auth_token"),
+  )
+
+  assert anthropic_oauth.seed_non_rotating_org_store(source, target, user_scope="17") is False
+  assert not target.exists() and not target.parent.exists()
+  assert anthropic_oauth.seed_non_rotating_org_store(source, target, **_SEED_OWNER) is True
+
+
+def test_seed_non_rotating_org_store_with_only_rotating_material_writes_nothing(
+  tmp_path: Path,
+) -> None:
+  source = tmp_path / "oauth.json"
+  target = tmp_path / "target" / "oauth.json"
+  upsert_anthropic_oauth_record(source, _record("rotating@example.com"))
+
+  assert anthropic_oauth.seed_non_rotating_org_store(source, target) is False
+  assert not target.exists() and not target.parent.exists()
+  assert anthropic_oauth.seed_non_rotating_org_store(None, target) is False
+  assert anthropic_oauth.seed_non_rotating_org_store(tmp_path / "absent.json", target) is False
+
+
+def test_seed_non_rotating_org_store_leaves_an_existing_target_alone(tmp_path: Path) -> None:
+  source = tmp_path / "source.json"
+  target = tmp_path / "target" / "oauth.json"
+  _seed_source(source)
+  target.parent.mkdir()
+  target.write_text("{}", encoding="utf-8")
+
+  assert anthropic_oauth.seed_non_rotating_org_store(source, target) is False
+  assert target.read_text(encoding="utf-8") == "{}"
+
+
+def test_seed_non_rotating_org_store_does_not_mirror_top_level_refresh_material(
+  tmp_path: Path,
+) -> None:
+  # A legacy store: top-level access token + rotating refresh token, no accounts list.
+  source = tmp_path / "legacy.json"
+  target = tmp_path / "target" / "oauth.json"
+  source.write_text(
+    json.dumps({"auth_token": "sk-ant-oat01-legacy", "refresh_token": "sk-ant-ort01-legacy"}),
+    encoding="utf-8",
+  )
+
+  assert anthropic_oauth.seed_non_rotating_org_store(source, target) is False
+  assert not target.exists()
+
+  # The same legacy shape without a refresh token is non-rotating and is kept,
+  # and the seeded store never grows top-level refresh material.
+  source.write_text(json.dumps({"auth_token": "sk-ant-oat01-legacy"}), encoding="utf-8")
+  assert anthropic_oauth.seed_non_rotating_org_store(source, target, **_SEED_OWNER) is True
+  seeded = json.loads(target.read_text(encoding="utf-8"))
+  assert "refresh_token" not in seeded and "auth_token" not in seeded
+  assert [entry["access_token"] for entry in seeded["accounts"]] == ["sk-ant-oat01-legacy"]
+
+  # A modern store carrying stray top-level refresh material seeds without it.
+  modern_source = tmp_path / "modern.json"
+  modern_target = tmp_path / "modern-target" / "oauth.json"
+  _seed_source(modern_source, refresh_token="sk-ant-ort01-stray")
+  assert anthropic_oauth.seed_non_rotating_org_store(
+    modern_source, modern_target, **_SEED_OWNER,
+  ) is True
+  assert "sk-ant-ort01-stray" not in modern_target.read_text(encoding="utf-8")

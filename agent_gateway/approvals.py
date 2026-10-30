@@ -24,7 +24,6 @@ from .approval_store import (
   ApprovalRequestStore,
   PersistentGrantCancellationFenced,
   RootTurnRecordError,
-  SQLiteApprovalStore,
   verify_policy_generation,
 )
 from .policy_controls import effective_allow_tool_type
@@ -602,8 +601,6 @@ async def _reissue_under_current_policy_generation(
   publishes nothing. None means the generation still matches, or the call has
   no root turn to compare.
   """
-  if not isinstance(store, SQLiteApprovalStore):
-    return None
   # Only a root turn records its admitting policy generation; no child durable
   # record carries one, so child calls are not verified here.
   try:
@@ -708,8 +705,6 @@ async def _cancel_pending_approval_and_unblock(
   expected_session_id: str,
   expected_channel: str | None,
   autonomous_delivery: Mapping[str, Any] | None = None,
-  system_override: bool = False,
-  role_authorization_prechecked: bool = False,
   release_queue: bool = True,
 ) -> dict[str, Any]:
   """Fail closed at a run-cancellation boundary and release only denial."""
@@ -795,18 +790,6 @@ async def _cancel_pending_approval_and_unblock(
           approval_id=approval_id,
         )
       return {"identity_matches": False, "quarantined": True}
-    if not system_override and not role_authorization_prechecked and not policy.role_authorized_for_class(
-      decider_role=decider_role,
-      tool_class=request_record.tool_class,
-    ):
-      raise ApprovalActionError(
-        403,
-        {
-          "error": "Role is not authorized to cancel this approval",
-          "approval_id": approval_id,
-          "tool_class": request_record.tool_class,
-        },
-      )
     try:
       request_record, transitioned, identity_matches = await store.terminalize_pending_for_cancellation(
         approval_id,

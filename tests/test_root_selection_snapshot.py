@@ -360,6 +360,10 @@ def test_product_unadmitted_runtime_root_captures_once_and_forwards_to_child(
     def get_server_names(self) -> set[str]:
       return set()
 
+    def is_per_user_server(self, server_name: str) -> bool:
+      del server_name
+      return False
+
     def get_tool_definitions(self) -> list[dict[str, Any]]:
       return []
 

@@ -82,21 +82,6 @@ def terminal_result_doors(admitted_task: AdmittedTask | None) -> frozenset[str]:
   return declared_terminal_doors_from_grant(admitted_task.tool_grant)
 
 
-def persist_expectation_doors(admitted_task: AdmittedTask | None) -> frozenset[str]:
-  """Return the terminal doors a child owes a persist through, or none.
-
-  Whether an operation owes a persist is authored (``result_requires_persist``),
-  not derivable from its grant: a coordinator carries its children's writer
-  doors and a read-only skill keeps its narrative outcome. The lifecycle event
-  settles a child that ends with no accepted terminal door and no artifact as
-  blocked only for an operation that declares the expectation.
-  """
-
-  if admitted_task is None or not admitted_task.operation.result_requires_persist:
-    return frozenset()
-  return terminal_result_doors(admitted_task)
-
-
 def is_declared_terminal_door(tool_id: str) -> bool:
   if not tool_id.startswith(_FMS_DOOR_PREFIX):
     return False
@@ -365,7 +350,6 @@ def classify_child_outcome(
   result: Any | None,
   error: dict[str, Any] | None,
   *,
-  declared_terminal_doors: Iterable[str] | None = None,
   door_results: Sequence[Mapping[str, Any]] | None = None,
 ) -> ChildOutcomeClassification:
   if error is not None:
@@ -408,13 +392,8 @@ def classify_child_outcome(
       execution_status=execution.status,
     )
 
-  declared = frozenset(declared_terminal_doors or ())
   return _door_result_classification(
-    door_results=tuple(
-      door_result
-      for door_result in door_results or ()
-      if door_result.get("tool_name") in declared
-    ),
+    door_results=tuple(door_results or ()),
     process_outcome=(
       task_result.outcome.disposition
       if task_result.outcome is not None
@@ -553,7 +532,6 @@ __all__ = [
   "declared_terminal_doors_from_grant",
   "declared_terminal_tool_result_disposition",
   "latest_successful_declared_terminal_tool_result",
-  "persist_expectation_doors",
   "persist_skill_state",
   "result_response_text",
   "skill_state_prompt",

@@ -480,6 +480,7 @@ class ResilientCommercialUsageSink(Generic[CommercialUsageOutboxT]):
     enabled: bool = True,
     reconciliation_tracker: Any | None = None,
     on_reconciliation: Callable[[Any], Any] | None = None,
+    observation: Any = None,
   ) -> Any:
     from .commercial_usage import CommercialUsageProducer
 
@@ -500,6 +501,7 @@ class ResilientCommercialUsageSink(Generic[CommercialUsageOutboxT]):
       work_start=work_start,
       reconciliation_tracker=reconciliation_tracker,
       on_reconciliation=persist_and_observe,
+      observation=observation,
     )
 
   def record_reconciliation(
@@ -680,6 +682,7 @@ class CommercialUsageDurability:
     enabled: bool = True,
     reconciliation_tracker: Any | None = None,
     on_reconciliation: Callable[[Any], Any] | None = None,
+    observation: Any = None,
   ) -> Any:
     return self.sink.producer(
       claim=claim,
@@ -688,6 +691,7 @@ class CommercialUsageDurability:
       enabled=enabled,
       reconciliation_tracker=reconciliation_tracker,
       on_reconciliation=on_reconciliation,
+      observation=observation,
     )
 
   def reset_after_recovery(

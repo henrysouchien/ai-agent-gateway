@@ -218,13 +218,12 @@ async def _run_delegated_approval_lifecycle(
   a durable journal retain their live decision queue.
 
   A delegated run is unattended by construction — no human sits at its decision
-  channel — so every class outside the money boundary is settled here under the
-  run owner's own authority, the same rule the interactive policy applies
-  (`MONEY_BOUNDARY_TOOL_CLASSES`, `agent_gateway.approval_policy`). Only a live
-  order still asks.
+  channel — so every class outside the money boundary and non-sandboxed compute
+  is settled here under the run owner's own authority, the same rule the
+  interactive policy applies. Only a live order and non-sandboxed compute ask.
   """
 
-  if request.tool_class not in MONEY_BOUNDARY_TOOL_CLASSES:
+  if request.tool_class not in MONEY_BOUNDARY_TOOL_CLASSES and request.tool_name != "code_execute":
     decided_at = utc_now_fn()
     request = replace(
       request,
@@ -767,12 +766,11 @@ async def await_user_approval_via_pending_tools(
   """Publish the ask, then park the call or wait on the session's live queue.
 
   A call with a durable executable binding raises its ``park`` once the ask is
-  published: the turn ends awaiting approval and the decision reaches the
-  original call through its Continue hook whenever it arrives. A call without
-  one has nothing to continue from and waits here, unbounded by any timer, until
-  the decision arrives or the owning turn cancels this task. The durable request
-  stays pending until decided, and the live entry is removed whichever way this
-  ends.
+  published. Its pending entry identifies durable delivery before publication,
+  so even a vote during the durable log append reaches the original call through
+  its Continue hook. A call without one waits on the live queue until the decision
+  arrives or the owning turn cancels this task. The pending projection is removed
+  whichever way this ends.
   """
 
   approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
@@ -783,6 +781,7 @@ async def await_user_approval_via_pending_tools(
     "status": "approval_pending",
     "tool_name": request.tool_name,
     "resolved_qualifier": resolved_qualifier,
+    "durable_approval": park is not None,
   }
   planned_change = request.tool_args_redacted.get("planned_change")
   if isinstance(planned_change, dict):

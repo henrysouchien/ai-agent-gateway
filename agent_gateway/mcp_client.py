@@ -59,6 +59,12 @@ from .claim_signing_authority import (
   sign_gateway_user_claim,
 )
 from .policy_imports import load_server_policy_helpers, update_mcp_tool_metadata
+from .providers.anthropic_oauth import (
+  ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
+  ANTHROPIC_STORE_BASE_ENV,
+)
+from .providers.credential_pool import scope_admits_operator_seats
+from .user_runtime_credentials import load_user_runtime_credentials
 from .tool_definition import LiveToolRouteBinding, OriginatedToolDefinition
 from .tool_dispatch_classification import (
   OUTCOME_OK,
@@ -125,6 +131,14 @@ PER_USER_REAPER_INTERVAL_SECONDS = 60.0
 PER_USER_INSTANCE_CAP = 32
 PER_USER_DRAIN_POLL_SECONDS = 0.05
 
+class _RunScopedExpansion(dict):
+  """Startup/connect mapping. Not the gateway's full ambient environ."""
+
+def _oauth_credential_env_names() -> frozenset[str]:
+  """Pool credential names. ``USER_DATA_DIR`` is a state root, not a seat."""
+  return ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES - {ANTHROPIC_STORE_BASE_ENV}
+
+
 
 def _is_streamable_http_config(config: Mapping[str, Any]) -> bool:
   return str(config.get("type", "stdio")).strip().lower() in _STREAMABLE_HTTP_TYPES
@@ -172,11 +186,13 @@ def _build_mcp_env(
   *,
   environ: Mapping[str, str],
   base_environ: Mapping[str, str] | None = None,
+  absent: frozenset[str] = frozenset(),
 ) -> Dict[str, str]:
   return _config_helpers.build_mcp_env(
     server_env if isinstance(server_env, dict) else None,
     environ=environ,
     base_environ=os.environ if base_environ is None else base_environ,
+    absent=absent,
   )
 
 
@@ -996,7 +1012,7 @@ class McpClientManager:
       json_file_key_value_factory=_JsonFileKeyValue,
       fastmcp_oauth_factory=FastMCPOAuth,
       path_factory=Path,
-      environ=os.environ,
+      environ=self._child_expansion_environ(),
       logger=log,
     )
 
@@ -1948,6 +1964,18 @@ class McpClientManager:
       raise ValueError("run_scoped_env must not contain duplicate environment names")
     return names
 
+  def _declared_server_env_names(
+    self,
+    server_name: str,
+    config: Mapping[str, Any],
+  ) -> frozenset[str]:
+    base_name = server_name.removesuffix("[user]")
+    canonical_name = self._canonical_server_name(base_name)
+    return (
+      frozenset(self._server_env_passthrough.get(canonical_name, ()))
+      | frozenset(self._declared_run_scoped_env(config))
+    )
+
   def _scoped_server_env(
     self,
     server_name: str,
@@ -1955,22 +1983,134 @@ class McpClientManager:
     *,
     deployment_environ: Mapping[str, str] | None = None,
     projected_env: Mapping[str, str] | None = None,
-  ) -> Dict[str, str]:
-    base_name = server_name.removesuffix("[user]")
-    canonical_name = self._canonical_server_name(base_name)
-    declared_run_scoped = (
-      frozenset(self._server_env_passthrough.get(canonical_name, ()))
-      | frozenset(self._declared_run_scoped_env(config))
+  ) -> tuple[Dict[str, str], frozenset[str]]:
+    # Declared run-scoped deployment values may be copied from an explicit
+    # mapping. The connect path's mapping is the run projection, not a scan of
+    # ambient credentials: this config's non-pool run-scoped names are read
+    # from the deployment, and pool entries come only from projected_env.
+    connect_projection = (
+      deployment_environ is None
+      or deployment_environ is os.environ
+      or isinstance(deployment_environ, _RunScopedExpansion)
     )
-    source_env = os.environ if deployment_environ is None else deployment_environ
-    scoped: Dict[str, str] = {
-      env_name: str(source_env.get(env_name, ""))
-      for env_name in declared_run_scoped
-    }
+    if connect_projection or deployment_environ is None:
+      source: Mapping[str, str] = os.environ
+    else:
+      source = deployment_environ
+    run_scoped = tuple(self._declared_config_env_names(server_name, config))
+    scoped, _absent = _config_helpers.scope_run_env(run_scoped, source)
+    projection: Dict[str, str] = {}
     if projected_env is not None:
-      for env_name, env_value in projected_env.items():
-        if isinstance(env_name, str) and isinstance(env_value, str):
-          scoped[env_name] = env_value
+      for name, value in projected_env.items():
+        if isinstance(name, str) and isinstance(value, str):
+          projection[name] = value
+    elif connect_projection:
+      declared = self._declared_server_env_names(server_name, config)
+      for name, value in self._jobs_oauth_projection(os.environ).items():
+        if name in declared:
+          projection[name] = value
+    for name, value in projection.items():
+      scoped[name] = value
+    declared_names = self._declared_server_env_names(server_name, config)
+    return scoped, declared_names - scoped.keys()
+
+  def _declared_config_env_names(
+    self,
+    server_name: str,
+    config: Mapping[str, Any],
+  ) -> frozenset[str]:
+    """Declared jobs and deployment config, excluding OAuth seat material."""
+    return self._declared_server_env_names(server_name, config) - _oauth_credential_env_names()
+
+  def _jobs_oauth_projection(
+    self,
+    environ: Mapping[str, str],
+    *,
+    run_owner: str | None = None,
+  ) -> Dict[str, str]:
+    """OAuth pool entries only when this run's owner is the seat owner.
+
+    ``run_owner`` is the authenticated run. Without it, a placed bundle or a
+    bound claim signer is the run identity. An unbound shared process does not
+    infer an owner from the deployment roster. ``USER_DATA_DIR`` is not seat
+    material and is not returned here.
+    """
+    if run_owner is not None:
+      owner = str(run_owner).strip()
+    else:
+      bundle = load_user_runtime_credentials(environ)
+      if bundle is not None:
+        owner = (
+          str(bundle.user.risk_user_id)
+          if bundle.user.role.lower() == "owner"
+          else ""
+        )
+      elif self._user_claim_signer is not None:
+        owner = self._user_claim_signer.user_id
+      else:
+        owner = ""
+    if not owner or not scope_admits_operator_seats(owner, environ=environ):
+      return {}
+    return {
+      name: str(environ[name])
+      for name in _oauth_credential_env_names()
+      if name in environ
+    }
+
+  def _server_declares_jobs_oauth(self, server_name: str) -> bool:
+    names = self._server_env_passthrough.get(self._canonical_server_name(server_name), ())
+    return bool(set(names) & _oauth_credential_env_names())
+
+  def _jobs_run_config(
+    self,
+    config: Mapping[str, Any],
+    run_owner: str,
+  ) -> Dict[str, Any]:
+    """Stdio config for one authenticated jobs run, with that run's seat only."""
+    prepared = copy.deepcopy(dict(config))
+    projection = self._jobs_oauth_projection(os.environ, run_owner=run_owner)
+    env = dict(prepared.get("env") or {})
+    for name in projection:
+      env[name] = f"${{{name}}}"
+    prepared["env"] = env
+    if projection:
+      prepared["_projected_env"] = dict(projection)
+    return prepared
+
+  def _authenticated_jobs_subject(
+    self,
+    gateway_session: Any,
+  ) -> _PerUserGatewaySubject | None:
+    try:
+      subject = _PerUserGatewaySubject.from_gateway_session(gateway_session)
+    except ValueError:
+      return None
+    if not self._jobs_oauth_projection(os.environ, run_owner=subject.user_id):
+      return None
+    return subject
+
+  def _child_expansion_environ(self) -> Dict[str, str]:
+    """Allowlist plus declared non-pool run-scoped values, plus owner-matched pool entries.
+
+    This is the mapping startup and connect pass instead of os.environ. It is
+    not a credential scan of the gateway process.
+    """
+    source = os.environ
+    names = set(_config_helpers.DEFAULT_ENV_ALLOWLIST)
+    for config in self._configured_server_configs().values():
+      if not isinstance(config, Mapping):
+        continue
+      try:
+        declared = self._declared_run_scoped_env(config)
+      except ValueError:
+        continue
+      names.update(name for name in declared if name not in _oauth_credential_env_names())
+    for env_names in self._server_env_passthrough.values():
+      names.update(name for name in env_names if name not in _oauth_credential_env_names())
+    scoped = _RunScopedExpansion(
+      {name: str(source[name]) for name in names if name in source}
+    )
+    scoped.update(self._jobs_oauth_projection(source))
     return scoped
 
   def _prepare_server_config_for_startup(
@@ -1993,6 +2133,19 @@ class McpClientManager:
         "oauth is not supported"
       )
     self._declared_run_scoped_env(prepared)
+    projection = self._jobs_oauth_projection(os.environ)
+    if projection:
+      refs = set(self._declared_run_scoped_env(prepared))
+      env_block = prepared.get("env")
+      if isinstance(env_block, dict):
+        for value in env_block.values():
+          if isinstance(value, str):
+            refs.update(_config_helpers.ENV_REF_RE.findall(value))
+      pool_refs = refs & _oauth_credential_env_names()
+      if pool_refs:
+        prepared["_projected_env"] = {
+          name: projection[name] for name in pool_refs if name in projection
+        }
     return prepared
 
   def _per_user_binding_fingerprint(
@@ -2094,19 +2247,24 @@ class McpClientManager:
       expires_at = float("inf")
     else:
       env = dict(config.get("env") or {})
-      if broker_session is None:
-        broker_session = await self._mint_gsheets_broker_session(subject)
-      token, expires_at, broker_url = broker_session
-      projection = {
-        "GSHEETS_TOKEN_MODE": "broker",
-        "GSHEETS_HEADLESS": "1",
-        "GSHEETS_BROKER_URL": broker_url,
-        "GSHEETS_BROKER_SESSION_TOKEN": token,
-      }
-      for env_name in projection:
-        env.setdefault(env_name, f"${{{env_name}}}")
-      config["env"] = env
-      config["_projected_env"] = dict(projection)
+      if self._server_declares_jobs_oauth(server_name):
+        prepared = self._jobs_run_config(config, subject.user_id)
+        config = prepared
+        expires_at = float("inf")
+      else:
+        if broker_session is None:
+          broker_session = await self._mint_gsheets_broker_session(subject)
+        token, expires_at, broker_url = broker_session
+        projection = {
+          "GSHEETS_TOKEN_MODE": "broker",
+          "GSHEETS_HEADLESS": "1",
+          "GSHEETS_BROKER_URL": broker_url,
+          "GSHEETS_BROKER_SESSION_TOKEN": token,
+        }
+        for env_name in projection:
+          env.setdefault(env_name, f"${{{env_name}}}")
+        config["env"] = env
+        config["_projected_env"] = dict(projection)
     # The tier-1 credential is read only by this gateway process and is never
     # copied into the child config/environment.
     host = _PerUserChildHost(server_name, subject.user_id)
@@ -2292,7 +2450,8 @@ class McpClientManager:
         # A forced broker-expiry replacement is the exception: the current
         # child is known invalid and must not remain cached when minting fails.
         broker_session = None
-        if not http:
+        jobs_oauth = self._server_declares_jobs_oauth(server_name)
+        if not http and not jobs_oauth:
           try:
             broker_session = await self._mint_gsheets_broker_session(subject)
           except BaseException:
@@ -2674,6 +2833,27 @@ class McpClientManager:
         )
         return None, _sheets_gateway_error(payload)
       server = per_user_state.server
+    elif self._server_declares_jobs_oauth(transport_server_name):
+      jobs_subject = self._authenticated_jobs_subject(gateway_session)
+      if jobs_subject is not None:
+        per_user_subject = jobs_subject
+        try:
+          per_user_state = await self._get_per_user_server(
+            transport_server_name, per_user_subject,
+          )
+        except _PerUserMcpError as exc:
+          return None, {
+            "code": "mcp_tool_error",
+            "sub_code": exc.code,
+            "message": str(exc),
+          }
+        except Exception:
+          return None, {
+            "code": "mcp_tool_error",
+            "sub_code": "mcp_user_authority_unavailable",
+            "message": "Jobs MCP could not be started for this run.",
+          }
+        server = per_user_state.server
     expected_seconds = self._expected_seconds_for_tool(transport_server_name, name, original_name)
     try:
       if per_user_state is not None:

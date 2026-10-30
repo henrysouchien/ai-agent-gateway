@@ -782,7 +782,7 @@ class _ResumeTestProvider(ModelProvider):
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
   def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
     return {}
@@ -800,7 +800,6 @@ def _dispatcher(*, capability_bind = TEST_CAPABILITY_BIND) -> ToolDispatcher:
 def _runner(
   tmp_path: Path,
   *,
-  max_resume_chain_depth: int = 3,
   max_retained_tasks: int = 50,
   capability_execution: BoundCapabilityExecution | None = None,
 ) -> _ResumeTestRunner:
@@ -823,7 +822,6 @@ def _runner(
     agent_session_log=AgentSessionLog(path=tmp_path / "sessions" / "runner.jsonl"),
     workspace_dir=str(tmp_path),
     task_registry=TaskRegistry(max_retained=max_retained_tasks),
-    max_resume_chain_depth=max_resume_chain_depth,
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
@@ -1018,7 +1016,6 @@ async def _append_interrupted_skill_task(
   execution_snapshot = build_agent_execution_snapshot(
     operation=operation,
     result_instructions=render_result_instructions(result_requirement),
-    max_tokens=64_000,
     cost_observation_threshold_usd=5.0,
     provider_tool_definitions=tuple(
       ProviderToolDefinition(definition=definition)
@@ -1032,7 +1029,6 @@ async def _append_interrupted_skill_task(
         } for tool_id in sorted(set(allowed_tools)))
       )
     ),
-    max_resume_chain_depth=3,
   )
   execution_snapshot = execution_snapshot.model_copy(update={
     "admitted_context": admitted_context,
@@ -1551,7 +1547,7 @@ def test_run_agent_child_reconciles_its_own_skill_not_the_parents(
       _ = client, timeout
 
     def get_model_info(self, model: str) -> ModelInfo:
-      return ModelInfo(id=model, provider=self.name)
+      return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
     def normalize_messages(self, messages: list[dict[str, Any]], model_info: ModelInfo) -> list[dict[str, Any]]:
       _ = model_info
@@ -1667,7 +1663,7 @@ semantic_metadata:
     )
     parent_admission = ActiveSkillAdmission(
       skill_name="parent-skill-a",
-      execution_limits=SkillExecutionLimits(max_tokens=None),
+      execution_limits=SkillExecutionLimits(),
     )
     token = set_current_skill_admission(parent_admission)
     try:
@@ -4832,7 +4828,7 @@ def test_resume_successor_collision_returns_structured_error(
 
 def test_resume_chain_depth_is_measured_not_capped(tmp_path: Path) -> None:
   async def _case() -> None:
-    runner = _runner(tmp_path, max_resume_chain_depth=3)
+    runner = _runner(tmp_path)
     registry = runner._task_registry
     registry.register("background_agent", task_id="bg_3")
     registry.register("background_agent", task_id="bg_3_r1", original_task_id="bg_3")
@@ -5925,11 +5921,11 @@ def test_resume_dispatches_through_the_live_route(
   _run(_case())
 
 
-def test_resume_handler_continues_past_the_admitted_chain_depth(
+def test_resume_handler_records_the_successor_chain_depth(
   tmp_path: Path,
 ) -> None:
   async def _case() -> None:
-    runner = _runner(tmp_path, max_resume_chain_depth=1)
+    runner = _runner(tmp_path)
     await _append_interrupted_skill_task(
       runner,
       task_id="bg_depth_root",
@@ -6361,7 +6357,6 @@ def test_resume_handler_uses_exact_admitted_prompt_after_skill_source_changes(
     )
     assert captured["system_prompt"] == successor_snapshot.system_prompt
     assert "client_timeout" not in captured
-    assert captured["max_tokens"] == successor_snapshot.max_tokens
     assert captured["cost_observation_threshold_usd"] == (
       successor_snapshot.cost_observation_threshold_usd
     )

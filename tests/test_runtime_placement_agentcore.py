@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatchcase
 import json
@@ -9,6 +10,7 @@ from pathlib import Path
 import stat
 import threading
 from typing import Any
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import httpx
@@ -19,10 +21,13 @@ from websockets.asyncio.client import connect as websocket_connect
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
+from hank_contracts.agent_api import AGENT_API_CLAIM_ENV_VARS
 from hank_contracts.user_claims import derive_user_claim_key
-from agent_gateway.runtime_placement import RuntimePlacement
+from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
+from agent_gateway.runtime_placement import DESK_LEASE_SECONDS, DeskLeaseRefused, RuntimePlacement
 from agent_gateway.runtime_placement_agentcore import (
   AgentCoreRuntimeBackend,
+  desk_prelease_policy,
   desk_session_policy,
   generate_ws_connection,
 )
@@ -31,6 +36,7 @@ from agent_gateway.user_runtime_credentials import (
   DeskReplica,
   USER_RUNTIME_CREDENTIALS_FILE_ENV,
   UserRuntimeIdentity,
+  derive_approval_claim_key,
   load_user_runtime_credentials,
 )
 
@@ -57,9 +63,15 @@ SHARED_ENV = {
   "AWS_SECRET_ACCESS_KEY": "shared-aws-secret",
   "AWS_SESSION_TOKEN": "shared-aws-session",
   "GATEWAY_SUBJECT_ASSERTION_ED25519_PUBLIC_KEYS": '{"test":"public-key"}',
+  "GATEWAY_APPROVAL_DB_PATH": "/edge/private/approvals.sqlite3",
+  "AGENT_AUTONOMOUS_APPROVALS_DB_PATH": "/edge/private/autonomous-approvals.sqlite3",
+  "AGENT_AUTONOMOUS_APPROVAL_DECISIONS_PATH": "/edge/private/approval-decisions.jsonl",
+  "GATEWAY_APPROVAL_AUDIT_DIR": "/edge/private/approval-audit",
+  "HANK_APPROVALS_EGRESS_URL": "https://private-approvals.example.test",
 }
 FIRST_CHUNK = b'data: {"type":"delta","text":"first"}\n\n'
 LAST_CHUNK = b'data: {"type":"complete"}\n\n'
+LEASE_DEADLINE = datetime(2026, 10, 30, 12, 34, 56, 123456, tzinfo=timezone.utc)
 
 
 async def _body(*chunks: bytes) -> AsyncIterator[bytes]:
@@ -107,6 +119,22 @@ class _FakeSession:
     return {}
 
 
+class _ExpiredWriterOwner:
+  """Stub the lease owner's successful CAS after its prior deadline."""
+
+  def __init__(self, prior: dict[str, Any], epoch: int) -> None:
+    self.prior = prior
+    self.now = prior["expires_at"] + 1
+    self.epoch = epoch
+
+  def acquire(self, holder: str) -> dict[str, Any]:
+    assert self.now > self.prior["expires_at"]
+    return {
+      "epoch": self.epoch, "holder": holder,
+      "expires_at": self.now + DESK_LEASE_SECONDS, "state": "held",
+    }
+
+
 class _FakeRuntime:
   """Serve on another loop: backend.start()/health() intentionally block the caller."""
 
@@ -119,6 +147,12 @@ class _FakeRuntime:
     self.bootstraps: list[tuple[str, dict[str, Any]]] = []
     self.credential_updates: list[tuple[str, dict[str, Any]]] = []
     self.initializations: dict[str, dict[str, Any]] = {}
+    self.leases: dict[str, dict[str, Any]] = {}
+    self.next_epoch = 41
+    self.refusal: str | None = None
+    self.refusal_writer: dict[str, Any] | None = None
+    self.lease_override: dict[str, Any] | None = None
+    self.writer_owner: Any = None
     self.product_requests: list[tuple[str, TunnelRequest]] = []
     self.edge_frames: list[dict[str, Any]] = []
     self.runtime_frames: list[dict[str, Any]] = []
@@ -172,9 +206,34 @@ class _FakeRuntime:
           raise AssertionError(f"Unexpected edge control: {kind}")
         self.changed.notify_all()
       if kind == "bootstrap":
+        if self.writer_owner is not None and session_id not in self.leases:
+          try:
+            self.leases[session_id] = self.writer_owner.acquire(session_id)
+          except DeskLeaseRefused as exc:
+            await endpoint.control("failed", {
+              "error": "DeskLeaseRefused", "finding": str(exc),
+              "writer": exc.record.model_dump() if exc.record is not None else None,
+            })
+            return
+        if self.refusal is not None:
+          await endpoint.control("failed", {
+            "error": "DeskLeaseRefused", "finding": self.refusal, "writer": self.refusal_writer,
+          })
+          return
+        if session_id not in self.leases:
+          self.leases[session_id] = {
+            "epoch": self.next_epoch, "holder": f"runtime-{session_id}",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=DESK_LEASE_SECONDS)).timestamp(),
+            "state": "held",
+          }
+          self.next_epoch += 1
+        await endpoint.control("lease", self.leases[session_id] if self.lease_override is None else self.lease_override)
+      elif kind == "credentials":
+        if "bundle" in body:
+          assert body["bundle"]["generation"] == self.leases[session_id]["epoch"]
         if self.ready_gate is not None:
           await self.ready_gate.wait()
-        await endpoint.control("ready", {"generation": body["generation"]})
+        await endpoint.control("ready", {"generation": self.leases[session_id]["epoch"]})
 
     async def product(request: TunnelRequest) -> TunnelResponse:
       self.product_requests.append((session_id, request))
@@ -236,6 +295,16 @@ class _FakeRuntime:
     assert self.stream_release is not None
     self.loop.call_soon_threadsafe(self.stream_release.set)
 
+  def renew(self, session_id: str, expires_at: float) -> None:
+    async def notify() -> None:
+      record = {**self.leases[session_id], "expires_at": expires_at}
+      self.leases[session_id] = record
+      await self.connections[session_id].send(json.dumps({
+        "t": "control", "kind": "lease", "body": record,
+      }))
+
+    asyncio.run_coroutine_threadsafe(notify(), self.loop).result(timeout=5)
+
   def drop(self, session_id: str) -> None:
     async def disconnect() -> None:
       await self.connections[session_id].close(code=1012, reason="transient runtime socket loss")
@@ -290,7 +359,7 @@ def aws_session() -> _FakeSession:
 
 
 @pytest.fixture
-def egress_calls() -> list[tuple[UserRuntimeIdentity, str, Mapping[str, str]]]:
+def egress_calls() -> list[tuple[UserRuntimeIdentity, str, int, Mapping[str, str]]]:
   return []
 
 
@@ -302,13 +371,13 @@ def egress_requests() -> list[TunnelRequest]:
 @pytest.fixture
 def backend(
   tmp_path: Path, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
-  egress_calls: list[tuple[UserRuntimeIdentity, str, Mapping[str, str]]],
+  egress_calls: list[tuple[UserRuntimeIdentity, str, int, Mapping[str, str]]],
   egress_requests: list[TunnelRequest],
 ) -> Iterator[AgentCoreRuntimeBackend]:
   def egress_factory(
-    identity: UserRuntimeIdentity, storage_id: str, config: Mapping[str, str],
+    identity: UserRuntimeIdentity, storage_id: str, placement_generation: int, config: Mapping[str, str],
   ) -> Any:
-    egress_calls.append((identity, storage_id, dict(config)))
+    egress_calls.append((identity, storage_id, placement_generation, dict(config)))
 
     async def handle(request: TunnelRequest) -> TunnelResponse:
       egress_requests.append(request)
@@ -338,18 +407,43 @@ def _desk() -> DeskReplica:
 
 
 def test_desk_session_policy_grants_only_the_users_replica_prefix() -> None:
-  assert desk_session_policy(BUCKET, "17") == {
+  assert desk_session_policy(BUCKET, "17", LEASE_DEADLINE.timestamp()) == {
     "Version": "2012-10-17",
     "Statement": [
       {
         "Effect": "Allow",
         "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
         "Resource": f"arn:aws:s3:::{BUCKET}/users/17/*",
+        "Condition": {"DateLessThan": {"aws:CurrentTime": "2026-10-30T12:34:56.123456Z"}},
       },
       {
         "Effect": "Allow",
         "Action": "s3:ListBucket",
         "Resource": f"arn:aws:s3:::{BUCKET}",
+        "Condition": {
+          "StringLike": {"s3:prefix": ["users/17/*", "users/17/"]},
+        },
+      },
+    ],
+  }
+
+
+def test_prelease_policy_can_only_cas_writer_and_read_desk_until_deadline() -> None:
+  policy = desk_prelease_policy(BUCKET, "17", LEASE_DEADLINE.timestamp())
+  deadline = {"DateLessThan": {"aws:CurrentTime": "2026-10-30T12:34:56.123456Z"}}
+  assert policy == {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
+        "Resource": f"arn:aws:s3:::{BUCKET}/users/17/writer.json", "Condition": deadline,
+      },
+      {
+        "Effect": "Allow", "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:::{BUCKET}/users/17/*", "Condition": deadline,
+      },
+      {
+        "Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{BUCKET}",
         "Condition": {"StringLike": {"s3:prefix": ["users/17/*", "users/17/"]}},
       },
     ],
@@ -371,7 +465,7 @@ def test_desk_session_policy_grants_only_the_users_replica_prefix() -> None:
 def test_listbucket_prefix_cannot_enumerate_numeric_siblings(
   storage_id: str, prefix: str, allowed: bool,
 ) -> None:
-  policy = desk_session_policy(BUCKET, storage_id)
+  policy = desk_session_policy(BUCKET, storage_id, LEASE_DEADLINE.timestamp())
   patterns = policy["Statement"][1]["Condition"]["StringLike"]["s3:prefix"]
   assert any(fnmatchcase(prefix, pattern) for pattern in patterns) is allowed
 
@@ -414,14 +508,42 @@ def test_websocket_sigv4_url_and_headers_are_deterministic(
   }
 
 
+def test_cold_start_mints_prelease_only_after_websocket_connects(
+  backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import agent_gateway.runtime_placement_agentcore as owner
+
+  now = [LEASE_DEADLINE.timestamp()]
+  monkeypatch.setattr(owner, "time", SimpleNamespace(time=lambda: now[0]))
+
+  @asynccontextmanager
+  async def cold_connect(*args: Any, **kwargs: Any):
+    # Connection establishment includes container cold start, not desk lease time.
+    now[0] += DESK_LEASE_SECONDS * 2
+    async with fake_runtime.connect(*args, **kwargs) as socket:
+      yield socket
+
+  backend._connect = cold_connect
+  placement = backend.start("17", IDENTITY, _desk())
+  assert placement.state == "ready"
+  bootstrap = fake_runtime.bootstraps[0][1]
+  deadline = datetime.fromisoformat(bootstrap["desk"]["credentials"]["Expiration"]).timestamp()
+  assert deadline == now[0] + DESK_LEASE_SECONDS
+  prelease = aws_session.assume_calls[0]
+  assert prelease["RoleSessionName"] == "hank-desk-17-prelease"
+  assert json.loads(prelease["Policy"]) == desk_prelease_policy(BUCKET, "17", deadline)
+  assert bootstrap["lease_seconds"] == DESK_LEASE_SECONDS
+
+
 def test_start_bootstraps_private_bundle_without_shared_authority(
   backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
-  egress_calls: list[tuple[UserRuntimeIdentity, str, Mapping[str, str]]],
+  egress_calls: list[tuple[UserRuntimeIdentity, str, int, Mapping[str, str]]],
 ) -> None:
   placement = backend.start("17", IDENTITY, _desk())
   assert placement.state == "ready"
   assert placement.backend == "agentcore"
-  assert placement.generation == 1
+  assert placement.generation == 41
   assert placement.handle is not None
   assert placement.url == f"agentcore://{placement.handle}"
   assert placement.bundle_path == str(backend.placement_root / "17" / "bundle.json")
@@ -431,12 +553,20 @@ def test_start_bootstraps_private_bundle_without_shared_authority(
   assert bundle is not None
   assert bundle.user == IDENTITY
   assert bundle.desk == _desk()
-  assert bundle.claim_signing.key == derive_user_claim_key(ORG_KEY, "alice", "alice@example.test")
+  assert bundle.generation == placement.generation
+  assert bundle.claim_signing.key == derive_user_claim_key(
+    ORG_KEY, "alice", "alice@example.test",
+  )
+  assert bundle.approval_claim_signing.key == derive_approval_claim_key(
+    ORG_KEY, "alice", "alice@example.test", placement.generation,
+  )
   assert fake_runtime.bootstraps[0][0] == placement.handle
   bootstrap = fake_runtime.bootstraps[0][1]
-  assert set(bootstrap) == {"bundle", "desk", "env", "generation"}
-  assert bootstrap["bundle"] == json.loads(bundle_path.read_text())
-  assert bootstrap["generation"] == placement.generation
+  assert set(bootstrap) == {"storage_id", "desk", "env", "lease_seconds"}
+  assert bootstrap["storage_id"] == placement.storage_id
+  assert bootstrap["lease_seconds"] == DESK_LEASE_SECONDS
+  assert fake_runtime.credential_updates[0][1]["bundle"] == json.loads(bundle_path.read_text())
+  assert fake_runtime.credential_updates[0][1]["desk"]["AccessKeyId"] == "DESKACCESS2"
   assert bootstrap["desk"]["url"] == f"s3://{BUCKET}"
   assert bootstrap["desk"]["credentials"] == {
     "AccessKeyId": "DESKACCESS1", "SecretAccessKey": "desk-secret-1",
@@ -452,6 +582,8 @@ def test_start_bootstraps_private_bundle_without_shared_authority(
     "RISK_API_URL": "http://127.0.0.1:8090/egress/risk",
     "EDGAR_API_URL": "http://127.0.0.1:8090/egress/edgar",
     "RISK_MODULE_RESOLVER_URL": "http://127.0.0.1:8090/egress/resolver/api/internal/resolve-credential",
+    "HANK_APPROVALS_EGRESS_URL": "http://127.0.0.1:8090/egress/approvals",
+    "HANK_APPROVAL_TRANSPORT": "agentcore",
   }
   wire = json.dumps(bootstrap)
   for name, authority in SHARED_ENV.items():
@@ -460,11 +592,23 @@ def test_start_bootstraps_private_bundle_without_shared_authority(
   for authority in ("EDGEACCESS", "edge-secret", "edge-session-token"):
     assert authority not in wire
   assert aws_session.client_calls == [("sts", "us-east-2"), ("bedrock-agentcore", "us-east-2")]
-  assert aws_session.assume_calls == [{
-    "RoleArn": ROLE_ARN, "RoleSessionName": "hank-desk-17-g1", "DurationSeconds": 3600,
-    "Policy": json.dumps(desk_session_policy(BUCKET, "17")),
-  }]
-  assert egress_calls == [(IDENTITY, "17", SHARED_ENV)]
+  assert len(aws_session.assume_calls) == 2
+  prelease, held = aws_session.assume_calls
+  prelease_deadline = json.loads(prelease["Policy"])["Statement"][0]["Condition"]["DateLessThan"]["aws:CurrentTime"]
+  assert bootstrap["desk"]["credentials"]["Expiration"] == prelease_deadline
+  assert prelease == {
+    "RoleArn": ROLE_ARN, "RoleSessionName": "hank-desk-17-prelease", "DurationSeconds": 900,
+    "Policy": json.dumps(desk_prelease_policy(
+      BUCKET, "17", datetime.fromisoformat(prelease_deadline.replace("Z", "+00:00")).timestamp(),
+    )),
+  }
+  assert held == {
+    "RoleArn": ROLE_ARN, "RoleSessionName": "hank-desk-17-g41", "DurationSeconds": 900,
+    "Policy": json.dumps(desk_session_policy(BUCKET, "17", fake_runtime.leases[placement.handle]["expires_at"])),
+  }
+  held_deadline = json.loads(held["Policy"])["Statement"][0]["Condition"]["DateLessThan"]["aws:CurrentTime"]
+  assert fake_runtime.credential_updates[0][1]["desk"]["Expiration"] == held_deadline
+  assert egress_calls == [(IDENTITY, "17", placement.generation, SHARED_ENV)]
   assert fake_runtime.product_requests == []
   assert backend.health(placement)
   assert fake_runtime.product_requests[-1] == (
@@ -473,39 +617,137 @@ def test_start_bootstraps_private_bundle_without_shared_authority(
   fake_runtime.health_status = 503
   assert not backend.health(placement)
   fake_runtime.health_status = 200
+  retained_bundle = bundle_path.read_bytes()
   assert backend.start("17", IDENTITY, _desk()) == placement
   assert len(fake_runtime.bootstraps) == 1
-  assert len(aws_session.assume_calls) == 1
+  assert len(aws_session.assume_calls) == 2
+  assert bundle_path.read_bytes() == retained_bundle
   # SQLite is a routing index; neither derived authority nor AWS material lives
   # in it, and its sidecar WAL is held to the same boundary.
   for path in (backend.store.path, Path(str(backend.store.path) + "-wal")):
     if path.exists():
-      for secret in (ORG_KEY, IDENTITY.key, bundle.claim_signing.key, "desk-secret-1", "edge-secret"):
+      for secret in (
+        ORG_KEY, IDENTITY.key, bundle.claim_signing.key,
+        bundle.approval_claim_signing.key, "desk-secret-1", "edge-secret",
+      ):
         assert secret.encode() not in path.read_bytes()
   assert ORG_KEY not in repr(backend)
   assert IDENTITY.key not in repr(backend)
 
 
+@pytest.mark.parametrize("writer_state", ("held", "released"))
+def test_stopped_session_replacement_refuses_unexpired_writer(
+  backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
+  egress_calls: list[tuple[UserRuntimeIdentity, str, int, Mapping[str, str]]],
+  writer_state: str,
+) -> None:
+  from agent_gateway.runtime_placement import WriterRecord
+
+  first = backend.start("17", IDENTITY, _desk())
+  assert first.handle is not None
+  writer = WriterRecord.model_validate({
+    **fake_runtime.leases[first.handle], "state": writer_state,
+  })
+  assert writer.expires_at > datetime.now(timezone.utc).timestamp()
+  attempts: list[str] = []
+
+  class UnexpiredWriterOwner:
+    def acquire(self, holder: str) -> dict[str, Any]:
+      attempts.append(holder)
+      raise DeskLeaseRefused("prior writer deadline has not expired", record=writer)
+
+  fake_runtime.writer_owner = UnexpiredWriterOwner()
+  bundle_before = Path(first.bundle_path).read_bytes()
+  updates_before = len(fake_runtime.credential_updates)
+  backend.stop(first)
+  with pytest.raises(DeskLeaseRefused, match="prior writer deadline") as caught:
+    backend.replace(first)
+  assert caught.value.record is not None
+  assert caught.value.record == writer
+  assert caught.value.record.holder == writer.holder
+  assert caught.value.record.epoch == first.generation
+  assert len(attempts) == 1
+  assert attempts[0] != first.handle
+  stored = backend.store.get("17")
+  assert stored is not None
+  assert stored.state != "ready"
+  assert stored.handle is None
+  assert stored.generation == first.generation
+  assert Path(first.bundle_path).read_bytes() == bundle_before
+  assert len(egress_calls) == 1
+  assert len(fake_runtime.credential_updates) == updates_before
+  assert len(fake_runtime.leases) == 1
+  assert fake_runtime.next_epoch == first.generation + 1
+  assert len(aws_session.stop_calls) == 2
+
+
 def test_stop_uses_runtime_session_and_replacement_advances_generation(
   backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
+  egress_calls: list[tuple[UserRuntimeIdentity, str, int, Mapping[str, str]]],
 ) -> None:
   first = backend.start("17", IDENTITY, _desk())
-  original_bundle = Path(first.bundle_path).read_bytes()
+  original_bundle = load_user_runtime_credentials({USER_RUNTIME_CREDENTIALS_FILE_ENV: first.bundle_path})
+  assert original_bundle is not None
+  assert first.handle is not None
+  fake_runtime.writer_owner = _ExpiredWriterOwner(fake_runtime.leases[first.handle], 508)
   replacement = backend.replace(first)
   assert replacement.state == "ready"
-  assert replacement.generation == first.generation + 1
+  assert replacement.generation == 508
   assert replacement.handle is not None
   assert replacement.handle != first.handle
   assert replacement.url != first.url
   assert replacement.bundle_path == first.bundle_path
-  assert Path(replacement.bundle_path).read_bytes() == original_bundle
+  replacement_bundle = load_user_runtime_credentials({
+    USER_RUNTIME_CREDENTIALS_FILE_ENV: replacement.bundle_path,
+  })
+  assert replacement_bundle is not None
+  assert replacement_bundle.user == original_bundle.user
+  assert replacement_bundle.desk == original_bundle.desk
+  assert replacement_bundle.generation == replacement.generation
+  assert replacement_bundle.claim_signing.key == derive_user_claim_key(
+    ORG_KEY, IDENTITY.slug, IDENTITY.email,
+  )
+  assert replacement_bundle.claim_signing.key == original_bundle.claim_signing.key
+  assert replacement_bundle.approval_claim_signing.key == derive_approval_claim_key(
+    ORG_KEY, IDENTITY.slug, IDENTITY.email, replacement.generation,
+  )
+  assert replacement_bundle.approval_claim_signing.key != original_bundle.approval_claim_signing.key
+  original_approval_authority = GatewayClaimSigningAuthority(original_bundle.approval_claim_signing.key)
+  replacement_approval_authority = GatewayClaimSigningAuthority(replacement_bundle.approval_claim_signing.key)
+  original_approval_environment = original_approval_authority.sign_user_claim(
+    user_id=IDENTITY.slug, user_email=IDENTITY.email,
+  )
+  replacement_approval_environment = replacement_approval_authority.sign_user_claim(
+    user_id=IDENTITY.slug, user_email=IDENTITY.email,
+  )
+  original_approval_claim = {
+    field: original_approval_environment[env_name]
+    for field, env_name in AGENT_API_CLAIM_ENV_VARS.items()
+  }
+  replacement_approval_claim = {
+    field: replacement_approval_environment[env_name]
+    for field, env_name in AGENT_API_CLAIM_ENV_VARS.items()
+  }
+  assert original_approval_authority.verify_user_claim(original_approval_claim) is not None
+  assert replacement_approval_authority.verify_user_claim(original_approval_claim) is None
+  assert replacement_approval_authority.verify_user_claim(replacement_approval_claim) is not None
+  assert original_approval_authority.verify_user_claim(replacement_approval_claim) is None
+  retained_bundle = Path(replacement.bundle_path).read_bytes()
+  assert backend.start("17", IDENTITY, _desk()) == replacement
+  assert Path(replacement.bundle_path).read_bytes() == retained_bundle
   assert aws_session.stop_calls == [{
     "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": first.handle, "qualifier": "DEFAULT",
   }]
-  assert [(session_id, body["generation"]) for session_id, body in fake_runtime.bootstraps] == [
-    (first.handle, 1), (replacement.handle, 2),
+  assert [session_id for session_id, _ in fake_runtime.bootstraps] == [
+    first.handle, replacement.handle,
   ]
-  assert aws_session.assume_calls[1]["RoleSessionName"] == "hank-desk-17-g2"
+  assert all("takeover_epoch" not in body for _, body in fake_runtime.bootstraps)
+  assert [body["bundle"]["generation"] for _, body in fake_runtime.credential_updates] == [41, 508]
+  assert egress_calls == [
+    (IDENTITY, "17", first.generation, SHARED_ENV),
+    (IDENTITY, "17", replacement.generation, SHARED_ENV),
+  ]
+  assert aws_session.assume_calls[3]["RoleSessionName"] == "hank-desk-17-g508"
   backend.stop(first)
   assert backend.store.get("17") == replacement
   assert len(aws_session.stop_calls) == 1
@@ -518,6 +760,43 @@ def test_stop_uses_runtime_session_and_replacement_advances_generation(
   assert aws_session.stop_calls[-1] == {
     "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": replacement.handle, "qualifier": "DEFAULT",
   }
+
+
+@pytest.mark.parametrize("mismatch", ("generation", "generic_key", "approval_key", "both"))
+def test_ready_bundle_must_match_current_placement_generation(
+  backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, mismatch: str,
+) -> None:
+  first = backend.start("17", IDENTITY, _desk())
+  bundle_path = Path(first.bundle_path)
+  stale_bundle = json.loads(bundle_path.read_text())
+  if mismatch in ("generation", "both"):
+    stale_bundle["generation"] = first.generation + 1
+  if mismatch == "generic_key":
+    stale_bundle["claim_signing"]["key"] = derive_user_claim_key(
+      "other-org-authority-at-least-32-bytes", IDENTITY.slug, IDENTITY.email,
+    )
+  if mismatch in ("approval_key", "both"):
+    stale_bundle["approval_claim_signing"]["key"] = derive_approval_claim_key(
+      ORG_KEY, IDENTITY.slug, IDENTITY.email, first.generation + 1,
+    )
+  bundle_path.write_text(json.dumps(stale_bundle))
+
+  replacement = backend.start("17", IDENTITY, _desk())
+
+  assert replacement.generation == first.generation + 1
+  assert replacement.handle != first.handle
+  bundle = load_user_runtime_credentials({USER_RUNTIME_CREDENTIALS_FILE_ENV: replacement.bundle_path})
+  assert bundle is not None
+  assert bundle.generation == replacement.generation
+  assert bundle.claim_signing.key == derive_user_claim_key(
+    ORG_KEY, IDENTITY.slug, IDENTITY.email,
+  )
+  assert bundle.approval_claim_signing.key == derive_approval_claim_key(
+    ORG_KEY, IDENTITY.slug, IDENTITY.email, replacement.generation,
+  )
+  assert fake_runtime.credential_updates[-1][1]["bundle"]["generation"] == replacement.generation
+  assert backend.start("17", IDENTITY, _desk()) == replacement
+  assert len(fake_runtime.bootstraps) == 2
 
 
 def test_transport_initialization_and_streaming_preserve_http_request_and_response(
@@ -594,7 +873,7 @@ def test_runtime_odd_id_egress_requests_share_the_product_tunnel(
 
 def test_socket_reconnect_reuses_session_and_idempotent_bootstrap(
   backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
-  egress_calls: list[tuple[UserRuntimeIdentity, str, Mapping[str, str]]],
+  egress_calls: list[tuple[UserRuntimeIdentity, str, int, Mapping[str, str]]],
 ) -> None:
   placement = backend.start("17", IDENTITY, _desk())
   assert placement.handle is not None
@@ -605,7 +884,11 @@ def test_socket_reconnect_reuses_session_and_idempotent_bootstrap(
   assert backend.health(placement)
   assert backend.store.get("17") == placement
   assert fake_runtime.bootstraps == [
-    (placement.handle, first_bootstrap), (placement.handle, first_bootstrap),
+    (placement.handle, first_bootstrap),
+    (placement.handle, {
+      **first_bootstrap,
+      "desk": {**first_bootstrap["desk"], "credentials": fake_runtime.credential_updates[0][1]["desk"]},
+    }),
   ]
   assert fake_runtime.initializations == {placement.handle: first_bootstrap}
   assert len(fake_runtime.connect_calls) == 2
@@ -613,7 +896,7 @@ def test_socket_reconnect_reuses_session_and_idempotent_bootstrap(
     headers[SESSION_HEADER] == placement.handle for _, headers in fake_runtime.connect_calls
   )
   assert fake_runtime.connect_calls[0][0] == fake_runtime.connect_calls[1][0]
-  assert len(aws_session.assume_calls) == 1
+  assert len(aws_session.assume_calls) == 3
   assert aws_session.stop_calls == []
   assert len(egress_calls) == 1
 
@@ -628,39 +911,57 @@ def test_socket_reconnect_reuses_session_and_idempotent_bootstrap(
   asyncio.run(asyncio.wait_for(scenario(), timeout=10))
 
 
-def test_desk_credentials_renew_on_same_session_and_reconnect_with_current_material(
+def test_desk_credentials_remint_only_on_actual_lease_deadline_and_reconnect(
   backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
 ) -> None:
-  aws_session.expirations.append(datetime.now(timezone.utc) + timedelta(seconds=1))
+  # An expiring STS session does not allocate a fresh write deadline.
+  aws_session.expirations.extend([
+    datetime.now(timezone.utc) + timedelta(seconds=1),
+    datetime.now(timezone.utc) + timedelta(seconds=1),
+  ])
   placement = backend.start("17", IDENTITY, _desk())
   assert placement.handle is not None
   original_bundle = Path(placement.bundle_path).read_bytes()
-  original_bootstrap = fake_runtime.bootstraps[0][1]
-  fake_runtime.wait_credentials(1)
-  session_id, update = fake_runtime.credential_updates[0]
+  initial_update = fake_runtime.credential_updates[0][1]
+  initial_record = fake_runtime.leases[placement.handle]
+  with fake_runtime.changed:
+    assert not fake_runtime.changed.wait_for(lambda: len(fake_runtime.credential_updates) > 1, timeout=1.2)
+  assert len(aws_session.assume_calls) == 2
+  assert len(fake_runtime.credential_updates) == 1
+  renewed_deadline = initial_record["expires_at"] + 37.125
+  fake_runtime.renew(placement.handle, renewed_deadline)
+  fake_runtime.wait_credentials(2)
+  session_id, update = fake_runtime.credential_updates[1]
   assert session_id == placement.handle
   assert set(update) == {"desk"}
-  assert update["desk"] == {
-    "AccessKeyId": "DESKACCESS2", "SecretAccessKey": "desk-secret-2",
-    "SessionToken": "desk-token-2", "Expiration": update["desk"]["Expiration"],
+  assert update["desk"]["AccessKeyId"] == "DESKACCESS3"
+  assert initial_update["desk"]["AccessKeyId"] == "DESKACCESS2"
+  assert len(aws_session.assume_calls) == 3
+  assert aws_session.assume_calls[2] == {
+    "RoleArn": ROLE_ARN, "RoleSessionName": f"hank-desk-17-g{placement.generation}",
+    "DurationSeconds": 900,
+    "Policy": json.dumps(desk_session_policy(BUCKET, "17", renewed_deadline)),
   }
-  assert datetime.fromisoformat(update["desk"]["Expiration"]) > datetime.fromisoformat(
-    original_bootstrap["desk"]["credentials"]["Expiration"],
-  )
-  assert original_bootstrap["desk"]["credentials"]["AccessKeyId"] == "DESKACCESS1"
-  assert len(aws_session.assume_calls) == 2
-  assert aws_session.assume_calls[1] == aws_session.assume_calls[0]
+  old_condition = json.loads(aws_session.assume_calls[1]["Policy"])["Statement"][0]["Condition"]
+  new_condition = json.loads(aws_session.assume_calls[2]["Policy"])["Statement"][0]["Condition"]
+  assert old_condition != new_condition
+  assert new_condition == {"DateLessThan": {
+    "aws:CurrentTime": datetime.fromtimestamp(renewed_deadline, timezone.utc).isoformat().replace("+00:00", "Z"),
+  }}
+  assert update["desk"]["Expiration"] == new_condition["DateLessThan"]["aws:CurrentTime"]
   assert Path(placement.bundle_path).read_bytes() == original_bundle
   assert backend.store.get("17") == placement
   assert backend.health(placement)
   fake_runtime.drop(placement.handle)
   fake_runtime.wait_bootstraps(2)
   latest_bootstrap = fake_runtime.bootstraps[-1][1]
-  assert latest_bootstrap == {
-    **original_bootstrap, "desk": {**original_bootstrap["desk"], "credentials": update["desk"]},
-  }
+  assert latest_bootstrap["desk"]["credentials"] == update["desk"]
+  assert "generation" not in latest_bootstrap
+  assert "bundle" not in latest_bootstrap
   assert backend.health(placement)
-  assert len(aws_session.assume_calls) == 2
+  assert len(aws_session.assume_calls) == 4
+  assert aws_session.assume_calls[3]["Policy"] == aws_session.assume_calls[2]["Policy"]
+  assert len(fake_runtime.initializations) == 1
   assert aws_session.stop_calls == []
 
 
@@ -677,13 +978,21 @@ def test_missing_aws_session_stops_locally_and_allows_a_new_generation(
   assert backend.store.get("17") == stopped
   assert not backend.health(stopped)
   aws_session.stop_error = None
+  assert placement.handle is not None
+  fake_runtime.writer_owner = _ExpiredWriterOwner(
+    fake_runtime.leases[placement.handle], placement.generation + 1,
+  )
   restarted = backend.start("17", IDENTITY, _desk())
   assert restarted.state == "ready"
   assert restarted.generation == placement.generation + 1
   assert restarted.handle is not None
   assert restarted.handle != placement.handle
-  assert [(session_id, body["generation"]) for session_id, body in fake_runtime.bootstraps] == [
-    (placement.handle, 1), (restarted.handle, 2),
+  assert [session_id for session_id, _ in fake_runtime.bootstraps] == [
+    placement.handle, restarted.handle,
+  ]
+  assert all("takeover_epoch" not in body for _, body in fake_runtime.bootstraps)
+  assert [body["bundle"]["generation"] for _, body in fake_runtime.credential_updates] == [
+    placement.generation, restarted.generation,
   ]
   assert aws_session.stop_calls == [{
     "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": placement.handle, "qualifier": "DEFAULT",
@@ -759,3 +1068,54 @@ def test_stop_wakes_http_request_waiting_for_reconnect_readiness(
   stored = backend.store.get("17")
   assert stored is not None
   assert stored.state == "stopped"
+
+
+@pytest.mark.parametrize("refused_record", [
+  None,
+  {"epoch": 900, "holder": "another-runtime", "expires_at": 1793370000.0, "state": "held"},
+])
+def test_refused_restore_surfaces_finding_without_placement_bundle_or_generation(
+  backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
+  egress_calls: list[tuple[UserRuntimeIdentity, str, int, Mapping[str, str]]],
+  refused_record: dict[str, Any] | None,
+) -> None:
+  fake_runtime.refusal = "Finding: writer.json is held by another runtime at epoch 900"
+  fake_runtime.refusal_writer = refused_record
+  with pytest.raises(DeskLeaseRefused, match="Finding: writer.json is held") as caught:
+    backend.start("17", IDENTITY, _desk())
+  if refused_record is None:
+    assert caught.value.record is None
+  else:
+    assert caught.value.record is not None
+    assert caught.value.record.model_dump() == refused_record
+  assert backend.store.get("17") is None
+  assert not (backend.placement_root / "17" / "bundle.json").exists()
+  assert egress_calls == []
+  assert fake_runtime.credential_updates == []
+  assert len(aws_session.assume_calls) == 1
+  assert len(aws_session.stop_calls) == 1
+  fake_runtime.refusal = None
+  fake_runtime.next_epoch = 901
+  placement = backend.start("17", IDENTITY, _desk())
+  assert placement.generation == 901
+
+
+@pytest.mark.parametrize("bad_record", [
+  {"epoch": "41", "holder": "holder", "expires_at": 1793370000.0, "state": "held"},
+  {"epoch": True, "holder": "holder", "expires_at": 1793370000.0, "state": "held"},
+  {"epoch": 41, "holder": "holder", "expires_at": float("inf"), "state": "held"},
+  {"epoch": 41, "holder": "holder", "expires_at": 1793370000.0, "state": "held", "extra": 1},
+])
+def test_lease_control_parses_writer_record_before_minting_or_placement(
+  backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
+  bad_record: dict[str, Any],
+) -> None:
+  from pydantic import ValidationError
+
+  fake_runtime.lease_override = bad_record
+  with pytest.raises(ValidationError):
+    backend.start("17", IDENTITY, _desk())
+  assert backend.store.get("17") is None
+  assert not (backend.placement_root / "17" / "bundle.json").exists()
+  assert len(aws_session.assume_calls) == 1
+  assert fake_runtime.credential_updates == []

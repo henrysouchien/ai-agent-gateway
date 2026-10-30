@@ -59,7 +59,6 @@ from .runner_background_tasks import (
 from .runner_cleanup import attach_cleanup_failure
 from .runner_run_loop_defaults import (
   MAX_NOTIFICATIONS_PER_TURN as _MAX_NOTIFICATIONS_PER_TURN,
-  MAX_TOKENS_CONTINUATIONS as _MAX_TOKENS_CONTINUATIONS,
   MAX_TOKENS_NUDGE as _MAX_TOKENS_NUDGE,
 )
 from .runner_session_lifecycle import _runner_attr
@@ -264,9 +263,7 @@ class _NoToolUseTurnOutcome(Protocol):
     stop_reason: str | None,
     pending_notification_count: int,
     max_tokens_continuations: int,
-    max_tokens_max_attempts: int,
     max_tokens_nudge: str,
-    unbounded_max_tokens_continuations: bool = False,
   ) -> NoToolUseTurnOutcome: ...
 
 
@@ -1200,7 +1197,6 @@ class RunnerRunLoopMixin:
     _containment: ContainmentSettings
     _coordinator: CoordinatorConfig | None
     _dispatcher: AgentRunnerDispatcher
-    _max_tokens_override: int | None
     _pending_workflow_output_attachments: dict[
       str,
       WorkflowOutputAttachment,
@@ -2691,7 +2687,6 @@ class RunnerRunLoopMixin:
     mark_terminal_interruption: Callable[[str], None],
     max_tokens_continuation_pending: bool,
     max_tokens_continuations: int,
-    max_tokens_continuations_limit: int,
     max_tokens_nudge: str,
     last_ordinary_turn: int | None,
     no_tool_use_turn_outcome: _NoToolUseTurnOutcome,
@@ -2740,11 +2735,7 @@ class RunnerRunLoopMixin:
       stop_reason=turn.stop_reason,
       pending_notification_count=0,
       max_tokens_continuations=max_tokens_continuations,
-      max_tokens_max_attempts=max_tokens_continuations_limit,
       max_tokens_nudge=max_tokens_nudge,
-      unbounded_max_tokens_continuations=(
-        is_child_logical_response
-      ),
     )
     max_tokens_continuations = no_tool_outcome.max_tokens_continuations
     if turn.stop_reason == "pause_turn":
@@ -2763,24 +2754,11 @@ class RunnerRunLoopMixin:
         max_tokens_continuation_pending = True
       else:
         logger.warning(
-          "[%s] Turn %d hit max_tokens with no usable tool call; continuing with truncation nudge (%d/%d)",
+          "[%s] Turn %d hit max_tokens with no usable tool call; continuing with truncation nudge (continuation %d)",
           self._sid,
           turn_count,
           max_tokens_continuations,
-          max_tokens_continuations_limit,
         )
-    elif no_tool_outcome.reason == "max_tokens_terminal":
-      logger.error(
-        "[%s] Turn %d hit max_tokens with no usable tool call after %d continuation attempts; ending run",
-        self._sid,
-        turn_count,
-        max_tokens_continuations_limit,
-      )
-      terminal_failure = (
-        "max_tokens_exhausted",
-        "provider_turn_error: provider exhausted the bounded "
-        "max_tokens continuation attempts before completing the turn.",
-      )
     if no_tool_outcome.runtime_guard is not None:
       guard, message = no_tool_outcome.runtime_guard
       self._append(build_runtime_guard_event(guard=guard, message=message))
@@ -3402,9 +3380,6 @@ class RunnerRunLoopMixin:
     no_tool_use_turn_outcome = _runner_attr(
       self, "_no_tool_use_turn_outcome", _no_tool_use_turn_outcome
     )
-    max_tokens_continuations_limit = _runner_attr(
-      self, "_MAX_TOKENS_CONTINUATIONS", _MAX_TOKENS_CONTINUATIONS
-    )
     max_tokens_nudge = _runner_attr(self, "_MAX_TOKENS_NUDGE", _MAX_TOKENS_NUDGE)
     execute_tool_use_loop = _runner_attr(self, "_execute_tool_use_loop", _execute_tool_use_loop)
     sub_agent_batch_error = _runner_attr(self, "_sub_agent_batch_error", _sub_agent_batch_error)
@@ -3541,17 +3516,9 @@ class RunnerRunLoopMixin:
 
       max_tokens_selection = select_run_max_tokens(
         config,
-        max_tokens_override=self._max_tokens_override,
         model_info=model_info,
       )
       max_tokens = max_tokens_selection.value
-      if max_tokens_selection.clamped:
-        logger.info(
-          "[%s] max_tokens %d clamped to model max_output_tokens %d",
-          self._sid,
-          max_tokens_selection.requested,
-          max_tokens_selection.model_max_output,
-        )
 
       base_kwargs: Dict[str, Any] = {
         "tools": cached_tools,
@@ -4214,7 +4181,6 @@ class RunnerRunLoopMixin:
           model_info = self._provider.get_model_info(upstream_model)
           max_tokens = select_run_max_tokens(
             config,
-            max_tokens_override=self._max_tokens_override,
             model_info=model_info,
           ).value
           effective_compaction_trigger = effective_compaction_trigger_fn(
@@ -4469,7 +4435,6 @@ class RunnerRunLoopMixin:
             mark_terminal_interruption=mark_terminal_interruption,
             max_tokens_continuation_pending=max_tokens_continuation_pending,
             max_tokens_continuations=max_tokens_continuations,
-            max_tokens_continuations_limit=max_tokens_continuations_limit,
             max_tokens_nudge=max_tokens_nudge,
             last_ordinary_turn=last_ordinary_turn,
             no_tool_use_turn_outcome=no_tool_use_turn_outcome,

@@ -714,6 +714,7 @@ def test_registered_predicate_uses_prepared_call_and_never_legacy_policy() -> No
     PreparedToolCall({"write": True}, "sandbox"),
   ) is True
   assert [call.prepared_input["write"] for call in predicate_calls] == [False, True]
+  assert [call.exact_backend for call in predicate_calls] == ["sandbox", "sandbox"]
   assert cache_calls[-1].exact_backend == "sandbox"
 
 

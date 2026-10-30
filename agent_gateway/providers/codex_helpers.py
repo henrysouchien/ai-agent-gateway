@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from ..tool_result_compaction import make_error_result
-from .base import ModelInfo, StreamEvent
+from .base import ModelInfo, StreamEvent, stream_error
 
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 JWT_CLAIM_PATH = "https://api.openai.com/auth"
@@ -520,7 +520,7 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
     code = str(event.get("code") or "")
     message = str(event.get("message") or "")
     detail = message or code or _json_dumps_compact(event)
-    raise RuntimeError(f"Codex error: {detail}")
+    raise stream_error(f"Codex error: {detail}", event.get("code"))
 
   if event_type == "response.failed":
     response = event.get("response") or {}
@@ -528,7 +528,7 @@ def _map_event(event: dict[str, Any], state: _ResponsesStreamState) -> list[Stre
       response = {}
     error = response.get("error") or {}
     message = str(error.get("message") or "")
-    raise RuntimeError(message or "Codex response failed")
+    raise stream_error(message or "Codex response failed", error.get("code"))
 
   if event_type in {"response.done", "response.completed"}:
     response = event.get("response") or {}

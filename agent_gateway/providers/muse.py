@@ -20,6 +20,7 @@ from .base import (
   ModelInfo,
   ModelProvider,
   StreamEvent,
+  stream_error,
   _classify_provider_credential_failure,
   _error_code_from_exception,
   _is_context_length_exception,
@@ -81,24 +82,13 @@ from .xai_helpers import (
 # https://dev.meta.ai/docs/error-handling
 DEFAULT_MUSE_BASE_URL = "https://api.meta.ai/v1"
 
+# Typed HTTP transport retry classification at provider entry (with 5xx in is_retryable_error);
+# 408/409 are transient request-timeout/conflict statuses, not usage-limit signals.
 _RETRYABLE_STATUSES = frozenset({408, 409})
 _REFUSAL_RE_TEXT = (
   "content_policy_violation",
   "content policy",
   "content-policy",
-)
-_USAGE_LIMIT_MARKERS = (
-  "rate_limit_exceeded",
-  "rate_limit_error",
-  "rate limit",
-  "rate-limit",
-  "ratelimit",
-  "too many requests",
-  "quota exhausted",
-  "quota exceeded",
-  "usage limit",
-  "usage quota",
-  "usage_limit",
 )
 
 
@@ -162,23 +152,32 @@ def _not_a_rate_limit(exc: Exception, status: int | None) -> bool:
   return status == 400 or _is_content_refusal(exc) or _is_context_length_exception(exc)
 
 
-def _only_usage_limit(exc: Exception, status: int | None) -> bool:
-  """True when the body is a rate/usage/quota exhaustion and nothing else."""
-  if status in {400, 401, 403} or _not_a_rate_limit(exc, status):
-    return False
+def _only_usage_limit(exc: Exception) -> bool:
+  """True when the typed error type/code is a rate/usage/quota exhaustion."""
   error = _error_object(exc)
-  kind = str(error.get("type") or "").strip().lower()
-  code = str(error.get("code") or "").strip().lower()
+  kind = error.get("type")
+  if kind is not None and not isinstance(kind, str):
+    raise TypeError("Muse error type must be a string")
+  kind = kind.strip().lower() if kind is not None else ""
+  if "code" in error:
+    code = error["code"]
+  else:
+    for attr in ("code", "error_code", "type"):
+      value = getattr(exc, attr, None)
+      if value is not None and not isinstance(value, str):
+        raise TypeError("Muse error code must be a string")
+      if value:
+        break
+    code = _error_code_from_exception(exc)
+  if code is not None and not isinstance(code, str):
+    raise TypeError("Muse error code must be a string")
+  code = code.strip().lower() if code is not None else ""
   if kind in {"invalid_request_error", "authentication_error", "billing_error", "server_error"}:
     return False
   if kind == "rate_limit_error" or code == "rate_limit_exceeded":
     return True
   usage_tokens = ("rate_limit", "ratelimit", "quota", "usage_limit", "usage_quota")
-  if any(token in kind for token in usage_tokens) or any(token in code for token in usage_tokens):
-    return True
-  if kind or code:
-    return False
-  return any(marker in _searchable(exc) for marker in _USAGE_LIMIT_MARKERS)
+  return any(token in kind for token in usage_tokens) or any(token in code for token in usage_tokens)
 
 
 def _retry_after_reset(exc: Exception) -> float | None:
@@ -257,10 +256,12 @@ def _map_muse_event(event: dict[str, Any], state: _ResponsesStreamState) -> list
   try:
     mapped = map_event(event, state)
   except RuntimeError as exc:
-    raise RuntimeError(_muse_stream_error(str(exc))) from exc
+    raise stream_error(_muse_stream_error(str(exc)), getattr(exc, "error_code", None)) from exc
   terminal = state.terminal_error
   if terminal is not None:
-    state.terminal_error = RuntimeError(_muse_stream_error(str(terminal)))
+    state.terminal_error = stream_error(
+      _muse_stream_error(str(terminal)), getattr(terminal, "error_code", None),
+    )
   return mapped
 
 
@@ -471,11 +472,9 @@ class MuseResponsesProvider(ModelProvider):
       return _credential_failure(exc, kind="auth", status=status)
     if status == 403:
       return _credential_failure(exc, kind="billing", status=status)
-    if _only_usage_limit(exc, status):
+    if _only_usage_limit(exc):
       return _credential_failure(exc, kind="rate_limit", status=status, reset_at=_retry_after_reset(exc))
-    if status != 429:
-      return _classify_provider_credential_failure(provider=self.name, exc=exc)
-    return None
+    return _classify_provider_credential_failure(provider=self.name, exc=exc)
 
   def next_credential(
     self,

@@ -29,6 +29,10 @@ MUSE_DEVICE_AUTH_URL = "https://auth.meta.com/oidc/device/authorization/"
 MUSE_DEVICE_TOKEN_URL = "https://auth.meta.com/oidc/device/token/"
 MUSE_KEY_URL = "https://api.meta.ai/muse-code/key"
 MUSE_API_VERSION = "1.0.0"
+MUSE_AUTH_STORE_PATH_ENV = "MUSE_AUTH_STORE_PATH"
+# Environment names that carry one person's Muse subscription store; a
+# non-owner placement must not inherit them.
+MUSE_PERSONAL_OAUTH_ENV_NAMES = frozenset({MUSE_AUTH_STORE_PATH_ENV})
 
 
 def resolve_muse_store_path(
@@ -39,7 +43,7 @@ def resolve_muse_store_path(
 ) -> Path:
   return resolve_provider_store_path(
     "muse", "credentials.json", config, environ=environ, user_scope=user_scope,
-    override_config_keys=("auth_store_path",), override_env_vars=("MUSE_AUTH_STORE_PATH",),
+    override_config_keys=("auth_store_path",), override_env_vars=(MUSE_AUTH_STORE_PATH_ENV,),
   )
 
 
@@ -51,7 +55,7 @@ def resolve_muse_store_paths(
 ) -> tuple[Path | None, Path]:
   return resolve_provider_store_paths(
     "muse", "credentials.json", config, environ=environ, user_scope=user_scope,
-    override_config_keys=("auth_store_path",), override_env_vars=("MUSE_AUTH_STORE_PATH",),
+    override_config_keys=("auth_store_path",), override_env_vars=(MUSE_AUTH_STORE_PATH_ENV,),
   )
 
 

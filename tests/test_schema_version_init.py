@@ -73,6 +73,8 @@ async def _resolve_credentials(
 
 def _materialize_service_credential(
   handle: CredentialHandle,
+  *,
+  user_scope: object = None,
 ) -> MaterializedCredential:
   assert handle is _SERVICE_HANDLE
   return MaterializedCredential(

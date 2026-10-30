@@ -6,9 +6,11 @@ This example enables the built-in `code_execute` tool.
 
 - Anthropic API access
 - `python3`
-- Docker if you want the preferred sandboxed backend
+- Docker only when explicitly configuring container placement
 
-The gateway prefers Docker when a usable Docker image is available and falls back to subprocess execution otherwise.
+This example uses the default local persistent Python kernel. Set
+`CodeExecutionConfig(placement="docker", ...)` to place that kernel in Docker;
+an unavailable configured backend returns an error rather than selecting another.
 
 ## Install
 
@@ -20,11 +22,6 @@ mkdir -p "$USER_DATA_DIR/gateway"
 chmod 700 "$USER_DATA_DIR" "$USER_DATA_DIR/gateway"
 ```
 
-Optional: override the Docker image the backend checks for.
-
-```bash
-export CODE_EXECUTE_DOCKER_IMAGE="ai-excel-addin-code-exec:latest"
-```
 
 ## Run
 
@@ -62,4 +59,4 @@ curl -N http://127.0.0.1:8000/api/chat \
 - `code_execution=True` adds built-in code execution tools.
 - Foreground runs stream `tool_output_chunk` events as stdout and stderr arrive.
 - Background runs return a `task_id`; the cell runs as a background job on the turn's task registry and its result is delivered like any background task result.
-- Docker is preferred for sandboxing; subprocess is the fallback for development environments.
+- Local and Docker placements share the persistent kernel; placement is explicit, not an availability fallback.

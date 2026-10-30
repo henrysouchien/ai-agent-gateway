@@ -556,7 +556,6 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     disallowed_tools: list[str] | None = None,
     mcp_server_configs: dict | None = None,
     allowed_tools: list[str] | None = None,
-    max_tokens_override: int | None = None,
     on_usage: Callable[..., Any] | None = None,
     on_session_summary: Callable[..., Any] | None = None,
     on_late_usage_event: Callable[..., Any] | None = None,
@@ -619,24 +618,16 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._credential_env = _agent_sdk_credential_env(
       capability_execution
     )
-    if max_tokens_override is not None and (
-      isinstance(max_tokens_override, bool)
-      or not isinstance(max_tokens_override, int)
-      or max_tokens_override <= 0
-    ):
-      raise ValueError("SDK max_tokens_override must be a positive integer")
     # Always set: ClaudeAgentOptions.env merges with the parent environment, so
     # an unset value would inherit the gateway's CLAUDE_CODE_MAX_OUTPUT_TOKENS.
     self._credential_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(
       select_run_max_tokens(
         dict(capability_execution.auth_config),
-        max_tokens_override=max_tokens_override,
         model_info=capability_execution.provider.get_model_info(
           capability_bind.upstream_model
         ),
       ).value
     )
-    self._max_tokens_override = max_tokens_override
     self._system_prompt = system_prompt
     self._disallowed_tools = list(disallowed_tools or sdk_config.disallowed_tools)
     mcp_config_metadata = mcp_server_configs

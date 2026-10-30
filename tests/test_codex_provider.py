@@ -19,6 +19,7 @@ from agent_gateway.providers import CodexProvider
 from model_authority.thinking import ThinkingLevel
 import agent_gateway.providers.codex_helpers as codex_helpers
 from agent_gateway.providers.codex import (
+  CodexCredentialExpired,
   _ResponsesStreamState,
   _convert_messages,
   _convert_tools,
@@ -914,3 +915,76 @@ def test_stream_without_diagnostics_leaves_the_fields_unset() -> None:
   start, _, end = events
   assert (start.provider_response_id, start.provider_request_id, start.rate_limit) == (None, None, None)
   assert (end.provider_response_id, end.service_tier) == (None, None)
+
+
+def test_error_event_carries_its_own_error_code() -> None:
+  with pytest.raises(RuntimeError, match="Codex error: limited") as caught:
+    _map_event(
+      {"type": "error", "code": "rate_limit_exceeded", "message": "limited"},
+      _ResponsesStreamState(),
+    )
+
+  assert getattr(caught.value, "error_code", None) == "rate_limit_exceeded"
+
+
+def test_response_failed_event_carries_its_own_error_code() -> None:
+  with pytest.raises(RuntimeError, match="^failed$") as caught:
+    _map_event(
+      {"type": "response.failed", "response": {"error": {"code": "server_error", "message": "failed"}}},
+      _ResponsesStreamState(),
+    )
+
+  assert getattr(caught.value, "error_code", None) == "server_error"
+
+
+def _stream_status(status: int, body: dict[str, Any] | str) -> Exception:
+  def handle_request(request: httpx.Request) -> httpx.Response:
+    if isinstance(body, str):
+      return httpx.Response(status, text=body, request=request)
+    return httpx.Response(status, json=body, request=request)
+
+  async def collect() -> None:
+    provider = CodexProvider()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle_request)) as client:
+      provider._client_state[client] = {
+        "token": _fake_jwt("acct_test"),
+        "account_id": "acct_test",
+        "endpoint_url": "https://codex.example/responses",
+        "init_headers": {},
+      }
+      async for _event in provider.stream(client, {"model": "gpt-6-astra"}):
+        pass
+
+  with pytest.raises(Exception) as caught:
+    asyncio.run(collect())
+  return caught.value
+
+
+def test_expired_authentication_token_is_a_typed_credential_error() -> None:
+  exc = _stream_status(401, {"error": {"message": "Provided authentication token is expired."}})
+
+  assert isinstance(exc, CodexCredentialExpired)
+  assert not isinstance(exc, httpx.HTTPStatusError)
+  assert exc.status_code == 401
+  provider = CodexProvider()
+  failure = provider.classify_credential_failure(exc)
+  assert failure is not None
+  assert failure.kind == "auth"
+  assert provider.is_retryable_error(exc) is False
+
+
+def test_expired_authentication_token_with_signin_suffix_is_typed() -> None:
+  exc = _stream_status(
+    401,
+    {"error": {"message": "Provided authentication token is expired. Please try signing in again."}},
+  )
+
+  assert isinstance(exc, CodexCredentialExpired)
+  assert not isinstance(exc, httpx.HTTPStatusError)
+  assert exc.status_code == 401
+
+def test_a_different_codex_401_stays_a_raw_http_status_error() -> None:
+  exc = _stream_status(401, {"error": {"message": "Incorrect API key provided"}})
+
+  assert isinstance(exc, httpx.HTTPStatusError)
+  assert not isinstance(exc, CodexCredentialExpired)

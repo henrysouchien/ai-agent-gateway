@@ -7,14 +7,24 @@ from fastapi import APIRouter, Request
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 
+from ..autonomous_claim_broker import frame_cap_metrics as claim_broker_frame_cap_metrics
+from ..autonomous_event_channel import frame_cap_metrics as event_channel_frame_cap_metrics
+from ..autonomous_frame_metrics import FrameCapSnapshot
+
 
 CONTROL_PLANE_VERSION = "1"
+
+
+class FrameCapsHealth(BaseModel):
+  claim_broker: FrameCapSnapshot
+  event_channel: FrameCapSnapshot
 
 
 class ControlHealthResponse(BaseModel):
   status: str
   version: str
   endpoints: list[str]
+  frame_caps: FrameCapsHealth
 
 
 def _control_route_entries(request: Request, route_prefix: str) -> list[str]:
@@ -71,9 +81,18 @@ def build_health_router(*, route_prefix: str) -> APIRouter:
       ),
       version=CONTROL_PLANE_VERSION,
       endpoints=_control_route_entries(request, route_prefix),
+      frame_caps=FrameCapsHealth(
+        claim_broker=claim_broker_frame_cap_metrics.snapshot(),
+        event_channel=event_channel_frame_cap_metrics.snapshot(),
+      ),
     )
 
   return router
 
 
-__all__ = ["CONTROL_PLANE_VERSION", "ControlHealthResponse", "build_health_router"]
+__all__ = [
+  "CONTROL_PLANE_VERSION",
+  "FrameCapsHealth",
+  "ControlHealthResponse",
+  "build_health_router",
+]

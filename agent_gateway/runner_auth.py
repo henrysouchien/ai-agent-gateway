@@ -22,8 +22,9 @@ def merge_refreshed_auth_config(
 ) -> Dict[str, Any]:
   """Rotate credential material; execution selection and bound values stay.
 
-  The execution bind owns model selection, provider and max_tokens. Auth mode
-  belongs to the serving credential: refreshed material replaces it when
+  The execution bind owns model selection and provider; the output-token
+  request is `select_run_max_tokens`'s, never a credential-refresh default.
+  Auth mode belongs to the serving credential: refreshed material replaces it when
   supplied, otherwise the current mode remains. Provider pool fields
   (project_id, account_identity, auth_store_path, credential_source,
   refresh_token, token_expires_at, credential_affinity_key,
@@ -41,9 +42,7 @@ def merge_refreshed_auth_config(
 
   provider = str(config.get("provider") or "").strip().lower()
 
-  bound_values: Dict[str, Any] = {
-    "max_tokens": int(config.get("max_tokens", 16000)),
-  }
+  bound_values: Dict[str, Any] = {}
   if provider:
     bound_values["provider"] = provider
   merged = {

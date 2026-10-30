@@ -33,7 +33,6 @@ from .text_paging import json_bounded_text_prefix
 
 
 AGENT_RESULT_CONTENT_CHUNK_MAX_BYTES = 24_000
-AGENT_RESULT_CONTENT_PAGE_MAX_BYTES = 32_000
 AGENT_RESULT_CONTENT_MAX_SEQUENCE = 9_007_199_254_740_991
 _CONTENT_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
@@ -498,15 +497,6 @@ def _page_result_content(
     "next_cursor": None if end else {"after_char": delivered_end},
     "end": end,
   }
-  if len(
-    json.dumps(
-      page,
-      ensure_ascii=False,
-      sort_keys=True,
-      separators=(",", ":"),
-    ).encode("utf-8")
-  ) > AGENT_RESULT_CONTENT_PAGE_MAX_BYTES:
-    raise ValueError("agent result content page exceeds its byte limit")
   return page
 
 
@@ -555,7 +545,6 @@ async def read_admitted_result_content(
 
 __all__ = [
   "AGENT_RESULT_CONTENT_CHUNK_MAX_BYTES",
-  "AGENT_RESULT_CONTENT_PAGE_MAX_BYTES",
   "AGENT_RESULT_CONTENT_MAX_SEQUENCE",
   "ResultContentUnavailable",
   "make_get_agent_result_content_handler",

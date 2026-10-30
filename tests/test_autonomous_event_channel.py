@@ -23,6 +23,7 @@ from agent_gateway.autonomous_event_channel import (
   AutonomousEventChannelBoundsError,
   AutonomousEventChannelChild,
   AutonomousEventChannelError,
+  AutonomousEventChannelFrameCapError,
   AutonomousEventChannelParent,
   AutonomousEventChannelProtocolError,
   AutonomousEventChannelStateError,
@@ -1152,16 +1153,23 @@ def test_parent_rejects_declared_oversize_frame_without_reading_body() -> None:
 def test_parent_enforces_line_bound(monkeypatch: pytest.MonkeyPatch) -> None:
   parent, raw_child = _raw_parent_pair()
   monkeypatch.setattr(channel, "AUTONOMOUS_EVENT_CHANNEL_MAX_LINE_BYTES", 32)
+  event_frame = _canonical_frame(_event(0, {
+    "type": "stream_complete",
+    "text": "x" * 64,
+  }))
   try:
     _send_raw_stream(raw_child, [
       _canonical_frame(_hello()),
-      _canonical_frame(_event(0, {
-        "type": "stream_complete",
-        "text": "x" * 64,
-      })),
+      event_frame,
     ])
-    with pytest.raises(AutonomousEventChannelBoundsError, match="line"):
+    with pytest.raises(AutonomousEventChannelFrameCapError) as exc_info:
       parent.receive(timeout_seconds=1)
+    finding = exc_info.value.finding
+    assert finding.channel == "event_channel"
+    assert finding.direction == "receive"
+    assert finding.size_basis == "declared"
+    assert finding.cap_bytes == channel.AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES
+    assert finding.frame_size_bytes == len(event_frame)
   finally:
     raw_child.close()
     parent.close()
@@ -1326,10 +1334,16 @@ def test_canonical_preflight_rejects_huge_scalar_before_json_dumps(
 
   monkeypatch.setattr(channel.json, "dumps", unexpected_dump)
   started = time.monotonic()
-  with pytest.raises(AutonomousEventChannelBoundsError, match="line"):
+  with pytest.raises(AutonomousEventChannelFrameCapError) as exc_info:
     snapshot_autonomous_event({"type": "text_delta", "value": value})
   assert time.monotonic() - started < 1.0
   assert dumps_called is False
+  finding = exc_info.value.finding
+  assert finding.channel == "event_channel"
+  assert finding.direction == "send"
+  assert finding.size_basis == "lower_bound"
+  assert finding.cap_bytes == channel.AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES
+  assert finding.frame_size_bytes > channel.AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES
 
 
 def test_public_event_snapshot_is_canonical_bounded_and_immutable() -> None:
@@ -1404,11 +1418,17 @@ def test_child_enforces_line_bound(monkeypatch: pytest.MonkeyPatch) -> None:
   try:
     pair.child.start(timeout_seconds=1)
     monkeypatch.setattr(channel, "AUTONOMOUS_EVENT_CHANNEL_MAX_LINE_BYTES", 32)
-    with pytest.raises(AutonomousEventChannelBoundsError, match="line"):
+    with pytest.raises(AutonomousEventChannelFrameCapError) as exc_info:
       pair.child.send_event(
         {"type": "text_delta", "text": "x" * 64},
         timeout_seconds=1,
       )
+    finding = exc_info.value.finding
+    assert finding.channel == "event_channel"
+    assert finding.direction == "send"
+    assert finding.size_basis == "lower_bound"
+    assert finding.cap_bytes == channel.AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES
+    assert finding.frame_size_bytes > 0
   finally:
     pair.close()
 

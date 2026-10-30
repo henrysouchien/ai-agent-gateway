@@ -50,7 +50,6 @@ __all__ = (
   "WARM_IDLE_SECONDS",
   "USAGE_FRESH_TTL_SECONDS",
   "USAGE_UNAVAILABLE_SECONDS",
-  "USAGE_RETRY_AFTER_CAP_SECONDS",
   "LAST_GOOD_MAX_AGE_SECONDS",
   "AFFINITY_PRUNE_SECONDS",
   "PROBE_BATCH_BUDGET_SECONDS",
@@ -110,10 +109,11 @@ SHORT_WINDOW_HEAT = 0.85
 WARM_IDLE_SECONDS = 3600.0
 USAGE_FRESH_TTL_SECONDS = 300.0
 USAGE_UNAVAILABLE_SECONDS = 3600.0
-USAGE_RETRY_AFTER_CAP_SECONDS = 3600.0
 LAST_GOOD_MAX_AGE_SECONDS = 86400.0
 AFFINITY_PRUNE_SECONDS = 30 * 86400.0
 PROBE_BATCH_BUDGET_SECONDS = 2.0
+# Bounds concurrent usage probes so a large credential pool cannot open an unbounded fan-out
+# against the Anthropic usage endpoint inside one batch.
 PROBE_MAX_CONCURRENCY = 4
 ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
@@ -132,8 +132,6 @@ _FIVE_HOUR = "five_hour"
 _SEVEN_DAY = "seven_day"
 _FIVE_HOUR_SECONDS = 5 * 3600.0
 _SEVEN_DAY_SECONDS = 7 * 86400.0
-_TRANSIENT_PROBE_SECONDS = 300.0
-_RETRY_AFTER_DEFAULT_SECONDS = 300.0
 _USAGE_JITTER = 0.25
 _ENDPOINT_ABSENT_STATUSES = frozenset({404, 405, 410, 501})
 # A reset value this small predates the decade, so it is a delay, not an instant
@@ -942,8 +940,16 @@ class ProbeResult:
   probe: UsageProbeState
 
 
-def _unavailable(moment: float, seconds: float, reason: str, generation: str | None) -> ProbeResult:
-  until = moment + seconds
+def _unavailable(
+  moment: float, seconds: float | None, reason: str, generation: str | None,
+) -> ProbeResult:
+  """A probe that returned no usage, scheduled only when the endpoint declared a wait.
+
+  Without a declared wait the next selection probes again: the reason is recorded
+  and the failure logged, and no hand-written interval stands in for the endpoint's.
+  """
+
+  until = None if seconds is None else moment + seconds
   return ProbeResult(
     windows=(),
     probe=UsageProbeState(
@@ -955,8 +961,8 @@ def _unavailable(moment: float, seconds: float, reason: str, generation: str | N
   )
 
 
-def _retry_after_seconds(value: str | None, *, moment: float) -> float:
-  """Retry-After capped at an hour; absent, invalid or non-positive means five minutes."""
+def _retry_after_seconds(value: str | None, *, moment: float) -> float | None:
+  """The wait a Retry-After value declares, verbatim; `None` when it declares none."""
 
   text = (value or "").strip()
   seconds = _finite(text)
@@ -966,8 +972,8 @@ def _retry_after_seconds(value: str | None, *, moment: float) -> float:
     except (TypeError, ValueError):
       seconds = None
   if seconds is None or seconds <= 0:
-    return _RETRY_AFTER_DEFAULT_SECONDS
-  return min(seconds, USAGE_RETRY_AFTER_CAP_SECONDS)
+    return None
+  return seconds
 
 
 def _looks_like_usage(payload: Any) -> TypeGuard[Mapping[str, Any]]:
@@ -989,7 +995,7 @@ async def _fetch_usage(client: httpx.AsyncClient, target: ProbeTarget, moment: f
     )
   except Exception as exc:
     LOGGER.warning("Anthropic usage probe for %s failed (%s)", target.locator.id, type(exc).__name__)
-    return _unavailable(moment, _TRANSIENT_PROBE_SECONDS, "network", generation)
+    return _unavailable(moment, None, "network", generation)
 
   status = response.status_code
   if status in (401, 403):
@@ -1001,13 +1007,13 @@ async def _fetch_usage(client: httpx.AsyncClient, target: ProbeTarget, moment: f
     return _unavailable(moment, USAGE_UNAVAILABLE_SECONDS, "route", generation)
   if status != 200:
     LOGGER.warning("Anthropic usage probe for %s returned HTTP %s", target.locator.id, status)
-    return _unavailable(moment, _TRANSIENT_PROBE_SECONDS, "network", generation)
+    return _unavailable(moment, None, "network", generation)
   try:
     payload = response.json()
   except ValueError:
     payload = None
   if not _looks_like_usage(payload):
-    return _unavailable(moment, _TRANSIENT_PROBE_SECONDS, "parse", generation)
+    return _unavailable(moment, None, "parse", generation)
   jitter = random.uniform(1.0 - _USAGE_JITTER, 1.0 + _USAGE_JITTER)
   return ProbeResult(
     windows=parse_usage_report(payload, now=moment),

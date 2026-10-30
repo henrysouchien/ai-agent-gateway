@@ -157,3 +157,97 @@ def test_emit_execution_audit_noops_without_request_store_or_emitter() -> None:
   asyncio.run(_run())
 
 
+def test_remote_execution_audit_omits_args_before_transport(monkeypatch: Any) -> None:
+  async def _run() -> None:
+    secret = "REMOTE-EXECUTION-CREDENTIAL-9f21d7"
+    boundary = SecretBoundary((secret,))
+    from agent_gateway.approval_remote import RemoteExecutionAuditEmitter
+    from agent_gateway.approval_remote_store import RuntimeExecutionAuditEmitter
+
+    calls: list[dict[str, Any]] = []
+
+    async def transport(self: Any, **kwargs: Any) -> None:
+      calls.append({
+        "args": dict(kwargs["raw_tool_args"]),
+        "error": kwargs["error_summary"],
+      })
+
+    monkeypatch.setattr(RemoteExecutionAuditEmitter, "emit_execution_outcome", transport)
+    client: Any = SimpleNamespace()
+    emitter = RuntimeExecutionAuditEmitter(client)
+    raw_args = {"api_key": secret, "path": "report.xlsx"}
+    await audit.emit_execution_audit(
+      SimpleNamespace(approval_id="approval-1", tool_name="write_file"),
+      raw_args,
+      approval_store=SimpleNamespace(audit_emitter=emitter),
+      outcome="tool_error",
+      error_summary=f"failed {secret}",
+      boundary_sanitizer=lambda value, sink: boundary.sanitize(value, sink=sink),
+    )
+    assert secret not in repr(calls)
+    assert calls[0]["args"] == {}
+    assert raw_args["api_key"] == secret
+
+  asyncio.run(_run())
+
+
+def test_local_execution_audit_leaves_redaction_with_emitter() -> None:
+  async def _run() -> None:
+
+    class LocalEmitter:
+      async def emit_execution_outcome(
+        self,
+        *,
+        request: Any,
+        raw_tool_args: dict[str, Any],
+        outcome: str,
+        error_summary: str | None,
+        boundary_sanitizer: Any,
+      ) -> None:
+        assert raw_tool_args == {"path": "report.xlsx"}
+        assert boundary_sanitizer is sanitizer
+
+    sanitizer = lambda value, sink: value
+    await audit.emit_execution_audit(
+      SimpleNamespace(approval_id="approval-1"),
+      {"path": "report.xlsx"},
+      approval_store=SimpleNamespace(audit_emitter=LocalEmitter()),
+      outcome="success",
+      boundary_sanitizer=sanitizer,
+    )
+
+  asyncio.run(_run())
+
+
+def test_remote_execution_audit_preserves_request_projection(monkeypatch: Any) -> None:
+  async def _run() -> None:
+    from agent_gateway.approval_remote import RemoteExecutionAuditEmitter
+    from agent_gateway.approval_remote_store import RuntimeExecutionAuditEmitter
+
+    request = SimpleNamespace(
+      approval_id="approval-1", tool_name="write_file",
+      args_hash="hmac-sha256-v1:original-key:original-digest",
+      tool_args_redacted={"private": "<original-redaction>"},
+    )
+    calls: list[Any] = []
+
+    async def transport(self: Any, **kwargs: Any) -> None:
+      assert kwargs["raw_tool_args"] == {}
+      calls.append(kwargs["request"])
+
+    monkeypatch.setattr(RemoteExecutionAuditEmitter, "emit_execution_outcome", transport)
+    client: Any = SimpleNamespace()
+    emitter = RuntimeExecutionAuditEmitter(client)
+
+    await audit.emit_execution_audit(
+      request,
+      {"private": "input"},
+      approval_store=SimpleNamespace(audit_emitter=emitter),
+      outcome="success",
+    )
+    assert calls == [request]
+    assert calls[0] is request
+    assert request.args_hash == "hmac-sha256-v1:original-key:original-digest"
+    assert request.tool_args_redacted == {"private": "<original-redaction>"}
+
+  asyncio.run(_run())

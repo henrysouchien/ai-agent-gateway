@@ -155,6 +155,8 @@ def build_env_telegram_approval_notification_sender(env: dict[str, str] | None =
 
     def _post() -> None:
       request = urllib.request.Request(url, data=data, method="POST")
+      # The urlopen timeout is the sole bound on this POST: the thread has no other
+      # cancellation, so a hung Telegram endpoint would otherwise hold it forever.
       with urllib.request.urlopen(request, timeout=10) as response:
         response.read()
 

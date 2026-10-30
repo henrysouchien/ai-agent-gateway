@@ -14,7 +14,7 @@ from model_authority.thinking import EffortResolution, ThinkingLevel
 # follows a full local prefill). It fires only on *no progress* — every
 # non-heartbeat provider event resets the clock — never on a turn's duration,
 # so it cannot cut valid work. The turn runner retries a stalled stream up to
-# STREAM_RETRY_MAX; direct stream consumers raise StreamStallError instead.
+# TRANSPORT_RETRY_POLICY.max_retries; direct stream consumers raise StreamStallError instead.
 # The soft budget cannot end a hung request, because its ladder counts completed
 # requests. Each turn's elapsed and last-progress seconds ride the `heartbeat`
 # event, every retry rides `stream_retry`, and the terminal error names attempts.

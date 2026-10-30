@@ -167,8 +167,8 @@ def test_foreign_named_entries_are_ignored_loudly_not_silently(
   assert any("Not_A_Skill" in message for message in messages)
 
 
-@pytest.mark.parametrize("ticker,resolved", [("0700", "0700"), ("PETR4", "PETR4"), ("TAEE11.SA", "TAEE11.SA")])
-def test_extended_tickers_accepted_verbatim(
+@pytest.mark.parametrize("ticker,resolved", [("0700", "0700"), ("PETR4", "PETR4")])
+def test_extended_tickers_resolve_to_canonical_contract_ticker(
   tmp_path: Path,
   monkeypatch: pytest.MonkeyPatch,
   ticker: str,
@@ -183,3 +183,20 @@ def test_extended_tickers_accepted_verbatim(
     artifact_id="2026-07-09T233509.044-run-a",
   )
   assert artifact.ticker == resolved
+
+
+@pytest.mark.parametrize("ticker", ["0700.HK.HK", "TAEE11.SA.SA"])
+def test_non_fixed_point_ticker_spellings_are_rejected(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  ticker: str,
+) -> None:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "data"))
+
+  with pytest.raises(ArtifactPathError):
+    artifact_json_path_for_request(
+      "alice",
+      ticker=ticker,
+      skill="sniff-test",
+      artifact_id="2026-07-09T233509.044-run-a",
+    )

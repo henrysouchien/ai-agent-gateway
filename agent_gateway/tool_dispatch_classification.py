@@ -23,7 +23,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-import random
 import re
 from typing import Any, Literal
 
@@ -99,6 +98,8 @@ _POLICY_ERROR_CODES = frozenset(
 )
 _POLICY_ERROR_CODE_PREFIXES = ("planned_write_",)
 
+# Untyped tool-transport text is classified here; retry_eligible below is the
+# containment owner that prevents write and approval replay.
 _RATE_LIMIT_TEXT_RE = re.compile(
   r"\b(?:429|too many requests|rate[ _-]?limit(?:ed|ing)?|overload(?:ed)?)\b",
   re.IGNORECASE,
@@ -457,29 +458,33 @@ def _materialize_source_value(value: Any) -> Any:
 # --------------------------------------------------------------------------
 
 
-DEFAULT_MAX_TOOL_RETRIES = 2
-_BACKOFF_BASE_SECONDS = 0.5
-_BACKOFF_MAX_SECONDS = 8.0
-
-
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
-  """Bounded, jittered retry at the dispatch site.
+  """The one transport retry setting: attempts after the first and the backoff.
 
-  This policy applies only to one registered tool dispatch. Whole autonomous
-  sessions are single-attempt because replay could repeat completed effects.
+  Tool dispatch retries (this module's ``retry_decision``) and the provider
+  stream retry loop (``runner_stream_turn``) both read ``TRANSPORT_RETRY_POLICY``;
+  neither carries a count or a delay of its own. Delay for the completed
+  1-based attempt ``n`` is ``base_delay_seconds * backoff_factor ** (n - 1)``.
+  Attempts are measured by the callers (``dispatch_retries_exhausted``,
+  ``stream_retry`` events). A provider's own retry (SDK ``max_retries``) is
+  zero, so this is the only retry writer. Whole autonomous sessions are
+  single-attempt because replay could repeat completed effects.
   """
 
-  max_retries: int = DEFAULT_MAX_TOOL_RETRIES
-  base_delay_seconds: float = _BACKOFF_BASE_SECONDS
-  max_delay_seconds: float = _BACKOFF_MAX_SECONDS
+  max_retries: int = 3
+  base_delay_seconds: float = 2.0
+  backoff_factor: float = 2.0
   # Retry never re-enters an approval round-trip.
   allow_when_approval_required: bool = False
 
 
-DEFAULT_TOOL_RETRY_POLICY = RetryPolicy()
+TRANSPORT_RETRY_POLICY = RetryPolicy()
 
 
+# Retry eligibility (here and in retry_decision) protects against replaying writes and
+# approval round-trips and classifies transport failures only; it does not park or retry
+# usage-limit exhaustion.
 def retry_eligible(entry: DispatchEntry | None) -> bool:
   """Reads retry by default; writes never, regardless of annotation."""
 
@@ -494,7 +499,7 @@ def retry_decision(
   entry: DispatchEntry | None,
   outcome: str,
   attempt: int,
-  policy: RetryPolicy = DEFAULT_TOOL_RETRY_POLICY,
+  policy: RetryPolicy = TRANSPORT_RETRY_POLICY,
   *,
   needs_approval: bool = False,
   aborted: bool = False,
@@ -520,25 +525,15 @@ def retry_decision(
 
 def retry_backoff_seconds(
   attempt: int,
-  policy: RetryPolicy = DEFAULT_TOOL_RETRY_POLICY,
-  *,
-  rng: random.Random | None = None,
+  policy: RetryPolicy = TRANSPORT_RETRY_POLICY,
 ) -> float:
-  """Jittered exponential backoff for the completed 1-based ``attempt``."""
+  """Exponential backoff for the completed 1-based ``attempt``."""
 
-  exponent = max(0, int(attempt) - 1)
-  ceiling = min(
-    policy.max_delay_seconds,
-    policy.base_delay_seconds * (2**exponent),
-  )
-  source = rng if rng is not None else random
-  return round(source.uniform(0.0, max(0.0, ceiling)), 4)
+  return policy.base_delay_seconds * (policy.backoff_factor ** (max(0, int(attempt) - 1)))
 
 
 __all__ = [
   "ALL_DISPATCH_OUTCOMES",
-  "DEFAULT_MAX_TOOL_RETRIES",
-  "DEFAULT_TOOL_RETRY_POLICY",
   "DispatchEntry",
   "DispatchOutcome",
   "OUTCOME_CANCELLED",
@@ -549,6 +544,7 @@ __all__ = [
   "OUTCOME_TRANSPORT",
   "RETRYABLE_OUTCOMES",
   "RetryPolicy",
+  "TRANSPORT_RETRY_POLICY",
   "ToolResultSettlement",
   "build_dispatch_record",
   "build_dispatch_record_for_outcome",

@@ -14,7 +14,7 @@ reads everything model-specific from the bound registry entry: limits and the
 parameter) through `model_info_from_entry()` in `base.py`, and prices through
 `authority_rate_table()`. No module here keeps a table keyed by model name; a new
 model or a changed request fact is an artifact change, not an adapter change.
-Mechanism: `docs/reference/model-authority.md` (monorepo root).
+Mechanism: [model authority](../../../../docs/reference/model-authority.md).
 
 Each adapter declares what it can execute in `adapter_route_support()` (adapter id,
 protocol profiles, routes). `installed_adapter_route_support()` in `__init__.py`
@@ -39,6 +39,7 @@ ahead of code), and selection skips it with `provider_unavailable`
 | `google_antigravity.py` | `GoogleAntigravityProvider` | Gemini over Cloud Code Assist (`daily-cloudcode-pa`), route `google.antigravity`; Bearer OAuth token plus `project_id` from the Antigravity login (Henry 2026-10-10) |
 | `copilot.py` | `CopilotResponsesProvider` | GitHub Copilot proxy over the Responses family, route `copilot.api` |
 | `muse.py` | `MuseResponsesProvider` | Meta Model API over the Responses family, route `muse.api` |
+| `kimi_code.py`, `kimi_code_oauth.py` | `KimiCodeProvider` | Kimi Code Chat Completions, route `kimi.code`; OAuth device-code or API-key credentials |
 | `ollama.py` | `OllamaLocalProvider` | Chat Completions against the local Ollama daemon, route `ollama.local`; `-cloud` tags reach Ollama's cloud through a signed-in daemon |
 | `ollama_cloud.py` | `OllamaCloudProvider` | Ollama Cloud API-key entry, Chat Completions on `https://ollama.com/v1`, route `ollama.cloud` |
 | `agent_sdk.py` | `AgentSDKConfig` | Claude Agent SDK runner configuration |
@@ -49,11 +50,36 @@ Hank) per provider family, not per route: a handle names the family, and
 `create_client` receives no route. So each provider family declares one route; a
 second route that needs other material is a second family with its own class. An
 adapter only reports `has_active_credential()`. Each adapter classifies its own
-failures (`classify_credential_failure`): a usage limit or HTTP 429 is `rate_limit`,
-a hard 401/403 denial is `auth` or `billing`, and a 400, content refusal or context
-overflow is neither, so the runner's fallback hop names the right reason.
+failures (`classify_credential_failure`) from the typed HTTP status and the
+`error_code` its producer attached (an in-band stream error carries its own code
+through `base.stream_error`; message prose is read only for billing wording, the
+context-length error and Anthropic's declared regain-access reset): a usage limit or
+HTTP 429 is `rate_limit`, a hard 401/403 denial is `auth` or `billing`, and a 400,
+content refusal or context overflow is neither, so the runner's fallback hop names
+the right reason.
 `agent_gateway.auth.AuthConfig` admits exactly the provider families these
 declarations name.
+
+## Isolated and local-process credential seeding
+
+A private org root (an isolated instance's `state/user-data`, or a fresh
+`LocalProcessRuntimeBackend` placement's `USER_DATA_DIR`) starts empty and is
+seeded from the edge's own store, not by hand. The source order is the shared
+pair's user-data store, then the operator's `~/.agent_gateway`; the first copy of
+each provider file wins and an existing target is never overwritten. Seeded files
+are mode `0600` and land at the org root (`<root>/<family>/...`), never under
+`users/<sid>/`, which holds only that user's own enrollments.
+
+Static entries are copied. Rotating refresh grants are not, because a refresh
+through either copy would invalidate the other. `anthropic_oauth.seed_non_rotating_org_store()`
+writes an Anthropic target only when none exists, from the source's entries that
+carry no `refresh_token` (no-refresh setup tokens and static credentials); refresh-bearing
+entries, the store's top-level `refresh_token` and the source's retirement maps
+(`retirements`, `retired_auth_token_grants`) are not copied. Kimi and xAI OAuth are
+used in place, through `KIMI_CODE_AUTH_STORE_PATH` and `XAI_AUTH_STORE_PATH`
+(unless the environment already sets them), with refresh serialized on each
+store's existing lock. AgentCore and microVM placements receive no shared org
+secrets. The operator-facing steps are in [local gateway deployment](../../../../docs/runbooks/local-gateway-deployment.md).
 
 ## Anthropic credential sources
 
@@ -93,15 +119,16 @@ store, its directory or its lock file) and runs no environment sync, so it
 registers and retires nothing. The caller supplies the authenticated user
 scope, authorizing lookup in that user's private store and the org store (only
 the org store without a user scope). A reference encodes no store path. Exact
-lookup only reads: an absent environment name reports `unobservable`, an empty
-source reports `removed`, and a changed source reports `superseded`. An
+lookup only reads: an absent environment name or present empty source reports
+`unobservable`, and a non-empty changed source reports `superseded`. An
 unwritable or unreadable store is the typed `AnthropicStoreError` (`code`
 `store_unreadable` with its own `next_call`), never a raw `OSError`.
-Environment-pool reconciliation alone (the pool resolve, not the exact lookup)
-retires observed empty or changed pool sources: each environment-pool token's
-source is keyed by its own material's digest (`env:<name>:<sha256>`), so two
-processes with different values for one name never retire each other's
-generation, while a name observed empty still retires that name's slot.
+Environment-pool reconciliation only enrolls observed sources; absent, partial
+and empty observations retire nothing. Each environment-pool token's source is
+keyed by its own material's digest (`env:<name>:<sha256>`), so two processes
+with different values for one name never retire each other's generation, and
+restoring a value restores its original generation. Explicit person removal
+stays `remove_anthropic_oauth_record`.
 Environment credentials remain org sources, not copies enrolled into each
 user's store.
 
@@ -126,10 +153,11 @@ request.
 session_id)` ranks private before org, keeps one hour of warm affinity (recorded
 on success by `record_anthropic_success`), then orders by reserve, the 85%
 short-window guard, measured before unknown, priority, and weekly then
-short-window drain. A refresh failure cools the account down and re-ranks; with
-every account blocked the earliest-reset one binds. `rotate_anthropic_credential_source(sources,
-*, current, until, model, scope, reason)` records a scoped cooldown for the
-current account and ranks the siblings, with no fallback.
+short-window drain. A refresh failure skips the account for that pass and
+re-ranks; with every account blocked the earliest-reset one binds.
+`rotate_anthropic_credential_source(sources, *, current, until, model, scope,
+reason)` records a scoped cooldown for the current account when `until` is the
+reset the limiter declared (none otherwise) and ranks the siblings, with no fallback.
 `anthropic_credential_blocked_until()` answers from the same ranker. There is
 no process-local pool state: cooldowns are these sidecar rows. Refresh keeps the
 store-wide `_store_lock` flock protocol used by published gateways, with a bounded
@@ -147,17 +175,22 @@ resolver-issued `credential_source` is an affinity hint and re-ranks the pool;
 an exact one is honoured. It probes stale subscription
 accounts (`probe_usage_batch`; direct `api.anthropic.com` only, 2 s and four
 concurrent requests; a 401/403 makes telemetry unavailable for an hour and never
-parks inference) and `stream` ingests `anthropic-ratelimit-unified-*` headers on
+parks inference; a 429 probe waits the `Retry-After` it sent, verbatim, and any
+other failed probe with no declared wait is probed again at the next selection)
+and `stream` ingests `anthropic-ratelimit-unified-*` headers on
 success and on a failure that carries a response.
 `AnthropicProvider.classify_credential_failure` parks a quota 429 for its scope
 (`limit_scope`, shared or a model family) until its reset; a concurrency 429 or
-a 529 backs off without parking; any other 403 keeps `billing`.
+a 529 backs off without parking; any other 403 keeps `billing`. A limit or
+denial that declared no reset rotates to the next sibling and parks nothing; a
+failed refresh skips that account for the selection in progress and the next
+selection retries it.
 
 Operators set policy with `python3 -m agent_gateway.cli auth policy anthropic
 --identity ACCOUNT [--user N|--store PATH] (--priority INT --reserve-pct FLOAT |
 --reset)` and read the cached view with `auth list anthropic --usage`. Mechanism
-and rules: `docs/reference/provider-authentication-and-token-methods.md`;
-design: `docs/design/anthropic-quota-aware-account-selection-spec.md`.
+and rules: [provider authentication and token methods](../../../../docs/reference/provider-authentication-and-token-methods.md);
+design: [Anthropic quota-aware account selection](../../../../docs/design/anthropic-quota-aware-account-selection-spec.md).
 
 ## Spend ledger metering
 

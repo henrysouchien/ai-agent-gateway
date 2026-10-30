@@ -289,7 +289,7 @@ class _NoCredentialProvider(ModelProvider):
     return self.available
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
 
 def _make_no_credential_runner(
@@ -344,7 +344,7 @@ class _CredentialProvider(ModelProvider):
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
 
   def estimate_cost(
     self,
@@ -397,7 +397,7 @@ class _ModelInfoFailureProvider(_CredentialProvider):
   def get_model_info(self, model: str) -> ModelInfo:
     self._model_info_calls += 1
     if self._model_info_calls <= 3:
-      return ModelInfo(id=model, provider=self.name)
+      return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name)
     raise RuntimeError(f"metadata rejected credential={self._secret}")
 
 
@@ -1165,7 +1165,6 @@ def test_runner_run_loop_method_is_inherited_from_mixin() -> None:
 
 def test_runner_still_reexports_run_loop_constants() -> None:
   assert gateway_runner._MAX_NOTIFICATIONS_PER_TURN == 5
-  assert gateway_runner._MAX_TOKENS_CONTINUATIONS == 3
 
 
 def test_native_context_surface_failure_log_is_value_free(caplog) -> None:
@@ -5274,51 +5273,6 @@ def test_named_child_terminal_failure_keeps_narrative_path(
   asyncio.run(_case())
 
 
-def test_max_tokens_exhaustion_cannot_commit_with_queued_notification() -> None:
-  async def _case() -> None:
-    runner = _make_credential_runner()
-    runner._notification_queue.push(
-      TaskNotification(
-        task_id="bg_max_tokens",
-        agent_name="reviewer",
-        event="completed",
-        summary="retained result",
-        timestamp=1.0,
-        payload={"kind": "report"},
-      )
-    )
-    stream_calls = 0
-
-    async def stream_turn(**_kwargs: Any):
-      nonlocal stream_calls
-      stream_calls += 1
-      return object(), StreamTurnResult(
-        full_text="partial",
-        stop_reason="max_tokens",
-        content_blocks=[{"type": "text", "text": "partial"}],
-      )
-
-    runner._stream_turn = stream_turn
-    await runner.run(
-      messages=[{"role": "user", "content": "finish"}],
-    )
-
-    events = [entry.event for entry in runner._log.entries]
-    assert stream_calls == 4
-    assert runner._notification_queue.pending_count == 1
-    assert any(
-      event.get("type") == "error"
-      and "max_tokens continuation attempts" in str(event.get("error"))
-      for event in events
-    )
-    assert not any(
-      event.get("type") == "stream_complete"
-      for event in events
-    )
-
-  asyncio.run(_case())
-
-
 def test_terminal_tool_cannot_commit_with_mid_batch_notification(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7486,7 +7440,6 @@ def _todo_no_tool_kwargs(state: Any, msgs: list[dict[str, Any]]) -> dict[str, An
     mark_terminal_interruption=lambda *a: None,
     max_tokens_continuation_pending=False,
     max_tokens_continuations=0,
-    max_tokens_continuations_limit=0,
     max_tokens_nudge="",
     last_ordinary_turn=None,
     no_tool_use_turn_outcome=no_tool_use_turn_outcome,

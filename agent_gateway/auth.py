@@ -413,7 +413,7 @@ class CredentialsTimeoutError(Exception):
   def __init__(self, message: str | None = None) -> None:
     super().__init__(
       message
-      or "Credential resolution timed out. Check the resolver latency or raise resolver_timeout_seconds."
+      or "Credential resolution timed out. Check the resolver latency."
     )
 
 

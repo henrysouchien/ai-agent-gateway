@@ -536,6 +536,7 @@ async def _resolve_parked_approval_decision(
   try:
     if (
       pending is not None
+      and pending.get("durable_approval") is not True
       and target_session is not None
       and target_session.approval_queues.get(request_record.tool_call_id) is not None
     ):

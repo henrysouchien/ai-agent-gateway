@@ -21,7 +21,7 @@ from agent_gateway.autonomous_event_channel import (
   adopt_inherited_autonomous_event_channel,
 )
 from agent_gateway.autonomous_launch_envelope import (
-  AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+  AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
@@ -68,6 +68,8 @@ _SERVICE_MATERIAL = MaterializedCredential(
 
 def _materialize_service_credential(
   handle: CredentialHandle,
+  *,
+  user_scope: object = None,
 ) -> MaterializedCredential:
   if handle is not _SERVICE_HANDLE:
     raise RuntimeError("unknown test credential handle")
@@ -213,7 +215,7 @@ def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
     _ = args
     process = _CompletedProcess(os.dup(kwargs["pass_fds"][0]))
     envelope = json.loads(
-      kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV]
+      Path(kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8")
     )
     process.start_event_channel(envelope["channel_id"])
     process.retain_inherited_fds(tuple(kwargs["pass_fds"][1:]))
@@ -247,7 +249,7 @@ def _make_app(monkeypatch, tmp_path: Path, events: list[dict[str, Any]]):
       autonomous_skill_admission_policy_resolver=lambda skill_name: (
         AutonomousSkillAdmissionPolicy(
           False,
-          SkillExecutionLimits(None),
+          SkillExecutionLimits(),
         )
       ),
       autonomous_capability_binding_resolver=_autonomous_capability_binding,

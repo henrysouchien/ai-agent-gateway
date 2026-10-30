@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Uni
 from .auth import ProviderCredentialFailure
 from .providers.anthropic import referenced_tool_names
 from .providers.anthropic_oauth import AnthropicSourceError
+from .providers.codex import CodexCredentialExpired
 from .capability_execution import CapabilityExecutionResolver, FallbackSkip, ModelFallbackHop
 from model_authority.binding import validate_reported_identity
 from .providers import ModelInfo
@@ -36,6 +37,7 @@ from .commercial_work_start import commercial_budget_stop_fields
 from .skill_context import current_skill
 from .spend_metering import ProviderCallMeter, SpendBudgetBlocked
 from .runner_state import StreamTurnFailure, StreamTurnResult, select_run_max_tokens
+from .tool_dispatch_classification import TRANSPORT_RETRY_POLICY, retry_backoff_seconds
 from .runner_streaming import (
   STREAM_STALL_TIMEOUT,
   STREAM_THINKING_STALL_TIMEOUT,
@@ -68,9 +70,6 @@ if TYPE_CHECKING:
 log = logging.getLogger("agent_gateway.runner")
 STREAM_GUARD_POLL_INTERVAL = 2.0
 STREAM_PROGRESS_LOG_INTERVAL = 60.0
-STREAM_RETRY_MAX = 3
-STREAM_RETRY_DELAY = 2.0
-STREAM_RETRY_BACKOFF = 2.0
 
 
 def _runner_module_attr(name: str, fallback: Any) -> Any:
@@ -90,10 +89,31 @@ def _format_error_with_rejection_detail(
   return f"{formatted_error} | {rejection_detail}"
 
 
+def credential_expired_terminal_error(
+  exc: BaseException,
+  *,
+  model_key: str,
+  label: str,
+) -> str | None:
+  """Caller-visible state when an expired Codex credential has no chain entry left."""
+
+  if not isinstance(exc, CodexCredentialExpired):
+    return None
+  key = model_key.strip()
+  shown = label.strip()
+  named = f"{shown} ({key})" if shown and shown != key else key
+  return (
+    "CodexCredentialExpired: "
+    f"{named} credential has expired: choose another model or re-authenticate"
+  )
+
+
+
 class RunnerStreamTurnMixin:
   _first_text_at: float | None = None
   # This runner's last fallback hop: the chain position the next hop walks
-  # on from. The next turn's runner starts on the primary with none.
+  # on from. Fresh runners start with none; the shared execution resolver
+  # carries still-failed positions into their initial selection.
   _model_fallback_hop: ModelFallbackHop | None = None
   _model_fallback_reason: Literal["usage_limit", "credential_denied", "provider_outage"] | None = None
 
@@ -114,7 +134,6 @@ class RunnerStreamTurnMixin:
     _last_request_wire_tools: list[dict[str, Any]]
     _last_request_advertised_tool_names: frozenset[str]
     _tool_prefix: RequestToolPrefix
-    _max_tokens_override: int | None
     _provider: ModelProvider
     _sid: str
     _stream_stall_timeout: float | None
@@ -260,9 +279,7 @@ class RunnerStreamTurnMixin:
     logger = _runner_attr(self, "log", log)
     cancelled_error_type = getattr(asyncio_module, "CancelledError", asyncio.CancelledError)
     first_completed = getattr(asyncio_module, "FIRST_COMPLETED", asyncio.FIRST_COMPLETED)
-    stream_retry_max = _runner_attr(self, "STREAM_RETRY_MAX", STREAM_RETRY_MAX)
-    stream_retry_delay = _runner_attr(self, "STREAM_RETRY_DELAY", STREAM_RETRY_DELAY)
-    stream_retry_backoff = _runner_attr(self, "STREAM_RETRY_BACKOFF", STREAM_RETRY_BACKOFF)
+    stream_retry_max = TRANSPORT_RETRY_POLICY.max_retries
     stream_guard_poll_interval = _runner_attr(self, "STREAM_GUARD_POLL_INTERVAL", STREAM_GUARD_POLL_INTERVAL)
     last_progress_at = time_module.monotonic()
     progress_events = 0
@@ -346,8 +363,8 @@ class RunnerStreamTurnMixin:
 
       The hop happens at this attempt boundary: the failed attempt's partial
       output is already discarded and completed tool effects stay in the
-      transcript, never replayed. Hop state is this runner's only; the next
-      turn's runner binds the primary again.
+      transcript, never replayed. The resolver remembers credential failures
+      for fresh runners in this authenticated selection scope.
       """
 
       nonlocal client, model_info, max_tokens, requested_effort, effort_resolution, _effective_stall_timeout
@@ -371,6 +388,14 @@ class RunnerStreamTurnMixin:
       if snapshot is None or context is None:
         return False
       primary = self._capability_execution
+      if primary.resolver is not None:
+        primary.resolver._record_model_fallback_failure(
+          primary, snapshot,
+          selection_provenance=context.selection_provenance,
+          previous=self._model_fallback_hop,
+          reason=reason,
+          reset_at=reset_at,
+        )
       skipped_reasons: list[FallbackSkip] = []
       hop = CapabilityExecutionResolver.rebind_model_fallback(
         primary, snapshot,
@@ -400,7 +425,6 @@ class RunnerStreamTurnMixin:
       model_info = self._provider.get_model_info(hop.execution.bind.upstream_model)
       max_tokens = select_run_max_tokens(
         config,
-        max_tokens_override=self._max_tokens_override,
         model_info=model_info,
       ).value
       requested_effort, effort_resolution, _effective_stall_timeout = _bound_request_facts()
@@ -849,9 +873,6 @@ class RunnerStreamTurnMixin:
         raise stream_error
       raise asyncio_module.CancelledError()
 
-    def _retry_delay(next_transient_retry: int) -> float:
-      return stream_retry_delay * (stream_retry_backoff ** (next_transient_retry - 1))
-
     async def _emit_stream_retry(
       attempt: int, attempt_start_mono: float, error: str, *, new_credential: bool = False,
     ) -> None:
@@ -860,7 +881,7 @@ class RunnerStreamTurnMixin:
         backoff_s: float | None = 0.0
         next_retry_delay = 0.0
       elif transient_retries < stream_retry_max:
-        backoff_s = _retry_delay(transient_retries + 1)
+        backoff_s = retry_backoff_seconds(transient_retries + 1, TRANSPORT_RETRY_POLICY)
         next_retry_delay = backoff_s
       else:
         backoff_s = None
@@ -1180,6 +1201,15 @@ class RunnerStreamTurnMixin:
             is_context_length=True,
           )
         if not self._provider.is_retryable_error(exc):
+          ref = _model_ref(self._capability_execution)
+          expired_error = credential_expired_terminal_error(
+            exc,
+            model_key=str(ref["model_key"]),
+            label=str(ref["label"]),
+          )
+          if expired_error is not None:
+            logged_exc = expired_error
+            event_error = expired_error
           logger.error(
             "[%s] Stream error on turn %d after %.1fs (non-retryable): %s",
             self._sid,

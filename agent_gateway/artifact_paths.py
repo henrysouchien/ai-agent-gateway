@@ -11,45 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
 
+from agent_workflow_contracts.ticker_contract import normalize_contract_ticker
 
 
-_EXCHANGE_SUFFIXES = (
-  ".TO",
-  ".HK",
-  ".AX",
-  ".PA",
-  ".DE",
-  ".SW",
-  ".AS",
-  ".SS",
-  ".SZ",
-  ".OL",
-  ".MI",
-  ".CO",
-  ".ST",
-  ".HE",
-  ".BR",
-  ".SA",
-  ".SI",
-  ".KS",
-  ".TW",
-  ".BO",
-  ".NS",
-  ".L",
-  ".T",
-)
-# Share-class suffixes are collapsed to a trailing letter (BRK.B / BRK-B -> BRKB).
-# Preferred lines (for example EFC-PC, PPL-PA) are intentionally left hyphenated
-# so they fail _TICKER_RE and cannot become common-equity artifact paths.
-_SHARE_CLASS_SUFFIXES = (".A", ".B", "-A", "-B")
-_TICKER_RE = re.compile(r"^[A-Z]{1,6}$")
-# Non-US listings carry digits and exchange-suffix dots (B3 "TAEE11", HK
-# "0700"). The writer side (api/research/artifact_paths.py) accepts them
-# verbatim under this same path-safe rule; the read/list side must mirror it or
-# persisted artifacts become unreadable (Lane H LH-12 reader symmetry).
-# Hyphens stay excluded so preferred lines (EFC-PC, PPL-PA) keep failing per
-# the non-common-equity policy above.
-_EXTENDED_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.]{0,14}$")
 # Component length cap (128 chars) is owned by the artifact-store and skill-catalog
 # contracts (api/agent/shared/canvas_artifact_store.py:19,
 # api/agent/shared/document_artifact_erase.py:25, api/agent/skills/catalog.py:737-738)
@@ -205,6 +169,53 @@ def reject_unsafe_path(path: str) -> None:
 def user_workspace_root(user_id: str) -> Path:
   normalized_user_id = _validate_user_id(user_id)
   return (user_data_dir() / "users" / normalized_user_id / "workspace").resolve()
+
+
+def user_issue_inbox_db_path(user_id: str) -> Path:
+  """Resolve durable issue intake within the authenticated user's workspace."""
+  root = user_workspace_root(user_id)
+  path = _resolve_under_workspace(root, "issue-inbox", _ISSUE_INBOX_DB_FILENAME)
+  path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+  return path
+
+
+def existing_user_issue_inbox_db_paths(
+  environ: Mapping[str, str] | None = None,
+) -> list[Path]:
+  """Enumerate per-user issue inboxes that already exist, ordered by user id.
+
+  Read-only counterpart of `user_issue_inbox_db_path` for operator drains: it
+  creates no directories and returns only stores a user's session has written.
+  An entry that is not a plain user-id directory or whose inbox file resolves
+  outside that user's workspace is logged and skipped, never followed.
+  """
+  users_root = user_data_dir(environ=environ) / "users"
+  try:
+    user_dirs = sorted(users_root.iterdir(), key=lambda child: child.name)
+  except FileNotFoundError:
+    return []
+  paths: list[Path] = []
+  for user_dir in user_dirs:
+    if not user_dir.is_dir():
+      continue
+    try:
+      _validate_user_id(user_dir.name)
+      workspace_root = (users_root / user_dir.name / "workspace").resolve()
+      path = _resolve_under_workspace(
+        workspace_root, "issue-inbox", _ISSUE_INBOX_DB_FILENAME,
+      )
+    except ArtifactPathError as exc:
+      log.warning("issue-inbox enumeration skipped user directory %r: %s", user_dir.name, exc)
+      continue
+    if path.is_file():
+      paths.append(path)
+  return paths
+
+
+def user_error_signals_cursor_path(user_id: str) -> Path:
+  """Resolve the user's independent error observation cursor."""
+  root = user_workspace_root(user_id)
+  return _resolve_under_workspace(root, ".error_signals_cursor.json")
 
 
 def user_data_dir(
@@ -440,19 +451,14 @@ def _validate_ticker(ticker: str) -> str:
 
 def normalize_ticker_for_artifact_request(ticker: str) -> str:
   decoded = _validate_path_component(ticker, "ticker")
-  normalized = _normalize_ticker(decoded)
-  if _TICKER_RE.match(normalized):
-    return normalized
-  raw = decoded.strip().upper()
-  if _EXTENDED_TICKER_RE.match(raw) and ".." not in raw and not raw.endswith("."):
-    return raw
-  raise ArtifactPathError("invalid ticker path component")
+  try:
+    return normalize_contract_ticker(decoded)
+  except ValueError as exc:
+    raise ArtifactPathError("invalid ticker path component") from exc
 
 
 def canonicalize_ticker(ticker: object) -> str:
   """Canonicalize and validate an explicit ticker without app imports."""
-  from agent_workflow_contracts.ticker_contract import normalize_contract_ticker
-
   return normalize_contract_ticker(ticker)
 
 
@@ -498,30 +504,13 @@ def _split_path_components(path: str) -> list[str]:
   return [component for component in decoded.split("/") if component]
 
 
-def _normalize_ticker(raw: str) -> str:
-  value = raw.strip().upper()
-  if value.endswith("."):
-    value = value[:-1]
-
-  for suffix in _EXCHANGE_SUFFIXES:
-    if value.endswith(suffix):
-      value = value[: -len(suffix)]
-      break
-
-  for suffix in _SHARE_CLASS_SUFFIXES:
-    if value.endswith(suffix) and len(value) > len(suffix):
-      value = value[: -len(suffix)] + suffix[-1]
-      break
-
-  return value
-
-
 __all__ = [
   "ArtifactPath",
   "ArtifactPathError",
   "artifact_json_paths_for_request",
   "artifact_json_path_for_request",
   "canonicalize_ticker",
+  "existing_user_issue_inbox_db_paths",
   "ISSUE_INBOX_DB_ENV",
   "letter_docx_path_for_request",
   "normalize_ticker_for_artifact_request",
@@ -529,5 +518,7 @@ __all__ = [
   "resolve_issue_inbox_db_path",
   "ticker_artifact_paths_for_request",
   "user_data_dir",
+  "user_error_signals_cursor_path",
+  "user_issue_inbox_db_path",
   "user_workspace_root",
 ]

@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 
 import asyncio
+import dataclasses
 import json
 import os
 import sqlite3
@@ -29,7 +30,7 @@ from agent_gateway.spend_metering import (
   SpendBudgetBlocked,
   spend_credential,
 )
-import agent_gateway.runner as gateway_runner
+import agent_gateway.runner_stream_turn as runner_stream_turn
 from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
 )
@@ -80,7 +81,7 @@ class _Provider(ModelProvider):
     return None
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name, supports_thinking=True)
+    return ModelInfo(max_output_tokens=16_384, id=model, provider=self.name, supports_thinking=True)
 
   def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
     return {}
@@ -414,7 +415,11 @@ def _runner(provider: ModelProvider, config: dict[str, Any] | None = None) -> tu
 
 
 def test_a_retried_runner_turn_writes_one_row_per_upstream_attempt(monkeypatch) -> None:
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0)
+  monkeypatch.setattr(
+    runner_stream_turn,
+    "TRANSPORT_RETRY_POLICY",
+    dataclasses.replace(runner_stream_turn.TRANSPORT_RETRY_POLICY, base_delay_seconds=0.0),
+  )
   provider = _Provider(_usage_then(RuntimeError("transient")), _ok_step("done"))
   runner, _ = _runner(provider)
 
@@ -431,7 +436,11 @@ def test_a_retried_runner_turn_writes_one_row_per_upstream_attempt(monkeypatch) 
 
 
 def test_a_runner_turn_refused_by_a_freeze_never_starts_the_provider_call_or_retries(monkeypatch) -> None:
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0)
+  monkeypatch.setattr(
+    runner_stream_turn,
+    "TRANSPORT_RETRY_POLICY",
+    dataclasses.replace(runner_stream_turn.TRANSPORT_RETRY_POLICY, base_delay_seconds=0.0),
+  )
   _freeze_payg()
   provider = _Provider(_ok_step())
   runner, _ = _runner(provider)

@@ -44,6 +44,8 @@ _SERVICE_MATERIAL = MaterializedCredential(
 
 def _materialize_service_credential(
   handle: CredentialHandle,
+  *,
+  user_scope: object = None,
 ) -> MaterializedCredential:
   if handle is not _SERVICE_HANDLE:
     raise RuntimeError("unknown test credential handle")

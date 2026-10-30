@@ -553,7 +553,7 @@ def test_run_agent_spawn_uses_current_rotated_parent_credential(
       pass
 
     def get_model_info(self, model: str) -> ModelInfo:
-      return ModelInfo(id=model, provider=self.name, supports_thinking=True)
+      return ModelInfo(id=model, provider=self.name, supports_thinking=True, max_output_tokens=16_384)
 
     def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
       return kwargs
@@ -870,7 +870,6 @@ def _catalog_runtime(
       mcp_tools_by_server=mcp_tools,
       runtime_server_refs=frozenset(mcp_tools),
       session_inject_servers=session_inject_servers,
-      max_tokens=2_222,
       effort=effort,
     ),
   )
@@ -1223,7 +1222,7 @@ def test_injected_catalog_admission_consumes_snapshot_and_policy_directly() -> N
   spawn = runner.spawn_calls[0]
   assert spawn["capability_execution"].bind.effort == "low"
   assert "max_turns" not in spawn
-  assert spawn["max_tokens"] == 2_222
+  assert "max_tokens" not in spawn
   assert "max_budget_usd" not in spawn
   assert TaskResult.model_validate(result).logical_task.operation == (
     resolved.snapshot.operation
@@ -3269,11 +3268,7 @@ class _UnpublishableForegroundRunner(_Runner):
     self._workspace_dir = tmp_path
 
   async def _append_durable_event(self, event: dict[str, Any]) -> object:
-    if event.get("type") in {
-      "task_registered",
-      "task_completed",
-      "agent_completion",
-    }:
+    if event.get("type") == "agent_completion":
       raise ParentResultMaterializationError("forced publication failure")
     self.durable_events.append(dict(event))
     return object()
@@ -4166,7 +4161,7 @@ class _KernelChildProvider(ModelProvider):
     pass
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(id=model, provider=self.name, max_output_tokens=16_384)
 
   def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
     return kwargs
@@ -4779,6 +4774,277 @@ def _narrative_registry_runner(tmp_path: Path) -> _RegistryRunner:
 
   runner.spawn_sub_agent = _spawn_with_narrative
   return runner
+
+
+class _DurableRegistryForegroundRunner(_RegistryRunner):
+  def __init__(self, tmp_path: Path) -> None:
+    super().__init__(tmp_path)
+    self.session_log = AgentSessionLog(tmp_path / "foreground-session.jsonl")
+    self._agent_session_log = self.session_log
+
+  async def _append_durable_event(self, event: dict[str, Any]) -> object:
+    entry = await self.session_log.append(event)
+    self.durable_events.append(dict(event))
+    return entry
+
+
+async def _assert_foreground_terminal_restore(
+  runner: _DurableRegistryForegroundRunner,
+  *,
+  expected_status: str,
+  expected_state: TaskState,
+) -> TaskResult:
+  # Reopen the journal and use the real restore owner, not the live claim or
+  # a hand-built registration/completion pair.
+  reopened = AgentSessionLog(runner.session_log.path)
+  entries, _ = await reopened.query(
+    event_types={"task_registered", "task_completed", "agent_completion"},
+    order="asc",
+  )
+  events = [entry.event for entry in entries]
+  assert [event["type"] for event in events] == [
+    "task_registered", "task_completed",
+  ]
+  registration, completion = events
+  assert completion["task_id"] == registration["task_id"]
+  canonical = TaskResult.model_validate(completion["result"])
+  assert canonical.execution.status == expected_status
+  assert canonical.attempt.physical_task_id == registration["task_id"]
+  restored = TaskRegistry()
+  restored.load_from_events(events)
+  tasks = restored.list_tasks()
+  assert len(tasks) == 1
+  task = tasks[0]
+  assert task.task_id == registration["task_id"]
+  assert task.reconstructed_from_log
+  assert task.state == expected_state
+  assert task.state != TaskState.PARKED
+  assert TaskResult.model_validate(task.result) == canonical
+  return canonical
+
+
+@pytest.mark.parametrize("boundary", ["cancelled", "runtime_error", "invalid_result"])
+def test_foreground_dispatch_failure_restores_terminal_not_parked(
+  tmp_path: Path,
+  boundary: str,
+) -> None:
+  runner = _DurableRegistryForegroundRunner(tmp_path)
+  entered = asyncio.Event()
+  wait = asyncio.Event()
+
+  try:
+    TaskResult.model_validate({})
+  except ValidationError as invalid:
+    class InvalidTaskResult(TaskResult):
+      def __getattribute__(self, name: str, invalid=invalid) -> object:
+        if name == "execution":
+          raise invalid
+        return super().__getattribute__(name)
+  else:
+    raise AssertionError("expected TaskResult validation to fail")
+
+  async def fail_dispatch(task: str, **kwargs: Any) -> tuple[TaskResult, None]:
+    runner.spawn_calls.append({"task": task, **kwargs})
+    # The registration must already exist while dispatch is still suspended.
+    entries, _ = await runner.session_log.query(
+      event_types={"task_registered"}, order="asc",
+    )
+    assert len(entries) == 1
+    assert entries[0].event["task_id"] == kwargs["attempt"].physical_task_id
+    entered.set()
+    if boundary == "cancelled":
+      await wait.wait()
+    if boundary == "runtime_error":
+      raise RuntimeError("final narrative publication failed")
+    return InvalidTaskResult.model_construct(), None
+
+  runner.spawn_sub_agent = fail_dispatch
+  handler = _handler(runner, loader=SkillLoader(tmp_path / "skills"))
+
+  async def exercise() -> None:
+    caller = asyncio.create_task(handler({
+      "objective": "Return the complete evidence report.",
+      "background": False,
+    }))
+    if boundary == "cancelled":
+      await entered.wait()
+      caller.cancel()
+      with pytest.raises(asyncio.CancelledError):
+        await caller
+    elif boundary == "runtime_error":
+      with pytest.raises(RuntimeError, match="final narrative publication failed"):
+        await caller
+    else:
+      with pytest.raises(ValidationError):
+        await caller
+    canonical = await _assert_foreground_terminal_restore(
+      runner,
+      expected_status="cancelled" if boundary == "cancelled" else "failed",
+      expected_state=TaskState.KILLED if boundary == "cancelled" else TaskState.FAILED,
+    )
+    if boundary == "cancelled":
+      assert canonical.execution.terminal_reason == "cancelled"
+
+  asyncio.run(exercise())
+
+
+def test_foreground_returned_error_restores_terminal_not_parked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+  runner = _DurableRegistryForegroundRunner(tmp_path)
+
+  async def fail_dispatch(task: str, **kwargs: Any) -> tuple[None, dict[str, str]]:
+    runner.spawn_calls.append({"task": task, **kwargs})
+    entries, _ = await runner.session_log.query(
+      event_types={"task_registered"}, order="asc",
+    )
+    assert len(entries) == 1
+    assert entries[0].event["task_id"] == kwargs["attempt"].physical_task_id
+    return None, {"code": "child_execution_failed", "message": "Child execution failed."}
+
+  monkeypatch.setattr(runner, "spawn_sub_agent", fail_dispatch)
+  handler = _handler(runner, loader=SkillLoader(tmp_path / "skills"))
+
+  async def exercise() -> None:
+    result, error = await handler({
+      "objective": "Return the complete evidence report.",
+      "background": False,
+    })
+    assert result is None
+    assert error is not None
+    assert error["code"] == "child_execution_failed"
+    await _assert_foreground_terminal_restore(
+      runner, expected_status="failed", expected_state=TaskState.FAILED,
+    )
+
+  asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failed_event", ["skill_run_started", "skill_result_captured"])
+def test_foreground_lifecycle_persistence_error_restores_actual_terminal_result(
+  tmp_path: Path,
+  failed_event: str,
+) -> None:
+  loader = _write_operation(tmp_path / "skills", execution_class="node.implement")
+  runner = _DurableRegistryForegroundRunner(tmp_path)
+  append = runner._append_durable_event
+  successful_results: list[TaskResult] = []
+  spawn = runner.spawn_sub_agent
+
+  async def fail_lifecycle(event: dict[str, Any]) -> object:
+    if event["type"] == failed_event:
+      raise OSError("required lifecycle journal unavailable")
+    return await append(event)
+
+  async def record_result(task: str, **kwargs: Any):
+    result, error = await spawn(task, **kwargs)
+    successful_results.append(result)
+    return result, error
+
+  runner._append_durable_event = fail_lifecycle
+  runner.spawn_sub_agent = record_result
+
+  async def exercise() -> None:
+    with pytest.raises(OSError, match="required lifecycle journal unavailable"):
+      await _handler(runner, loader=loader)({
+        "operation": _operation(loader),
+        "objective": "Review the filing evidence.",
+        "background": False,
+      })
+    completed_child = failed_event == "skill_result_captured"
+    canonical = await _assert_foreground_terminal_restore(
+      runner,
+      expected_status="succeeded" if completed_child else "failed",
+      expected_state=TaskState.COMPLETED if completed_child else TaskState.FAILED,
+    )
+    if completed_child:
+      assert canonical == successful_results[0]
+    else:
+      assert runner.spawn_calls == []
+
+  asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("execution_status", ["succeeded", "failed", "cancelled"])
+@pytest.mark.parametrize("failure_boundary", ["publisher", "journal_append"])
+def test_foreground_envelope_exception_restores_actual_canonical_status_once(
+  tmp_path: Path,
+  execution_status: str,
+  failure_boundary: str,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import agent_gateway.sub_agent as sub_agent_mod
+
+  runner = _DurableRegistryForegroundRunner(tmp_path)
+  canonical_results: list[TaskResult] = []
+
+  async def spawn_result(task: str, **kwargs: Any):
+    call = {"task": task, **kwargs}
+    runner.spawn_calls.append(call)
+    if execution_status == "succeeded":
+      reference = publish_final_narrative(
+        workspace_dir=tmp_path,
+        sub_agent_id=kwargs["attempt"].physical_task_id,
+        terminal_event_seq=1,
+        text="Canonical completed child narrative.",
+      )
+      canonical = _spawn_result(call).model_copy(update={
+        "values": TaskResultValues(
+          terminal_narrative=terminal_narrative_content_handle(reference),
+        ),
+      })
+    else:
+      canonical = task_result_from_execution(
+        [{"type": "interrupted", "reason": "soft_budget_abort"}]
+        if execution_status == "failed" else [],
+        logical_task=kwargs["logical_task"],
+        attempt=kwargs["attempt"],
+        requirement=kwargs["result_requirement"],
+        provenance=kwargs["result_provenance"],
+        final_narrative=None,
+        stalled=False,
+        external_terminal_signals=("cancelled",)
+        if execution_status == "cancelled" else (),
+      )
+    canonical_results.append(canonical)
+    return canonical, None
+
+  async def fail_envelope(**_kwargs: Any):
+    raise OSError("completion envelope publication unavailable")
+
+  runner.spawn_sub_agent = spawn_result
+  if failure_boundary == "publisher":
+    monkeypatch.setattr(sub_agent_mod, "_publish_foreground_completion", fail_envelope)
+  else:
+    append = runner._append_durable_event
+
+    async def fail_envelope_append(event: dict[str, Any]) -> object:
+      if event["type"] == "agent_completion":
+        raise OSError("completion envelope journal unavailable")
+      return await append(event)
+
+    runner._append_durable_event = fail_envelope_append
+
+  async def exercise() -> None:
+    result, error = await _handler(
+      runner, loader=SkillLoader(tmp_path / "skills"),
+    )({
+      "objective": "Return the complete evidence report.",
+      "background": False,
+    })
+    assert result is None
+    assert error is not None
+    assert error["code"] == "agent_completion_materialization_failed"
+    canonical = await _assert_foreground_terminal_restore(
+      runner,
+      expected_status=execution_status,
+      expected_state={
+        "succeeded": TaskState.COMPLETED,
+        "failed": TaskState.FAILED,
+        "cancelled": TaskState.KILLED,
+      }[execution_status],
+    )
+    assert canonical == canonical_results[0]
+
+  asyncio.run(exercise())
 
 
 def test_identical_run_agent_returns_prior_completion_without_respawn(

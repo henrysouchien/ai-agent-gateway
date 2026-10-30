@@ -109,7 +109,11 @@ def _make_app():
       model_entitled_keys=frozenset(INITIAL_MODEL_REGISTRY.models),
     )
 
-  def _materialize(handle: CredentialHandle) -> MaterializedCredential:
+  def _materialize(
+    handle: CredentialHandle,
+    *,
+    user_scope: object = None,
+  ) -> MaterializedCredential:
     return MaterializedCredential(
       handle=handle,
       auth_config={

@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 
 from .auth import (
   ChannelMismatchError,
-  CredentialsTimeoutError,
   CrossUserReuseError,
   MissingUserIdError,
 )
@@ -180,7 +179,7 @@ def _generic_skill_admission_policy_resolver(
         bool(profile.resumable)
         and profile.mutation_mode != "model_writer"
       ),
-      execution_limits=SkillExecutionLimits(max_tokens=profile.max_tokens),
+      execution_limits=SkillExecutionLimits(),
     )
 
   return resolve
@@ -318,11 +317,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   build_chat_runtime = config.build_chat_runtime
   if build_chat_runtime is None:
     raise ValueError("GatewayServerConfig.build_chat_runtime is required")
-  if (
-    config.session_execution_policy_resolver is not None
-    and not callable(config.session_execution_policy_resolver)
-  ):
-    raise TypeError("session_execution_policy_resolver must be callable")
   if (
     config.selected_content_admitter is not None
     and not callable(config.selected_content_admitter)
@@ -510,7 +504,10 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         transcript_retention_days=config.transcript_retention_days,
       )
     )
-    approval_maintenance_task = asyncio.create_task(maintain_pending_loop(app.state.gateway_approval_store))
+    approval_maintenance_task = (
+      None if app.state.gateway_approval_remote
+      else asyncio.create_task(maintain_pending_loop(app.state.gateway_approval_store))
+    )
     retention_task: asyncio.Task[Any] | None = None
 
     async def _retention_loop() -> None:
@@ -599,7 +596,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
 
       maintenance_tasks = [
         cleanup_task,
-        approval_maintenance_task,
+        *([approval_maintenance_task] if approval_maintenance_task is not None else []),
         *([retention_task] if retention_task is not None else []),
       ]
       for maintenance_task in maintenance_tasks:
@@ -804,11 +801,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   )
   setattr(
     _build_chat_runtime_for_dispatch,
-    "_gateway_session_execution_policy_resolver",
-    config.session_execution_policy_resolver,
-  )
-  setattr(
-    _build_chat_runtime_for_dispatch,
     "_gateway_service_provider_handles",
     dict(config.service_provider_handles),
   )
@@ -839,7 +831,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     "_gateway_selected_content_admitter",
     config.selected_content_admitter,
   )
-  setattr(_build_chat_runtime_for_dispatch, "_gateway_resolver_timeout_seconds", config.resolver_timeout_seconds)
   app.state.gateway_build_chat_runtime = _build_chat_runtime_for_dispatch
   app.state.user_event_bus = UserEventBus()
   app.state.root_continue_hook = config.root_continue_hook
@@ -1022,20 +1013,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     )
     if resolver is not None:
       try:
-        result = await asyncio.wait_for(
-          resolver(payload.api_key, payload),
-          timeout=config.resolver_timeout_seconds,
-        )
-      except asyncio.TimeoutError:
-        status, error_payload = _error_payload(
-          CredentialsTimeoutError(
-            f"Credential resolution for user '{resolved_user_id or 'unresolved'}' timed out after "
-            f"{config.resolver_timeout_seconds:.1f}s. Check the resolver latency or raise resolver_timeout_seconds."
-          ),
-          user_id=resolved_user_id,
-          timeout_seconds=config.resolver_timeout_seconds,
-        )
-        return JSONResponse(error_payload, status_code=status)
+        result = await resolver(payload.api_key, payload)
       except Exception as exc:
         status, error_payload = _error_payload(exc, user_id=resolved_user_id)
         return JSONResponse(error_payload, status_code=status)
@@ -1955,7 +1933,6 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     create_control_plane_router(
       auth=auth,
       credentials_resolver=config.credentials_resolver,
-      resolver_timeout_seconds=config.resolver_timeout_seconds,
       tenant_id=config.tenant_id,
       allow_service_credentials_for_interactive=(
         config.allow_service_credentials_for_interactive

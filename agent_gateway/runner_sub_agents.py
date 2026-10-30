@@ -289,7 +289,6 @@ class RunnerSubAgentMixin:
     _full_session_id: str
     _log: EventLog
     _containment: ContainmentSettings
-    _max_resume_chain_depth: int
     _mcp_activation_fold: McpActivationFold
     _mcp_client: McpClientManager | None
     _on_late_usage_event: (
@@ -334,7 +333,6 @@ class RunnerSubAgentMixin:
     dispatcher: ToolDispatcher,
     sub_session: Any | None = None,
     excluded_tools: Set[str] | None = None,
-    max_tokens: int = 64000,
     call_index: int = 0,
     parent_turn_id: str | None = None,
     task_entry: TaskEntry | None = None,
@@ -435,7 +433,6 @@ class RunnerSubAgentMixin:
         else None
       ),
       capability_execution=capability_execution,
-      max_tokens_override=max_tokens,
       stream_stall_timeout=self._stream_stall_timeout,
       mcp_client=self._mcp_client,
       mcp_activation_fold=self._mcp_activation_fold,
@@ -468,7 +465,6 @@ class RunnerSubAgentMixin:
       result_requirement=result_requirement,
       agent_session_log=self._agent_session_log,
       message_inbox=task_entry.message_inbox if task_entry else None,
-      max_resume_chain_depth=self._max_resume_chain_depth,
       emit_session_recap=False,
       code_execution_spill_dir_provider=child_spill_sink,
       commercial_usage_producer=getattr(self, "_commercial_usage_producer", None),
@@ -638,7 +634,6 @@ class RunnerSubAgentMixin:
     dispatcher: ToolDispatcher,
     sub_session: Any | None = None,
     excluded_tools: Set[str] | None = None,
-    max_tokens: int = 64000,
     call_index: int = 0,
     parent_turn_id: str | None = None,
     task_entry: TaskEntry | None = None,
@@ -758,7 +753,6 @@ class RunnerSubAgentMixin:
         else None
       ),
       capability_execution=capability_execution,
-      max_tokens_override=max_tokens,
       stream_stall_timeout=self._stream_stall_timeout,
       mcp_client=self._mcp_client,
       mcp_activation_fold=self._mcp_activation_fold,
@@ -794,7 +788,6 @@ class RunnerSubAgentMixin:
       result_requirement=result_requirement,
       agent_session_log=self._agent_session_log,
       message_inbox=task_entry.message_inbox if task_entry else None,
-      max_resume_chain_depth=self._max_resume_chain_depth,
       emit_session_recap=False,
       code_execution_spill_dir_provider=child_spill_sink,
       commercial_usage_producer=getattr(self, "_commercial_usage_producer", None),
@@ -1094,6 +1087,10 @@ async def _close_sub_runner(
   str | None,
   list[str],
 ]:
+  # Resource containment, not a request budget: a hung child's client teardown
+  # must end so the parent's own teardown proceeds. It refuses nothing; a
+  # teardown that fails or is cancelled is recorded below as a run_error with
+  # phase "force_close" and a cleanup warning.
   try:
     await sub_runner.force_close(timeout=2.0)
   except asyncio.CancelledError as exc:

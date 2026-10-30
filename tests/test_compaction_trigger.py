@@ -129,7 +129,7 @@ def test_context_pressure_decision_uses_exact_integer_boundary_math() -> None:
 
 
 def _model(context_window: int) -> ModelInfo:
-  return ModelInfo(id="m", provider="anthropic", context_window=context_window)
+  return ModelInfo(id="m", provider="anthropic", context_window=context_window, max_output_tokens=16_384)
 
 
 def test_disabled_trigger_stays_none() -> None:

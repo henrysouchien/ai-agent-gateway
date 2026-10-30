@@ -241,7 +241,6 @@ def create_agent(
   auth_token: str | None = None,
   user_scope: Any = None,
   rates_file: Path | None = None,
-  max_tokens: int = 16_000,
   mcp_servers: dict[str, dict[str, Any]] | None = None,
   mcp_config_path: str | Path | None = None,
   mcp_timeout_overrides: dict[str, int] | None = None,
@@ -272,7 +271,6 @@ def create_agent(
   on_startup: Callable[..., Any] | None = None,
   on_shutdown: Callable[..., Any] | None = None,
   credentials_resolver: CredentialsResolver | None = None,
-  resolver_timeout_seconds: float = 5.0,
   usage_ledger: UsageLedger | None = None,
   usage_ledger_dlq_path: Path | None = None,
   coordinator: CoordinatorConfig | None = None,
@@ -324,7 +322,6 @@ def create_agent(
       Omitted, the bind is unscoped and admits no operator seat.
     rates_file: Optional JSON rate-table override used for Anthropic provider
       construction. When omitted, the helper uses env/default resolution.
-    max_tokens: Per-turn output token cap passed to the provider.
     mcp_servers: Inline MCP server definitions. When provided, the helper uses
       `McpClientManager(config_path=None, inline_servers=...)`.
     mcp_config_path: Alternate Claude desktop config file to read MCP servers
@@ -492,7 +489,6 @@ def create_agent(
       api_key,
       auth_token,
       provider_config,
-      max_tokens=max_tokens,
       user_scope=user_scope,
     )
   else:
@@ -503,7 +499,6 @@ def create_agent(
       None,
       provider_config,
       auth_config={},
-      max_tokens=max_tokens,
       user_scope=user_scope,
     )
   if (
@@ -540,8 +535,9 @@ def create_agent(
   }
 
   def _materialize_service_credential(
-    handle: CredentialHandle,
+    handle: CredentialHandle, *, user_scope: Any = None,
   ) -> MaterializedCredential:
+    del user_scope  # The caller-supplied static service config is already resolved.
     if handle is not service_credential_handle:
       raise RuntimeError("unknown easy-agent service credential handle")
     return MaterializedCredential(
@@ -993,7 +989,6 @@ def create_agent(
         capability_entry.provider: service_credential_handle
       },
       service_auth_config_resolver=_materialize_service_credential,
-      resolver_timeout_seconds=resolver_timeout_seconds,
       commercial_work_start_gate=commercial_work_start_gate,
       mcp_client=mcp_client,
       on_startup=_combined_startup,

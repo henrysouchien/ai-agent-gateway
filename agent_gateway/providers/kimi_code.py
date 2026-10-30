@@ -17,11 +17,10 @@ from .base import (
 )
 from .credential_pool import rotate_provider_credential
 from .kimi_code_oauth import kimi_common_headers
-from .ollama import OllamaLocalProvider, _chat_compat, _chat_completions_url
+from .ollama import OllamaLocalProvider, _chat_compat, _chat_completions_url, _is_usage_limit_only
 from .ollama_cloud import (
   _credential_failure,
   _is_content_refusal,
-  _is_usage_limit_only,
   _retry_after_reset_at,
   _without_replayed_reasoning,
 )
@@ -122,13 +121,12 @@ class KimiCodeProvider(OllamaLocalProvider):
   ) -> dict[str, Any]:
     model_info = self.get_model_info(model)
     compat = _chat_compat(model_info)
-    clamped_max_tokens = min(max_tokens, model_info.max_output_tokens)
     params = super().build_request_params(
       model=model,
       messages=messages,
       system_prompt=system_prompt,
       tools=tools,
-      max_tokens=clamped_max_tokens,
+      max_tokens=max_tokens,
       thinking_level=thinking_level,
       **kwargs,
     )

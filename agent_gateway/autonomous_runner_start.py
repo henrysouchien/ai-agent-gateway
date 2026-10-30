@@ -43,7 +43,7 @@ from .autonomous_credential_handoff import (
   encode_autonomous_credential_handoff,
 )
 from .autonomous_launch_envelope import (
-  AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+  AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
   AUTONOMOUS_RUNTIME_SESSION_PURPOSE,
   AutonomousControlAuthority,
   AutonomousDispatchScope,
@@ -57,7 +57,6 @@ from .autonomous_claim_broker import (
 )
 from .autonomous_event_channel import (
   AUTONOMOUS_EVENT_CHANNEL_FD_ENV,
-  AUTONOMOUS_EVENT_CHANNEL_MAX_IO_TIMEOUT_SECONDS,
   AutonomousEventChannelChild,
   create_autonomous_event_channel,
 )
@@ -879,7 +878,6 @@ class AutonomousRegistryStartMixin:
       mode: str,
       task: str | None,
       skill: str | None,
-      context: str | None,
       pack: str | None = None,
       deliver: bool = True,
       ticker: str | None = None,
@@ -1502,6 +1500,7 @@ class AutonomousRegistryStartMixin:
         normalized_pack = resumed_record.pack
         normalized_deliver = resumed_record.deliver
 
+      normalized_context = context.strip() if isinstance(context, str) and context.strip() else None
       cmd = self._build_cmd(
         profile=normalized_profile,
         mode=normalized_mode,
@@ -1509,7 +1508,6 @@ class AutonomousRegistryStartMixin:
         skill=normalized_skill,
         pack=normalized_pack,
         deliver=normalized_deliver,
-        context=context,
         ticker=ticker,
         research_file_id=normalized_research_file_id,
       )
@@ -1676,9 +1674,7 @@ class AutonomousRegistryStartMixin:
         log_stat.st_ino,
       ))
       log_handle = os_module.fdopen(log_fd, "wb")
-      event_channel_pair = create_autonomous_event_channel(
-        io_timeout_seconds=AUTONOMOUS_EVENT_CHANNEL_MAX_IO_TIMEOUT_SECONDS,
-      )
+      event_channel_pair = create_autonomous_event_channel()
       event_channel_parent = event_channel_pair.parent
       event_channel_child = event_channel_pair.child
       (
@@ -1705,7 +1701,7 @@ class AutonomousRegistryStartMixin:
         skill=normalized_skill,
         pack=normalized_pack,
         deliver=normalized_deliver,
-        context=context.strip() if isinstance(context, str) and context.strip() else None,
+        context=normalized_context,
         ticker=canonicalize_ticker(ticker) if isinstance(ticker, str) and ticker.strip() else None,
         channel=normalized_channel,
         dev_mode=False,
@@ -1909,7 +1905,16 @@ class AutonomousRegistryStartMixin:
         env[AUTONOMOUS_APPROVAL_CHANNEL_FD_ENV] = str(
           approval_channel_child_fd
         )
-      env[AUTONOMOUS_CAPABILITY_ENVELOPE_ENV] = envelope_json
+      envelope_path = canonical_log_dir / f"{task_id}.launch-envelope.json"
+      envelope_fd, envelope_stat = secure_create_owned_file(envelope_path)
+      created_run_files.append((
+        envelope_path,
+        envelope_stat.st_dev,
+        envelope_stat.st_ino,
+      ))
+      with os_module.fdopen(envelope_fd, "w", encoding="utf-8") as envelope_handle:
+        envelope_handle.write(envelope_json)
+      env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV] = str(envelope_path)
       record.claim_broker = AutonomousClaimBroker(
         authority,
         envelope_json,

@@ -286,17 +286,9 @@ def _project_summary(
     metadata.get("required_context"),
     field_name="required_context",
   )
-  requires_portfolio_context = _coerce_bool(
-    metadata.get("requires_portfolio_context"),
-    field_name="requires_portfolio_context",
+  requires_portfolio_context = bool(
+    PORTFOLIO_CONTEXT_NAMES.intersection(required_context)
   )
-  if (
-    requires_portfolio_context
-    and not PORTFOLIO_CONTEXT_NAMES.intersection(required_context)
-  ):
-    raise ValueError(
-      "portfolio context requirement must be present in required_context"
-    )
   blocked_reason = _clean_text(metadata.get("blocked_reason"))
   can_launch = profile.agent_callable and blocked_reason is None
   schedule_eligible = _schedule_eligible(semantic)

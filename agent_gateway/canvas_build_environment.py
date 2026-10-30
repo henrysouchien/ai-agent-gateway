@@ -77,6 +77,8 @@ class CanvasBuildFailure(Exception):
     return {"validation_failed": {"stage": self.stage, "diagnostics": self.diagnostics}}
 
 
+# Capability by construction: the build directory configured for this runtime
+# determines whether canvas building exists; it is not a per-run behaviour gate.
 def canvas_build_enabled(env: Mapping[str, str] | None = None) -> bool:
   values = os.environ if env is None else env
   return bool(str(values.get(CANVAS_BUILD_DIR_ENV, "")).strip())

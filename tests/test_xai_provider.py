@@ -425,8 +425,21 @@ def test_single_done_event_whole_tool_call_maps_full_lifecycle() -> None:
 
 
 def test_error_event_identifies_xai() -> None:
-  with pytest.raises(RuntimeError, match="xAI error"):
-    map_event({"type": "error", "message": "bad request"}, _ResponsesStreamState())
+  with pytest.raises(RuntimeError, match="xAI error: bad request") as caught:
+    map_event({"type": "error", "message": "bad request", "code": "rate_limit_exceeded"}, _ResponsesStreamState())
+  assert getattr(caught.value, "error_code", None) == "rate_limit_exceeded"
+
+
+def test_response_failed_event_carries_its_own_error_code() -> None:
+  event = {"type": "response.failed", "response": {"error": {"message": "no capacity", "code": "server_error"}}}
+  with pytest.raises(RuntimeError, match="xAI response failed: no capacity") as caught:
+    map_event(event, _ResponsesStreamState())
+  assert getattr(caught.value, "error_code", None) == "server_error"
+
+
+def test_non_string_event_code_is_not_stringified_into_error_code() -> None:
+  with pytest.raises(TypeError, match="provider error code must be a string"):
+    map_event({"type": "error", "message": "bad request", "code": 429}, _ResponsesStreamState())
 
 
 @pytest.mark.parametrize(

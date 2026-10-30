@@ -337,7 +337,11 @@ def stub_capability_execution_resolver(
     for handle in (*user_handles.values(), *service_handles.values())
   }
 
-  def _materialize(handle: CredentialHandle) -> MaterializedCredential:
+  def _materialize(
+    handle: CredentialHandle,
+    *,
+    user_scope: object = None,
+  ) -> MaterializedCredential:
     return material_by_identity[id(handle)]
 
   return CapabilityExecutionResolver(

@@ -8,6 +8,40 @@ import agent_gateway.event_log as event_log_module
 from agent_gateway.event_log import EventLog
 
 
+@pytest.mark.parametrize("first_seq", [1, 41])
+def test_iter_from_uses_absolute_sequence_floor(first_seq: int) -> None:
+  async def scenario() -> None:
+    event_log = EventLog(first_seq=first_seq)
+    event_log.append({"type": "text_delta", "text": "continued"})
+    event_log.append({"type": "stream_complete"})
+    assert event_log.next_seq == first_seq + 2
+    assert event_log.closed
+    assert [entry.seq async for entry in event_log.iter_from(first_seq - 1)] == [
+      first_seq, first_seq + 1,
+    ]
+    assert [entry.seq async for entry in event_log.iter_from(first_seq)] == [first_seq + 1]
+    assert [entry.seq async for entry in event_log.iter_from(first_seq + 1)] == []
+
+  asyncio.run(scenario())
+
+
+def test_unadmitted_log_closes_without_manufacturing_terminal() -> None:
+  async def scenario() -> None:
+    event_log = EventLog(first_seq=41)
+    waiting = asyncio.create_task(anext(event_log.iter_from(40), None))
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    event_log.close_without_terminal()
+    assert await waiting is None
+    assert event_log.closed
+    assert not event_log.has_terminal
+    assert event_log.entries == []
+    assert event_log.next_seq == 41
+    assert event_log.append({"type": "text_delta", "text": "late"}) is None
+
+  asyncio.run(scenario())
+
+
 def test_append_isolates_nested_entry_from_input_and_callback() -> None:
   callback_events: list[dict[str, object]] = []
 

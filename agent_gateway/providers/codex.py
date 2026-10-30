@@ -48,6 +48,29 @@ from .codex_helpers import (
 
 log = logging.getLogger(__name__)
 
+CODEX_AUTH_TOKEN_ENV = "CODEX_AUTH_TOKEN"
+CODEX_AUTH_JSON_ENV = "CODEX_AUTH_JSON"
+# Environment names that carry one person's ChatGPT Codex bearer token or
+# auth.json path; a non-owner placement must not inherit them.
+CODEX_PERSONAL_OAUTH_ENV_NAMES = frozenset({CODEX_AUTH_TOKEN_ENV, CODEX_AUTH_JSON_ENV})
+
+# The ChatGPT Codex backend's own 401 sentence when the bound token's exp has
+# passed. Parsed once here; the runner never re-reads the provider prose.
+_EXPIRED_CREDENTIAL_SENTENCE = "provided authentication token is expired"
+
+
+def _is_expired_credential_message(message: str) -> bool:
+  return message.strip().lower().startswith(_EXPIRED_CREDENTIAL_SENTENCE)
+
+
+class CodexCredentialExpired(Exception):
+  """The selected Codex credential is expired. Not a transport failure."""
+
+  def __init__(self, message: str, *, status_code: int) -> None:
+    super().__init__(message)
+    self.status_code = status_code
+
+
 
 class CodexProvider(ModelProvider):
   """`ModelProvider` implementation for the ChatGPT Codex responses backend."""
@@ -379,7 +402,10 @@ class CodexProvider(ModelProvider):
     async with client.stream("POST", endpoint_url, json=request_params, headers=headers) as response:
       if response.status_code != 200:
         info = await _parse_error_response(response)
-        raise httpx.HTTPStatusError(str(info["message"] or "Request failed"), request=response.request, response=response)
+        message = str(info["message"] or "Request failed")
+        if response.status_code == 401 and _is_expired_credential_message(message):
+          raise CodexCredentialExpired(message, status_code=response.status_code)
+        raise httpx.HTTPStatusError(message, request=response.request, response=response)
 
       stream_state = _ResponsesStreamState()
       stream_state.provider_request_id, stream_state.rate_limit = response_diagnostics(response.headers)
@@ -392,6 +418,8 @@ class CodexProvider(ModelProvider):
             yield mapped_event
 
   def is_retryable_error(self, exc: Exception) -> bool:
+    if isinstance(exc, CodexCredentialExpired):
+      return False
     if isinstance(exc, httpx.HTTPStatusError):
       return exc.response.status_code in _RETRYABLE_STATUSES
     if isinstance(exc, (httpx.TransportError, httpx.StreamError)):
@@ -403,6 +431,10 @@ class CodexProvider(ModelProvider):
 
 
 __all__ = [
+  "CODEX_AUTH_JSON_ENV",
+  "CODEX_AUTH_TOKEN_ENV",
+  "CODEX_PERSONAL_OAUTH_ENV_NAMES",
+  "CodexCredentialExpired",
   "CodexProvider",
   "_build_headers",
   "_convert_messages",

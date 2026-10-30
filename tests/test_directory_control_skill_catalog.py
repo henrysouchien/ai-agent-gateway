@@ -58,7 +58,6 @@ metadata:
   display_label: Must Not Win
   typed_contract: platform:external-result@7
   required_context: [portfolio, ticker, ticker, '  ']
-  requires_portfolio_context: 'yes'
   modes: ''
   compatible_modes: [must-not-win]
   tier_availability: [paid, paid, ' enterprise ']
@@ -617,7 +616,6 @@ def test_list_does_not_resolve_blocks_but_detail_does(tmp_path: Path) -> None:
   "frontmatter",
   [
     "catalog: maybe",
-    "max_tokens: not-an-int",
     "semantic_metadata: not-a-mapping",
     "semantic_metadata:\n  output_contracts: [not-a-mapping]",
     "metadata:\n  required_context: bad: mapping",

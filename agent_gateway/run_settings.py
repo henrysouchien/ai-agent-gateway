@@ -3,7 +3,7 @@
 Owner doc: ``docs/reference/agent-run-containment.md``. The bounds are the soft-turn ladder
 thresholds per session kind, its final factor and grace turns, the child silence timeout,
 spawn depth and concurrency, the context-pressure percentages and the repeat-tool-error
-limit. This module is the only reader of the operator file (``~/.config/hank/run-settings.json``,
+limit, and the plan-author attempt count. This module is the only reader of the operator file (``~/.config/hank/run-settings.json``,
 path override ``HANK_RUN_SETTINGS_PATH``) and the only writer of it (``set_operator_setting``,
 reached by ``scripts/hank_settings.py set``). Every ``load_run_settings()`` re-stats the file
 (``operator_settings.StampCache``), so a change is in force at the next read of a running

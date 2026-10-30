@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -21,6 +22,7 @@ from model_authority.spend_ledger import SpendLedgerUnavailable
 from model_authority.spend_settings import SpendSettingsError, spend_breaches
 from ..auth import AuthMechanism, EntitlementKind, evaluate_placement_eligibility
 from ..user_runtime_credentials import deployment_owner_scopes
+from .credential_pool import scope_admits_operator_seats
 
 
 LOGGER = logging.getLogger(__name__)
@@ -94,21 +96,13 @@ ANTHROPIC_PUBLIC_AUTH_CONFIG_FIELDS: frozenset[str] = frozenset({
   "credential_source",
   "workspace_id",
 })
-# A limiter that rejects a credential without naming a reset window keeps it out
-# of rotation for this long. The window is a representation of "unknown reset",
-# not a policy: the next attempt on that credential re-blocks it if it is still
-# limited, and a declared 5h/7d reset always wins over this default.
-UNDECLARED_LIMIT_BLOCK_SECONDS = 300.0
 # An access token this close to expiry is refreshed before it is used.
 REFRESH_MARGIN_SECONDS = 120.0
-# A record whose refresh failed is parked exactly like a usage-limited one: the
-# next sibling serves, and the next attempt on this record retries the refresh.
-REFRESH_FAILURE_BLOCK_SECONDS = 300.0
 # Refresh runs on the synchronous credential-binding path (`create_client`,
 # `get_anthropic_config`), so a hung token endpoint holds the event loop for as
 # long as this allows. Bound it to seconds: a refresh that does not answer in
-# that window is a failed refresh, which parks the account and lets the next
-# sibling serve, and the next attempt retries it.
+# that window is a failed refresh, which skips the account for that selection
+# and lets the next sibling serve, and the next attempt retries it.
 HTTP_CONNECT_TIMEOUT_SECONDS = 5.0
 HTTP_TIMEOUT_SECONDS = 10.0
 # One account's refresh lock is waited on for at most the single-exchange
@@ -770,6 +764,66 @@ def remove_anthropic_oauth_record(path: Path, identity: str) -> bool:
     return removed
 
 
+def seed_non_rotating_org_store(
+  source: Path | None,
+  target: Path,
+  *,
+  user_scope: Any = None,
+  environ: Mapping[str, str] | None = None,
+) -> bool:
+  """Seed an absent org store with the source's non-rotating credentials only.
+
+  Copies the `accounts` / `static_credentials` entries that carry no
+  `refresh_token` (generation ids and grant hashes preserved) and nothing
+  else: a refresh token is a single-use rotating grant, so mirroring it would
+  fork the grant between two stores, and a legacy top-level `auth_token`
+  paired with a top-level `refresh_token` is half of such a grant and is
+  dropped with it. The retirement maps are not copied: they only describe the
+  source's own history (`retirements` explains generation refs the target never
+  issued; `retired_auth_token_grants` holds hashes derived from retired token
+  material), and a fresh store enrolls retained material under its own lock.
+  A `user_scope` that is not a deployment owner (`scope_admits_operator_seats`)
+  receives `api_key` records only: setup-token / `auth_token` seats are the
+  operator's personal subscription and are never copied.
+  The source is read-only here (no migration write). Returns False for an
+  absent source, an existing target, or when nothing non-rotating remains.
+  """
+
+  if source is None or not source.is_file() or target.exists():
+    return False
+  with _store_read_lock(source):
+    loaded = _load_store_unlocked(source, migrate=False)
+    try:
+      raw = json.loads(source.read_text(encoding="utf-8"))
+    except OSError as exc:
+      raise AnthropicStoreError(source, exc) from exc
+  # Legacy fallback (`auth_token`) only exists when `accounts` is not a list.
+  legacy_refresh = not isinstance(raw.get("accounts"), list) and bool(
+    str(raw.get("refresh_token") or "").strip()
+  )
+  owner = scope_admits_operator_seats(user_scope, environ=environ)
+  seeded = _AnthropicStore()
+  for source_records, seeded_records in (
+    (() if legacy_refresh else loaded.accounts, seeded.accounts),
+    (loaded.static_credentials, seeded.static_credentials),
+  ):
+    for record in source_records:
+      if record.refresh_token:
+        continue
+      if not owner and record.credential_kind != "api_key":
+        continue
+      seeded_records.append(
+        record if record.generation_id and record.grant_hash else _new_generation(record)
+      )
+  if not seeded.accounts and not seeded.static_credentials:
+    return False
+  with _store_lock(target):
+    if target.exists():
+      return False
+    _write_store_unlocked(target, seeded)
+  return True
+
+
 def _pool_tokens(raw: str) -> tuple[str, ...]:
   """Sibling tokens carried by the JSON-array env form.
 
@@ -1018,8 +1072,8 @@ def _environment_source(name: str, material: str) -> str:
 
   Every pool form keys by its own material, so two processes that share the
   org store but present different values for one name occupy distinct sources
-  and never retire each other's generation. A name's slot is retired only when
-  that name is observed empty (see `_sync_environment_tokens`).
+  and never retire each other's generation. No observation retires a slot (see
+  `_sync_environment_tokens`).
   """
 
   digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
@@ -1067,54 +1121,31 @@ def _sync_environment_tokens(
   env: Mapping[str, str],
   enrolled_tokens: Mapping[str, tuple[Path, AnthropicOAuthRecord]],
 ) -> dict[tuple[str, str], AnthropicOAuthRecord]:
-  """Reconcile observed org-env members; an absent name has no retirement authority.
+  """Register the org-env members this process observes; it never retires any.
 
   Each setup token's source is named by its own material's digest, exactly as a
   request-carried token is (`_request_source`). The deployment API key is
-  registered separately by the gateway materializer. Two processes that share
-  the org store but carry different setup values for a name therefore occupy
-  distinct sources: neither retires the other's generation.
-  A process retires only the members of a source it actually observes to have
-  changed or emptied — a name present-but-empty still retires that name's slot
-  (per the reference: an emptied env name retires its slot), while an absent
-  name asserts nothing.
+  registered separately by the gateway materializer. An absent, partial, or
+  empty environment name only limits what this process can see: it has no
+  authority to retire a generation it does not currently observe, and different
+  processes' material never retires each other. Removing a person's
+  generation is the explicit `remove_anthropic_oauth_record`.
   """
 
   selected: dict[tuple[str, str], AnthropicOAuthRecord] = {}
   with _store_lock(path):
     store = _load_store_unlocked(path)
     before = tuple(record.generation_id for record in store.static_credentials)
-    desired: set[str] = set()
     for name, read_form in _ENV_POOL_FORMS:
       for token in read_form(env.get(name, "")):
         if token in enrolled_tokens:
           continue
-        source = _environment_source(name, token)
-        desired.add(source)
         record = _register_static_unlocked(
-          store, token, credential_kind="auth_token", source=source,
+          store, token, credential_kind="auth_token",
+          source=_environment_source(name, token),
         )
         if record is not None:
           selected[(name, token)] = record
-    pool_names = {name for name, _read in _ENV_POOL_FORMS}
-    for record in tuple(store.static_credentials):
-      if not record.source.startswith("env:"):
-        continue
-      name = record.source.removeprefix("env:").split(":", 1)[0]
-      # A name this process cannot observe asserts nothing.
-      if name not in pool_names or name not in env:
-        continue
-      if name == ANTHROPIC_AUTH_TOKENS_ENV:
-        # Membership reconciliation: an array member this observation no longer
-        # names is retired as removed.
-        if record.source not in desired:
-          _retire_generation(store, record, "removed")
-          store.static_credentials.remove(record)
-      elif _environment_source_material(record.source, env) == ():
-        # A single-valued name retires its slot only when observed empty: a
-        # different non-empty value is a co-existing source, not a retirement.
-        _retire_generation(store, record, "removed")
-        store.static_credentials.remove(record)
     if before != tuple(record.generation_id for record in store.static_credentials):
       _write_store_unlocked(path, store)
   return selected
@@ -1226,15 +1257,21 @@ def resolve_anthropic_credentials(
   bound_source = cfg.get("credential_source")
   if isinstance(bound_source, Mapping):
     # Caller-held transient generations can be reconstructed only from their
-    # own bearer. Read provenance first so a token already owned by a store
-    # cannot bypass that owner's admission or retirement decision.
+    # own bearer. Read store and environment provenance first so operator
+    # material cannot bypass its owner's admission or retirement decision.
     generation_ref = str(bound_source.get("generation_ref") or "")
     bound_token = str(cfg.get("auth_token") or "").strip()
+    environment_owned = any(
+      bound_token in read_form(env.get(name, ""))
+      for name, read_form in _ENV_POOL_FORMS
+    )
     if (
       not scope and bound_token
       and generation_ref == _transient_request_anthropic_credential(bound_token).generation_ref
       and not _stored_auth_token_generation_ref(bound_token, store_paths)
     ):
+      if environment_owned:
+        raise AnthropicSourceError("unobservable")
       credential = _transient_request_anthropic_credential(bound_token)
     else:
       # Store-backed exact lookup is read-only: it never syncs env material,
@@ -1437,7 +1474,7 @@ def _resolve_generation(
         if available is None:
           raise AnthropicSourceError("unobservable")
         if record.access_token not in available:
-          raise AnthropicSourceError("superseded" if available else "removed")
+          raise AnthropicSourceError("superseded" if available else "unobservable")
       key = (
         record.identity
         if record in store.accounts or record.credential_kind == "api_key"
@@ -1782,27 +1819,18 @@ def _rank_candidate(
   )
 
 
-def _note_refresh_failure(credential: AnthropicCredential, exc: AnthropicOAuthError, moment: float) -> None:
-  """Account for a refresh that did not produce a usable credential.
+def _note_refresh_failure(credential: AnthropicCredential, exc: AnthropicOAuthError) -> None:
+  """Log a refresh that did not produce a usable credential.
 
-  A retired generation or a peer still mid-exchange says nothing about the
-  account, so only the in-memory pass skips it. A failed exchange cools the
-  account down for every process that shares its store's sidecar.
+  Nothing is parked: `_select_ranked` skips the account for its own pass and the
+  next selection retries the refresh, as for a retired generation or a peer still
+  mid-exchange.
   """
 
-  locator = credential.locator
-  if isinstance(exc, (AnthropicSourceError, AnthropicRefreshBusy)):
-    LOGGER.warning("Anthropic account %s is unavailable to this selection: %s", locator.id, type(exc).__name__)
-    return
-  quota.record_cooldown(
-    credential.sidecar_store_path,
-    locator,
-    quota.Cooldown(scope="shared", until=moment + REFRESH_FAILURE_BLOCK_SECONDS, reason="refresh_failed"),
-  )
   LOGGER.warning(
-    "Anthropic OAuth refresh failed for %s; cooling it down for %.0fs",
-    locator.id,
-    REFRESH_FAILURE_BLOCK_SECONDS,
+    "Anthropic account %s is unavailable to this selection: %s",
+    credential.locator.id,
+    type(exc).__name__,
   )
 
 
@@ -1817,9 +1845,11 @@ def _select_ranked(
 ) -> AnthropicCredential | None:
   """Rank `credentials` and bind the best one that survives refresh preflight.
 
-  A refresh failure cools that account down and re-ranks, so the next candidate
-  is whatever the ranker now prefers (another tier when the whole tier failed;
-  a warm account kept when its would-be replacement cannot refresh). All
+  A refresh failure skips that account for the rest of this pass and re-ranks, so
+  the next candidate is whatever the ranker now prefers (another tier when the
+  whole tier failed; a warm account kept when its would-be replacement cannot
+  refresh). The skip is in memory only: nothing is parked, and the next selection
+  retries the refresh. All
   preflights share one lock-wait budget. When every candidate is blocked,
   `fallback` binds the ranker's earliest-reset account with no refresh, so a
   single credential is never withheld; without it there is no result.
@@ -1852,9 +1882,9 @@ def _select_ranked(
         selected = _current_credential(credential, refresh=True, now=moment, deadline=deadline)
       except AnthropicOAuthError as exc:
         failed[candidate.locator.id] = quota.Cooldown(
-          scope="shared", until=moment + REFRESH_FAILURE_BLOCK_SECONDS, reason="refresh_failed",
+          scope="shared", until=math.inf, reason="refresh_failed",
         )
-        _note_refresh_failure(credential, exc, moment)
+        _note_refresh_failure(credential, exc)
         break
       LOGGER.info(
         "Anthropic credential selected: account=%s tier=%s reason=%s",
@@ -1922,16 +1952,18 @@ def rotate_anthropic_credential_source(
   sources: AnthropicCredentialSources,
   *,
   current: str,
-  until: float,
+  until: float | None,
   now: float | None = None,
   model: str | None = None,
   scope: str = "shared",
   reason: str = "rate_limit",
 ) -> AnthropicCredential | None:
-  """Cool the current credential down until `until` and hand back the next sibling.
+  """Hand back the next sibling of `current`, cooling `current` down only to a declared reset.
 
-  The cooldown is the sidecar's scoped row for the current account (`scope` is
-  `shared` or the model family the limit applies to), so every process sees it.
+  `until` is the reset the limiter declared. The cooldown is the sidecar's scoped
+  row for the current account (`scope` is `shared` or the model family the limit
+  applies to), so every process sees it; with no declared reset `current` is only
+  excluded from this rotation and nothing is recorded.
   Unlike binding there is no fallback here: handing back a credential a limiter
   already rejected would rotate the run in circles instead of letting the
   caller's existing retry run its course.
@@ -1942,11 +1974,12 @@ def rotate_anthropic_credential_source(
   siblings = sources.credentials
   if failed is not None:
     failed_id = failed.locator.id
-    quota.record_cooldown(
-      failed.sidecar_store_path,
-      failed.locator,
-      quota.Cooldown(scope=scope, until=until, reason=reason),
-    )
+    if until is not None:
+      quota.record_cooldown(
+        failed.sidecar_store_path,
+        failed.locator,
+        quota.Cooldown(scope=scope, until=until, reason=reason),
+      )
     siblings = tuple(credential for credential in siblings if credential.locator.id != failed_id)
   if not siblings:
     return None
@@ -2085,9 +2118,8 @@ def ensure_fresh_anthropic_credential(
   except AnthropicOAuthError as exc:
     # The bound credential is still handed to the request: the provider's 401
     # is what rotates the run to a sibling, and withholding it here would end
-    # the turn with no request made at all. The failure still cools the account
-    # down for later selections.
-    _note_refresh_failure(credential, exc, time.time() if now is None else now)
+    # the turn with no request made at all. The next selection retries the refresh.
+    _note_refresh_failure(credential, exc)
     return credential.token
 
 
@@ -2294,9 +2326,7 @@ __all__ = [
   "AnthropicOAuthError",
   "AnthropicOAuthRecord",
   "AnthropicSourceError",
-  "REFRESH_FAILURE_BLOCK_SECONDS",
   "REFRESH_MARGIN_SECONDS",
-  "UNDECLARED_LIMIT_BLOCK_SECONDS",
   "anthropic_credential_mechanism_and_entitlement",
   "anthropic_generation_auth_config",
   "is_anthropic_generation_ref",

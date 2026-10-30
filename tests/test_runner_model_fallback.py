@@ -9,6 +9,7 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 from pathlib import Path
@@ -18,8 +19,11 @@ import pytest
 
 from agent_gateway import AgentRunner, EventLog, McpClientManager, ModelInfo, ModelProvider, ToolDispatcher
 import agent_gateway.runner as gateway_runner
+import agent_gateway.runner_stream_turn as runner_stream_turn
+import agent_gateway.capability_execution as capability_execution
 from agent_gateway.admission import root_context
 from agent_gateway.auth import ProviderCredentialFailure
+from agent_gateway.providers.codex import CodexCredentialExpired, CodexProvider
 from agent_gateway.execution_identity import DispatchIdentity
 from agent_gateway.fork_request_handoff import (
   ForkRequestHandoff,
@@ -67,19 +71,21 @@ OPUS = "test.anthropic.opus"
 SONNET = "test.anthropic.sonnet"
 SONNET_SDK = "test.anthropic.sonnet-sdk"
 SOL = "test.codex.sol"
+MUSE = "test.muse.muse"
 OPENAI = "test.openai.sol"
 GROK = "test.xai.grok"
 _UPSTREAM = {
   OPUS: "claude-opus-test", SONNET: "claude-sonnet-test", SONNET_SDK: "claude-sonnet-sdk-test",
-  SOL: "gpt-sol-test", OPENAI: "gpt-openai-test", GROK: "grok-test",
+  SOL: "gpt-sol-test", MUSE: "muse-test", OPENAI: "gpt-openai-test", GROK: "grok-test",
 }
 _PROVIDER = {
   OPUS: "anthropic", SONNET: "anthropic", SONNET_SDK: "anthropic", SOL: "codex",
-  OPENAI: "openai", GROK: "xai",
+  MUSE: "muse", OPENAI: "openai", GROK: "xai",
 }
 _TOKEN_A = "sk-ant-oat01-fallback-account-a-000000000000"
 _TOKEN_B = "sk-ant-oat01-fallback-account-b-000000000000"
 _CODEX_KEY = "codex-account"
+_MUSE_KEY = "muse-account"
 _OPENAI_KEY = "sk-openai-fallback"
 _GROK_KEY = "sk-xai-fallback"
 
@@ -114,6 +120,7 @@ class _World:
     self.limit_after: dict[str, int] = {}
     self.down: set[str] = set()
     self.siblings: dict[str, str] = {}
+    self.rotation_generation_metadata = False
     self.turns: dict[str, list[list[StreamEvent]]] = {}
     self.windows: dict[str, int] = {}
     self.calls: list[tuple[str, str, str]] = []
@@ -128,6 +135,7 @@ class _World:
     self.denied_models: set[str] = set()
     self.denied_kind: Literal["auth", "billing"] = "auth"
     self.denied_reset_at: float | None = None
+    self.expired_models: set[str] = set()
     self.on_call: Callable[[int], Awaitable[None]] | None = None
     # Providers that accept the request and then never send a stream event.
     self.stalled: set[str] = set()
@@ -181,6 +189,11 @@ class _ScriptedProvider(ModelProvider):
       await asyncio.sleep(3600)
     if model in world.denied_models:
       raise _Denied(world.denied_kind, world.denied_reset_at)
+    if model in world.expired_models:
+      raise CodexCredentialExpired(
+        "Provided authentication token is expired.",
+        status_code=401,
+      )
     served = sum(1 for _, called, _ in world.calls[:-1] if called == model)
     if model in world.limited_models or served >= world.limit_after.get(model, 1 << 30):
       raise _Limited(world.reset_at)
@@ -202,12 +215,21 @@ class _ScriptedProvider(ModelProvider):
       return ProviderCredentialFailure(
         provider=self.name, kind=exc.kind, status_code=403, reset_at=exc.reset_at,
       )
+    if isinstance(exc, CodexCredentialExpired):
+      return CodexProvider().classify_credential_failure(exc)
     return None
 
   def next_credential(self, config: Any, failure: ProviderCredentialFailure) -> dict[str, Any] | None:
     _ = failure
     sibling = self._world.siblings.get(str(config.get("auth_token") or ""))
-    return {"auth_token": sibling} if sibling is not None else None
+    if sibling is None:
+      return None
+    rotated: dict[str, Any] = {"auth_token": sibling}
+    if self._world.rotation_generation_metadata:
+      member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(sibling)
+      assert member is not None
+      rotated["credential_source"] = member.source_metadata()
+    return rotated
 
   def is_retryable_error(self, exc: Exception) -> bool:
     return isinstance(exc, (_Limited, _Outage))
@@ -337,12 +359,14 @@ def _resolver(
   material = {
     "anthropic": {"auth_mode": "oauth", "auth_token": _TOKEN_A, "provider": "anthropic", ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True},
     "codex": {"auth_mode": "api", "api_key": _CODEX_KEY, "provider": "codex"},
+    "muse": {"auth_mode": "api", "api_key": _MUSE_KEY, "provider": "muse"},
     "openai": {"auth_mode": "api", "api_key": _OPENAI_KEY, "provider": "openai"},
     "xai": {"auth_mode": "api", "api_key": _GROK_KEY, "provider": "xai"},
   }
   adapters = {
     "test.anthropic": _ScriptedProvider("anthropic", world),
     "test.codex": _ScriptedProvider("codex", world),
+    "test.muse": _ScriptedProvider("muse", world),
     "test.openai": _ScriptedProvider("openai", world),
     "test.xai": _ScriptedProvider("xai", world),
   }
@@ -434,10 +458,18 @@ class _Turn:
     return [entry.event for entry in self.event_log.entries]
 
 
+_FAST_RETRIES = 2
+
+
 @pytest.fixture(autouse=True)
 def _fast_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 0.0)
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_MAX", 2)
+  monkeypatch.setattr(
+    runner_stream_turn,
+    "TRANSPORT_RETRY_POLICY",
+    replace(
+      runner_stream_turn.TRANSPORT_RETRY_POLICY, max_retries=_FAST_RETRIES, base_delay_seconds=0.0,
+    ),
+  )
 
 
 @pytest.fixture(autouse=True)
@@ -585,7 +617,7 @@ def test_outage_after_the_retry_budget_hops_and_spends_no_extra_primary_attempt(
 
   events = turn.run()
 
-  assert world.calls == [("anthropic", "claude-opus-test", _TOKEN_A)] * (1 + gateway_runner.STREAM_RETRY_MAX) + [
+  assert world.calls == [("anthropic", "claude-opus-test", _TOKEN_A)] * (1 + _FAST_RETRIES) + [
     ("codex", "gpt-sol-test", _CODEX_KEY),
   ]
   [hop] = _of_type(events, "model_fallback")
@@ -602,7 +634,7 @@ def test_outage_with_no_chain_takes_todays_failure_path() -> None:
 
   events = turn.run()
 
-  assert len(world.calls) == 1 + gateway_runner.STREAM_RETRY_MAX
+  assert len(world.calls) == 1 + _FAST_RETRIES
   assert not _of_type(events, "model_fallback")
   assert len(_of_type(events, "error")) == 1
   assert turn.runner.capability_execution is turn.primary
@@ -622,7 +654,7 @@ def test_stall_through_the_retry_budget_hops_as_an_outage() -> None:
 
   events = turn.run(timeout=30)
 
-  assert world.calls == [("anthropic", "claude-opus-test", _TOKEN_A)] * (1 + gateway_runner.STREAM_RETRY_MAX) + [
+  assert world.calls == [("anthropic", "claude-opus-test", _TOKEN_A)] * (1 + _FAST_RETRIES) + [
     ("codex", "gpt-sol-test", _CODEX_KEY),
   ]
   [hop] = _of_type(events, "model_fallback")
@@ -639,7 +671,7 @@ def test_stall_with_no_chain_takes_todays_failure_path() -> None:
 
   events = turn.run(timeout=30)
 
-  assert len(world.calls) == 1 + gateway_runner.STREAM_RETRY_MAX
+  assert len(world.calls) == 1 + _FAST_RETRIES
   assert not _of_type(events, "model_fallback")
   [error] = _of_type(events, "error")
   assert "Stream watchdog" in str(error.get("error"))
@@ -672,7 +704,430 @@ def test_completed_tool_effects_are_not_replayed_after_a_mid_run_hop() -> None:
   assert not _of_type(events, "error")
 
 
-def test_next_turn_returns_to_the_primary_once_its_block_window_ends() -> None:
+def test_fresh_no_preset_turn_skips_failed_primary_and_chain_entries_on_the_shared_resolver() -> None:
+  world = _World()
+  world.limited_models = {_UPSTREAM[OPUS]}
+  world.denied_models = {_UPSTREAM[SOL]}
+  chain = (FallbackEntry(model=SOL), FallbackEntry(model=MUSE))
+  providers = frozenset({"anthropic", "codex", "muse"})
+  resolver = _resolver(world, chain=chain, providers_with_credentials=providers)
+  first = _Turn(resolver)
+  assert first.primary.bind.model_key == OPUS
+
+  first_events = first.run()
+
+  assert world.calls == [
+    ("anthropic", _UPSTREAM[OPUS], _TOKEN_A),
+    ("codex", _UPSTREAM[SOL], _CODEX_KEY),
+    ("muse", _UPSTREAM[MUSE], _MUSE_KEY),
+  ]
+  hops = _of_type(first_events, "model_fallback")
+  assert [(hop["from"]["model_key"], hop["to"]["model_key"], hop["reason"], hop["chain_index"]) for hop in hops] == [
+    (OPUS, SOL, "usage_limit", 0),
+    (SOL, MUSE, "credential_denied", 1),
+  ]
+  assert not _of_type(first_events, "error")
+  assert first.runner.capability_execution.bind.model_key == MUSE
+
+  world.calls.clear()
+  world.requests.clear()
+  equal_snapshot = replace(first.snapshot)
+  assert equal_snapshot == first.snapshot
+  assert equal_snapshot is not first.snapshot
+  second = _Turn(resolver, snapshot=equal_snapshot)
+  assert second.runner is not first.runner
+  assert second.primary.bind.model_key == MUSE
+
+  second_events = second.run()
+
+  assert world.calls == [("muse", _UPSTREAM[MUSE], _MUSE_KEY)]
+  assert [request["model"] for request in world.requests] == [_UPSTREAM[MUSE]]
+  assert not _of_type(second_events, "model_fallback")
+  assert not _of_type(second_events, "error")
+  assert second.runner.capability_execution.bind.model_key == MUSE
+  [completion] = _of_type(second_events, "turn_complete")
+  assert completion["usage"]["capability_bind"]["model_key"] == MUSE
+
+  fresh_resolver = _resolver(world, chain=chain, providers_with_credentials=providers)
+  fresh = _Turn(fresh_resolver, snapshot=replace(first.snapshot))
+  assert fresh.primary.bind.model_key == OPUS
+  world.calls.clear()
+  fresh_events = fresh.run()
+  assert [model for _, model, _ in world.calls] == [_UPSTREAM[OPUS], _UPSTREAM[SOL], _UPSTREAM[MUSE]]
+  assert [hop["reason"] for hop in _of_type(fresh_events, "model_fallback")] == [
+    "usage_limit", "credential_denied",
+  ]
+  assert not _of_type(fresh_events, "error")
+
+
+def test_same_provider_fallback_account_rebind_preserves_failed_primary_across_fresh_turns() -> None:
+  world = _World()
+  world.limited_models = {_UPSTREAM[OPUS]}
+
+  async def park_first_account(count: int) -> None:
+    assert count == 1
+    _park(_TOKEN_A, until=world.reset_at)
+    world.on_call = None
+
+  world.on_call = park_first_account
+  resolver = _resolver(world, chain=(FallbackEntry(model=SONNET), FallbackEntry(model=SOL)))
+  first = _Turn(resolver)
+  assert first.primary.bind.model_key == OPUS
+
+  first_events = first.run()
+
+  assert world.calls == [
+    ("anthropic", _UPSTREAM[OPUS], _TOKEN_A),
+    ("anthropic", _UPSTREAM[SONNET], _TOKEN_B),
+  ]
+  [hop] = _of_type(first_events, "model_fallback")
+  assert (hop["from"]["model_key"], hop["to"]["model_key"], hop["reason"]) == (
+    OPUS, SONNET, "usage_limit",
+  )
+  assert not _of_type(first_events, "credential_refreshed")
+  assert not _of_type(first_events, "error")
+  member_b = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(_TOKEN_B)
+  assert member_b is not None
+  generation_b = member_b.source_metadata()["generation_ref"]
+  serving = first.runner.capability_execution
+  assert serving.bind.model_key == SONNET
+  assert serving.bind.credential_ref == generation_b
+  [first_completion] = _of_type(first_events, "turn_complete")
+  assert first_completion["usage"]["capability_bind"]["model_key"] == SONNET
+
+  world.calls.clear()
+  world.requests.clear()
+  equal_snapshot = replace(first.snapshot)
+  assert equal_snapshot == first.snapshot
+  assert equal_snapshot is not first.snapshot
+  second = _Turn(resolver, snapshot=equal_snapshot)
+  assert second.runner is not first.runner
+  assert second.primary.bind.model_key == SONNET
+
+  second_events = second.run()
+
+  assert [(provider, model) for provider, model, _ in world.calls] == [
+    ("anthropic", _UPSTREAM[SONNET]),
+  ]
+  assert [request["model"] for request in world.requests] == [_UPSTREAM[SONNET]]
+  assert not _of_type(second_events, "model_fallback")
+  assert not _of_type(second_events, "error")
+  assert second.runner.capability_execution.bind.model_key == SONNET
+  [second_completion] = _of_type(second_events, "turn_complete")
+  assert second_completion["usage"]["capability_bind"]["model_key"] == SONNET
+
+
+def test_generation_rotation_shares_failed_primary_with_original_and_serving_resolvers() -> None:
+  world = _World()
+  world.limited_models = {_UPSTREAM[OPUS]}
+  world.siblings = {_TOKEN_A: _TOKEN_B}
+  world.rotation_generation_metadata = True
+  resolver = _resolver(world, chain=(FallbackEntry(model=SOL),))
+  first = _Turn(resolver)
+
+  first_events = first.run()
+
+  assert world.calls == [
+    ("anthropic", _UPSTREAM[OPUS], _TOKEN_A),
+    ("anthropic", _UPSTREAM[OPUS], _TOKEN_B),
+    ("codex", _UPSTREAM[SOL], _CODEX_KEY),
+  ]
+  [rotation] = _of_type(first_events, "credential_refreshed")
+  [hop] = _of_type(first_events, "model_fallback")
+  assert first_events.index(rotation) < first_events.index(hop)
+  assert (hop["reason"], hop["to"]["model_key"]) == ("usage_limit", SOL)
+  assert not _of_type(first_events, "error")
+  serving = first.runner.capability_execution
+  assert serving.bind.model_key == SOL
+  # Generation metadata must exercise the production resolver-cloning path.
+  assert serving.resolver is not None and serving.resolver is not resolver
+
+  world.calls.clear()
+  world.requests.clear()
+  second = _Turn(resolver, snapshot=replace(first.snapshot))
+  assert second.primary.bind.model_key == SOL
+
+  second_events = second.run()
+
+  assert world.calls == [("codex", _UPSTREAM[SOL], _CODEX_KEY)]
+  assert [request["model"] for request in world.requests] == [_UPSTREAM[SOL]]
+  assert not _of_type(second_events, "model_fallback")
+  assert not _of_type(second_events, "error")
+  assert second.runner.capability_execution.bind.model_key == SOL
+
+  world.calls.clear()
+  world.requests.clear()
+  third = _Turn(serving.resolver, snapshot=replace(first.snapshot))
+  assert third.primary.bind.model_key == SOL
+
+  third_events = third.run()
+
+  assert world.calls == [("codex", _UPSTREAM[SOL], _CODEX_KEY)]
+  assert [request["model"] for request in world.requests] == [_UPSTREAM[SOL]]
+  assert not _of_type(third_events, "model_fallback")
+  assert not _of_type(third_events, "error")
+  assert third.runner.capability_execution.bind.model_key == SOL
+
+
+def test_explicit_primary_failure_does_not_poison_default_progress_on_the_same_resolver() -> None:
+  world = _World()
+  world.limited_models = {_UPSTREAM[OPUS]}
+  resolver = _resolver(world)
+  first = _Turn(resolver, explicit=OPUS)
+  assert (first.primary.bind.model_key, first.primary.bind.selection_source) == (OPUS, "explicit_user")
+
+  first_events = first.run()
+
+  assert world.calls == [
+    ("anthropic", _UPSTREAM[OPUS], _TOKEN_A),
+    ("codex", _UPSTREAM[SOL], _CODEX_KEY),
+  ]
+  [first_hop] = _of_type(first_events, "model_fallback")
+  assert (first_hop["reason"], first_hop["to"]["model_key"]) == ("usage_limit", SOL)
+  assert first.runner.capability_execution.bind.model_key == SOL
+  assert not _of_type(first_events, "error")
+
+  world.calls.clear()
+  second = _Turn(resolver, snapshot=first.snapshot)
+  assert (second.primary.bind.model_key, second.primary.bind.selection_source) == (OPUS, "capability_default")
+
+  # The limit remains: this default selection must probe its own primary before
+  # recording a failure, rather than inheriting the explicit pick's failure.
+  second_events = second.run()
+
+  assert world.calls == [
+    ("anthropic", _UPSTREAM[OPUS], _TOKEN_A),
+    ("codex", _UPSTREAM[SOL], _CODEX_KEY),
+  ]
+  [second_hop] = _of_type(second_events, "model_fallback")
+  assert (second_hop["reason"], second_hop["to"]["model_key"]) == ("usage_limit", SOL)
+  assert second.runner.capability_execution.bind.selection_source == "capability_default"
+  assert not _of_type(second_events, "error")
+
+  world.calls.clear()
+  third = _Turn(resolver, snapshot=first.snapshot)
+  assert third.primary.bind.model_key == SOL
+  third_events = third.run()
+  assert world.calls == [("codex", _UPSTREAM[SOL], _CODEX_KEY)]
+  assert not _of_type(third_events, "model_fallback")
+  assert not _of_type(third_events, "error")
+
+
+def test_explicit_cross_primary_selection_does_not_resume_another_primarys_chain_position() -> None:
+  world = _World()
+  world.limited_models = {_UPSTREAM[OPUS]}
+  world.denied_models = {_UPSTREAM[SONNET]}
+  resolver = _resolver(
+    world,
+    chain=(FallbackEntry(model=SONNET), FallbackEntry(model=SOL), FallbackEntry(model=MUSE)),
+    providers_with_credentials=frozenset({"anthropic", "codex", "muse"}),
+  )
+  first = _Turn(resolver, explicit=OPUS)
+  assert (first.primary.bind.model_key, first.primary.bind.selection_source) == (OPUS, "explicit_user")
+
+  first_events = first.run()
+
+  assert world.calls == [
+    ("anthropic", _UPSTREAM[OPUS], _TOKEN_A),
+    ("anthropic", _UPSTREAM[SONNET], _TOKEN_A),
+    ("codex", _UPSTREAM[SOL], _CODEX_KEY),
+  ]
+  assert [
+    (hop["from"]["model_key"], hop["to"]["model_key"], hop["chain_index"], hop["reason"])
+    for hop in _of_type(first_events, "model_fallback")
+  ] == [
+    (OPUS, SONNET, 0, "usage_limit"),
+    (SONNET, SOL, 1, "credential_denied"),
+  ]
+  first_bind = first.runner.capability_execution.bind
+  assert (first_bind.model_key, first_bind.selection_source) == (SOL, "explicit_user")
+  assert first.dispatcher._capability_bind is first_bind
+  assert not _of_type(first_events, "error")
+
+  world.denied_models = {_UPSTREAM[SOL]}
+  world.calls.clear()
+  world.requests.clear()
+  second = _Turn(resolver, snapshot=first.snapshot, explicit=SOL)
+  assert second.snapshot is first.snapshot
+  assert (second.primary.bind.model_key, second.primary.bind.selection_source) == (SOL, "explicit_user")
+
+  second_events = second.run()
+
+  assert world.calls == [
+    ("codex", _UPSTREAM[SOL], _CODEX_KEY),
+    ("anthropic", _UPSTREAM[SONNET], _TOKEN_A),
+  ]
+  assert [request["model"] for request in world.requests] == [_UPSTREAM[SOL], _UPSTREAM[SONNET]]
+  [hop] = _of_type(second_events, "model_fallback")
+  assert (
+    hop["from"]["model_key"], hop["to"]["model_key"], hop["chain_index"], hop["reason"],
+  ) == (SOL, SONNET, 0, "credential_denied")
+  second_bind = second.runner.capability_execution.bind
+  assert (second_bind.model_key, second_bind.selection_source) == (SONNET, "explicit_user")
+  assert second.dispatcher._capability_bind is second_bind
+  [completion] = _of_type(second_events, "turn_complete")
+  assert completion["usage"]["capability_bind"]["model_key"] == SONNET
+  assert not _of_type(second_events, "error")
+
+
+def test_pool_handle_to_generation_rotation_revives_failed_primary() -> None:
+  world = _World()
+  world.limited_models = {_UPSTREAM[OPUS]}
+  resolver = _resolver(world)
+  first = _Turn(resolver)
+  assert first.primary.bind.credential_ref == "user:anthropic"
+  assert "credential_source" not in first.primary.auth_config
+
+  first_events = first.run()
+
+  assert world.calls == [
+    ("anthropic", _UPSTREAM[OPUS], _TOKEN_A),
+    ("codex", _UPSTREAM[SOL], _CODEX_KEY),
+  ]
+  [hop] = _of_type(first_events, "model_fallback")
+  assert (hop["reason"], hop["to"]["model_key"]) == ("usage_limit", SOL)
+  assert first.runner.capability_execution.bind.model_key == SOL
+  assert not _of_type(first_events, "credential_refreshed")
+  assert not _of_type(first_events, "error")
+
+  member_b = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(_TOKEN_B)
+  assert member_b is not None
+  generation_b = member_b.source_metadata()
+  rotated_auth = {"auth_token": _TOKEN_B, "credential_source": generation_b}
+  rotated = CapabilityExecutionResolver.rebind_rotated_credential(
+    first.primary,
+    rotated_auth,
+    merged_auth_config={**first.primary.auth_config, **rotated_auth},
+  )
+  assert rotated is not None
+  assert rotated.bind.model_key == OPUS
+  assert rotated.bind.credential_ref == generation_b["generation_ref"]
+  assert rotated.resolver is not None
+
+  world.limited_models.clear()
+  world.calls.clear()
+  world.requests.clear()
+  second = _Turn(rotated.resolver)
+  assert second.primary.bind.model_key == OPUS
+  assert second.primary.bind.credential_ref == generation_b["generation_ref"]
+
+  second_events = second.run()
+
+  assert world.calls == [("anthropic", _UPSTREAM[OPUS], _TOKEN_B)]
+  assert [request["model"] for request in world.requests] == [_UPSTREAM[OPUS]]
+  assert not _of_type(second_events, "model_fallback")
+  assert not _of_type(second_events, "error")
+  serving = second.runner.capability_execution
+  assert serving.bind.model_key == OPUS
+  assert serving.bind.credential_ref == generation_b["generation_ref"]
+
+
+def test_unchanged_frozen_credential_does_not_revive_failed_primary() -> None:
+  world = _World()
+  world.limited_models = {_UPSTREAM[OPUS]}
+  world.siblings = {_TOKEN_A: _TOKEN_B}
+  world.rotation_generation_metadata = True
+  resolver = _resolver(world)
+  first = _Turn(resolver)
+
+  first_events = first.run()
+
+  assert world.calls == [
+    ("anthropic", _UPSTREAM[OPUS], _TOKEN_A),
+    ("anthropic", _UPSTREAM[OPUS], _TOKEN_B),
+    ("codex", _UPSTREAM[SOL], _CODEX_KEY),
+  ]
+  [hop] = _of_type(first_events, "model_fallback")
+  assert (hop["reason"], hop["to"]["model_key"]) == ("usage_limit", SOL)
+  assert first.runner.capability_execution.bind.model_key == SOL
+  assert not _of_type(first_events, "error")
+  member_b = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(_TOKEN_B)
+  assert member_b is not None
+  generation_b = member_b.source_metadata()
+  failed_bind = CapabilityBind.model_validate({
+    **first.primary.bind.to_json(), "credential_ref": generation_b["generation_ref"],
+  })
+  assert failed_bind.model_key == OPUS
+  assert failed_bind.credential_ref == generation_b["generation_ref"]
+  assert first.primary.bind.credential_ref != failed_bind.credential_ref
+
+  resumed = resolver.with_frozen_credential(
+    failed_bind,
+    {
+      "auth_mode": "oauth", "auth_token": _TOKEN_B, "provider": "anthropic",
+      "credential_source": generation_b,
+      ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
+    },
+  )
+  world.calls.clear()
+  world.requests.clear()
+  second = _Turn(resumed, snapshot=replace(first.snapshot))
+  assert second.primary.bind.model_key == SOL
+
+  second_events = second.run()
+
+  assert world.calls == [("codex", _UPSTREAM[SOL], _CODEX_KEY)]
+  assert [request["model"] for request in world.requests] == [_UPSTREAM[SOL]]
+  assert not _of_type(second_events, "model_fallback")
+  assert not _of_type(second_events, "error")
+  assert second.runner.capability_execution.bind.model_key == SOL
+
+
+def test_changed_frozen_credential_revives_only_its_providers_failed_entries() -> None:
+  world = _World()
+  world.limited_models = {_UPSTREAM[OPUS]}
+  world.denied_models = {_UPSTREAM[SOL]}
+  resolver = _resolver(
+    world,
+    chain=(FallbackEntry(model=SOL), FallbackEntry(model=MUSE)),
+    providers_with_credentials=frozenset({"anthropic", "codex", "muse"}),
+  )
+  first = _Turn(resolver)
+  codex_bind = resolver.select_bind(
+    "session.driver",
+    explicit_intent=ModelSelectionIntent(model_key=SOL, effort=None, source="explicit_user"),
+    selection_snapshot=first.snapshot,
+  )
+  first_events = first.run()
+  assert first.runner.capability_execution.bind.model_key == MUSE
+  assert [hop["reason"] for hop in _of_type(first_events, "model_fallback")] == [
+    "usage_limit", "credential_denied",
+  ]
+
+  renewed_codex_key = f"{_CODEX_KEY}-renewed"
+  renewed = resolver.with_frozen_credential(
+    CapabilityBind.model_validate({**codex_bind.to_json(), "credential_ref": "user:codex:renewed"}),
+    {"auth_mode": "api", "api_key": renewed_codex_key, "provider": "codex"},
+  )
+  world.denied_models.clear()
+  world.calls.clear()
+  second = _Turn(renewed, snapshot=replace(first.snapshot))
+  assert second.primary.bind.model_key == SOL
+  assert second.primary.bind.credential_ref == "user:codex:renewed"
+  second_events = second.run()
+  assert world.calls == [("codex", _UPSTREAM[SOL], renewed_codex_key)]
+  assert not _of_type(second_events, "model_fallback")
+  assert not _of_type(second_events, "error")
+
+  renewed = renewed.with_frozen_credential(
+    CapabilityBind.model_validate({**first.primary.bind.to_json(), "credential_ref": "user:anthropic:renewed"}),
+    {
+      "auth_mode": "oauth", "auth_token": _TOKEN_B, "provider": "anthropic",
+      ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
+    },
+  )
+  world.limited_models.clear()
+  world.calls.clear()
+  third = _Turn(renewed, snapshot=replace(first.snapshot))
+  assert third.primary.bind.model_key == OPUS
+  assert third.primary.bind.credential_ref == "user:anthropic:renewed"
+  third_events = third.run()
+  assert world.calls == [("anthropic", _UPSTREAM[OPUS], _TOKEN_B)]
+  assert not _of_type(third_events, "model_fallback")
+  assert not _of_type(third_events, "error")
+
+
+def test_next_turn_returns_to_the_primary_once_its_block_window_ends(monkeypatch: pytest.MonkeyPatch) -> None:
   world = _World()
   world.limited_models = {_UPSTREAM[OPUS]}
   resolver = _resolver(world)
@@ -680,6 +1135,7 @@ def test_next_turn_returns_to_the_primary_once_its_block_window_ends() -> None:
   first.run()
   assert first.runner.capability_execution.bind.model_key == SOL
 
+  monkeypatch.setattr(capability_execution, "time", SimpleNamespace(time=lambda: world.reset_at + 1))
   world.limited_models = set()
   world.calls.clear()
   second = _Turn(resolver)
@@ -888,7 +1344,7 @@ def test_fallback_usage_names_the_table_that_priced_each_hop(
 
   assert len(_of_type(events, "model_fallback")) == 1
   primary_usage, fallback_usage = turn.usage[:-1], turn.usage[-1]
-  assert len(primary_usage) == 1 + gateway_runner.STREAM_RETRY_MAX
+  assert len(primary_usage) == 1 + _FAST_RETRIES
   assert all(
     event.provider == "anthropic"
     and event.rate_table_version == "2026-10-07"
@@ -905,7 +1361,7 @@ def test_partial_usage_is_billed_when_the_client_disconnects_at_budget_exhaustio
   world.down = {"anthropic"}
   world.partial_outage = True
   turn = _Turn(_resolver(world))
-  last_attempt = 1 + gateway_runner.STREAM_RETRY_MAX
+  last_attempt = 1 + _FAST_RETRIES
 
   async def disconnect_on_last_attempt(count: int) -> None:
     if count == last_attempt:
@@ -1096,6 +1552,48 @@ def test_denied_chain_exhausts_and_fails_as_today() -> None:
   assert turn.runner.capability_execution.bind.model_key == OPENAI
 
 
+def test_expired_codex_hops_when_another_chain_entry_exists() -> None:
+  world = _World()
+  world.expired_models = {_UPSTREAM[SOL]}
+  turn = _Turn(_resolver(
+    world,
+    chain=(FallbackEntry(model=OPENAI),),
+    providers_with_credentials=frozenset({"codex", "openai"}),
+  ), explicit=SOL)
+
+  events = turn.run()
+
+  assert world.calls == [
+    ("codex", _UPSTREAM[SOL], _CODEX_KEY),
+    ("openai", _UPSTREAM[OPENAI], _OPENAI_KEY),
+  ]
+  [hop] = _of_type(events, "model_fallback")
+  assert hop["reason"] == "credential_denied"
+  assert hop["to"]["model_key"] == OPENAI
+  assert not _of_type(events, "error")
+
+
+def test_expired_codex_with_no_chain_entry_names_model_and_remedy() -> None:
+  world = _World()
+  world.expired_models = {_UPSTREAM[SOL]}
+  turn = _Turn(_resolver(
+    world,
+    chain=(),
+    providers_with_credentials=frozenset({"codex"}),
+  ), explicit=SOL)
+
+  events = turn.run()
+
+  assert world.calls == [("codex", _UPSTREAM[SOL], _CODEX_KEY)]
+  assert not _of_type(events, "model_fallback")
+  [error] = _of_type(events, "error")
+  assert error["error"] == (
+    "CodexCredentialExpired: codex gpt-sol-test (test.codex.sol) "
+    "credential has expired: choose another model or re-authenticate"
+  )
+  assert "HTTPStatusError" not in error["error"]
+
+
 def test_reached_budget_stops_before_the_fallback_hop() -> None:
   world = _World()
   world.denied_models = {_UPSTREAM[OPUS]}
@@ -1133,8 +1631,11 @@ def test_reached_budget_stops_before_the_fallback_hop() -> None:
 def test_credential_rotation_and_model_fallback_hops_do_not_compound_retry_backoff(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_DELAY", 3.0)
-  monkeypatch.setattr(gateway_runner, "STREAM_RETRY_BACKOFF", 2.0)
+  monkeypatch.setattr(
+    runner_stream_turn,
+    "TRANSPORT_RETRY_POLICY",
+    replace(runner_stream_turn.TRANSPORT_RETRY_POLICY, base_delay_seconds=3.0, backoff_factor=2.0),
+  )
   retry_sleeps: list[float] = []
 
   async def record_sleep(delay: float, result: Any = None) -> Any:

@@ -499,6 +499,33 @@ def test_stream_wire(
   assert any(event.type == "message_end" and event.stop_reason == "end_turn" for event in events)
 
 
+@pytest.mark.parametrize(
+  "event",
+  [
+    {"type": "error", "code": "insufficient_quota", "message": "You exceeded your current quota"},
+    {
+      "type": "response.failed",
+      "response": {"error": {"code": "rate_limit_exceeded", "message": "Too many requests"}},
+    },
+  ],
+  ids=["error-event", "response-failed"],
+)
+def test_copilot_in_band_usage_limit_is_copilot_labelled_typed_and_rate_limit(event: dict[str, Any]) -> None:
+  """An in-band quota error over HTTP 200 rotates as rate_limit, not as a billing denial."""
+  from agent_gateway.providers.copilot import _map_copilot_event
+  from agent_gateway.providers.codex_helpers import _ResponsesStreamState
+
+  with pytest.raises(RuntimeError) as raised:
+    _map_copilot_event(event, _ResponsesStreamState())
+
+  assert str(raised.value).startswith("copilot ")
+  assert "xAI" not in str(raised.value)
+  failure = CopilotResponsesProvider().classify_credential_failure(raised.value)
+  assert failure is not None
+  assert failure.kind == "rate_limit"
+  assert failure.error_code in {"insufficient_quota", "rate_limit_exceeded"}
+
+
 def test_muse_stream_reports_response_diagnostics_reasoning_tokens_and_reasoning_item() -> None:
   """Muse rides the OpenAI Responses mapper: response.id, service_tier, reasoning_tokens, headers."""
   stream_events: list[dict[str, Any]] = [

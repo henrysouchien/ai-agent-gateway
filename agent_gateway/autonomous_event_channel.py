@@ -15,12 +15,33 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import ValidationError
+
+from .autonomous_frame_metrics import (
+  FrameCapFinding,
+  FrameCapFindingEvent,
+  FrameCapMetrics,
+)
+
 
 AUTONOMOUS_EVENT_CHANNEL_VERSION = 1
+# Hang bound on the private gateway↔child frame channel: a runaway child or
+# corrupt length prefix must not make the gateway allocate or read without limit.
+# FRAME-CAPS-ARE-CONTAINMENT (Henry, 723db4743e); precedent e9d4dc138c:
+# a 2.49 MB tool result killed bg_353. Keep the durable record at full fidelity,
+# stream its compacted projection, and warn/drop an undeliverable non-terminal.
+# This channel ceiling includes the four-byte length header.
 AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES = 2 * 1024 * 1024
 AUTONOMOUS_EVENT_CHANNEL_MAX_LINE_BYTES = 2 * 1024 * 1024
 AUTONOMOUS_EVENT_CHANNEL_MAX_EVENTS = 100_000
 AUTONOMOUS_EVENT_CHANNEL_MAX_EVENT_BYTES = 64 * 1024 * 1024
+# Resource containment: these are the only hang bounds on the child-process
+# peer sockets (no tool or request clock reaches either socket); the approval
+# channel imports both. DEFAULT_IO_TIMEOUT is the one default for each
+# blocking send/recv (event create/adopt, approval send, runner start);
+# MAX_IO_TIMEOUT is the largest value a caller may configure. HELLO bounds
+# only the wait for the peer's first frame (the incremental stream is
+# unbounded afterward). They refuse no event.
 AUTONOMOUS_EVENT_CHANNEL_DEFAULT_IO_TIMEOUT_SECONDS = 300.0
 AUTONOMOUS_EVENT_CHANNEL_MAX_IO_TIMEOUT_SECONDS = 24 * 60 * 60.0
 HELLO_HANDSHAKE_TIMEOUT_SECONDS = 120.0
@@ -30,15 +51,19 @@ AUTONOMOUS_EVENT_CHANNEL_DIGEST_DOMAIN = (
 )
 
 _FRAME_HEADER = struct.Struct(">I")
-# Fixed cost of one EVENT frame around its canonical event: the length header,
-# the sibling keys written by `_encode_event_wire_frame`, the hex channel id,
-# and the widest `seq` the channel's event-count bound allows.
-_EVENT_FRAME_ENVELOPE_BYTES = (
+# Fixed cost of one EVENT frame around its canonical event, without seq digits:
+# the length header, sibling keys, and the 64-hex channel id.
+_EVENT_FRAME_FIXED_ENVELOPE_BYTES = (
   _FRAME_HEADER.size
   + len(b'{"channel_id":"","event":,"kind":"EVENT","seq":,"version":1}')
   + 64
+)
+_EVENT_FRAME_ENVELOPE_BYTES = (
+  _EVENT_FRAME_FIXED_ENVELOPE_BYTES
   + len(str(AUTONOMOUS_EVENT_CHANNEL_MAX_EVENTS))
 )
+# A Finding reports only bytes known to exist, including the minimum seq 0.
+_EVENT_FRAME_MINIMUM_ENVELOPE_BYTES = _EVENT_FRAME_FIXED_ENVELOPE_BYTES + 1
 _CHANNEL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_JSON_NESTING = 128
@@ -61,6 +86,8 @@ _SUMMARY_FIELDS = frozenset({
   "event_digest",
 })
 
+frame_cap_metrics = FrameCapMetrics("event_channel")
+
 
 class AutonomousEventChannelError(RuntimeError):
   """Base failure for the autonomous inherited event channel."""
@@ -76,6 +103,28 @@ class AutonomousEventChannelProtocolError(AutonomousEventChannelError):
 
 class AutonomousEventChannelBoundsError(AutonomousEventChannelProtocolError):
   """A declared event-channel resource bound was exceeded."""
+
+
+class _CanonicalJsonByteBoundsError(AutonomousEventChannelBoundsError):
+  """A byte preflight refusal with the canonical bytes already observed."""
+
+  def __init__(self, minimum_size_bytes: int) -> None:
+    self.minimum_size_bytes = minimum_size_bytes
+    super().__init__(
+      "autonomous event channel canonical JSON exceeds its byte bound"
+    )
+
+
+class AutonomousEventChannelFrameCapError(AutonomousEventChannelBoundsError):
+  """A frame exceeded the channel's hang bound, with its typed Finding."""
+
+  def __init__(self, finding: FrameCapFinding) -> None:
+    self.finding = finding
+    super().__init__(
+      "autonomous event channel frame exceeds the 2 MiB bound: "
+      f"size_basis={finding.size_basis}, "
+      f"frame_size_bytes={finding.frame_size_bytes}, cap_bytes={finding.cap_bytes}"
+    )
 
 
 class AutonomousEventChannelTimeout(AutonomousEventChannelError):
@@ -205,9 +254,7 @@ def _validate_timeout(value: object, *, field_name: str) -> float:
 def _json_string_size(value: str, *, byte_limit: int) -> int:
   size = 2
   if size > byte_limit:
-    raise AutonomousEventChannelBoundsError(
-      "autonomous event channel canonical JSON exceeds its byte bound"
-    )
+    raise _CanonicalJsonByteBoundsError(size)
   for character in value:
     codepoint = ord(character)
     if character in {'"', "\\"} or character in {
@@ -234,10 +281,14 @@ def _json_string_size(value: str, *, byte_limit: int) -> int:
       increment = 4
     size += increment
     if size > byte_limit:
-      raise AutonomousEventChannelBoundsError(
-        "autonomous event channel canonical JSON exceeds its byte bound"
-      )
+      raise _CanonicalJsonByteBoundsError(size)
   return size
+
+
+def _json_int_minimum_size(value: int) -> int:
+  # 1233 / 4096 is below log10(2); unlike the refusal estimator, this
+  # cannot overstate the digits, even at a power-of-ten boundary.
+  return ((max(value.bit_length() - 1, 0) * 1233) >> 12) + 1 + (value < 0)
 
 
 def _json_int_size(value: int, *, byte_limit: int) -> int:
@@ -247,9 +298,7 @@ def _json_int_size(value: int, *, byte_limit: int) -> int:
   decimal_digit_upper_bound = ((bit_length * 1234) >> 12) + 1
   size = decimal_digit_upper_bound + (1 if value < 0 else 0)
   if size > byte_limit:
-    raise AutonomousEventChannelBoundsError(
-      "autonomous event channel canonical JSON exceeds its byte bound"
-    )
+    raise _CanonicalJsonByteBoundsError(_json_int_minimum_size(value))
   return size
 
 
@@ -259,7 +308,7 @@ def _snapshot_json_value(
   depth: int,
   byte_limit: int,
   state: _JsonSnapshotState,
-) -> tuple[Any, int]:
+) -> tuple[Any, int, int]:
   state.value_nodes += 1
   if state.value_nodes > _MAX_JSON_VALUE_NODES:
     raise AutonomousEventChannelBoundsError(
@@ -271,21 +320,19 @@ def _snapshot_json_value(
     )
   if value is None:
     if byte_limit < 4:
-      raise AutonomousEventChannelBoundsError(
-        "autonomous event channel canonical JSON exceeds its byte bound"
-      )
-    return None, 4
+      raise _CanonicalJsonByteBoundsError(4)
+    return None, 4, 4
   if type(value) is bool:
     size = 4 if value else 5
     if size > byte_limit:
-      raise AutonomousEventChannelBoundsError(
-        "autonomous event channel canonical JSON exceeds its byte bound"
-      )
-    return value, size
+      raise _CanonicalJsonByteBoundsError(size)
+    return value, size, size
   if type(value) is int:
-    return value, _json_int_size(value, byte_limit=byte_limit)
+    size = _json_int_size(value, byte_limit=byte_limit)
+    return value, size, _json_int_minimum_size(value)
   if type(value) is str:
-    return value, _json_string_size(value, byte_limit=byte_limit)
+    size = _json_string_size(value, byte_limit=byte_limit)
+    return value, size, size
   if type(value) is float:
     if not math.isfinite(value):
       raise AutonomousEventChannelProtocolError(
@@ -293,10 +340,8 @@ def _snapshot_json_value(
       )
     size = len(repr(value))
     if size > byte_limit:
-      raise AutonomousEventChannelBoundsError(
-        "autonomous event channel canonical JSON exceeds its byte bound"
-      )
-    return value, size
+      raise _CanonicalJsonByteBoundsError(size)
+    return value, size, size
   if type(value) not in {dict, list}:
     raise AutonomousEventChannelProtocolError(
       "autonomous event channel payloads must contain only exact JSON values"
@@ -309,11 +354,10 @@ def _snapshot_json_value(
     )
   state.seen_containers[container_id] = value
   if byte_limit < 2:
-    raise AutonomousEventChannelBoundsError(
-      "autonomous event channel canonical JSON exceeds its byte bound"
-    )
+    raise _CanonicalJsonByteBoundsError(2)
 
   used = 2
+  minimum_used = 2
   try:
     if type(value) is dict:
       snapshot: dict[str, Any] = {}
@@ -325,9 +369,11 @@ def _snapshot_json_value(
           )
         separator_size = 0 if first else 1
         key_budget = byte_limit - used - separator_size - 1
+        minimum_used += separator_size + 1
         key_size = _json_string_size(key, byte_limit=key_budget)
         used += separator_size + key_size + 1
-        item_snapshot, item_size = _snapshot_json_value(
+        minimum_used += key_size
+        item_snapshot, item_size, item_minimum_size = _snapshot_json_value(
           item,
           depth=depth + 1,
           byte_limit=byte_limit - used,
@@ -335,15 +381,17 @@ def _snapshot_json_value(
         )
         snapshot[key] = item_snapshot
         used += item_size
+        minimum_used += item_minimum_size
         first = False
-      return snapshot, used
+      return snapshot, used, minimum_used
     else:
       snapshot_list: list[Any] = []
       first = True
       for item in value:
         separator_size = 0 if first else 1
         used += separator_size
-        item_snapshot, item_size = _snapshot_json_value(
+        minimum_used += separator_size
+        item_snapshot, item_size, item_minimum_size = _snapshot_json_value(
           item,
           depth=depth + 1,
           byte_limit=byte_limit - used,
@@ -351,8 +399,13 @@ def _snapshot_json_value(
         )
         snapshot_list.append(item_snapshot)
         used += item_size
+        minimum_used += item_minimum_size
         first = False
-      return snapshot_list, used
+      return snapshot_list, used, minimum_used
+  except _CanonicalJsonByteBoundsError as exc:
+    raise _CanonicalJsonByteBoundsError(
+      minimum_used + exc.minimum_size_bytes
+    ) from exc
   except AutonomousEventChannelError:
     raise
   except RuntimeError as exc:
@@ -370,7 +423,7 @@ def _canonical_json_snapshot(
 ) -> _CanonicalJsonSnapshot:
   if type(max_bytes) is not int or max_bytes <= 0:
     raise ValueError("autonomous event channel canonical JSON bound is invalid")
-  snapshot, estimated_size = _snapshot_json_value(
+  snapshot, estimated_size, _ = _snapshot_json_value(
     value,
     depth=0,
     byte_limit=max_bytes,
@@ -390,9 +443,7 @@ def _canonical_json_snapshot(
       "autonomous event channel payload is not canonical-JSON encodable"
     ) from exc
   if len(encoded) > max_bytes:
-    raise AutonomousEventChannelBoundsError(
-      "autonomous event channel canonical JSON exceeds its byte bound"
-    )
+    raise _CanonicalJsonByteBoundsError(len(encoded))
   if len(encoded) > estimated_size:
     raise AutonomousEventChannelProtocolError(
       "autonomous event channel canonical JSON preflight underestimated output"
@@ -453,6 +504,19 @@ def _decode_canonical_json_object(body: bytes) -> dict[str, Any]:
       "autonomous event channel frame is not canonical JSON"
     )
   return value
+
+
+def _decode_received_wire_frame(wire: _WireFrame) -> dict[str, Any]:
+  """Decode a received frame, recording byte refusals only at wire entry."""
+  try:
+    return _decode_canonical_json_object(wire.body)
+  except _CanonicalJsonByteBoundsError as exc:
+    raise AutonomousEventChannelFrameCapError(frame_cap_metrics.record(
+      frame_size_bytes=len(wire.frame_bytes),
+      cap_bytes=AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES,
+      direction="receive",
+      size_basis="declared",
+    )) from exc
 
 
 def _require_exact_fields(
@@ -545,6 +609,16 @@ def _snapshot_event(event: dict[str, Any]) -> _EventSnapshot:
       event,
       max_bytes=AUTONOMOUS_EVENT_CHANNEL_MAX_LINE_BYTES - 1,
     )
+  except _CanonicalJsonByteBoundsError as exc:
+    raise AutonomousEventChannelFrameCapError(FrameCapFinding(
+      channel="event_channel",
+      direction="send",
+      size_basis="lower_bound",
+      frame_size_bytes=(
+        _EVENT_FRAME_MINIMUM_ENVELOPE_BYTES + exc.minimum_size_bytes
+      ),
+      cap_bytes=AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES,
+    )) from exc
   except AutonomousEventChannelBoundsError as exc:
     raise AutonomousEventChannelBoundsError(
       "autonomous event channel event line exceeds the 2 MiB bound"
@@ -557,9 +631,15 @@ def _snapshot_event(event: dict[str, Any]) -> _EventSnapshot:
     len(snapshot.encoded)
     > AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES - _EVENT_FRAME_ENVELOPE_BYTES
   ):
-    raise AutonomousEventChannelBoundsError(
-      "autonomous event channel frame exceeds the 2 MiB bound"
-    )
+    raise AutonomousEventChannelFrameCapError(FrameCapFinding(
+      channel="event_channel",
+      direction="send",
+      size_basis="lower_bound",
+      frame_size_bytes=(
+        _EVENT_FRAME_MINIMUM_ENVELOPE_BYTES + len(snapshot.encoded)
+      ),
+      cap_bytes=AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES,
+    ))
   if type(snapshot.value) is not dict:
     raise AutonomousEventChannelProtocolError(
       "autonomous event channel events must be JSON objects"
@@ -606,15 +686,30 @@ def autonomous_event_fits_frame(event: dict[str, Any]) -> bool:
 
 
 def _encode_wire_frame(value: dict[str, Any]) -> _WireFrame:
-  body = _canonical_json_bytes(
-    value,
-    max_bytes=AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES - _FRAME_HEADER.size,
-  )
+  try:
+    body = _canonical_json_bytes(
+      value,
+      max_bytes=AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES - _FRAME_HEADER.size,
+    )
+  except _CanonicalJsonByteBoundsError as exc:
+    # Preflight constructs evidence only; a forwarded Finding EVENT is counted
+    # by the parent receiver, not once here and again on receipt.
+    raise AutonomousEventChannelFrameCapError(FrameCapFinding(
+      channel="event_channel",
+      frame_size_bytes=_FRAME_HEADER.size + exc.minimum_size_bytes,
+      cap_bytes=AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES,
+      direction="send",
+      size_basis="lower_bound",
+    )) from exc
   frame_length = _FRAME_HEADER.size + len(body)
   if frame_length > AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES:
-    raise AutonomousEventChannelBoundsError(
-      "autonomous event channel frame exceeds the 2 MiB bound"
-    )
+    raise AutonomousEventChannelFrameCapError(FrameCapFinding(
+      channel="event_channel",
+      frame_size_bytes=frame_length,
+      cap_bytes=AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES,
+      direction="send",
+      size_basis="actual",
+    ))
   frame_bytes = _FRAME_HEADER.pack(len(body)) + body
   return _WireFrame(body=body, frame_bytes=frame_bytes)
 
@@ -635,9 +730,12 @@ def _encode_event_wire_frame(
     + b',"version":1}'
   )
   if _FRAME_HEADER.size + len(body) > AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES:
-    raise AutonomousEventChannelBoundsError(
-      "autonomous event channel frame exceeds the 2 MiB bound"
-    )
+    raise AutonomousEventChannelFrameCapError(frame_cap_metrics.record(
+      frame_size_bytes=_FRAME_HEADER.size + len(body),
+      cap_bytes=AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES,
+      direction="send",
+      size_basis="actual",
+    ))
   return _WireFrame(
     body=body,
     frame_bytes=_FRAME_HEADER.pack(len(body)) + body,
@@ -761,9 +859,12 @@ def _recv_wire_frame(
       "autonomous event channel rejects empty frames"
     )
   if _FRAME_HEADER.size + body_length > AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES:
-    raise AutonomousEventChannelBoundsError(
-      "autonomous event channel frame exceeds the 2 MiB bound"
-    )
+    raise AutonomousEventChannelFrameCapError(frame_cap_metrics.record(
+      frame_size_bytes=_FRAME_HEADER.size + body_length,
+      cap_bytes=AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES,
+      direction="receive",
+      size_basis="declared",
+    ))
   body = _recv_exact(
     sock,
     body_length,
@@ -1091,12 +1192,24 @@ class AutonomousEventChannelChild(_OwnedEventChannelEndpoint):
           raise AutonomousEventChannelProtocolError(
             "autonomous private executable capture must be a JSON object"
           )
-        frame = _encode_wire_frame({
-          "kind": "PRIVATE_EXECUTABLE_CAPTURE",
-          "version": AUTONOMOUS_EVENT_CHANNEL_VERSION,
-          "channel_id": self._channel_id,
-          "private_executable_capture": payload,
-        })
+        try:
+          frame = _encode_wire_frame({
+            "kind": "PRIVATE_EXECUTABLE_CAPTURE",
+            "version": AUTONOMOUS_EVENT_CHANNEL_VERSION,
+            "channel_id": self._channel_id,
+            "private_executable_capture": payload,
+          })
+        except AutonomousEventChannelFrameCapError as exc:
+          try:
+            self._send_event(
+              {"type": "frame_cap_finding", "finding": exc.finding.model_dump()},
+              terminal_required=False,
+              deadline=time.monotonic() + self._timeout(timeout_seconds),
+            )
+          except Exception as finding_exc:
+            # Diagnostic transport cannot replace the original capture failure.
+            raise exc from finding_exc
+          raise
         _send_wire_frame(
           self._require_socket(),
           frame,
@@ -1152,7 +1265,7 @@ class AutonomousEventChannelChild(_OwnedEventChannelEndpoint):
           raise AutonomousEventChannelAcknowledgementError(
             "autonomous event channel closed before ACK"
           )
-        ack = _decode_canonical_json_object(ack_wire.body)
+        ack = _decode_received_wire_frame(ack_wire)
         _require_exact_fields(ack, _SUMMARY_FIELDS, kind="ACK")
         _require_kind(ack, "ACK")
         _require_version(ack)
@@ -1250,7 +1363,7 @@ class AutonomousEventChannelParent(_OwnedEventChannelEndpoint):
       raise AutonomousEventChannelProtocolError(
         "autonomous event channel closed before HELLO"
       )
-    hello = _decode_canonical_json_object(hello_wire.body)
+    hello = _decode_received_wire_frame(hello_wire)
     _require_exact_fields(hello, _HELLO_FIELDS, kind="HELLO")
     _require_kind(hello, "HELLO")
     _require_version(hello)
@@ -1286,7 +1399,23 @@ class AutonomousEventChannelParent(_OwnedEventChannelEndpoint):
       raise AutonomousEventChannelProtocolError(
         "autonomous event channel EVENT sequence is not contiguous"
       )
-    event_snapshot = _snapshot_event(value["event"])
+    try:
+      event_snapshot = _snapshot_event(value["event"])
+    except AutonomousEventChannelFrameCapError as exc:
+      raise AutonomousEventChannelFrameCapError(frame_cap_metrics.record(
+        frame_size_bytes=len(wire.frame_bytes),
+        cap_bytes=AUTONOMOUS_EVENT_CHANNEL_MAX_FRAME_BYTES,
+        direction="receive",
+        size_basis="declared",
+      )) from exc
+    finding_event = None
+    if event_snapshot.event_type == "frame_cap_finding":
+      try:
+        finding_event = FrameCapFindingEvent.model_validate(value["event"])
+      except ValidationError as exc:
+        raise AutonomousEventChannelProtocolError(
+          "autonomous event channel frame-cap Finding event is invalid"
+        ) from exc
     if len(self._receive_records) >= AUTONOMOUS_EVENT_CHANNEL_MAX_EVENTS:
       raise AutonomousEventChannelBoundsError(
         "autonomous event channel event count exceeds 100,000"
@@ -1308,6 +1437,8 @@ class AutonomousEventChannelParent(_OwnedEventChannelEndpoint):
     self._receive_terminal_seen = (
       event_snapshot.event_type in _TERMINAL_EVENT_TYPES
     )
+    if finding_event is not None:
+      frame_cap_metrics.record_finding(finding_event.finding)
     return record
 
   def _receive_final_stream(
@@ -1377,7 +1508,7 @@ class AutonomousEventChannelParent(_OwnedEventChannelEndpoint):
       raise AutonomousEventChannelProtocolError(
         "autonomous event channel closed before END"
       )
-    end = _decode_canonical_json_object(end_wire.body)
+    end = _decode_received_wire_frame(end_wire)
     if end.get("kind") != "END":
       raise AutonomousEventChannelProtocolError(
         "autonomous event channel terminal event was not the final EVENT"
@@ -1413,7 +1544,7 @@ class AutonomousEventChannelParent(_OwnedEventChannelEndpoint):
       raise AutonomousEventChannelProtocolError(
         "autonomous event channel closed before END"
       )
-    value = _decode_canonical_json_object(wire.body)
+    value = _decode_received_wire_frame(wire)
     kind = value.get("kind")
     if self._receive_terminal_seen and kind != "END":
       raise AutonomousEventChannelProtocolError(
@@ -1613,9 +1744,7 @@ class AutonomousEventChannelPair:
 def create_autonomous_event_channel(
   *,
   channel_id: str | None = None,
-  io_timeout_seconds: float = (
-    AUTONOMOUS_EVENT_CHANNEL_DEFAULT_IO_TIMEOUT_SECONDS
-  ),
+  io_timeout_seconds: float = AUTONOMOUS_EVENT_CHANNEL_DEFAULT_IO_TIMEOUT_SECONDS,
 ) -> AutonomousEventChannelPair:
   """Create a private AF_UNIX stream pair with CLOEXEC set on both endpoints."""
 
@@ -1674,9 +1803,7 @@ def adopt_inherited_autonomous_event_channel(
   fd: int,
   *,
   channel_id: str,
-  io_timeout_seconds: float = (
-    AUTONOMOUS_EVENT_CHANNEL_DEFAULT_IO_TIMEOUT_SECONDS
-  ),
+  io_timeout_seconds: float = AUTONOMOUS_EVENT_CHANNEL_DEFAULT_IO_TIMEOUT_SECONDS,
 ) -> AutonomousEventChannelChild:
   """Take sole ownership of an explicitly inherited child socket descriptor."""
 
@@ -1747,6 +1874,7 @@ __all__ = [
   "AutonomousEventChannelBoundsError",
   "AutonomousEventChannelChild",
   "AutonomousEventChannelError",
+  "AutonomousEventChannelFrameCapError",
   "AutonomousEventChannelPair",
   "AutonomousEventChannelParent",
   "AutonomousEventChannelProtocolError",
@@ -1760,5 +1888,6 @@ __all__ = [
   "adopt_inherited_autonomous_event_channel",
   "autonomous_event_fits_frame",
   "create_autonomous_event_channel",
+  "frame_cap_metrics",
   "snapshot_autonomous_event",
 ]

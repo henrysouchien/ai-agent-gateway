@@ -72,6 +72,17 @@ def kimi_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
     pool.clear()
 
 
+@pytest.fixture
+def owner_scope(monkeypatch: pytest.MonkeyPatch) -> str:
+  """Deployment owner roster; returns the owner's run scope, the only one an org OAuth seat serves."""
+  monkeypatch.delenv("HANK_USER_RUNTIME_CREDENTIALS_FILE", raising=False)
+  monkeypatch.setenv(
+    "GATEWAY_USER_KEYS",
+    json.dumps([{"slug": "operator", "risk_user_id": 1, "role": "owner"}]),
+  )
+  return "1"
+
+
 def test_extract_kimi_account_identity_prefers_email_then_user_id_then_sub() -> None:
   assert extract_kimi_account_identity(
     _jwt({"email": "seat@example.com", "user_id": "u-1", "sub": "s-1"})
@@ -454,12 +465,11 @@ def _request_params(provider: KimiCodeProvider, level: ThinkingLevel, max_tokens
   )
 
 
-def test_build_request_params_encodes_enabled_thinking_effort_and_clamps_max_tokens() -> None:
+def test_build_request_params_encodes_enabled_thinking_effort() -> None:
   params = _request_params(KimiCodeProvider(), ThinkingLevel.HIGH, 500_000)
   assert params["model"] == "k3"
   assert params["thinking"] == {"type": "enabled", "effort": "high"}
   assert "reasoning_effort" not in params
-  assert params["max_tokens"] == 131072
 
 
 def test_build_request_params_encodes_disabled_thinking_when_effort_is_none() -> None:
@@ -470,7 +480,7 @@ def test_build_request_params_encodes_disabled_thinking_when_effort_is_none() ->
 
 @pytest.mark.parametrize("failure_kind", ["rate_limit", "auth"])
 def test_next_credential_rotates_to_seat_two_and_parks_seat_one(
-  kimi_env: Path, failure_kind: CredentialFailureKind,
+  kimi_env: Path, owner_scope: str, failure_kind: CredentialFailureKind,
 ) -> None:
   store = kimi_env / "kimi_code" / "oauth.json"
   first = _seat("first@example.com")
@@ -484,6 +494,7 @@ def test_next_credential_rotates_to_seat_two_and_parks_seat_one(
     "auth_token": first["access_token"],
     "api_key": "",
     "account_identity": "first@example.com",
+    "auth_user_scope": owner_scope,
   }
   reset_at = time.time() + 600
   failure = ProviderCredentialFailure(
@@ -507,7 +518,9 @@ def test_next_credential_rotates_to_seat_two_and_parks_seat_one(
   assert pool.blocked_until("second@example.com") == reset_at
 
 
-def test_next_credential_does_not_rotate_oauth_seat_on_billing_failure(kimi_env: Path) -> None:
+def test_next_credential_does_not_rotate_oauth_seat_on_billing_failure(
+  kimi_env: Path, owner_scope: str,
+) -> None:
   store = kimi_env / "kimi_code" / "oauth.json"
   first = _seat("first@example.com")
   save_kimi_code_token_record(store, first)
@@ -517,8 +530,30 @@ def test_next_credential_does_not_rotate_oauth_seat_on_billing_failure(kimi_env:
     "auth_mode": "oauth",
     "auth_token": first["access_token"],
     "account_identity": "first@example.com",
+    "auth_user_scope": owner_scope,
   }
   failure = ProviderCredentialFailure(provider="kimi_code", kind="billing", status_code=402)
+  assert KimiCodeProvider().next_credential(config, failure) is None
+
+
+@pytest.mark.parametrize("scope", ["13", ""])
+def test_next_credential_never_rotates_onto_org_oauth_seat_for_non_owner(
+  kimi_env: Path, owner_scope: str, scope: str,
+) -> None:
+  store = kimi_env / "kimi_code" / "oauth.json"
+  first = _seat("first@example.com")
+  save_kimi_code_token_record(store, first)
+  save_kimi_code_token_record(store, _seat("second@example.com"))
+  config = {
+    "provider": "kimi_code",
+    "auth_mode": "oauth",
+    "auth_token": first["access_token"],
+    "account_identity": "first@example.com",
+    "auth_user_scope": scope,
+  }
+  failure = ProviderCredentialFailure(
+    provider="kimi_code", kind="rate_limit", status_code=429, reset_at=time.time() + 600,
+  )
   assert KimiCodeProvider().next_credential(config, failure) is None
 
 

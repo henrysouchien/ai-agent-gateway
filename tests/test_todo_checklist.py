@@ -485,7 +485,7 @@ def _as_skill(name: str):
   from agent_gateway.skill_limits import ActiveSkillAdmission, SkillExecutionLimits
 
   return set_current_skill(
-    ActiveSkillAdmission(skill_name=name, execution_limits=SkillExecutionLimits(max_tokens=None))
+    ActiveSkillAdmission(skill_name=name, execution_limits=SkillExecutionLimits())
   )
 
 

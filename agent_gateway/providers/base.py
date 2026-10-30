@@ -23,7 +23,6 @@ from model_authority.thinking import EffortResolution, ThinkingLevel
 log = logging.getLogger(__name__)
 
 
-_STATUS_CODE_RE = re.compile(r"\b(400|401|403|404|429|5\d\d)\b")
 _BILLING_PATTERNS = (
   re.compile(r"\bbilling\b", re.IGNORECASE),
   re.compile(r"\bquota\b", re.IGNORECASE),
@@ -40,19 +39,42 @@ _REGAIN_ACCESS_RE = re.compile(
   r"\bregain access on (\d{4}-\d{2}-\d{2}) at (\d{2}:\d{2})(?::(\d{2}))?\s+UTC\b",
   re.IGNORECASE,
 )
-_AUTH_PATTERNS = (
-  re.compile(r"\bunauthorized\b", re.IGNORECASE),
-  re.compile(r"\bauth(?:entication|orization)?(?:\s+failed|\s+error)?\b", re.IGNORECASE),
-  re.compile(r"\binvalid api key\b", re.IGNORECASE),
-  re.compile(r"\bexpired (?:token|credential|key)\b", re.IGNORECASE),
+# Auth and rate-limit failures are read from the typed HTTP status and the typed
+# ``error_code`` the producer attached (an SDK/HTTP error carries both; an in-band
+# stream error carries its own ``code`` through ``stream_error``), never from message
+# prose. Only three text readings remain; each is the one owner of an
+# invariant no producer declares as a typed field:
+#
+# ``_BILLING_PATTERNS``: a spent quota, an exhausted credit balance and an API usage
+#   cap arrive as the provider's own prose on statuses (400, 403, 429) that a plain
+#   request error and a quota error share, and some also arrive as an
+#   ``insufficient_quota`` code. No typed field separates "this credential is spent"
+#   from "this request is malformed", and misreading a spent key as a bad request
+#   leaves the run on a credential every call will reject. Kept as text until a
+#   producer declares the distinction; it refuses nothing, it names the failure kind.
+# ``_REGAIN_ACCESS_RE``: reads the reset instant Anthropic declares only inside the
+#   usage-cap sentence ("You will regain access on ..."). That is the provider's own
+#   declared reset (the one value credential parking is keyed to), not a threshold.
+# ``_CONTEXT_LENGTH_PATTERNS`` (below): context overflow is a 400 whose type is the
+#   generic invalid-request type on every provider; only the prose names it. It routes
+#   the failure to compaction and rejects nothing.
+#
+# Typed vocabulary of the codes producers declare. An unlisted code is no credential
+# failure, so the run keeps its transient-retry path.
+_AUTH_ERROR_CODES = frozenset({
+  "authentication_error",
+  "invalid_api_key",
+  "unauthorized",
   # A 403 whose organization refuses OAuth is a property of this credential's
   # account, not of the request: a sibling in another organization answers it.
-  re.compile(r"\boauth_not_allowed_for_organization\b", re.IGNORECASE),
-)
-_RATE_LIMIT_PATTERNS = (
-  re.compile(r"\brate(?:\s+limit(?:ed|ing)?|\s+limited)\b", re.IGNORECASE),
-  re.compile(r"\btoo many requests\b", re.IGNORECASE),
-)
+  "oauth_not_allowed_for_organization",
+})
+_RATE_LIMIT_ERROR_CODES = frozenset({
+  "rate_limit",
+  "rate_limit_error",
+  "rate_limit_exceeded",
+  "too_many_requests",
+})
 # Anthropic's unified subscription limiter reports one status and one reset per
 # window; the status names whether that window is still serving requests.
 _LIMIT_WINDOW_PROJECTIONS = (
@@ -84,8 +106,10 @@ class ModelInfo:
 
   id: str
   provider: str
+  max_output_tokens: int
+  # Production uses model_info_from_entry below, which always supplies the
+  # authority's required typed compat value; this default serves direct test doubles.
   context_window: int = 200_000
-  max_output_tokens: int = 16_384
   supports_thinking: bool = False
   supports_vision: bool = True
   supports_tool_use: bool = True
@@ -245,6 +269,21 @@ class CostEstimate:
   cost_known: bool = True
 
 
+def stream_error(message: str, code: Any = None) -> RuntimeError:
+  """A ``RuntimeError`` for an in-band stream error event (HTTP 200 body).
+
+  ``error_code`` is the event's own ``code`` when it is a non-empty string, never
+  a stringified number; ``_error_code_from_exception`` reads it, so the failure
+  keeps its class once the message is only a message.
+  """
+
+  if code is not None and not isinstance(code, str):
+    raise TypeError("provider error code must be a string")
+  exc = RuntimeError(message)
+  exc.error_code = code.strip() or None if code is not None else None  # type: ignore[attr-defined]
+  return exc
+
+
 def _status_code_from_exception(exc: Exception) -> int | None:
   status_code = getattr(exc, "status_code", None)
   if status_code is None:
@@ -354,12 +393,8 @@ def _classify_provider_credential_failure(
   status_code = _status_code_from_exception(exc)
   message = " ".join(part for part in (str(exc), _response_text(exc)) if part).strip()
   error_code = _error_code_from_exception(exc)
+  code = (error_code or "").strip().lower()
   searchable = " ".join(part for part in (message, error_code or "") if part)
-
-  if status_code is None:
-    match = _STATUS_CODE_RE.search(searchable)
-    if match:
-      status_code = int(match.group(1))
 
   if any(pattern.search(searchable) for pattern in _BILLING_PATTERNS):
     return ProviderCredentialFailure(
@@ -371,7 +406,7 @@ def _classify_provider_credential_failure(
       reset_at=_credential_reset_at(exc),
     )
 
-  if status_code in {401} or any(pattern.search(searchable) for pattern in _AUTH_PATTERNS):
+  if status_code == 401 or code in _AUTH_ERROR_CODES:
     return ProviderCredentialFailure(
       provider=provider,
       kind="auth",
@@ -391,7 +426,7 @@ def _classify_provider_credential_failure(
       reset_at=_credential_reset_at(exc),
     )
 
-  if status_code == 429 or any(pattern.search(searchable) for pattern in _RATE_LIMIT_PATTERNS):
+  if status_code == 429 or code in _RATE_LIMIT_ERROR_CODES:
     return ProviderCredentialFailure(
       provider=provider,
       kind="rate_limit",

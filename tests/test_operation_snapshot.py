@@ -22,6 +22,7 @@ from agent_workflow_contracts import (
   AdmittedTask,
   AgentExecutionSnapshot,
   AgentOperationSnapshot,
+  AgentResumeMechanics,
   EvidencePort,
   OutcomeRequirement,
   ProjectionRequirement,
@@ -315,27 +316,49 @@ def test_composed_instructions_round_trip_past_the_retired_length_ceiling() -> N
     operation=operation,
     result_instructions="Report the evidence.",
     admission_date="2026-10-08",
-    max_tokens=256_001,
     cost_observation_threshold_usd=None,
     provider_tool_definitions=(),
-    max_resume_chain_depth=1_001,
   )
   assert composed in snapshot.system_prompt
-  assert snapshot.max_tokens == 256_001
-  assert snapshot.resume_mechanics.max_chain_depth == 1_001
+  assert "max_tokens" not in snapshot.model_dump(mode="json")
+  assert snapshot.max_tokens is None
   assert "client_timeout_seconds" not in snapshot.model_dump(mode="json")
   assert AgentExecutionSnapshot.model_validate_json(
     snapshot.model_dump_json()
   ) == snapshot
 
 
-@pytest.mark.parametrize(
-  ("resumable", "depth"),
-  [(True, 0), (False, 7), (True, 1_001), (False, 1_001)],
-)
-def test_resume_depth_is_recorded_independently_of_resumability(
+def test_durable_resume_mechanics_with_retired_chain_depth_round_trip_as_written() -> None:
+  durable = {
+    "resumable": True,
+    "max_chain_depth": 3,
+    "transcript_strategy": "durable_reconstruction",
+    "prompt_strategy": "reuse_exact",
+    "tool_grant_strategy": "reissue_exact",
+    "control_message_strategy": "admitted_exact",
+  }
+  original = dict(durable)
+
+  restored = AgentResumeMechanics.model_validate(durable)
+
+  assert durable == original
+  assert restored.resumable is True
+  assert restored.model_dump(mode="json") == original
+
+  produced = AgentResumeMechanics(
+    resumable=True,
+    transcript_strategy="durable_reconstruction",
+    prompt_strategy="reuse_exact",
+    tool_grant_strategy="reissue_exact",
+    control_message_strategy="admitted_exact",
+  )
+  assert "max_chain_depth" not in produced.model_dump(mode="json")
+  assert "max_chain_depth" not in produced.model_dump_json()
+
+
+@pytest.mark.parametrize("resumable", [True, False])
+def test_resumability_is_recorded_and_lineage_depth_is_unbounded(
   resumable: bool,
-  depth: int,
 ) -> None:
   operation = build_agent_operation_snapshot(
     name="deep-operation",
@@ -350,14 +373,11 @@ def test_resume_depth_is_recorded_independently_of_resumability(
     operation=operation,
     result_instructions="Report the evidence.",
     admission_date="2026-10-08",
-    max_tokens=256_001,
     cost_observation_threshold_usd=None,
     provider_tool_definitions=(),
-    max_resume_chain_depth=depth,
   )
   restored = AgentExecutionSnapshot.model_validate_json(snapshot.model_dump_json())
   assert restored.resume_mechanics.resumable is resumable
-  assert restored.resume_mechanics.max_chain_depth == depth
 
   lineage = AdmittedLineage(parent_job_id="parent-job", depth=1_001)
   assert AdmittedLineage.model_validate_json(lineage.model_dump_json()) == lineage
@@ -398,15 +418,15 @@ def test_result_metadata_does_not_refuse_declared_modes_or_projections() -> None
   [
     (
       "narrative",
-      "sha256:8ad1e10f103631018a6bfc8d2c50f4508fd4b3b61c9a5a9ee45ac87ce87ed79b",
+      "sha256:8f75c61cd3b3a718a7b39c931a9c886a7cb6eb10c4059338c51c6223f437acc1",
     ),
     (
       "projection",
-      "sha256:06194bd9d897dcde6f8ec0ed82f8f78e66720c6bcc553946558d4e509814b22d",
+      "sha256:510f9b09eb89475c75187efac06798c77b033295a8cf41a4469c28ef3ca095a8",
     ),
     (
       "long",
-      "sha256:6b437abc8e1f188bd191e8d281b37a56b578ee1524f7b02b18c0d02c589855ec",
+      "sha256:9add31a01d46d9acaea39c97d89c890532ce612264d64275873bc297e8b28dba",
     ),
   ],
 )
@@ -417,6 +437,8 @@ def test_historical_admitted_task_serialization_keeps_its_sealed_digest(
   # Captured with the models at 632de9a90437. Narrative and long tasks passed
   # that revision's validators. The projection capture used model_construct
   # to preserve its serializer's bytes for the shape its validator refused.
+  # max_tokens is optional legacy on read: the sealed bytes carry it, and the
+  # digests prove it still parses and round-trips unchanged.
   wire = json.loads(r"""
   {
     "schema_version": "1.2",
@@ -448,7 +470,7 @@ def test_historical_admitted_task_serialization_keeps_its_sealed_digest(
       "cost_observation_threshold_usd": null,
       "provider_tool_definitions": [],
       "resume_mechanics": {
-        "resumable": true, "max_chain_depth": 3,
+        "resumable": true,
         "transcript_strategy": "durable_reconstruction",
         "prompt_strategy": "reuse_exact",
         "tool_grant_strategy": "reissue_exact",
@@ -505,7 +527,7 @@ def test_historical_admitted_task_serialization_keeps_its_sealed_digest(
     },
     "outcome_policy": {"routes": [{"disposition": "complete", "action": "settle"}]},
     "admitted_plan_digest": null,
-    "admitted_task_digest": "sha256:8ad1e10f103631018a6bfc8d2c50f4508fd4b3b61c9a5a9ee45ac87ce87ed79b",
+    "admitted_task_digest": "sha256:8f75c61cd3b3a718a7b39c931a9c886a7cb6eb10c4059338c51c6223f437acc1",
     "model_bind_digest": "sha256:71a01a4bbf585f1a8dcdd48ae4caff44bf564902725d703cd356bb5a9f591fa3",
     "capability_binding_digest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     "tool_grant_digest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
@@ -525,7 +547,6 @@ def test_historical_admitted_task_serialization_keeps_its_sealed_digest(
       + "\n\nCurrent date: 2026-10-08\n\nHistorical result instructions."
     )
     wire["execution_snapshot"]["max_tokens"] = 256_000
-    wire["execution_snapshot"]["resume_mechanics"]["max_chain_depth"] = 100
   wire["admitted_task_digest"] = expected_digest
 
   restored = AdmittedTask.model_validate_json(json.dumps(wire))

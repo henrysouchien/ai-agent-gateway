@@ -209,8 +209,9 @@ def make_test_app():
     )
 
     def _materialize_test_credential(
-      handle: CredentialHandle,
+      handle: CredentialHandle, *, user_scope: Any = None,
     ) -> MaterializedCredential:
+      del user_scope  # The fixture's service material is already resolved.
       if handle is not service_handle:
         raise RuntimeError("unknown gateway test credential handle")
       return service_material

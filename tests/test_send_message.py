@@ -152,7 +152,7 @@ class _StubProvider:
     _ = client, timeout
 
   def get_model_info(self, model: str) -> ModelInfo:
-    return ModelInfo(id=model, provider=self.name)
+    return ModelInfo(id=model, provider=self.name, max_output_tokens=16_384)
 
   def build_request_params(
     self,
@@ -1628,7 +1628,7 @@ Send the filing evidence to the parent, then return a short conclusion.
       pass
 
     def get_model_info(self, model: str) -> ModelInfo:
-      return ModelInfo(id=model, provider=self.name)
+      return ModelInfo(id=model, provider=self.name, max_output_tokens=16_384)
 
     def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
       return kwargs

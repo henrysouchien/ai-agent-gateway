@@ -7,11 +7,12 @@ register a second one and does not enqueue a parent notification.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from agent_workflow_contracts import (
   AdmittedTask,
@@ -34,6 +35,7 @@ from .runner_background_tasks import (
 from .final_narrative_artifact import FinalNarrativeArtifactError
 from .runner_session_events import build_agent_completion_event
 from .sub_agent_narrative_result import read_task_result_terminal_narrative
+from .skill_lifecycle import drain_owned_lifecycle_task
 from .task_registry import TaskEntry, task_state_for_result
 
 
@@ -111,13 +113,13 @@ def build_own_journal_registration(
   runner_id: str,
   gateway_session_id: str,
 ) -> dict[str, Any]:
-  """The ``task_registered`` of a job whose own writer journals it.
+  """Build the registration naming the session that journals this attempt.
 
-  The writer is the registered task's session: ``sub_agent_id`` is its gateway
-  session id, which ``transcript.child_run_segment_for_task`` matches to the
-  writer's attach to read the job's events after this registration as its
-  attempt. The registry entry is not stamped: its terminal stamping stays
-  ``publish_child_completion``'s, at the job's one settlement.
+  ``sub_agent_id`` is that session's gateway id, which
+  ``transcript.child_run_segment_for_task`` matches to its writer's attach.
+  An own-writer job registers after attaching; a foreground delegation registers
+  before the child attaches and records its distinct parent session id.
+  The registry entry is not stamped until completion publication.
   """
 
   view = SimpleNamespace(
@@ -144,7 +146,74 @@ def build_own_journal_registration(
   )
 
 
-async def publish_child_completion(
+def _stamp_child_result(
+  entry: TaskEntry,
+  *,
+  admitted_task: AdmittedTask,
+  result: TaskResult,
+  capability_bind_receipt: Mapping[str, str],
+  completed_at: float,
+  settle_entry_state: bool,
+) -> None:
+  policy = entry.parent_result_policy or ordinary_parent_result_policy(result)
+  entry.result = result.model_dump(mode="json")
+  entry.capability_bind_receipt = dict(capability_bind_receipt)
+  entry.admitted_task = admitted_task
+  entry.task_result = result
+  entry.parent_result_policy = policy
+  if entry.completed_at is None:
+    entry.completed_at = completed_at
+  if settle_entry_state:
+    entry.state = task_state_for_result(result)
+  metadata = dict(entry.metadata)
+  metadata.setdefault("admitted_task", admitted_task.model_dump(mode="json"))
+  metadata.setdefault("parent_result_policy", policy.model_dump(mode="json"))
+  entry.metadata = metadata
+
+
+async def publish_registered_child_settlement(
+  *,
+  transport: CompletionTransport,
+  entry: TaskEntry,
+  admitted_task: AdmittedTask,
+  result: TaskResult,
+  capability_bind_receipt: Mapping[str, str],
+  completed_at: float | None = None,
+) -> float:
+  """Commit execution independently of readable-result materialization."""
+
+  async def persist() -> float:
+    async with entry.finalization_lock:
+      if entry.completion_persistence_state == "committed":
+        return cast(float, entry.completed_at)
+      now = completed_at if completed_at is not None else datetime.datetime.now(datetime.UTC).timestamp()
+      _stamp_child_result(
+        entry, admitted_task=admitted_task, result=result,
+        capability_bind_receipt=capability_bind_receipt,
+        completed_at=now, settle_entry_state=True,
+      )
+      # Execution details live in the canonical TaskResult; a transport or
+      # cancellation exception is not a second, conflicting execution error.
+      entry.error = None
+      await transport.append(task_completed_event_payload(
+        entry, task_state_for_result(result),
+        correlation_payload=task_correlation_payload(
+          entry, runner_id=transport.runner_id, role=transport.role,
+        ),
+        completed_at=now,
+      ))
+      entry.completion_persistence_state = "committed"
+      return now
+
+  settlement = asyncio.create_task(persist())
+  try:
+    return await asyncio.shield(settlement)
+  except asyncio.CancelledError:
+    await drain_owned_lifecycle_task(settlement)
+    raise
+
+
+def _build_child_completion_publication(
   *,
   transport: CompletionTransport,
   entry: TaskEntry,
@@ -154,13 +223,8 @@ async def publish_child_completion(
   agent_name: str | None = None,
   completed_at: float | None = None,
   settle_entry_state: bool = True,
-) -> AgentCompletionEnvelope:
-  """Journal ``task_registered``, ``task_completed`` and ``agent_completion``.
-
-  ``settle_entry_state`` is false for a pipeline stage whose registry entry is
-  still settled by the pipeline's own transition. Stamping a terminal state
-  here would make that transition a no-op and drop the stage listener.
-  """
+) -> tuple[AgentCompletionEnvelope, dict[str, Any], tuple[dict[str, Any], ...]]:
+  """Materialize and stamp one settlement before compiling its journal events."""
 
   if not transport.parent_session_id or not transport.principal_id:
     raise RuntimeError(
@@ -189,46 +253,96 @@ async def publish_child_completion(
       workspace_dir=transport.workspace_dir,
       principal_id=transport.principal_id,
     )
-  policy = entry.parent_result_policy or ordinary_parent_result_policy(result)
-  result_payload = result.model_dump(mode="json")
-  receipt = dict(capability_bind_receipt)
-  entry.result = result_payload
-  entry.capability_bind_receipt = receipt
-  entry.admitted_task = admitted_task
-  entry.task_result = result
-  entry.parent_result_policy = policy
+  _stamp_child_result(
+    entry, admitted_task=admitted_task, result=result,
+    capability_bind_receipt=capability_bind_receipt,
+    completed_at=now, settle_entry_state=settle_entry_state,
+  )
   entry.completion_envelope = envelope
-  if entry.completed_at is None:
-    entry.completed_at = now
-  if settle_entry_state:
-    entry.state = task_state_for_result(result)
-  metadata = dict(entry.metadata)
-  metadata.setdefault("admitted_task", admitted_task.model_dump(mode="json"))
-  metadata.setdefault("parent_result_policy", policy.model_dump(mode="json"))
-  entry.metadata = metadata
 
   correlation = task_correlation_payload(
     entry,
     runner_id=transport.runner_id,
     role=transport.role,
   )
-  append = transport.append
-  await append(task_registered_event_payload(
+  registration = task_registered_event_payload(
     entry,
     correlation_payload=correlation,
     agent_name=agent_name if agent_name is not None else entry.agent_name,
     parent_session_id=transport.parent_session_id,
-  ))
-  await append(task_completed_event_payload(
-    entry,
-    task_state_for_result(result),
-    correlation_payload=correlation,
-    completed_at=entry.completed_at or now,
-  ))
-  await append(build_agent_completion_event(
-    task_id=entry.task_id,
-    envelope=envelope,
-    ts=entry.completed_at or now,
+  )
+  settlement = (
+    task_completed_event_payload(
+      entry,
+      task_state_for_result(result),
+      correlation_payload=correlation,
+      completed_at=entry.completed_at or now,
+    ),
+    build_agent_completion_event(
+      task_id=entry.task_id,
+      envelope=envelope,
+      ts=entry.completed_at or now,
+    ),
+  )
+  return envelope, registration, settlement
+
+
+async def publish_child_completion(
+  *,
+  transport: CompletionTransport,
+  entry: TaskEntry,
+  admitted_task: AdmittedTask,
+  result: TaskResult,
+  capability_bind_receipt: Mapping[str, str],
+  agent_name: str | None = None,
+  completed_at: float | None = None,
+  settle_entry_state: bool = True,
+) -> AgentCompletionEnvelope:
+  """Register and settle a child at publication (pipeline-stage contract).
+
+  ``settle_entry_state`` is false when the pipeline's own transition still
+  settles the registry entry; stamping it here would drop the stage listener.
+  """
+
+  envelope, registration, settlement = _build_child_completion_publication(
+    transport=transport,
+    entry=entry,
+    admitted_task=admitted_task,
+    result=result,
+    capability_bind_receipt=capability_bind_receipt,
+    agent_name=agent_name,
+    completed_at=completed_at,
+    settle_entry_state=settle_entry_state,
+  )
+  for event in (registration, *settlement):
+    await transport.append(event)
+  return envelope
+
+
+async def publish_registered_child_completion(
+  *,
+  transport: CompletionTransport,
+  entry: TaskEntry,
+  admitted_task: AdmittedTask,
+  result: TaskResult,
+  capability_bind_receipt: Mapping[str, str],
+  agent_name: str | None = None,
+  completed_at: float | None = None,
+) -> AgentCompletionEnvelope:
+  """Settle an attempt registered in its transcript before its first model turn."""
+
+  settled_at = await publish_registered_child_settlement(
+    transport=transport, entry=entry, admitted_task=admitted_task,
+    result=result, capability_bind_receipt=capability_bind_receipt,
+    completed_at=completed_at,
+  )
+  envelope = materialize_child_completion_envelope(
+    result, workspace_dir=transport.workspace_dir,
+    principal_id=transport.principal_id,
+  )
+  entry.completion_envelope = envelope
+  await transport.append(build_agent_completion_event(
+    task_id=entry.task_id, envelope=envelope, ts=settled_at,
   ))
   return envelope
 
@@ -238,4 +352,6 @@ __all__ = [
   "build_own_journal_registration",
   "materialize_child_completion_envelope",
   "publish_child_completion",
+  "publish_registered_child_completion",
+  "publish_registered_child_settlement",
 ]

@@ -26,6 +26,14 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_COPILOT_DEVICE_CODE_URL = "https://github.com/login/device/code"
 DEFAULT_COPILOT_TOKEN_URL = "https://github.com/login/oauth/access_token"
 DEFAULT_COPILOT_SCOPE = "read:user"
+COPILOT_AUTH_STORE_PATH_ENV = "COPILOT_AUTH_STORE_PATH"
+COPILOT_AUTH_TOKEN_ENV = "COPILOT_AUTH_TOKEN"
+COPILOT_GITHUB_TOKEN_ENV = "COPILOT_GITHUB_TOKEN"
+# Environment names that carry one person's Copilot OAuth identity (store path
+# and tokens); a non-owner placement must not inherit them.
+COPILOT_PERSONAL_OAUTH_ENV_NAMES = frozenset(
+  {COPILOT_AUTH_STORE_PATH_ENV, COPILOT_AUTH_TOKEN_ENV, COPILOT_GITHUB_TOKEN_ENV}
+)
 _HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 
@@ -81,7 +89,7 @@ def resolve_copilot_oauth_settings(
   store_path = resolve_provider_store_path(
     "copilot", "oauth.json", cfg, environ=env, user_scope=user_scope,
     override_config_keys=("auth_store_path",),
-    override_env_vars=("COPILOT_AUTH_STORE_PATH",),
+    override_env_vars=(COPILOT_AUTH_STORE_PATH_ENV,),
   )
 
   return CopilotOAuthSettings(
@@ -102,7 +110,7 @@ def resolve_copilot_store_paths(
   return resolve_provider_store_paths(
     "copilot", "oauth.json", config, environ=environ, user_scope=user_scope,
     override_config_keys=("auth_store_path",),
-    override_env_vars=("COPILOT_AUTH_STORE_PATH",),
+    override_env_vars=(COPILOT_AUTH_STORE_PATH_ENV,),
   )
 
 
@@ -155,7 +163,7 @@ def resolve_copilot_pool_candidates(
           provider="copilot", key=key, record=record,
           store_path=path, is_user_store=path == user_path, auth_mode="oauth",
         ))
-  for name in ("COPILOT_GITHUB_TOKEN", "COPILOT_AUTH_TOKEN"):
+  for name in (COPILOT_GITHUB_TOKEN_ENV, COPILOT_AUTH_TOKEN_ENV):
     token = str(env.get(name) or "").strip()
     if token:
       record = {"access_token": token}

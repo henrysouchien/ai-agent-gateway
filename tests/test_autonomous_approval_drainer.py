@@ -21,13 +21,10 @@ class FakeDeliveryStore:
     self,
     row_count: int,
     *,
-    retry_delay_ns: int = 1_000_000,
-    quarantine_after: int = 5,
     failure_recorder_errors: int = 0,
     quarantine_errors: int = 0,
     recovery_errors: int = 0,
   ) -> None:
-    now_ns = time.time_ns()
     self.rows = [
       {
         "delivery_sequence": sequence,
@@ -36,7 +33,6 @@ class FakeDeliveryStore:
         "nonce": f"nonce-{sequence}",
         "state": "pending",
         "attempt_count": 0,
-        "next_attempt_ns": now_ns,
         "last_attempt_ns": None,
       }
       for sequence in range(1, row_count + 1)
@@ -44,8 +40,6 @@ class FakeDeliveryStore:
     self.selector_calls: list[dict[str, int | None]] = []
     self.high_water_calls = 0
     self.failure_calls: list[int] = []
-    self.retry_delay_ns = retry_delay_ns
-    self.quarantine_after = quarantine_after
     self.failure_recorder_errors = failure_recorder_errors
     self.quarantine_errors = quarantine_errors
     self.recovery_errors = recovery_errors
@@ -74,12 +68,10 @@ class FakeDeliveryStore:
   async def list_pending_autonomous_approval_deliveries(
     self,
     *,
-    limit: int,
     after_sequence: int,
     through_sequence: int | None,
   ) -> list[dict[str, Any]]:
     self.selector_calls.append({
-      "limit": limit,
       "after_sequence": after_sequence,
       "through_sequence": through_sequence,
     })
@@ -96,7 +88,7 @@ class FakeDeliveryStore:
       )
     ]
     selected.sort(key=lambda row: int(row["delivery_sequence"]))
-    return selected[:limit]
+    return selected[:2]
 
   async def get_autonomous_approval_delivery(
     self,
@@ -140,11 +132,7 @@ class FakeDeliveryStore:
       )
     )
     row["attempt_count"] = int(row["attempt_count"]) + 1
-    now_ns = time.time_ns()
-    row["last_attempt_ns"] = now_ns
-    row["next_attempt_ns"] = now_ns + self.retry_delay_ns
-    if int(row["attempt_count"]) >= self.quarantine_after:
-      row["state"] = "quarantined"
+    row["last_attempt_ns"] = time.time_ns()
     self.failure_calls.append(int(row["delivery_sequence"]))
     return dict(row)
 
@@ -178,7 +166,6 @@ class FakeDeliveryStore:
 class FakeRegistry:
   def __init__(self) -> None:
     self.failed: list[tuple[Any, str]] = []
-    self.failure_event = asyncio.Event()
 
   def fail_autonomous_approval_delivery(
     self,
@@ -187,22 +174,27 @@ class FakeRegistry:
     error: str,
   ) -> None:
     self.failed.append((task_id, error))
-    self.failure_event.set()
+
+
+@pytest.fixture(autouse=True)
+def _fast_drain_failure_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setattr(
+    drainer_module,
+    "AUTONOMOUS_APPROVAL_DRAIN_FAILURE_BACKOFF_SECONDS",
+    0.001,
+  )
 
 
 def _coordinator(
   store: Any,
   *,
   registry: Any | None = None,
-  batch_limit: int = 2,
   shutdown_timeout_seconds: float = 1.0,
 ) -> AutonomousApprovalDeliveryCoordinator:
   return AutonomousApprovalDeliveryCoordinator(
     store=store,
     registry=registry or object(),  # type: ignore[arg-type]
-    batch_limit=batch_limit,
     shutdown_timeout_seconds=shutdown_timeout_seconds,
-    fallback_retry_base_seconds=0.001,
   )
 
 
@@ -226,8 +218,7 @@ def test_snapshot_drain_pages_through_exact_bounded_high_water() -> None:
       for call in store.selector_calls
     ] == [0, 2, 4]
     assert all(
-      call["limit"] == 2
-      and call["through_sequence"] == 5
+      call["through_sequence"] == 5
       for call in store.selector_calls
     )
 
@@ -254,12 +245,14 @@ def test_poison_rows_are_attempted_once_per_snapshot_without_spin() -> None:
 
     coordinator._deliver_one = fail  # type: ignore[method-assign]
 
-    assert await coordinator.drain_once() == 5
+    with pytest.raises(RuntimeError, match="remains pending"):
+      await coordinator.drain_once()
     assert attempted == [1, 2, 3, 4, 5]
     assert store.failure_calls == [1, 2, 3, 4, 5]
     assert [
       row["attempt_count"] for row in store.rows
     ] == [1, 1, 1, 1, 1]
+    assert [row["state"] for row in store.rows] == ["pending"] * 5
 
   asyncio.run(scenario())
 
@@ -267,7 +260,7 @@ def test_poison_rows_are_attempted_once_per_snapshot_without_spin() -> None:
 def test_wake_during_drain_is_not_lost() -> None:
   async def scenario() -> None:
     store = FakeDeliveryStore(1)
-    coordinator = _coordinator(store, batch_limit=1)
+    coordinator = _coordinator(store)
     first_entered = asyncio.Event()
     release_first = asyncio.Event()
     second_delivered = asyncio.Event()
@@ -293,7 +286,6 @@ def test_wake_during_drain_is_not_lost() -> None:
       "nonce": "nonce-2",
       "state": "pending",
       "attempt_count": 0,
-      "next_attempt_ns": time.time_ns(),
       "last_attempt_ns": None,
     })
     assert coordinator.wake() is True
@@ -312,7 +304,6 @@ def test_shutdown_cancels_a_hung_drain_within_bound() -> None:
     store = FakeDeliveryStore(1)
     coordinator = _coordinator(
       store,
-      batch_limit=1,
       shutdown_timeout_seconds=0.01,
     )
     entered = asyncio.Event()
@@ -343,77 +334,46 @@ def test_shutdown_cancels_a_hung_drain_within_bound() -> None:
   asyncio.run(scenario())
 
 
-def test_transient_failure_gets_one_shot_retry_without_polling() -> None:
+def test_pending_delivery_failure_is_nonterminal_and_later_delivers() -> None:
   async def scenario() -> None:
-    store = FakeDeliveryStore(
-      1,
-      retry_delay_ns=1_000_000,
-    )
-    coordinator = _coordinator(store, batch_limit=1)
-    delivered = asyncio.Event()
+    store = FakeDeliveryStore(1)
+    store.rows[0]["task_id"] = "bg-1"
+    registry = FakeRegistry()
+    coordinator = _coordinator(store, registry=registry)
     attempts = 0
 
-    async def fail_once(delivery: dict[str, Any]) -> None:
+    async def fail_then_deliver(_delivery: dict[str, Any]) -> None:
       nonlocal attempts
       attempts += 1
       if attempts == 1:
-        raise OSError("injected transient append failure")
+        raise OSError("injected append failure")
       store.rows[0]["state"] = "published"
-      delivered.set()
 
-    coordinator._deliver_one = fail_once  # type: ignore[method-assign]
-    coordinator.start()
-    await asyncio.wait_for(delivered.wait(), timeout=1)
-    await coordinator.shutdown()
+    coordinator._deliver_one = fail_then_deliver  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="remains pending"):
+      await coordinator.drain_once()
+    assert store.failure_calls == [1]
+    assert store.rows[0]["state"] == "pending"
+    assert store.rows[0]["attempt_count"] == 1
+    assert registry.failed == []
+
+    assert await coordinator.drain_once() == 1
 
     assert attempts == 2
-    assert store.failure_calls == [1]
     assert store.rows[0]["state"] == "published"
+    assert registry.failed == []
 
   asyncio.run(scenario())
 
 
-def test_retry_exhaustion_quarantines_and_fails_owner() -> None:
-  async def scenario() -> None:
-    store = FakeDeliveryStore(
-      1,
-      retry_delay_ns=1_000_000,
-      quarantine_after=2,
-    )
-    store.rows[0]["task_id"] = "bg-1"
-    registry = FakeRegistry()
-    coordinator = _coordinator(
-      store,
-      registry=registry,
-      batch_limit=1,
-    )
-
-    async def always_fail(_delivery: dict[str, Any]) -> None:
-      raise OSError("injected persistent append failure")
-
-    coordinator._deliver_one = always_fail  # type: ignore[method-assign]
-    coordinator.start()
-    await asyncio.wait_for(
-      registry.failure_event.wait(),
-      timeout=1,
-    )
-    await coordinator.shutdown()
-
-    assert store.rows[0]["state"] == "quarantined"
-    assert store.rows[0]["attempt_count"] == 2
-    assert len(registry.failed) == 1
-    assert registry.failed[0][0] == "bg-1"
-
-  asyncio.run(scenario())
-
-
-def test_failure_recorder_error_gets_bounded_fallback_retry() -> None:
+def test_failure_recorder_error_is_reported_and_retried_by_the_drain() -> None:
   async def scenario() -> None:
     store = FakeDeliveryStore(
       1,
       failure_recorder_errors=1,
     )
-    coordinator = _coordinator(store, batch_limit=1)
+    coordinator = _coordinator(store)
     delivered = asyncio.Event()
     attempts = 0
 
@@ -438,19 +398,15 @@ def test_failure_recorder_error_gets_bounded_fallback_retry() -> None:
   asyncio.run(scenario())
 
 
-def test_quarantine_recorder_error_gets_bounded_fallback_retry() -> None:
+def test_unwritten_quarantine_is_reported_and_does_not_fail_the_owner() -> None:
   async def scenario() -> None:
     store = FakeDeliveryStore(
       1,
-      quarantine_errors=1,
+      quarantine_errors=1_000_000,
     )
     store.rows[0]["task_id"] = "bg-1"
     registry = FakeRegistry()
-    coordinator = _coordinator(
-      store,
-      registry=registry,
-      batch_limit=1,
-    )
+    coordinator = _coordinator(store, registry=registry)
 
     async def permanently_fail(
       _delivery: dict[str, Any],
@@ -460,23 +416,65 @@ def test_quarantine_recorder_error_gets_bounded_fallback_retry() -> None:
       )
 
     coordinator._deliver_one = permanently_fail  # type: ignore[method-assign]
-    coordinator.start()
-    await asyncio.wait_for(
-      registry.failure_event.wait(),
-      timeout=1,
-    )
-    await coordinator.shutdown()
+    with pytest.raises(RuntimeError, match="not recorded"):
+      await coordinator.drain_once()
+
+    assert store.rows[0]["state"] == "pending"
+    assert registry.failed == []
+
+  asyncio.run(scenario())
+
+
+def test_permanent_quarantine_fails_the_active_owner() -> None:
+  async def scenario() -> None:
+    store = FakeDeliveryStore(1)
+    store.rows[0]["task_id"] = "bg-1"
+    registry = FakeRegistry()
+    coordinator = _coordinator(store, registry=registry)
+
+    async def permanently_fail(
+      _delivery: dict[str, Any],
+    ) -> None:
+      raise PermanentAutonomousApprovalDeliveryError(
+        "identity mismatch"
+      )
+
+    coordinator._deliver_one = permanently_fail  # type: ignore[method-assign]
+
+    assert await coordinator.drain_once() == 1
 
     assert store.rows[0]["state"] == "quarantined"
+    assert [task_id for task_id, _error in registry.failed] == ["bg-1"]
+    assert "identity mismatch" in registry.failed[0][1]
+    assert await coordinator.drain_once() == 0
     assert len(registry.failed) == 1
 
   asyncio.run(scenario())
 
 
-def test_startup_recovery_read_failure_gets_one_shot_retry() -> None:
+def test_vanished_row_failure_is_not_a_drain_error() -> None:
+  async def scenario() -> None:
+    store = FakeDeliveryStore(1)
+    coordinator = _coordinator(store)
+
+    async def fail_and_vanish(
+      _delivery: dict[str, Any],
+    ) -> None:
+      store.rows.clear()
+      raise OSError("injected delivery failure")
+
+    coordinator._deliver_one = fail_and_vanish  # type: ignore[method-assign]
+
+    assert await coordinator.drain_once() == 1
+    assert store.failure_calls == []
+
+  asyncio.run(scenario())
+
+
+def test_recovery_read_failure_is_retried_until_it_succeeds() -> None:
   async def scenario() -> None:
     store = FakeDeliveryStore(1, recovery_errors=1)
-    coordinator = _coordinator(store, batch_limit=1)
+    coordinator = _coordinator(store)
     delivered = asyncio.Event()
 
     async def deliver(_delivery: dict[str, Any]) -> None:
@@ -494,10 +492,10 @@ def test_startup_recovery_read_failure_gets_one_shot_retry() -> None:
   asyncio.run(scenario())
 
 
-def test_sustained_recovery_read_failure_reports_health_and_keeps_retrying() -> None:
+def test_repeated_recovery_read_failure_reports_health_and_keeps_retrying() -> None:
   async def scenario() -> None:
     store = FakeDeliveryStore(1, recovery_errors=5)
-    coordinator = _coordinator(store, batch_limit=1)
+    coordinator = _coordinator(store)
     delivery_started = asyncio.Event()
     release_delivery = asyncio.Event()
     delivered = asyncio.Event()
@@ -531,29 +529,12 @@ def test_sustained_recovery_read_failure_reports_health_and_keeps_retrying() -> 
   asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(
-  ("rows", "error"),
-  [
-    (
-      [
-        {"delivery_sequence": 2},
-        {"delivery_sequence": 1},
-      ],
-      "broke ordering",
-    ),
-    (
-      [
-        {"delivery_sequence": sequence}
-        for sequence in range(1, 4)
-      ],
-      "exceeded its bound",
-    ),
-  ],
-)
-def test_selector_contract_fails_closed(
-  rows: list[dict[str, int]],
-  error: str,
-) -> None:
+def test_selector_contract_fails_closed() -> None:
+  rows: list[dict[str, int]] = [
+    {"delivery_sequence": 2},
+    {"delivery_sequence": 1},
+  ]
+
   class InvalidStore:
     async def autonomous_approval_delivery_recovery_window(
       self,
@@ -570,15 +551,13 @@ def test_selector_contract_fails_closed(
       return rows
 
   async def scenario() -> None:
-    coordinator = _coordinator(InvalidStore(), batch_limit=2)
+    coordinator = _coordinator(InvalidStore())
 
     async def no_op(_delivery: dict[str, Any]) -> None:
       return None
 
     coordinator._deliver_one = no_op  # type: ignore[method-assign]
-    for row in rows:
-      row["next_attempt_ns"] = 1
-    with pytest.raises(RuntimeError, match=error):
+    with pytest.raises(RuntimeError, match="broke ordering"):
       await coordinator.drain_once()
 
   asyncio.run(scenario())

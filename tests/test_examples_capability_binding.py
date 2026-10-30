@@ -59,6 +59,7 @@ def test_custom_gateway_examples_consume_exact_session_driver_bind(
   assert materialized.auth_config["api_key"] == "test-anthropic-key"
   assert "model" not in materialized.auth_config
   assert "effort" not in materialized.auth_config
+  assert "max_tokens" not in materialized.auth_config
 
   session = app.state.auth.session_store.get_session(
     init_response.json()["session_id"]
@@ -100,7 +101,6 @@ def test_custom_gateway_examples_consume_exact_session_driver_bind(
     "auth_mode": "api",
     "api_key": "test-anthropic-key",
     "auth_token": "",
-    "max_tokens": 16_000,
     "billing_mode": "byok",
     "rate_table_version": module["rate_table"].version,
   }

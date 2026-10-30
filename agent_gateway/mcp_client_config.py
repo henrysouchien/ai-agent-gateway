@@ -6,10 +6,12 @@ import re
 import random
 import shutil
 from pathlib import Path
-from typing import Any, Callable, Final, Literal, Mapping, Sequence
+from typing import Any, Callable, Final, Iterable, Literal, Mapping, Sequence
 
 from mcp import MCPError
 from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT
+
+from .user_runtime_credentials import USER_STORAGE_ID_ENV
 
 
 class _McpConfigPathUnset(Enum):
@@ -25,10 +27,16 @@ SUPPORTED_SERVER_TYPES = {"stdio"} | STREAMABLE_HTTP_TYPES
 # HANK_MODEL_AUTHORITY_DIR: a stdio child that imports the model authority
 # (Risk and Investment servers through agent_gateway.providers) must load the
 # directory its parent loaded, not its own packaged copy.
+# USER_STORAGE_ID_ENV and INVESTMENT_TOOLS_STATE_DIR: a placed runtime's gateway
+# carries its desk's storage id and Investment state root
+# (runtime_placement.runtime_state_environment); every child it starts belongs
+# to the same desk and inherits both. The shared gateway has neither, so its
+# children get neither: an allowlisted name is copied only when present.
 DEFAULT_ENV_ALLOWLIST = {
   "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "USER",
   "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE", "NODE_PATH",
   "HANK_MODEL_AUTHORITY_DIR",
+  USER_STORAGE_ID_ENV, "INVESTMENT_TOOLS_STATE_DIR",
 }
 MCP_STDIO_CONNECT_RETRIES_ENV = "MCP_STDIO_CONNECT_RETRIES"
 MCP_STDIO_CONNECT_BACKOFF_ENV = "MCP_STDIO_CONNECT_BACKOFF_S"
@@ -83,11 +91,34 @@ def resolve_mcp_config_path(
   return Path(config_path).expanduser()
 
 
+def scope_run_env(
+  declared: Iterable[str],
+  environ: Mapping[str, str],
+  *,
+  projected: Mapping[str, str] | None = None,
+) -> tuple[dict[str, str], frozenset[str]]:
+  """The one derivation of a child's run-scoped env.
+
+  ``scoped`` holds each declared name SET in ``environ`` (an empty string is a
+  set value, carried as-is) overlaid with the projected string entries;
+  ``absent`` is every declared name ``scoped`` does not hold, which
+  ``build_mcp_env`` renders as an absent child variable.
+  """
+  declared_names = frozenset(declared)
+  scoped = {name: str(environ[name]) for name in declared_names if name in environ}
+  if projected is not None:
+    for name, value in projected.items():
+      if isinstance(name, str) and isinstance(value, str):
+        scoped[name] = value
+  return scoped, declared_names - scoped.keys()
+
+
 def build_mcp_env(
   server_env: Mapping[str, Any] | None,
   *,
   environ: Mapping[str, str],
   base_environ: Mapping[str, str] | None = None,
+  absent: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
   allowlist_source = base_environ if base_environ is not None else (
     environ
@@ -100,6 +131,8 @@ def build_mcp_env(
 
   for key, value in server_env.items():
     if value is None:
+      continue
+    if any(ref in absent for ref in ENV_REF_RE.findall(str(value))):
       continue
     env[str(key)] = expand_env_refs(value, environ=environ)
   return env
@@ -421,6 +454,7 @@ __all__ = [
   "resolve_mcp_config_path",
   "resolve_missing_stdio_executable",
   "safe_cache_name",
+  "scope_run_env",
   "startup_concurrency_limit",
   "stdio_connect_retries",
   "stdio_connect_retry_delay",

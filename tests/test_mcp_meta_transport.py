@@ -41,7 +41,6 @@ from gateway_test_support.mcp_meta_transport import (
 @pytest.fixture(autouse=True)
 def _transport_host_policy(owner_session_host_policy):
   # Sessionless MCP fixtures exercise role transport, not local-tool authority.
-  owner_session_host_policy.invite_denies_local_tool = lambda _tool: True
   return owner_session_host_policy
 
 

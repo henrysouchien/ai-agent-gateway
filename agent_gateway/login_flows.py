@@ -1304,8 +1304,10 @@ class OpenAILoginFlow:
     )
 
   def status(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
+    from .providers.openai import OPENAI_AUTH_TOKEN_ENV
+
     api_key_present = bool(os.environ.get("OPENAI_API_KEY", "").strip())
-    access_token_present = bool(os.environ.get("OPENAI_AUTH_TOKEN", "").strip())
+    access_token_present = bool(os.environ.get(OPENAI_AUTH_TOKEN_ENV, "").strip())
     if api_key_present or access_token_present:
       kind = "API key" if api_key_present else "bearer access token"
       stdout.write(f"OpenAI API: {kind} configured in the environment; no gateway OAuth store.\n")

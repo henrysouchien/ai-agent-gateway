@@ -1213,7 +1213,7 @@ def test_web_agent_run_schedule_crud_is_safe_and_owner_scoped(fake_schedule_back
           started_at=1_700_000_000.0,
           skill_resume_allowed=False,
           admitted_skill_execution_limits=(
-            SkillExecutionLimits(None)
+            SkillExecutionLimits()
             if kwargs["mode"] == "skill"
             else None
           ),

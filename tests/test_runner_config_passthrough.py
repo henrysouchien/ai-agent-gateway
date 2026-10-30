@@ -103,7 +103,7 @@ def test_default_stream_stall_timeout_extends_for_thinking_requests() -> None:
 
   assert runner._effective_stream_stall_timeout(
     config={"thinking": True},
-    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True),
+    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True, max_output_tokens=16_384),
     max_tokens=4096,
   ) == STREAM_THINKING_STALL_TIMEOUT
 
@@ -113,17 +113,17 @@ def test_default_stream_stall_timeout_stays_short_without_thinking() -> None:
 
   assert runner._effective_stream_stall_timeout(
     config={"thinking": False},
-    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True),
+    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True, max_output_tokens=16_384),
     max_tokens=4096,
   ) == STREAM_STALL_TIMEOUT
   assert runner._effective_stream_stall_timeout(
     config={"thinking": True},
-    model_info=ModelInfo(id="gpt-test", provider="openai", supports_thinking=False),
+    model_info=ModelInfo(id="gpt-test", provider="openai", supports_thinking=False, max_output_tokens=16_384),
     max_tokens=4096,
   ) == STREAM_STALL_TIMEOUT
   assert runner._effective_stream_stall_timeout(
     config={"thinking": True},
-    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True),
+    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True, max_output_tokens=16_384),
     max_tokens=1024,
   ) == STREAM_STALL_TIMEOUT
 
@@ -133,14 +133,14 @@ def test_explicit_stream_stall_timeout_overrides_thinking_default() -> None:
 
   assert runner._effective_stream_stall_timeout(
     config={"thinking": True},
-    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True),
+    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True, max_output_tokens=16_384),
     max_tokens=4096,
   ) == 42
 
 
 def test_observed_thinking_history_extends_later_turns_when_request_flag_is_false() -> None:
   runner = _make_runner()
-  model_info = ModelInfo(id="claude-sonnet-5", provider="anthropic", supports_thinking=True)
+  model_info = ModelInfo(id="claude-sonnet-5", provider="anthropic", supports_thinking=True, max_output_tokens=16_384)
   current_messages = [
     {
       "role": "assistant",
@@ -165,12 +165,12 @@ def test_runner_stall_timeout_delegate_uses_runner_module_constants(monkeypatch)
 
   assert runner._effective_stream_stall_timeout(
     config={"thinking": True},
-    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True),
+    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True, max_output_tokens=16_384),
     max_tokens=4096,
   ) == 11
   assert runner._effective_stream_stall_timeout(
     config={"thinking": False},
-    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True),
+    model_info=ModelInfo(id="claude-opus-4-7", provider="anthropic", supports_thinking=True, max_output_tokens=16_384),
     max_tokens=4096,
   ) == 7
 
@@ -214,7 +214,6 @@ def test_runner_preserves_extra_auth_config_keys_for_provider_create_client() ->
     "auth_token": "",
     "provider": "capture",
     "model": "claude-sonnet-5",
-    "max_tokens": 16000,
     "effort": "high",
     "thinking_enabled_requested": True,
     "base_url": "https://custom.example/v1",

@@ -33,8 +33,10 @@ from .runner_state import (
 )
 from .secret_boundary import (
   SecretBoundary,
+  retained_tool_result_preview,
   sanitize_boundary_value,
   sanitize_tool_event,
+  sanitization_failure_tool_block,
   sanitization_failure_tool_input,
 )
 from .skill_context import current_skill
@@ -45,7 +47,6 @@ from .tool_dispatcher_approval_lifecycle import ApprovalPark
 from .tool_dispatcher import _SpawningTurn
 from .tool_dispatch_classification import (
   DispatchEntry,
-  DEFAULT_MAX_TOOL_RETRIES as _MAX_TOOL_DISPATCH_RETRIES,
   RETRYABLE_OUTCOMES as _RETRYABLE_DISPATCH_OUTCOMES,
   ToolResultSettlement,
   build_dispatch_record_from_sources,
@@ -445,6 +446,37 @@ def _error_with_model_error_data(error: Dict[str, Any]) -> Dict[str, Any]:
   return enriched
 
 
+def retained_tool_result_entry(
+  result_entry: Dict[str, Any],
+  *,
+  boundary: SecretBoundary | None,
+) -> Dict[str, Any]:
+  """The boundary projection of one `tool_result` entry, for retained copies.
+
+  `result_entry` stays the raw live model source; durable previews, final
+  blocks, streamed copies and spill files are cut from this projection, which
+  is taken before any model or stream limit. A failed projection yields a
+  tombstone block whose `tool_use_id` is projected on its own, so the result
+  still pairs with its call. `result_entry` is not mutated.
+  """
+  retained = sanitize_boundary_value(
+    result_entry,
+    sink="tool_result",
+    boundary=boundary,
+  )
+  if isinstance(retained, dict):
+    return retained
+  tombstone = sanitization_failure_tool_block("tool_result")
+  safe_identity = sanitize_boundary_value(
+    {"tool_use_id": result_entry.get("tool_use_id")},
+    sink="tool_result",
+    boundary=boundary,
+  )
+  if isinstance(safe_identity, dict):
+    tombstone.update(safe_identity)
+  return tombstone
+
+
 class RunnerToolExecutionMixin:
   if TYPE_CHECKING:
     _batch_id: str | None
@@ -464,6 +496,7 @@ class RunnerToolExecutionMixin:
       WorkflowOutputAttachment,
     ]
     _request_id: str
+    _secret_boundary: SecretBoundary
     _sid: str
     _skill_run_id: str | None
     _task_registry: TaskRegistry
@@ -515,6 +548,8 @@ class RunnerToolExecutionMixin:
       *,
       tool_name: str,
       on_spill_publication: Callable[[SpillPublication], None] | None = None,
+      max_chars: int | None = None,
+      retained_entry: Dict[str, Any] | None = None,
     ) -> tuple[Dict[str, Any], Dict[str, Any]]: ...
 
     def _effective_excluded_tools(self) -> set[str]: ...
@@ -874,7 +909,7 @@ class RunnerToolExecutionMixin:
           )
           else self._tool_call_timeout
         )
-        # B-2: one bounded, jittered retry loop owns transient dispatch
+        # B-2: one bounded retry loop owns transient dispatch
         # failure; its bound is the attempt count, never a clock. MCP tools are
         # exactly where 429 and transport failures actually appear. The
         # tool_call_start event was appended before this loop and is never
@@ -1071,16 +1106,23 @@ class RunnerToolExecutionMixin:
         setattr(self, "_stop_after_tool_results_reason", "accepted_ui_blocks")
         setattr(self, "_stop_after_tool_results_tool_name", tool_name)
       log_error = error if error is not None else semantic_error
-      result_json = json_module.dumps(result, default=str) if result is not None else ""
-      result_bytes = len(result_json)
-      result_preview = result_json[:150] if result_json else "null"
+      result_bytes = (
+        len(json_module.dumps(result, default=str)) if result is not None else 0
+      )
       if error or semantic_error:
+        # Project the full error once, before the 200-char cut and before
+        # warning formatting, so a credential is never split by truncation.
+        safe_log_error = sanitize_boundary_value(
+          log_error,
+          sink="tool_log",
+          boundary=self._secret_boundary,
+        )
         logger.warning(
           "[%s] Tool %s error (%.1fs): %s",
           self._sid,
           tool_name,
           tool_elapsed,
-          log_error,
+          safe_log_error,
           extra={
             "data": {
               "event": "tool_done",
@@ -1090,8 +1132,12 @@ class RunnerToolExecutionMixin:
               "server": server,
               "error": True,
               "semantic_error": semantic_error is not None and error is None,
-              "error_detail": str(log_error)[:200],
-              "error_sub_code": log_error.get("sub_code", "") if isinstance(log_error, dict) else "",
+              "error_detail": str(safe_log_error)[:200],
+              "error_sub_code": (
+                safe_log_error.get("sub_code", "")
+                if isinstance(safe_log_error, dict)
+                else ""
+              ),
             }
           },
         )
@@ -1101,7 +1147,7 @@ class RunnerToolExecutionMixin:
           self._sid,
           tool_name,
           tool_elapsed,
-          result_preview,
+          retained_tool_result_preview(result, boundary=self._secret_boundary),
           extra={
             "data": {
               "event": "tool_done",
@@ -1293,33 +1339,34 @@ class RunnerToolExecutionMixin:
       nonlocal spill_publication
       spill_publication = publication
 
+    # `result_entry` stays the raw live model source. Everything retained from
+    # it (durable preview, final blocks, streamed copy, spill files) is cut from
+    # its boundary projection, taken before any model or stream limit: a cut
+    # over raw text can split a secret into a prefix no pattern recognizes.
+    retained_entry = retained_tool_result_entry(
+      result_entry,
+      boundary=self._secret_boundary,
+    )
     live_entry, durable_entry = self._compact_model_tool_result_entry(
       result_entry,
       tool_name=tool_name,
       on_spill_publication=_capture_spill_publication,
+      retained_entry=retained_entry,
     )
     final_tool_result_blocks = [dict(durable_entry)]
     final_tool_result_blocks.extend(dict(block) for block in extra_blocks)
     tool_complete_event["final_tool_result_blocks"] = final_tool_result_blocks
-    streamed_projection = project_tool_call_complete_for_stream(
-      tool_complete_event,
-      result_entry=result_entry,
-      live_entry=live_entry,
-    )
-    streamed_is_projected = streamed_projection is not tool_complete_event
+    # Sanitize the full event first: the stream projection truncates strings,
+    # and a cut must never split a secret before it is redacted.
     tool_complete_event = sanitize_tool_event(
       tool_complete_event,
       sink="tool_complete",
-      boundary=getattr(self, "_secret_boundary", None),
+      boundary=self._secret_boundary,
     )
-    streamed_tool_complete_event = (
-      sanitize_tool_event(
-        streamed_projection,
-        sink="tool_complete",
-        boundary=getattr(self, "_secret_boundary", None),
-      )
-      if streamed_is_projected
-      else tool_complete_event
+    streamed_tool_complete_event = project_tool_call_complete_for_stream(
+      tool_complete_event,
+      result_entry=result_entry,
+      live_entry=live_entry,
     )
     durable_tool_complete_event = tool_complete_event
     if spill_publication is not None:

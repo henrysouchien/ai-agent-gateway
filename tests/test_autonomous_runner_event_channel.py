@@ -146,7 +146,7 @@ from agent_gateway.autonomous_event_channel import (
   AUTONOMOUS_EVENT_CHANNEL_FD_ENV,
   adopt_inherited_autonomous_event_channel,
 )
-envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
+envelope=json.loads(__import__("pathlib").Path(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE"]).read_text(encoding="utf-8"))
 session_log_authority=envelope["workload"]["session_log_authority"]
 if session_log_authority["layout"] == "v2":
     for env_name, device_name, inode_name in (
@@ -243,7 +243,7 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
     assert passed_fd in captured["pass_fds"]
     assert stat.S_ISSOCK(captured["passed_fd_stats"][passed_fd].st_mode)
     envelope = json.loads(
-      captured["env"]["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"]
+      Path(captured["env"]["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE"]).read_text(encoding="utf-8")
     )
     log_authority = envelope["workload"]["session_log_authority"]
     assert log_authority["layout"] == "v2"
@@ -645,7 +645,7 @@ def _invalid_child(mode: str) -> str:
   return f"""
 import json,os,socket,struct
 from agent_gateway.autonomous_event_channel import AUTONOMOUS_EVENT_CHANNEL_FD_ENV
-envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
+envelope=json.loads(__import__("pathlib").Path(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE"]).read_text(encoding="utf-8"))
 channel_id=envelope["channel_id"]
 sock=socket.socket(fileno=int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV]))
 os.set_inheritable(sock.fileno(),False)
@@ -738,7 +738,7 @@ from agent_gateway.autonomous_event_channel import (
   AUTONOMOUS_EVENT_CHANNEL_FD_ENV,
   adopt_inherited_autonomous_event_channel,
 )
-envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
+envelope=json.loads(__import__("pathlib").Path(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE"]).read_text(encoding="utf-8"))
 channel=adopt_inherited_autonomous_event_channel(
   int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV]),
   channel_id=envelope["channel_id"],
@@ -796,7 +796,7 @@ from agent_gateway.autonomous_event_channel import (
   AUTONOMOUS_EVENT_CHANNEL_FD_ENV,
   adopt_inherited_autonomous_event_channel,
 )
-envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
+envelope=json.loads(__import__("pathlib").Path(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE"]).read_text(encoding="utf-8"))
 channel=adopt_inherited_autonomous_event_channel(
   int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV]),
   channel_id=envelope["channel_id"],
@@ -880,7 +880,7 @@ from agent_gateway.autonomous_event_channel import (
   AUTONOMOUS_EVENT_CHANNEL_FD_ENV,
   adopt_inherited_autonomous_event_channel,
 )
-envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
+envelope=json.loads(__import__("pathlib").Path(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE"]).read_text(encoding="utf-8"))
 channel=adopt_inherited_autonomous_event_channel(
   int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV]),
   channel_id=envelope["channel_id"],
@@ -929,7 +929,7 @@ from agent_gateway.approval_policy import (
   ApprovalRequest, approval_request_projection, sha256_args, utc_now,
 )
 from agent_gateway.providers.anthropic_oauth import is_anthropic_generation_ref
-envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
+envelope=json.loads(__import__("pathlib").Path(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE"]).read_text(encoding="utf-8"))
 channel=adopt_inherited_autonomous_event_channel(
   int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV]), channel_id=envelope["channel_id"],
 )
@@ -1171,7 +1171,7 @@ import json,os
 from agent_gateway.autonomous_event_channel import (
   AUTONOMOUS_EVENT_CHANNEL_FD_ENV, adopt_inherited_autonomous_event_channel,
 )
-envelope=json.loads(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE"])
+envelope=json.loads(__import__("pathlib").Path(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE"]).read_text(encoding="utf-8"))
 launch=envelope["workload"]["approval_continuation"]
 channel=adopt_inherited_autonomous_event_channel(
   int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV]), channel_id=envelope["channel_id"],

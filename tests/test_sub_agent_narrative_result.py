@@ -505,14 +505,12 @@ def _admitted_task(
       persisted_methodology_state=None,
       result_instructions=result_instructions,
       client_timeout_seconds=30.0,
-      max_tokens=1_024,
       provider_tool_definitions=tuple(
         ProviderToolDefinition(definition={"name": tool_id})
         for tool_id in tool_ids
       ),
       resume_mechanics=AgentResumeMechanics(
         resumable=resumable,
-        max_chain_depth=1 if resumable else 0,
         transcript_strategy="durable_reconstruction",
         prompt_strategy="reuse_exact",
         tool_grant_strategy="reissue_exact",

@@ -11,13 +11,16 @@ import threading
 import time
 from typing import Any, Iterator, Mapping
 
+from .autonomous_event_channel import (
+  AUTONOMOUS_EVENT_CHANNEL_DEFAULT_IO_TIMEOUT_SECONDS,
+  AUTONOMOUS_EVENT_CHANNEL_MAX_IO_TIMEOUT_SECONDS,
+)
+
 
 AUTONOMOUS_APPROVAL_CHANNEL_FD_ENV = (
   "AGENT_AUTONOMOUS_APPROVAL_CHANNEL_FD"
 )
 AUTONOMOUS_APPROVAL_CHANNEL_VERSION = 1
-AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_SEND_TIMEOUT_SECONDS = 5.0
-AUTONOMOUS_APPROVAL_CHANNEL_MAX_TIMEOUT_SECONDS = 24 * 60 * 60.0
 
 _FRAME_HEADER = struct.Struct("!I")
 _DECISION_FIELDS = frozenset({
@@ -116,10 +119,14 @@ def _positive_int(value: object, *, field_name: str) -> int:
 
 
 def _timeout(value: object, *, field_name: str) -> float:
+  # Resource containment: the only hang bound on the approval-decision socket
+  # to the child-process peer is the one IPC wait value the event channel owns.
+  # It bounds one blocking write and is the largest value a caller may set; a
+  # receive deadline of ``None`` waits for the peer to act or close.
   if (
     isinstance(value, bool)
     or not isinstance(value, (int, float))
-    or not 0 < float(value) <= AUTONOMOUS_APPROVAL_CHANNEL_MAX_TIMEOUT_SECONDS
+    or not 0 < float(value) <= AUTONOMOUS_EVENT_CHANNEL_MAX_IO_TIMEOUT_SECONDS
   ):
     raise ValueError(
       f"autonomous approval channel {field_name} is invalid"
@@ -826,9 +833,7 @@ class AutonomousApprovalChannelPair:
 def create_autonomous_approval_channel(
   *,
   authority: AutonomousApprovalChannelAuthority,
-  send_timeout_seconds: float = (
-    AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_SEND_TIMEOUT_SECONDS
-  ),
+  send_timeout_seconds: float = AUTONOMOUS_EVENT_CHANNEL_DEFAULT_IO_TIMEOUT_SECONDS,
   receive_timeout_seconds: float | None = None,
 ) -> AutonomousApprovalChannelPair:
   if type(authority) is not AutonomousApprovalChannelAuthority:
@@ -928,9 +933,7 @@ def adopt_inherited_autonomous_approval_channel(
 
 
 __all__ = [
-  "AUTONOMOUS_APPROVAL_CHANNEL_DEFAULT_SEND_TIMEOUT_SECONDS",
   "AUTONOMOUS_APPROVAL_CHANNEL_FD_ENV",
-  "AUTONOMOUS_APPROVAL_CHANNEL_MAX_TIMEOUT_SECONDS",
   "AUTONOMOUS_APPROVAL_CHANNEL_VERSION",
   "AutonomousApprovalChannelAuthority",
   "AutonomousApprovalChannelChild",

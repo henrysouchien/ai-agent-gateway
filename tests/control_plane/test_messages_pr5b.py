@@ -17,7 +17,7 @@ from agent_gateway.autonomous_event_channel import (
   adopt_inherited_autonomous_event_channel,
 )
 from agent_gateway.autonomous_launch_envelope import (
-  AUTONOMOUS_CAPABILITY_ENVELOPE_ENV,
+  AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
@@ -187,7 +187,7 @@ def _install_fake_spawn(monkeypatch) -> None:
     _ = args
     process = _FakeAutonomousProcess(os.dup(kwargs["pass_fds"][0]))
     envelope = json.loads(
-      kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_ENV]
+      Path(kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8")
     )
     process.start_event_channel(envelope["channel_id"])
     process.retain_inherited_fds(tuple(kwargs["pass_fds"][1:]))
@@ -245,7 +245,7 @@ def _make_app(
       model_registry=INITIAL_MODEL_REGISTRY,
       model_selection_policy=INITIAL_MODEL_SELECTION_POLICY,
       service_provider_handles={"anthropic": _TEST_SERVICE_HANDLE},
-      service_auth_config_resolver=lambda handle: MaterializedCredential(
+      service_auth_config_resolver=lambda handle, *, user_scope=None: MaterializedCredential(
         handle=handle,
         auth_config={
           "provider": "anthropic",

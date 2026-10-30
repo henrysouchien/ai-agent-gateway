@@ -13,6 +13,7 @@ from .capability_execution import BoundCapabilityExecution
 from .child_result_trust import UNTRUSTED_CHILD_RESULTS_POLICY
 from .provider_summarize import provider_summarize
 from .providers.base import ModelProvider
+from .runner_state import select_run_max_tokens
 from .runner_limits import compressible_message_tokens, estimate_tokens
 from model_authority.thinking import ThinkingLevel, parse_effort
 
@@ -894,12 +895,12 @@ def _require_exact_summary_effort(
   if requested is None:
     raise SummaryEffortUnsupported("Portable compaction requires a bound effort")
   model_info = provider.get_model_info(model)
-  model_max_tokens = int(getattr(model_info, "max_output_tokens", 0) or 0)
-  summary_max_tokens = (
-    min(SUMMARY_MAX_TOKENS, model_max_tokens)
-    if model_max_tokens > 0
-    else SUMMARY_MAX_TOKENS
+  max_tokens_selection = select_run_max_tokens(
+    config,
+    model_info=model_info,
+    requested=SUMMARY_MAX_TOKENS,
   )
+  summary_max_tokens = max_tokens_selection.value
   resolution = provider.resolve_effort(
     requested=requested,
     model=model,

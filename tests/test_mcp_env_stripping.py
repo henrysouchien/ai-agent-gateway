@@ -202,7 +202,7 @@ def test_build_mcp_env_expands_risk_module_dotenv_pointer(monkeypatch) -> None:
     "INVESTMENT_TOOLS_DISABLE_RESEARCH_IDEAS",
   ],
 )
-def test_server_env_passthrough_uses_parent_value_without_literal(
+def test_declared_jobs_config_comes_from_the_run_mapping_not_a_config_literal(
   tmp_path, monkeypatch, env_name
 ) -> None:
   config_path = tmp_path / "mcp.json"
@@ -220,7 +220,8 @@ def test_server_env_passthrough_uses_parent_value_without_literal(
     ),
     encoding="utf-8",
   )
-  monkeypatch.setattr(mcp_client_module.os, "environ", {env_name: "parent-secret"})
+  monkeypatch.setattr(mcp_client_module.os, "environ", {env_name: "run-scoped-value"})
+  monkeypatch.setattr(mcp_client_module, "load_user_runtime_credentials", lambda _env: None)
 
   manager = McpClientManager(
     config_path=config_path,
@@ -238,18 +239,18 @@ def test_server_env_passthrough_uses_parent_value_without_literal(
   jobs_spec = captured["jobs-mcp"]["env"]
   assert isinstance(jobs_spec, dict)
   assert jobs_spec == {env_name: f"${{{env_name}}}"}
-  with pytest.raises(TypeError, match="environ"):
-    _build_mcp_env(jobs_spec)  # pyright: ignore[reportCallIssue]  # negative: projection is required
-  with pytest.raises(McpEnvExpansionError, match=env_name):
-    _build_mcp_env(jobs_spec, environ={})
+  scoped, _absent = manager._scoped_server_env(
+    "jobs-mcp",
+    captured["jobs-mcp"],
+    deployment_environ={env_name: "run-scoped-value", "ANTHROPIC_API_KEY": "ambient"},
+  )
+  assert scoped[env_name] == "run-scoped-value"
+  assert "ANTHROPIC_API_KEY" not in scoped
   assert _build_mcp_env(
-    jobs_spec,
-    environ=manager._scoped_server_env(
-      "jobs-mcp", captured["jobs-mcp"], deployment_environ=mcp_client_module.os.environ,
-    ),
-  )[env_name] == "parent-secret"
-  assert captured["idea-workbench-mcp"]["env"] == {}
+    jobs_spec, environ=scoped, base_environ={},
+  )[env_name] == "run-scoped-value"
   assert "must-not-reach-child" not in json.dumps(captured)
+  assert captured["idea-workbench-mcp"]["env"] == {}
 
 
 @pytest.mark.parametrize(
@@ -477,4 +478,294 @@ def test_connect_passes_filtered_env_to_stdio_server_parameters(monkeypatch) -> 
     "ANTHROPIC_API_KEY": "explicit-anthropic",
   }
 
+  _run(manager._close_contexts(state.exit_contexts))
+
+
+_INVESTMENT_DESK_SERVERS = ("idea-workbench-mcp", "macro-mcp", "positioning-mcp")
+
+
+def _local_template_child_env(server_name: str, deployment_environ: dict[str, str]) -> dict[str, str]:
+  """The env the gateway gives one shipped local-template server, as its spawn builds it."""
+  servers = json.loads((ROOT / "deploy/mcp.local.template.json").read_text(encoding="utf-8"))["mcpServers"]
+  config = servers[server_name]
+  manager = McpClientManager(config_path=None)
+  scoped, absent = manager._scoped_server_env(server_name, config, deployment_environ=deployment_environ)
+  return _build_mcp_env(
+    config.get("env"),
+    environ=scoped,
+    base_environ=deployment_environ,
+    absent=absent,
+  )
+
+
+@pytest.mark.parametrize("server_name", _INVESTMENT_DESK_SERVERS)
+def test_placed_runtime_investment_children_inherit_the_desk_and_shared_children_do_not(
+  tmp_path, server_name
+) -> None:
+  from agent_gateway.runtime_placement import investment_state_dir, runtime_state_environment
+  from agent_gateway.user_runtime_credentials import USER_STORAGE_ID_ENV
+
+  launch = {
+    "PATH": "/usr/bin:/bin",
+    "LOCAL_GATEWAY_PYTHON": "/runtime/python",
+    "LOCAL_GATEWAY_RUNTIME_ROOT": "/runtime",
+    "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT": "/runtime/v1",
+  }
+  user_data_dir = tmp_path / "placement" / "user-data"
+  placed = _local_template_child_env(
+    server_name, {**launch, **runtime_state_environment(user_data_dir, "7")}
+  )
+  assert placed[USER_STORAGE_ID_ENV] == "7"
+  assert placed["INVESTMENT_TOOLS_STATE_DIR"] == str(investment_state_dir(user_data_dir, "7"))
+
+  shared = _local_template_child_env(server_name, launch)
+  assert USER_STORAGE_ID_ENV not in shared
+  assert "INVESTMENT_TOOLS_STATE_DIR" not in shared
+
+
+_UNSET_DECLARED_CONFIG = {
+  "command": "fake-mcp-server",
+  "run_scoped_env": ["SET_NAME", "UNSET_NAME", "EMPTY_NAME"],
+}
+
+
+def test_scoped_server_env_omits_declared_names_unset_in_the_deployment_env() -> None:
+  manager = McpClientManager(config_path=None)
+  scoped, absent = manager._scoped_server_env(
+    "child",
+    _UNSET_DECLARED_CONFIG,
+    deployment_environ={"SET_NAME": "value", "EMPTY_NAME": ""},
+  )
+
+  assert scoped == {"SET_NAME": "value", "EMPTY_NAME": ""}
+  assert absent == frozenset({"UNSET_NAME"})
+
+
+def test_scoped_server_env_delivers_declared_passthrough_from_the_run_mapping() -> None:
+  manager = McpClientManager(
+    config_path=None, server_env_passthrough={"child": {"PASS_NAME"}},
+  )
+
+  assert manager._scoped_server_env("child", {"command": "x"}, deployment_environ={}) == (
+    {}, frozenset({"PASS_NAME"}),
+  )
+  assert manager._scoped_server_env(
+    "child", {"command": "x"}, deployment_environ={"PASS_NAME": "run-scoped"},
+  ) == ({"PASS_NAME": "run-scoped"}, frozenset())
+  assert manager._scoped_server_env(
+    "child",
+    {"command": "x"},
+    deployment_environ={"PASS_NAME": "run-scoped", "ANTHROPIC_API_KEY": "ambient"},
+    projected_env={"PASS_NAME": "projected"},
+  ) == ({"PASS_NAME": "projected"}, frozenset())
+
+
+def test_jobs_oauth_requires_the_bound_run_owner(monkeypatch) -> None:
+  from agent_gateway.providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
+
+  manager = McpClientManager(
+    config_path=None,
+    server_env_passthrough={"jobs-mcp": set(ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES)},
+  )
+  environ = {
+    "ANTHROPIC_AUTH_TOKEN": "owner1-seat",
+    "USER_DATA_DIR": "/mnt/hank-data",
+    "ANTHROPIC_API_KEY": "payg-must-not-enter",
+  }
+  config = {
+    "command": "jobs-server",
+    "run_scoped_env": ["ANTHROPIC_AUTH_TOKEN", "USER_DATA_DIR"],
+    "env": {
+      "ANTHROPIC_AUTH_TOKEN": "${ANTHROPIC_AUTH_TOKEN}",
+      "USER_DATA_DIR": "${USER_DATA_DIR}",
+    },
+  }
+  monkeypatch.setattr(mcp_client_module, "load_user_runtime_credentials", lambda _env: None)
+  monkeypatch.setattr(
+    mcp_client_module, "scope_admits_operator_seats",
+    lambda scope, *, environ: str(scope) == "7",
+  )
+  assert manager._jobs_oauth_projection(environ) == {}
+  unbound, _ = manager._scoped_server_env("jobs-mcp", config, deployment_environ=environ)
+  assert "ANTHROPIC_AUTH_TOKEN" not in unbound
+  assert unbound["USER_DATA_DIR"] == "/mnt/hank-data"
+
+  class _Identity:
+    def __init__(self, role: str, risk_user_id: int) -> None:
+      self.role = role
+      self.risk_user_id = risk_user_id
+
+  class _Bundle:
+    def __init__(self, role: str, risk_user_id: int) -> None:
+      self.user = _Identity(role, risk_user_id)
+
+  monkeypatch.setattr(
+    mcp_client_module, "load_user_runtime_credentials",
+    lambda _env: _Bundle("invite", 9),
+  )
+  assert manager._jobs_oauth_projection(environ) == {}
+  monkeypatch.setattr(
+    mcp_client_module, "load_user_runtime_credentials",
+    lambda _env: _Bundle("owner", 8),
+  )
+  assert manager._jobs_oauth_projection(environ) == {}
+  invite_scoped, _ = manager._scoped_server_env(
+    "jobs-mcp", config, deployment_environ=environ,
+  )
+  assert "ANTHROPIC_AUTH_TOKEN" not in invite_scoped
+  assert invite_scoped["USER_DATA_DIR"] == "/mnt/hank-data"
+
+  monkeypatch.setattr(
+    mcp_client_module, "load_user_runtime_credentials",
+    lambda _env: _Bundle("owner", 7),
+  )
+  projected = manager._jobs_oauth_projection(environ)
+  assert projected == {"ANTHROPIC_AUTH_TOKEN": "owner1-seat"}
+  assert "USER_DATA_DIR" not in projected
+  admitted, _ = manager._scoped_server_env(
+    "jobs-mcp", config, deployment_environ=environ, projected_env=projected,
+  )
+  built = _build_mcp_env(config["env"], environ=admitted, base_environ={"PATH": "/usr/bin"})
+  assert built["ANTHROPIC_AUTH_TOKEN"] == "owner1-seat"
+  assert built["USER_DATA_DIR"] == "/mnt/hank-data"
+  assert "payg-must-not-enter" not in built.values()
+
+
+def test_non_owner_keeps_declared_user_data_dir_and_jobs_config() -> None:
+  manager = McpClientManager(
+    config_path=None,
+    server_env_passthrough={"jobs-mcp": {
+      "GMAIL_TOKEN_PATH",
+      "GMAIL_CREDENTIALS_PATH",
+      "INVESTMENT_TOOLS_DISABLE_RESEARCH_IDEAS",
+      "ANTHROPIC_AUTH_TOKEN",
+      "USER_DATA_DIR",
+    }},
+  )
+  deployment = {
+    "GMAIL_TOKEN_PATH": "/run/gmail-token",
+    "GMAIL_CREDENTIALS_PATH": "/run/gmail-credentials",
+    "INVESTMENT_TOOLS_DISABLE_RESEARCH_IDEAS": "1",
+    "USER_DATA_DIR": "/mnt/hank-data",
+    "ANTHROPIC_AUTH_TOKEN": "owner1-seat",
+    "ANTHROPIC_API_KEY": "ambient-payg",
+  }
+  config = {
+    "command": "jobs-server",
+    "run_scoped_env": ["USER_DATA_DIR"],
+    "env": {
+      "GMAIL_TOKEN_PATH": "${GMAIL_TOKEN_PATH}",
+      "GMAIL_CREDENTIALS_PATH": "${GMAIL_CREDENTIALS_PATH}",
+      "INVESTMENT_TOOLS_DISABLE_RESEARCH_IDEAS": "${INVESTMENT_TOOLS_DISABLE_RESEARCH_IDEAS}",
+      "USER_DATA_DIR": "${USER_DATA_DIR}",
+      "ANTHROPIC_AUTH_TOKEN": "${ANTHROPIC_AUTH_TOKEN}",
+    },
+  }
+  scoped, absent = manager._scoped_server_env(
+    "jobs-mcp", config, deployment_environ=deployment,
+  )
+  assert scoped["GMAIL_TOKEN_PATH"] == "/run/gmail-token"
+  assert scoped["GMAIL_CREDENTIALS_PATH"] == "/run/gmail-credentials"
+  assert scoped["INVESTMENT_TOOLS_DISABLE_RESEARCH_IDEAS"] == "1"
+  assert scoped["USER_DATA_DIR"] == "/mnt/hank-data"
+  assert "ANTHROPIC_AUTH_TOKEN" in absent
+  assert "ANTHROPIC_API_KEY" not in scoped
+  built = _build_mcp_env(config["env"], environ=scoped, base_environ={}, absent=absent)
+  assert built["USER_DATA_DIR"] == "/mnt/hank-data"
+  assert "ANTHROPIC_AUTH_TOKEN" not in built
+  assert "owner1-seat" not in built.values()
+
+
+def test_build_mcp_env_omits_entries_referencing_an_absent_declared_name() -> None:
+  environ = {"SET_NAME": "value"}
+  env = _build_mcp_env(
+    {
+      "UNSET_NAME": "${UNSET_NAME}",
+      "MIXED": "${SET_NAME}/x:${UNSET_NAME}",
+      "SET_NAME": "${SET_NAME}",
+      "LITERAL": "plain",
+    },
+    environ=environ,
+    base_environ={},
+    absent=frozenset({"UNSET_NAME"}),
+  )
+
+  assert env == {"SET_NAME": "value", "LITERAL": "plain"}
+
+
+def test_build_mcp_env_still_refuses_undeclared_reference_with_absent_names() -> None:
+  with pytest.raises(McpEnvExpansionError, match="NOT_DECLARED"):
+    _build_mcp_env(
+      {"X": "${NOT_DECLARED}"},
+      environ={},
+      base_environ={},
+      absent=frozenset({"UNSET_NAME"}),
+    )
+
+
+def test_stdio_child_env_lacks_declared_unset_names_and_keeps_empty_values(monkeypatch) -> None:
+  monkeypatch.setattr(
+    mcp_client_module.os,
+    "environ",
+    {"PATH": "/usr/bin", "SET_NAME": "value", "EMPTY_NAME": ""},
+  )
+  captured: dict[str, object] = {}
+
+  class _FakeServerParameters:
+    def __init__(self, **kwargs):
+      captured.update(kwargs)
+
+  class _FakeStdioContext:
+    async def __aenter__(self):
+      return object(), object()
+
+    async def __aexit__(self, exc_type, exc, tb):
+      return None
+
+  class _FakeClientSession:
+    def __init__(self, read_stream, write_stream):
+      pass
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+      return None
+
+    async def initialize(self):
+      return None
+
+    async def list_tools(self, *, params: PaginatedRequestParams | None = None) -> ListToolsResult:
+      return ListToolsResult(tools=[])
+
+  monkeypatch.setattr(mcp_client_module, "StdioServerParameters", _FakeServerParameters)
+  monkeypatch.setattr(
+    mcp_client_module, "stdio_client", lambda _params, errlog=None: _FakeStdioContext()
+  )
+  monkeypatch.setattr(mcp_client_module, "ClientSession", _FakeClientSession)
+  monkeypatch.setattr(
+    mcp_client_module, "_preflight_stdio_executable", lambda _command, _args, _env: None
+  )
+
+  manager = McpClientManager(config_path=None)
+  state = _run(
+    manager._connect(
+      "child",
+      {
+        **_UNSET_DECLARED_CONFIG,
+        "env": {
+          "SET_NAME": "${SET_NAME}",
+          "UNSET_NAME": "${UNSET_NAME}",
+          "EMPTY_NAME": "${EMPTY_NAME}",
+          "MIXED": "${SET_NAME}/x:${UNSET_NAME}",
+        },
+      },
+    )
+  )
+
+  assert captured["env"] == {
+    "PATH": "/usr/bin",
+    "SET_NAME": "value",
+    "EMPTY_NAME": "",
+  }
   _run(manager._close_contexts(state.exit_contexts))

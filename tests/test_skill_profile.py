@@ -183,31 +183,6 @@ def test_data_requirements_frontmatter_is_no_longer_a_declaration(
   assert "data_requirements" in profile.metadata
 
 
-@pytest.mark.parametrize("raw", ["7", 7, 7.0])
-def test_parse_max_structured_reads(tmp_path: Path, raw: object) -> None:
-  skill_path = _write_skill(tmp_path, f"max_structured_reads: {raw}", execution_class="node.implement")
-
-  profile = parse_skill_file(skill_path)
-
-  assert profile.max_structured_reads == 7
-  assert profile.metadata is None
-
-
-@pytest.mark.parametrize("raw", [0, -1])
-def test_parse_max_structured_reads_requires_positive_value(tmp_path: Path, raw: int) -> None:
-  skill_path = _write_skill(tmp_path, f"max_structured_reads: {raw}", execution_class="node.implement")
-
-  with pytest.raises(ValueError, match="greater than or equal to 1"):
-    parse_skill_file(skill_path)
-
-
-def test_parse_max_structured_reads_rejects_non_integer(tmp_path: Path) -> None:
-  skill_path = _write_skill(tmp_path, "max_structured_reads: nope", execution_class="node.implement")
-
-  with pytest.raises(ValueError, match="must be an integer"):
-    parse_skill_file(skill_path)
-
-
 def test_parse_subagent_return_contract_is_rejected(tmp_path: Path) -> None:
   skill_path = _write_skill(tmp_path, "subagent_return_contract: verify-finding-v1", execution_class="node.implement")
 
@@ -500,6 +475,21 @@ def test_declared_turn_and_cost_numbers_are_not_profile_fields(tmp_path: Path) -
   assert profile.metadata == {"max_budget_usd": "0.75", "max_turns": 20}
 
 
+def test_declared_max_tokens_is_retained_in_metadata(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    max_tokens: 4000
+    metadata:
+      custom: kept
+    """,
+    execution_class="node.implement",
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.metadata == {"custom": "kept", "max_tokens": 4000}
+
 
 
 
@@ -515,7 +505,6 @@ def test_positional_construction_compat() -> None:
   assert profile.agent_callable is False
   assert profile.mode == "full"
   assert profile.tool_packs_enabled is True
-  assert profile.max_structured_reads is None
 
 
 def test_agent_profile_subclass_compat() -> None:

@@ -171,6 +171,74 @@ def test_outbox_preserves_exact_v3_bind_and_reported_identity_bytes(tmp_path) ->
   )
 
 
+def _observation_payload(event_id: str) -> dict:
+  payload = {
+    **_v3_payload(event_id),
+    "execution_context_id": None,
+    "workflow_run_id": None,
+    "funding_route_id": None,
+    "reservation_id": None,
+    "shadow_rate_version": None,
+    "authenticated_subject": "user:101",
+  }
+  payload["source_payload_sha256"] = canonical_usage_payload_sha256(payload)
+  return payload
+
+
+def test_outbox_preserves_exact_observation_identity_bytes_and_commercial_digest(
+  tmp_path,
+) -> None:
+  commercial = _v3_payload("evt_commercial")
+  observation = _observation_payload("evt_observation")
+  # The subject is part of the digest; commercial V3 bytes never gain the key.
+  assert "authenticated_subject" not in commercial
+  assert observation["source_payload_sha256"] != commercial["source_payload_sha256"]
+  without_subject = {
+    key: value for key, value in observation.items() if key != "authenticated_subject"
+  }
+  assert canonical_usage_payload_sha256(without_subject) != (
+    observation["source_payload_sha256"]
+  )
+
+  outbox = CommercialUsageOutbox(tmp_path / "usage.sqlite3")
+  outbox.enqueue_batch([commercial, observation], created_at=NOW)
+
+  stored = outbox.get("evt_observation")
+  assert stored is not None
+  assert stored.payload == observation
+  assert stored.payload_json == json.dumps(
+    observation,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+    allow_nan=False,
+  )
+  assert stored.payload["authenticated_subject"] == "user:101"
+  assert stored.payload["capability_bind"] == observation["capability_bind"]
+  assert stored.payload["provider_reported_model"] == "claude-sonnet-test-20260801"
+  for field in (
+    "execution_context_id",
+    "workflow_run_id",
+    "funding_route_id",
+    "reservation_id",
+    "shadow_rate_version",
+    "workflow_attempt_group_id",
+    "work_authorization_id",
+  ):
+    assert stored.payload[field] is None
+  untouched = outbox.get("evt_commercial")
+  assert untouched is not None
+  assert untouched.payload == commercial
+
+  # Idempotent redelivery of the same observation; a changed subject under the
+  # same source identity is a digest conflict, not a second event.
+  outbox.enqueue_batch([observation], created_at=NOW)
+  changed = {**observation, "authenticated_subject": "user:102"}
+  changed["source_payload_sha256"] = canonical_usage_payload_sha256(changed)
+  with pytest.raises(CommercialUsageOutboxConflict):
+    outbox.enqueue_batch([changed], created_at=NOW)
+
+
 def test_outbox_migration_pragmas_and_health(tmp_path) -> None:
   path = tmp_path / "commercial" / "usage.sqlite3"
   outbox = CommercialUsageOutbox(path)

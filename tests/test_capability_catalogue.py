@@ -49,7 +49,7 @@ def _authority(tmp_path: Path, *, unpriced: tuple[str, ...] = ()) -> ModelAuthor
     "quant": _models(["openai.gpt-6-1-sol"], "high"),
     "extract": _models(["openai.gpt-6-1-sol.chat"], "low"),
     "peer": _models(["openai.gpt-6-luna-sdk"], "none"),
-    "ingest": _models(["anthropic.claude-opus-5-5-oauth"], "none"),
+    "ingest": _models(["anthropic.claude-sonnet-5-5-sdk"], "none"),
   }
   document["selection"].pop("presets", None)
   document["selection"]["capabilities"][SESSION_DRIVER_CAPABILITY]["default"] = {"kind": "tier", "tier": "default"}
@@ -92,7 +92,7 @@ def _builder(authority: ModelAuthority) -> Any:
   async def builder(*_args: Any, **_kwargs: Any) -> Any:
     raise AssertionError("the catalogue must not construct a runtime")
 
-  def _materialize(handle: CredentialHandle) -> MaterializedCredential:
+  def _materialize(handle: CredentialHandle, *, user_scope: Any = None) -> MaterializedCredential:
     raise AssertionError(f"the catalogue must not materialize a credential: {handle.provider}")
 
   adapters = {entry.adapter: entry.provider for entry in authority.registry.models.values()}

@@ -243,7 +243,6 @@ def test_gateway_strict_mode() -> None:
   app = create_agent(
     "test-key-strict",
     credentials_resolver=mock_resolver,
-    resolver_timeout_seconds=5.0,
   )
   client = TestClient(app)
 
@@ -307,47 +306,6 @@ def test_gateway_strict_mode() -> None:
     f"Expected 200 turn_complete from stubbed stream, got {resp.status_code}: {resp.text[:200]}"
   )
   print("  Passed multi-user validation and completed stubbed stream — PASS")
-  print("  PASS")
-
-
-def test_resolver_timeout() -> None:
-  divider("TEST: Resolver timeout")
-
-  from agent_gateway import create_agent
-  from agent_gateway.auth import AuthConfig, ResolverResult
-  from starlette.testclient import TestClient
-
-  async def slow_resolver(api_key: str, init_request) -> ResolverResult:
-    await asyncio.sleep(10)  # Way over the timeout
-    return ResolverResult(
-      user_id=init_request.user_id or "",
-      channel="excel",
-      credential_principal="service",
-      allow_service_for_interactive=True,
-      risk_user_id=101,
-      role="owner",
-      auth_config=AuthConfig.from_dict({
-        "provider": "anthropic",
-        "billing_mode": "byok",
-        "api_key": "never-reached",
-      }),
-    )
-
-  app = create_agent(
-    "test-key-timeout",
-    credentials_resolver=slow_resolver,
-    resolver_timeout_seconds=0.5,  # 500ms timeout
-  )
-  client = TestClient(app)
-
-  resp = client.post(
-    "/api/chat/init",
-    json={"api_key": "test-key-timeout", "user_id": "alice_42"},
-  )
-  print(f"  /chat/init with slow resolver → status {resp.status_code}")
-  body = resp.json()
-  assert body.get("error") == "credentials_timeout", f"Expected timeout error, got: {body}"
-  print(f"  Error: {body['error']} — PASS")
   print("  PASS")
 
 
@@ -547,7 +505,6 @@ if __name__ == "__main__":
   test_auth_config()
   test_gateway_explicit_user_id_without_resolver()
   test_gateway_strict_mode()
-  test_resolver_timeout()
 
   # Phase 1.2 tests
   test_billing_ledger()

@@ -458,6 +458,49 @@ def _publication_summary(publication: SpillPublication) -> dict[str, Any]:
   }
 
 
+def _fms_terminal_entry(
+  entry: Dict[str, Any],
+  content: str,
+  *,
+  tool_name: str,
+) -> Dict[str, Any] | None:
+  """The semantic receipt that stands for a settled ``fms_persist_*`` result."""
+  if not tool_name.startswith("fms_persist_") or is_error_tool_result_entry(entry, content):
+    return None
+  try:
+    parsed_dict = json.loads(content)
+  except (TypeError, ValueError):
+    return None
+  if not isinstance(parsed_dict, dict):
+    return None
+  delta = project_persist_envelope_delta(parsed_dict)
+  if delta is None:
+    return None
+  projected_entry = dict(entry)
+  projected_entry["content"] = json.dumps(delta, default=str)
+  return projected_entry
+
+
+def _plain_compacted_entry(
+  entry: Dict[str, Any],
+  content: str,
+  *,
+  tool_name: str,
+  max_chars: int,
+) -> Dict[str, Any]:
+  """``entry`` itself when it fits ``max_chars``, else a copy with a plain preview."""
+  compacted_content, was_truncated = truncate_model_tool_result_content(
+    content,
+    tool_name=tool_name,
+    max_chars=max_chars,
+  )
+  if not was_truncated:
+    return entry
+  compacted = dict(entry)
+  compacted["content"] = compacted_content
+  return compacted
+
+
 def compact_model_tool_result_entry(
   result_entry: Dict[str, Any],
   *,
@@ -469,62 +512,93 @@ def compact_model_tool_result_entry(
   uuid_factory: Callable[[], Any] | None = None,
   on_spill_publication: Callable[[SpillPublication], None] | None = None,
   max_chars: int | None = None,
+  retained_entry: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
   """Project one tool result entry for model context, spilling what it elides.
 
   `max_chars` is the bound the projected content must fit; it defaults to the
   model's tool-result limit, and a delivery channel with a smaller inline
   bound passes that bound.
+
+  Returns `(live_entry, durable_entry)`. `live_entry` is the model-visible
+  entry, projected from `result_entry` exactly as before. `durable_entry` is
+  what the event log and streams retain.
+
+  `retained_entry` is the boundary projection of `result_entry` (the same
+  envelope, its content already through the secret boundary). When given, the
+  durable entry, its preview and every spill file are produced from it, and
+  the model/stream cuts are taken only after that projection, so no cut can
+  leave a secret's prefix. `result_entry` is then the live source only: it is
+  neither retained nor spilled, and neither entry is mutated. When omitted the
+  two are the same object and the durable entry is the live entry.
   """
+  retained = result_entry if retained_entry is None else retained_entry
   content = result_entry.get("content")
   if not isinstance(content, str):
-    return result_entry, result_entry
+    return result_entry, retained
+  retained_content = retained["content"]
 
-  terminal_projection: str | None = None
-  if tool_name.startswith("fms_persist_") and not is_error_tool_result_entry(result_entry, content):
-    try:
-      parsed_dict = json.loads(content)
-    except (TypeError, ValueError):
-      parsed_dict = None
-    if isinstance(parsed_dict, dict):
-      delta = project_persist_envelope_delta(parsed_dict)
-      if delta is not None:
-        terminal_projection = json.dumps(delta, default=str)
-  if terminal_projection is not None:
-    projected_entry = dict(result_entry)
-    projected_entry["content"] = terminal_projection
+  live_terminal = _fms_terminal_entry(result_entry, content, tool_name=tool_name)
+  if live_terminal is not None:
+    durable_terminal = (
+      live_terminal
+      if retained is result_entry
+      else _fms_terminal_entry(retained, retained_content, tool_name=tool_name)
+    )
+    if durable_terminal is None:
+      durable_terminal = _plain_compacted_entry(
+        retained,
+        retained_content,
+        tool_name=tool_name,
+        max_chars=model_tool_result_max_chars() if max_chars is None else max_chars,
+      )
+    compacted_chars = len(live_terminal["content"])
     logger.info(
       "[%s] Tool %s result projected for model context | original_chars=%d projected_chars=%d",
       log_session_id,
       tool_name,
       len(content),
-      len(terminal_projection),
+      compacted_chars,
       extra={
         "data": {
           "event": "tool_result_semantically_compacted",
           "session_id": log_session_id,
           "tool": tool_name,
           "original_chars": len(content),
-          "compacted_chars": len(terminal_projection),
+          "compacted_chars": compacted_chars,
         }
       },
     )
-    return projected_entry, projected_entry
+    return live_terminal, durable_terminal
 
   if max_chars is None:
     max_chars = model_tool_result_max_chars()
-  plain_compacted_content, was_truncated = truncate_model_tool_result_content(
+  live_entry = _plain_compacted_entry(
+    result_entry,
     content,
     tool_name=tool_name,
     max_chars=max_chars,
   )
-  if not was_truncated:
-    return result_entry, result_entry
+  # The durable preview is cut from the projected content, never from the live
+  # text: a cut taken before the projection can split a secret.
+  durable_entry = (
+    live_entry
+    if retained is result_entry
+    else _plain_compacted_entry(
+      retained,
+      retained_content,
+      tool_name=tool_name,
+      max_chars=max_chars,
+    )
+  )
+  live_truncated = live_entry is not result_entry
+  # Redaction can lengthen content (a short secret becomes the marker), so the
+  # retained copy can exceed the limit when the raw one fits. It is then cut
+  # with the live entry untouched, and its full projected text still spills.
+  durable_truncated = durable_entry is not retained
+  if not live_truncated and not durable_truncated:
+    return result_entry, durable_entry
 
-  plain_compacted_entry = dict(result_entry)
-  plain_compacted_entry["content"] = plain_compacted_content
-  live_entry = plain_compacted_entry
-  durable_entry = plain_compacted_entry
   if spill_sink is not None and spill_dir_provider is not None:
     raise ValueError("pass spill_sink or spill_dir_provider, not both")
   configured_sink = normalize_spill_sink(spill_sink if spill_sink is not None else spill_dir_provider)
@@ -537,14 +611,17 @@ def compact_model_tool_result_entry(
       publication = write_spill_set(
         sink=configured_sink,
         tool_name=tool_name,
-        tool_use_id=result_entry.get("tool_use_id"),
-        content=content,
+        tool_use_id=retained.get("tool_use_id"),
+        content=retained_content,
         model_max_chars=max_chars,
         uuid_factory=uuid_factory or uuid.uuid4,
       )
       if on_spill_publication is not None:
         on_spill_publication(publication)
-      live_compacted_content, _ = truncate_model_tool_result_content(
+      # The model's preview keeps its prior text; only the pointer and summary
+      # come from the projected spill set.
+      if live_truncated:
+        live_compacted_content, _ = truncate_model_tool_result_content(
         content,
         tool_name=tool_name,
         max_chars=max_chars,
@@ -559,8 +636,8 @@ def compact_model_tool_result_entry(
           else None
         ),
       )
-      live_entry = dict(result_entry)
-      live_entry["content"] = live_compacted_content
+        live_entry = dict(result_entry)
+        live_entry["content"] = live_compacted_content
     except Exception as exc:
       logger.warning(
         "[%s] Tool %s result spill failed; using compacted preview only: %s",
@@ -569,6 +646,8 @@ def compact_model_tool_result_entry(
         exc,
         exc_info=True,
       )
+  if not live_truncated:
+    return live_entry, durable_entry
   logger.info(
     "[%s] Tool %s result compacted for model context | original_chars=%d compacted_chars=%d limit=%d",
     log_session_id,
@@ -598,11 +677,18 @@ def project_tool_call_complete_for_stream(
 ) -> Dict[str, Any]:
   """Return the live-stream projection of one ``tool_call_complete`` event.
 
-  ``event["result"]`` is the raw tool payload, and the durable event keeps it:
-  context rebuilds and resume read the durable record.  A live stream can be a
-  bounded transport — the autonomous event channel refuses any event line over
-  2 MiB — so an event too large for that frame is streamed with its result
-  elided, never as the bulk payload the spill set already holds.
+  ``event`` arrives already projected through the secret boundary: its
+  ``result`` and ``final_tool_result_blocks`` are the retained rendering, and
+  the durable event keeps them whole (context rebuilds and resume read the
+  durable record).  Every cut below is taken from that projection.
+  ``result_entry`` and ``live_entry`` are the *live* model-facing pair from
+  ``compact_model_tool_result_entry``: they say whether the model saw a
+  compacted copy and supply its spill metadata, and no text of theirs reaches
+  the streamed event except the ``spill_ref``/``spill_summary`` that the
+  projected spill set minted.  A live stream can be a bounded transport — the
+  autonomous event channel refuses any event line over 2 MiB — so an event too
+  large for that frame is streamed with its result elided, never as the bulk
+  payload the spill set already holds.
 
   The size question is put to the channel, on this event: the model-facing
   content is a different object, rewritten by the ``on_tool_result`` hooks

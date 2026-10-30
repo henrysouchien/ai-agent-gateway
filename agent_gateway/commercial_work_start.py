@@ -139,6 +139,10 @@ class CommercialWorkStartGate:
       return None
     claim_token = headers.get(COMMERCIAL_CLAIM_HEADER)
     authorization_token = headers.get(COMMERCIAL_WORK_AUTHORIZATION_HEADER)
+    if claim_token is None and authorization_token is None:
+      # No commercial headers: an ordinary authenticated turn on the session's
+      # own credentials. It creates no commercial account or spend authority.
+      return None
     if not claim_token or not authorization_token:
       raise CommercialWorkStartError(
         "commercial_work_authority_required",

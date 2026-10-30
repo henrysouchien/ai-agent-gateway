@@ -24,12 +24,19 @@ from .autonomous_launch_envelope import (
   _decode_broker_verified_autonomous_launch_envelope,
 )
 from .claim_signing_authority import GatewayClaimSigningAuthority
+from .autonomous_frame_metrics import FrameCapFinding, FrameCapMetrics
 
 
 AUTONOMOUS_CLAIM_BROKER_FD_ENV = (
   "AGENT_AUTONOMOUS_CLAIM_BROKER_FD"
 )
 AUTONOMOUS_CLAIM_BROKER_PROTOCOL_VERSION = 3
+# Hang bound on the private gateway↔child frame channel: a runaway child or
+# corrupt length prefix must not make the gateway allocate or read without limit.
+# FRAME-CAPS-ARE-CONTAINMENT (Henry, 723db4743e); precedent e9d4dc138c:
+# a 2.49 MB tool result killed bg_353. Keep the durable record at full fidelity,
+# stream its compacted projection, and warn/drop an undeliverable non-terminal.
+# This broker ceiling counts JSON body bytes; the four-byte header is separate.
 AUTONOMOUS_CLAIM_BROKER_MAX_FRAME_BYTES = 6 * 1024 * 1024
 AUTONOMOUS_CLAIM_BROKER_MAX_TTL_SECONDS = 600
 AUTONOMOUS_CLAIM_BROKER_IO_TIMEOUT_SECONDS = 5.0
@@ -50,9 +57,22 @@ _REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 _SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
 
+frame_cap_metrics = FrameCapMetrics("claim_broker")
+
 
 class AutonomousClaimBrokerError(RuntimeError):
   """The private autonomous signing channel failed closed."""
+
+
+class AutonomousClaimBrokerFrameCapError(AutonomousClaimBrokerError):
+  """A frame exceeded the channel's hang bound, with its counted Finding."""
+
+  def __init__(self, finding: FrameCapFinding) -> None:
+    self.finding = finding
+    super().__init__(
+      "autonomous claim broker frame exceeds its byte bound: "
+      f"{finding.frame_size_bytes} bytes > {finding.cap_bytes} byte cap"
+    )
 
 
 def _rejection_reason(exc: BaseException) -> str:
@@ -184,9 +204,23 @@ def _send_frame(
 ) -> None:
   encoded = _canonical_json(payload)
   if len(encoded) > AUTONOMOUS_CLAIM_BROKER_MAX_FRAME_BYTES:
-    raise AutonomousClaimBrokerError(
-      "autonomous claim broker frame exceeds its byte bound"
-    )
+    error = AutonomousClaimBrokerFrameCapError(frame_cap_metrics.record(
+      frame_size_bytes=len(encoded),
+      cap_bytes=AUTONOMOUS_CLAIM_BROKER_MAX_FRAME_BYTES,
+      direction="send",
+      size_basis="actual",
+    ))
+    # Forward only the length so the peer can record its existing cap refusal.
+    # Its receiver rejects the header and closes; no oversized body is written.
+    try:
+      _send_all(
+        sock,
+        struct.pack("!I", len(encoded)),
+        deadline=deadline,
+      )
+    except Exception as exc:
+      raise error from exc
+    raise error
   _send_all(
     sock,
     struct.pack("!I", len(encoded)) + encoded,
@@ -245,10 +279,14 @@ def _recv_frame(
       deadline=progress_deadline,
     )
   (length,) = struct.unpack("!I", header)
-  if (
-    length < 2
-    or length > AUTONOMOUS_CLAIM_BROKER_MAX_FRAME_BYTES
-  ):
+  if length > AUTONOMOUS_CLAIM_BROKER_MAX_FRAME_BYTES:
+    raise AutonomousClaimBrokerFrameCapError(frame_cap_metrics.record(
+      frame_size_bytes=length,
+      cap_bytes=AUTONOMOUS_CLAIM_BROKER_MAX_FRAME_BYTES,
+      direction="receive",
+      size_basis="declared",
+    ))
+  if length < 2:
     raise AutonomousClaimBrokerError(
       "autonomous claim broker frame length is invalid"
     )
@@ -943,6 +981,8 @@ __all__ = [
   "AUTONOMOUS_CLAIM_BROKER_PROTOCOL_VERSION",
   "AutonomousClaimBroker",
   "AutonomousClaimBrokerError",
+  "AutonomousClaimBrokerFrameCapError",
   "AutonomousClaimSigner",
   "adopt_inherited_autonomous_claim_signer",
+  "frame_cap_metrics",
 ]

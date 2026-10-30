@@ -2064,7 +2064,7 @@ class AutonomousRegistryStateMixin:
       # This validation-only value is replaced before exposure or persistence
       # after all task/owner invariants have passed.
       admitted_skill_execution_limits = (
-        SkillExecutionLimits(None)
+        SkillExecutionLimits()
         if mode == "skill"
         else None
       )

@@ -46,6 +46,8 @@ log = logging.getLogger(__name__)
 # https://ai.google.dev/api/generate-content (FinishReason, UsageMetadata).
 DEFAULT_GOOGLE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _API_KEY_HEADER = "x-goog-api-key"
+# Typed HTTP transport retry classification at provider entry (with 5xx in is_retryable_error);
+# 408/409 are transient request-timeout/conflict statuses, not usage-limit signals.
 _RETRYABLE_STATUSES = frozenset({408, 409})
 # The runner treats stop_reason "error" as a terminal provider error and does
 # not retry it. These finishReason / blockReason values are that stop.
@@ -85,17 +87,6 @@ _SURROGATE_RE = re.compile(
   r"[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]"
 )
 _GOOGLE_STATUS_RE = re.compile(r'"status"\s*:\s*"([A-Z0-9_]+)"')
-_USAGE_LIMIT_RE = re.compile(
-  r"\b("
-  r"resource[\s_-]*exhausted"
-  r"|exceeded your current quota"
-  r"|quota[\s_-]*(?:exhausted|exceeded|limit)"
-  r"|rate[\s_-]*limit(?:ed|ing)?"
-  r"|too many requests"
-  r"|usage[\s_-]*limit"
-  r")\b",
-  re.IGNORECASE,
-)
 _CONTENT_REFUSAL_RE = re.compile(
   r"\b("
   r"safety"
@@ -635,22 +626,6 @@ def _google_status(exc: Exception) -> str | None:
 
 def _is_content_refusal(exc: Exception) -> bool:
   return _CONTENT_REFUSAL_RE.search(_searchable(exc)) is not None
-
-
-def _is_usage_limit_only(exc: Exception) -> bool:
-  """True when the body is a rate/usage/quota exhaustion and nothing else."""
-
-  status = _status_code_from_exception(exc)
-  if status in {400, 401, 403}:
-    return False
-  if _is_context_length_exception(exc) or _is_content_refusal(exc):
-    return False
-  google_status = _google_status(exc)
-  if google_status == "RESOURCE_EXHAUSTED":
-    return True
-  if google_status in {"PERMISSION_DENIED", "UNAUTHENTICATED", "INVALID_ARGUMENT"}:
-    return False
-  return _USAGE_LIMIT_RE.search(_searchable(exc)) is not None
 
 
 def _retry_after_raw(exc: Exception) -> str | None:
@@ -1352,11 +1327,7 @@ class GoogleGenerateContentProvider(ModelProvider):
     # A 400, a content refusal, and a context-length error are not a hop.
     if status == 400 or _is_context_length_exception(exc) or _is_content_refusal(exc):
       return None
-    if _is_usage_limit_only(exc):
-      return _failure(exc, kind="rate_limit", status=status)
-    if status != 429:
-      return _classify_provider_credential_failure(provider=self.name, exc=exc)
-    return None
+    return _classify_provider_credential_failure(provider=self.name, exc=exc)
 
   def next_credential(
     self,
