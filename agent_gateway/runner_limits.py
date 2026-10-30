@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .containment_settings import ContainmentSettings
-from .providers.base import truncate_to_last_compaction
+from hank_model_transport.providers.base import truncate_to_last_compaction
 
 _REQUEST_TOKEN_FRAMING_BASE = 1024
 _REQUEST_TOKEN_FRAMING_PER_MESSAGE = 64

@@ -10,14 +10,14 @@ import httpx
 import pytest
 
 from agent_gateway.auth import AuthConfig
-from agent_gateway.providers import (
+from hank_model_transport.providers import (
   CopilotResponsesProvider,
   GoogleGenerateContentProvider,
   MuseResponsesProvider,
   OllamaLocalProvider,
   installed_adapter_route_support,
 )
-from agent_gateway.providers import base as provider_base
+from hank_model_transport.providers import base as provider_base
 from gateway_test_support.model_defaults import compat_for_profile
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from model_authority.rates import RateTable
@@ -334,7 +334,7 @@ def test_muse_credential_requires_api_key() -> None:
 
 
 def test_ollama_is_keyless_when_the_daemon_answers() -> None:
-  from agent_gateway.providers.ollama import _reset_presence_cache
+  from hank_model_transport.providers.ollama import _reset_presence_cache
 
   _reset_presence_cache()
   daemon = httpx.MockTransport(lambda _request: httpx.Response(200, json={"version": "0"}))
@@ -512,8 +512,8 @@ def test_stream_wire(
 )
 def test_copilot_in_band_usage_limit_is_copilot_labelled_typed_and_rate_limit(event: dict[str, Any]) -> None:
   """An in-band quota error over HTTP 200 rotates as rate_limit, not as a billing denial."""
-  from agent_gateway.providers.copilot import _map_copilot_event
-  from agent_gateway.providers.codex_helpers import _ResponsesStreamState
+  from hank_model_transport.providers.copilot import _map_copilot_event
+  from hank_model_transport.providers.codex_helpers import _ResponsesStreamState
 
   with pytest.raises(RuntimeError) as raised:
     _map_copilot_event(event, _ResponsesStreamState())

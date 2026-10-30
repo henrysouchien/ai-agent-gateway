@@ -23,19 +23,20 @@ from agent_gateway.mcp_activation import McpActivationFold  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
 from agent_gateway.server import ChatRequest  # noqa: E402
 from agent_gateway.skill_result_events import extract_fms_results  # noqa: E402
-from agent_gateway import AgentRunner, AgentSessionLog, EventLog, ModelInfo, ModelProvider, SessionStore, ToolDispatcher, ToolResultContext  # noqa: E402
+from agent_gateway import AgentRunner, AgentSessionLog, EventLog, SessionStore, ToolDispatcher, ToolResultContext
+from hank_model_transport.providers import ModelInfo, ModelProvider  # noqa: E402
 from agent_gateway.code_execution import CodeExecutionConfig, DockerBackend, build_code_execution, cleanup_code_execution  # noqa: E402
-from agent_gateway.providers import StreamEvent  # noqa: E402
+from hank_model_transport.providers import StreamEvent  # noqa: E402
 from agent_gateway.sub_agent import make_run_agent_handler  # noqa: E402
 from agent_gateway.tool_result_compaction import (  # noqa: E402
   annotate_result,
   compact_model_tool_result_entry,
   is_error_tool_result_entry,
-  make_error_result,
   project_tool_call_complete_for_stream,
   truncate_model_tool_result_content,
   write_tool_result_spill,
 )
+from hank_model_transport.tool_errors import make_error_result  # noqa: E402
 from agent_gateway.tool_result_spill import (  # noqa: E402
   SpillCapabilities,
   SpillSink,

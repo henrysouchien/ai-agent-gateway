@@ -26,9 +26,9 @@ from agent_gateway.events import (
   event_from_dict,
   event_to_dict,
 )
-from agent_gateway.multi_user.billing import SessionUsageSummary
-from agent_gateway.providers import ModelProvider, StreamEvent
-from agent_gateway.providers.base import ModelInfo
+from hank_model_transport.multi_user.billing import SessionUsageSummary
+from hank_model_transport.providers import ModelProvider, StreamEvent
+from hank_model_transport.providers.base import ModelInfo
 from agent_gateway.runner import AgentRunner
 from agent_gateway.secret_boundary import SecretBoundary
 from agent_gateway.sdk_runner import AgentSDKRunner
@@ -1303,7 +1303,7 @@ def test_create_agent_recap_keeps_delegated_child_tree_total_while_row_summary_s
 ) -> None:
   from dataclasses import replace
   import agent_gateway.easy as easy_mod
-  from agent_gateway.multi_user.billing import UsageEvent, _UsageAggregator
+  from hank_model_transport.multi_user.billing import UsageEvent, _UsageAggregator
 
   row_summaries: list[SessionUsageSummary] = []
   runner_holder: list[Any] = [None]

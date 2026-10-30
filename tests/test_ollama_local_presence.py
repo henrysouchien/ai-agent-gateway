@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterator
 import httpx
 import pytest
 
-from agent_gateway.providers.ollama import OllamaLocalProvider, _reset_presence_cache
+from hank_model_transport.providers.ollama import OllamaLocalProvider, _reset_presence_cache
 
 
 @pytest.fixture(autouse=True)
@@ -129,7 +129,7 @@ def test_probe_without_transport_uses_httpx_get(monkeypatch: pytest.MonkeyPatch)
     seen.append((url, kwargs.get("timeout")))
     return httpx.Response(200, json={"version": "0"})
 
-  monkeypatch.setattr("agent_gateway.providers.ollama.httpx.get", fake_get)
+  monkeypatch.setattr("hank_model_transport.providers.ollama.httpx.get", fake_get)
 
   assert OllamaLocalProvider().has_active_credential({}) is True
   assert seen == [("http://127.0.0.1:11434/api/version", 0.5)]

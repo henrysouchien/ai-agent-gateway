@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -36,7 +37,9 @@ from .final_narrative_artifact import FinalNarrativeArtifactError
 from .runner_session_events import build_agent_completion_event
 from .sub_agent_narrative_result import read_task_result_terminal_narrative
 from .skill_lifecycle import drain_owned_lifecycle_task
-from .task_registry import TaskEntry, task_state_for_result
+from .task_registry import TaskEntry, task_state_for_result, validate_task_result_admission
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +174,14 @@ def _stamp_child_result(
   entry.metadata = metadata
 
 
+def _validate_child_completion_identity(
+  entry: TaskEntry, admitted_task: AdmittedTask, result: TaskResult,
+) -> None:
+  validate_task_result_admission(result, admitted_task)
+  if entry.task_id != admitted_task.attempt.physical_task_id:
+    raise RuntimeError("child completion entry does not name the admitted task")
+
+
 async def publish_registered_child_settlement(
   *,
   transport: CompletionTransport,
@@ -181,12 +192,18 @@ async def publish_registered_child_settlement(
   completed_at: float | None = None,
 ) -> float:
   """Commit execution independently of readable-result materialization."""
+  _validate_child_completion_identity(entry, admitted_task, result)
 
   async def persist() -> float:
     async with entry.finalization_lock:
       if entry.completion_persistence_state == "committed":
         return cast(float, entry.completed_at)
-      now = completed_at if completed_at is not None else datetime.datetime.now(datetime.UTC).timestamp()
+      if entry.completed_at is None:
+        entry.completed_at = (
+          completed_at if completed_at is not None
+          else datetime.datetime.now(datetime.UTC).timestamp()
+        )
+      now = entry.completed_at
       _stamp_child_result(
         entry, admitted_task=admitted_task, result=result,
         capability_bind_receipt=capability_bind_receipt,
@@ -209,7 +226,15 @@ async def publish_registered_child_settlement(
   try:
     return await asyncio.shield(settlement)
   except asyncio.CancelledError:
-    await drain_owned_lifecycle_task(settlement)
+    try:
+      await drain_owned_lifecycle_task(settlement)
+    except Exception as exc:
+      entry.completion_persistence_state = "uncertain"
+      entry.completion_persistence_error = f"{type(exc).__name__}: {exc}"
+      log.exception(
+        "Child task %s settlement failed while its caller was cancelled",
+        entry.task_id,
+      )
     raise
 
 
@@ -232,14 +257,7 @@ def _build_child_completion_publication(
     )
   if not transport.workspace_dir:
     raise RuntimeError("child completion requires a parent workspace")
-  if result.attempt.physical_task_id != admitted_task.attempt.physical_task_id:
-    raise RuntimeError(
-      "child completion result does not settle the admitted task"
-    )
-  if entry.task_id != result.attempt.physical_task_id:
-    raise RuntimeError(
-      "child completion entry does not name the admitted task"
-    )
+  _validate_child_completion_identity(entry, admitted_task, result)
 
   now = (
     completed_at

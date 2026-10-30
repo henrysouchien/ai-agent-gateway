@@ -20,13 +20,13 @@ from .tool_dispatch_classification import (
   resolve_dispatch_entry as _resolve_dispatch_entry,
 )
 from .tool_result_semantics import classify_semantic_tool_error
-from .providers.anthropic import _server_tool_unit_deltas
+from hank_model_transport.providers.anthropic import _server_tool_unit_deltas
 from .runner_tool_audit import get_tool_risk_value
 from .secret_boundary import SANITIZATION_FAILED, sanitize_boundary_value
 
 
 if TYPE_CHECKING:
-  from .capability_execution import BoundCapabilityExecution
+  from hank_model_transport.capability_execution import BoundCapabilityExecution
   from .event_log import EventLog
   from .tool_dispatch_classification import DispatchEntry, ToolResultSettlement
   from .tool_dispatcher_approval_lifecycle import ApprovalPark

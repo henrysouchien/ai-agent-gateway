@@ -26,7 +26,7 @@ import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_agent
 from agent_gateway.tool_result_spill import SpillSink, TOOL_RESULT_READ_TOOL_DEF
 from agent_gateway.auth import AuthConfig, ResolverResult
-from agent_gateway._provider_utils import _resolve_provider
+from hank_model_transport._provider_utils import _resolve_provider
 from model_authority.binding import CapabilityResolutionError
 from hank_contracts.commercial_claims import VerifiedCommercialClaim
 from hank_contracts.commercial_work import (
@@ -35,11 +35,11 @@ from hank_contracts.commercial_work import (
 )
 from agent_gateway.commercial_authority_cache import CommercialAuthorityStateCache
 from agent_gateway.commercial_authority_subscriber import CommercialAuthoritySubscriber
-from agent_gateway.providers import AnthropicProvider, CodexProvider, OpenAIProvider, XAIProvider
+from hank_model_transport.providers import AnthropicProvider, CodexProvider, OpenAIProvider, XAIProvider
 from agent_gateway.skills import SkillStateStore
 from agent_gateway.server import ChatRequest, ChatTurnInputs
 from agent_gateway.server_chat_helpers import prepare_session_driver_turn
-from agent_gateway.policy_imports import configure_server_policy
+from hank_model_transport.policy_imports import configure_server_policy
 from agent_gateway.work_authorization_consumption import (
   WorkAuthorizationConsumptionRecord,
 )

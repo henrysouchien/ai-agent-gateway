@@ -13,10 +13,12 @@ if str(ROOT) not in sys.path:
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import resolve_auth_config
-from agent_gateway._provider_utils import _resolve_provider
+from hank_model_transport._provider_utils import resolve_auth_config
+from hank_model_transport._provider_utils import _resolve_provider
 from agent_gateway.auth import (
   AuthConfig,
+)
+from hank_model_transport.auth import (
   evaluate_placement_eligibility,
   filter_fallback_entries_for_placement,
 )
@@ -148,8 +150,8 @@ def test_seat_serves_run_iff_owner_equals_run_owner_without_admission_stamp(
 def test_resolve_auth_config_consults_pool_first_and_respects_parked_token() -> None:
   import json
   import time
-  from agent_gateway.providers.anthropic_oauth import ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD, resolve_anthropic_credentials
-  from agent_gateway.providers.anthropic_quota import Cooldown, record_cooldown
+  from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD, resolve_anthropic_credentials
+  from hank_model_transport.providers.anthropic_quota import Cooldown, record_cooldown
 
   monkeypatch = pytest.MonkeyPatch()
   monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-1")
@@ -787,7 +789,7 @@ def test_u9_get_anthropic_config_with_ambient_api_key_and_no_enrollment_withhold
   monkeypatch, tmp_path,
 ) -> None:
   from api import credentials
-  from agent_gateway.providers.anthropic_oauth import resolve_anthropic_credentials
+  from hank_model_transport.providers.anthropic_oauth import resolve_anthropic_credentials
 
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
   monkeypatch.delenv("ANTHROPIC_AUTH_STORE_PATH", raising=False)

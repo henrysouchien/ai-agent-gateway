@@ -22,11 +22,11 @@ import agent_gateway.server_chat_helpers as chat_helpers
 import agent_gateway.server_models as server_models
 from agent_gateway.event_log import EventLog, LogEntry
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.providers import AnthropicProvider, OpenAIProvider
-from agent_gateway.providers.agent_sdk import AgentSDKConfig, SDK_PINNED_VERSION
-from agent_gateway.providers.base import ModelInfo, ModelProvider, StreamEvent, stream_error
+from hank_model_transport.providers import AnthropicProvider, OpenAIProvider
+from hank_model_transport.providers.agent_sdk import AgentSDKConfig, SDK_PINNED_VERSION
+from hank_model_transport.providers.base import ModelInfo, ModelProvider, StreamEvent, stream_error
 from agent_gateway.runner import AgentRunner
-from agent_gateway.runner_auth import merge_refreshed_auth_config
+from hank_model_transport.runtime_helpers import merge_refreshed_auth_config
 from agent_gateway.sdk_runner import AgentSDKRunner
 from agent_gateway.server import ChatRuntime
 from agent_gateway.session import GatewaySession, SessionStream, StreamSubscriber

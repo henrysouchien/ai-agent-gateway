@@ -17,15 +17,17 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import (  # noqa: E402
+from agent_gateway import (
   AgentRunner,
   AgentSessionLog,
+  SessionContextBuilder,
+  ToolDispatcher,
+)
+from hank_model_transport.providers import (
   CostEstimate,
   ModelInfo,
   ModelProvider,
-  SessionContextBuilder,
   StreamEvent,
-  ToolDispatcher,
 )
 from agent_gateway.auth import AuthConfig, NoCredentialError, ResolverResult  # noqa: E402
 from model_authority.binding import CredentialHandle
@@ -39,12 +41,14 @@ from model_authority.selection import (
 )
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
 from agent_gateway import server as server_module  # noqa: E402
-from agent_gateway.server import (  # noqa: E402
+from agent_gateway.server import (
   ChatInitRequest,
   ChatRuntime,
   GatewayServerConfig,
-  MaterializedCredential,
   create_gateway_app,
+)
+from hank_model_transport.capability_execution import (
+  MaterializedCredential,
 )
 from agent_gateway.selected_content import SelectedContentAdmission  # noqa: E402
 from gateway_test_support.model_defaults import compat_for_profile  # noqa: E402

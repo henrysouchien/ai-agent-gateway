@@ -14,8 +14,8 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402
-from agent_gateway.providers.base import ModelInfo  # noqa: E402
+from hank_model_transport.providers.anthropic import AnthropicProvider  # noqa: E402
+from hank_model_transport.providers.base import ModelInfo  # noqa: E402
 from agent_gateway.secret_boundary import (  # noqa: E402
   REDACTED_SECRET,
   SANITIZATION_FAILED,
@@ -595,7 +595,7 @@ def test_payg_bound_auth_config_preserves_public_credential_ref_in_skill_result_
   """
   from agent_gateway.event_log import EventLog
   from model_authority.bind import CapabilityBind
-  from agent_gateway.providers.anthropic_oauth import (
+  from hank_model_transport.providers.anthropic_oauth import (
     ANTHROPIC_DEPLOYMENT_API_KEY_FIELD,
     ANTHROPIC_USER_SCOPE_FIELD,
     CREDENTIAL_AFFINITY_KEY_FIELD,

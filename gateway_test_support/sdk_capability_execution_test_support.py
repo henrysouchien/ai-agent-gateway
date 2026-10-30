@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from agent_gateway.capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 
 from gateway_test_support.capability_execution_test_support import (
   stub_capability_execution_resolver,

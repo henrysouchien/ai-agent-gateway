@@ -11,7 +11,7 @@ import pytest
 import yaml
 
 from agent_gateway import server_chat_helpers
-from agent_gateway.capability_execution import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 from agent_gateway.server_chat_helpers import build_capability_choices
 from agent_gateway.server_models import CapabilityRates
 from agent_gateway.session import SessionStore

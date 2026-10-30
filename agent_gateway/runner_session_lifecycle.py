@@ -69,7 +69,7 @@ from .session_recap import terminal_recap_payload
 if TYPE_CHECKING:
   from .agent_session_log import AgentSessionLog
   from .event_log import EventLog
-  from .providers import ModelProvider
+  from hank_model_transport.providers import ModelProvider
   from .skill_lifecycle import TopLevelSkillResultPolicy
   from .session import GatewaySession
   from .tool_dispatcher_approval_lifecycle import ApprovalPark

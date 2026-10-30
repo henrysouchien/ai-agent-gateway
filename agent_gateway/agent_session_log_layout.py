@@ -25,7 +25,7 @@ from .descriptor_paths import (
   absolute_lexical_path,
   open_directory_chain,
 )
-from .openai_history_fence import scope_provider_session_id
+from hank_model_transport.openai_history_fence import scope_provider_session_id
 
 if TYPE_CHECKING:
   from .agent_session_log import AgentSessionLogLocation

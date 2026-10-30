@@ -11,7 +11,7 @@ from .approval_policy import (
   ApprovalRequestPayload,
   RunContext,
 )
-from .policy_imports import resolve_effective_role
+from hank_model_transport.policy_imports import resolve_effective_role
 
 
 class SingleUserApprovalPolicy:

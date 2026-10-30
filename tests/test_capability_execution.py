@@ -13,19 +13,19 @@ from model_authority.binding import (
   ModelSelectionIntent,
   RunMode,
 )
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
   MaterializedCredential,
   derive_batch_capability_execution,
 )
 from agent_gateway.runner_hooks_lifecycle import RunnerHooksLifecycleMixin
-from agent_gateway.send_prompt import _prepare_bound_execution
+from hank_model_transport.send_prompt import _prepare_bound_execution
 from model_authority.bind import CapabilityBind
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from model_authority.registry import ProductModelRegistry
-from agent_gateway.providers import ModelInfo, ModelProvider
+from hank_model_transport.providers import ModelInfo, ModelProvider
 from gateway_test_support.model_defaults import SESSION_DRIVER
 
 _DRIVER_ENTRY = INITIAL_MODEL_REGISTRY.require(SESSION_DRIVER.model_key)

@@ -31,7 +31,7 @@ from model_authority.binding import (
 )
 from model_authority.capabilities import CAPABILITY_IDS, SESSION_DRIVER_CAPABILITY
 from model_authority.current import RATE_TABLES
-from .capability_execution import CapabilityExecutionResolver, preset_role_map
+from hank_model_transport.capability_execution import CapabilityExecutionResolver, preset_role_map
 from .control_run_lifecycle import coerce_control_run_state
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from model_authority.registry import ProductModelRegistry

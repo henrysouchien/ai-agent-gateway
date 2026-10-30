@@ -15,16 +15,17 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.providers import StreamEvent
-from agent_gateway.providers.anthropic import AnthropicProvider
-from agent_gateway import CapabilityExecutionResolver, resolve_auth_config
-from agent_gateway.capability_execution import MaterializedCredential
-from agent_gateway.providers.anthropic_oauth import (
+from hank_model_transport.providers import StreamEvent
+from hank_model_transport.providers.anthropic import AnthropicProvider
+from hank_model_transport._provider_utils import resolve_auth_config
+from hank_model_transport.capability_execution import CapabilityExecutionResolver, MaterializedCredential
+from hank_model_transport.providers.anthropic_oauth import (
   ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
   is_anthropic_generation_ref, resolve_anthropic_credentials,
 )
-from agent_gateway.send_prompt import _rotated_execution, send_prompt
+from hank_model_transport.send_prompt import _rotated_execution, send_prompt
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
+from gateway_test_support.transport_runtime import TEST_SEND_PROMPT_RUNTIME
 from model_authority.binding import AuthContext, CredentialHandle, ModelSelectionIntent
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 
@@ -144,7 +145,7 @@ def _run(provider: _PoolProvider) -> str:
     effort="none",
     auth_config=resolve_auth_config(max_tokens=1024, user_scope=1),
   )
-  return asyncio.run(send_prompt("hello", capability_execution=execution, user_id="alice", completion_record_root=None))
+  return asyncio.run(send_prompt("hello", runtime=TEST_SEND_PROMPT_RUNTIME, capability_execution=execution, user_id="alice", completion_record_root=None))
 
 
 @pytest.mark.parametrize(
@@ -266,6 +267,7 @@ def test_send_prompt_parking_persists_across_second_bind(
   observed_events = []
   assert asyncio.run(send_prompt(
     "hello", capability_execution=first_execution, user_id="alice",
+    runtime=TEST_SEND_PROMPT_RUNTIME,
     on_usage=observed_events.append, completion_record_root=None,
   )) == "answered-1"
   assert provider1.tokens_used == [_REFUSED, _SERVING]
@@ -278,7 +280,7 @@ def test_send_prompt_parking_persists_across_second_bind(
   assert observed_events[0].capability_bind["credential_ref"] == second_config["credential_source"]["generation_ref"]
   provider2 = _PoolProvider({_SERVING: "answered-2"})
   second_execution = bind(second_config, provider2)
-  assert asyncio.run(send_prompt("hello again", capability_execution=second_execution, user_id="alice", completion_record_root=None)) == "answered-2"
+  assert asyncio.run(send_prompt("hello again", runtime=TEST_SEND_PROMPT_RUNTIME, capability_execution=second_execution, user_id="alice", completion_record_root=None)) == "answered-2"
   assert provider2.tokens_used == [_SERVING]
 
 
@@ -304,7 +306,7 @@ def test_send_prompt_pool_of_one_selects_and_does_not_rotate_infinitely(
     auth_config=initial_config,
   )
   with pytest.raises(anthropic.RateLimitError):
-    asyncio.run(send_prompt("hello", capability_execution=execution, user_id="alice", completion_record_root=None))
+    asyncio.run(send_prompt("hello", runtime=TEST_SEND_PROMPT_RUNTIME, capability_execution=execution, user_id="alice", completion_record_root=None))
 
   assert provider.tokens_used == ["token-solo"]
 

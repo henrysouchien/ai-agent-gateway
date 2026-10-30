@@ -18,7 +18,7 @@ from agent_gateway.approval_remote_store import RemoteApprovalRequestStore
 from agent_gateway.approval_subsystem import (
   build_runtime_approval_subsystem, load_placed_approval_configuration,
 )
-from agent_gateway.user_runtime_credentials import (
+from hank_model_transport.user_runtime_credentials import (
   USER_RUNTIME_CREDENTIALS_FILE_ENV,
   DeskReplica,
   UserRuntimeIdentity,

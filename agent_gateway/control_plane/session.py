@@ -8,13 +8,15 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agent_gateway.auth import (
-  ChannelMismatchError,
   CredentialsResolver,
+)
+from agent_gateway.auth import (
+  ChannelMismatchError,
   CredentialsTimeoutError,
   MissingUserIdError,
 )
 from agent_gateway.approval_route import bind_session_approval_route
-from agent_gateway.providers.anthropic_oauth import ANTHROPIC_USER_SCOPE_FIELD
+from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_USER_SCOPE_FIELD
 from agent_gateway.session import AuthManager
 from agent_gateway.ttl_policy import (
   CONTROL_SESSION_TTL,

@@ -47,8 +47,10 @@ from agent_gateway.commercial_work_start import (
 from agent_gateway.server import (
   ChatRuntime,
   GatewayServerConfig,
-  MaterializedCredential,
   create_gateway_app,
+)
+from hank_model_transport.capability_execution import (
+  MaterializedCredential,
 )
 from agent_gateway.work_authorization_consumption import (
   WorkAuthorizationAlreadyAttached,

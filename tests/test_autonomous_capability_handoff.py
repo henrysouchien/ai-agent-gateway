@@ -42,7 +42,7 @@ from agent_gateway.autonomous_runner_start import (
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
-from agent_gateway.capability_execution import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 from agent_gateway.skill_limits import (
   AutonomousSkillAdmissionPolicy,
   SkillExecutionLimits,

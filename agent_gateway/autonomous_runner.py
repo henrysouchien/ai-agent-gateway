@@ -1884,6 +1884,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
           task=source.task, skill=source.skill, pack=source.pack,
           deliver=source.deliver, context=source.context, ticker=source.ticker,
           research_file_id=source.research_file_id, channel=source.channel,
+          dispatch_start_decision_id=source.dispatch_start_decision_id,
           dispatch_scope=source.dispatch_scope,
           resumed_from=source.control_run_id,
           approval_continuation=signed,

@@ -23,9 +23,9 @@ from typing import Any
 import httpx
 import pytest
 
-from agent_gateway.providers import anthropic_quota as quota
-from agent_gateway.providers.anthropic_oauth import ANTHROPIC_OAUTH_BETA
-from agent_gateway.providers.anthropic_quota import (
+from hank_model_transport.providers import anthropic_quota as quota
+from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_OAUTH_BETA
+from hank_model_transport.providers.anthropic_quota import (
   AccountLocator,
   AccountObservation,
   AccountPolicy,

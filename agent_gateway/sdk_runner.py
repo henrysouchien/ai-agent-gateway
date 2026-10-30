@@ -24,15 +24,17 @@ from .approval_route import (
   route_store,
 )
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
-from .capability_execution import BoundCapabilityExecution
+from model_authority.spend_ledger import spend_context
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from .event_log import EventLog
 from .context_capture import ContextCapture, build_context_manifest_event, canonical_manifest_digest
-from .multi_user.billing import BillingMode, SessionUsageSummary, UsageEvent, _UsageAggregator, normalize_identity
+from hank_model_transport.multi_user.billing import BillingMode, SessionUsageSummary, UsageEvent, _UsageAggregator, normalize_identity
 from .product_config import gateway_product_id
-from .providers.agent_sdk import AgentSDKConfig, estimate_cost, _validate_sdk_version
-from .providers.anthropic import _server_tool_unit_deltas
+from hank_model_transport.providers.agent_sdk import AgentSDKConfig, estimate_cost, _validate_sdk_version
+from hank_model_transport.providers.anthropic import _server_tool_unit_deltas
 from .usage_resilience import CommercialUsageCircuitOpen
-from .spend_metering import ProviderCallMeter
+from hank_model_transport.spend_metering import ProviderCallMeter
+from .transport_runtime import GATEWAY_SEND_PROMPT_RUNTIME
 from .commercial_work_start import commercial_budget_stop_fields
 from .runner import (
   ToolResultContext,
@@ -42,7 +44,7 @@ from .runner import (
 )
 from .runner_introspection import detect_keyword_param as _detect_keyword_param
 from .runner_background_lifecycle import _RunResearchFileActivityLease
-from .runner_state import select_run_max_tokens
+from hank_model_transport.runtime_helpers import select_run_max_tokens
 from .run_identity import RunIdentityCarrier
 from .runner_session_events import build_user_message_event
 from .selected_content import (
@@ -2039,19 +2041,21 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     options_kwargs = {key: value for key, value in options_kwargs.items() if value is not None}
 
     bind = self._capability_execution.bind
-    spend_meter = ProviderCallMeter(
-      provider=None,
-      provider_name=bind.provider,
-      model=effective_model,
-      model_key=bind.model_key,
-      config=self._capability_execution.auth_config,
-      call_site="agent_sdk",
-      session_id=self._session_id,
-      request_id=self._request_id,
-      run_id=self._skill_run_id,
-      skill=current_skill(),
-      attrs={"capability_id": bind.capability_id},
-    )
+    with spend_context(run_owner=self._usage_user_id):
+      spend_meter = ProviderCallMeter(
+        runtime=GATEWAY_SEND_PROMPT_RUNTIME,
+        provider=None,
+        provider_name=bind.provider,
+        model=effective_model,
+        model_key=bind.model_key,
+        config=self._capability_execution.auth_config,
+        call_site="agent_sdk",
+        session_id=self._session_id,
+        request_id=self._request_id,
+        run_id=self._skill_run_id,
+        skill=current_skill(),
+        attrs={"capability_id": bind.capability_id},
+      )
     spend_started = False
     spend_error: BaseException | None = None
     spend_started_mono = time.monotonic()

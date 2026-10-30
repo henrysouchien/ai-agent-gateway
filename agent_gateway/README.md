@@ -5,7 +5,6 @@ library API is documented in `../docs/`.
 
 | Subpackage | What it holds |
 |---|---|
-| `providers/` | model adapters and credential stores; see the [provider source map](providers/README.md). An adapter builds `ModelInfo` from the model's registry entry, its `compat:` block and the rate tables; a model ID with no registry entry is not callable |
 | `control_plane/` | the generic `/control/*` FastAPI routers (session, profiles, skills, schedules, runs, batches, approvals, events, health); product backends are supplied explicitly |
 | `code_execution/_backends/` | `ExecutionBackend` placements of one session-sticky Python kernel: `KernelBackend` (`placement="local"`) and `DockerBackend` (`placement="docker"`) share the persistent runner/codec |
 | `canvas_build/` | pinned Node toolchain (`.node-version`, `provision.sh`, `build.mjs`, `policy.mjs`) that compiles agent-authored canvas TSX |
@@ -16,6 +15,16 @@ library API is documented in `../docs/`.
 The model authority — registry, selection policy, resolver, rate tables, effort
 vocabulary and `CapabilityBind` — is not in this package. It is
 `hank-model-authority` (`../../model-authority/`, import `model_authority`).
+
+Provider adapters, credential stores, transport types and one-shot completion
+helpers live in [`hank_model_transport`](../../model-transport/hank_model_transport/),
+not in the gateway. Its adapters build `ModelInfo` from the model registry entry,
+its `compat` block and rate tables; a model ID with no registry entry is not callable.
+The gateway owns `AuthConfig`, capability resolvers, and
+`transport_runtime.GATEWAY_SEND_PROMPT_RUNTIME`, which gateway-hosted one-shot
+callers pass explicitly as `runtime=` to the transport's `send_prompt()` or
+`send_prompt_sync()`. Gateway host metadata lives in `gateway_info.py`; the
+transport's `package_info.py` holds only transport identity and version.
 
 Event credential projection: `secret_boundary.py` redacts authored inputs and
 display text in both `tool_calls_planned` and call-start events, leaving opaque

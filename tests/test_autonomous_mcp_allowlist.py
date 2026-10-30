@@ -14,7 +14,8 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.autonomous as autonomous  # noqa: E402
-from agent_gateway import BoundCapabilityExecution, EventLog  # noqa: E402
+from hank_model_transport.capability_execution import BoundCapabilityExecution
+from agent_gateway import EventLog  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.task_registry import TaskRegistry  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402

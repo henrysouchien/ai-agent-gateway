@@ -13,7 +13,7 @@ from agent_gateway.autonomous_event_channel import adopt_inherited_autonomous_ev
 from agent_gateway.autonomous_launch_envelope import AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
-from agent_gateway.capability_execution import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.event_log import EventLog
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY

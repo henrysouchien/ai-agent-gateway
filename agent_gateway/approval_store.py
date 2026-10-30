@@ -41,7 +41,6 @@ from .approval_policy import (
   canonical_json_strict,
   new_approval_id,
   revalidate_approval_request,
-  utc_now,
 )
 from .approval_remote import ApprovalRemoteReservationActive, ApprovalStoreAuditEmitter
 from .tool_policy_registry import PreparedToolCall as CanonicalPreparedToolCall
@@ -410,11 +409,19 @@ def _datetime_to_epoch_ns(value: datetime) -> int:
   )
 
 
+def _datetime_from_epoch_ns(value: int) -> datetime:
+  seconds, nanoseconds = divmod(value, 1_000_000_000)
+  return datetime.fromtimestamp(seconds, tz=UTC).replace(
+    microsecond=nanoseconds // 1_000
+  )
+
+
 def _trusted_utc_now(
   conn: sqlite3.Connection,
+  clock_ns: Callable[[], int],
 ) -> tuple[int, datetime]:
   """Advance the durable server-clock high-water or refuse rollback."""
-  now_ns = time.time_ns()
+  now_ns = clock_ns()
   prior_row = conn.execute(
     """
     SELECT observed_at_ns FROM approval_clock_high_water
@@ -437,11 +444,7 @@ def _trusted_utc_now(
     """,
     (now_ns,),
   )
-  seconds, nanoseconds = divmod(now_ns, 1_000_000_000)
-  now = datetime.fromtimestamp(seconds, tz=UTC).replace(
-    microsecond=nanoseconds // 1_000
-  )
-  return now_ns, now
+  return now_ns, _datetime_from_epoch_ns(now_ns)
 
 
 def _autonomous_approval_delivery_projection(
@@ -577,6 +580,7 @@ def _approval_vote_from_row(row: sqlite3.Row) -> ApprovalVote:
 def _insert_autonomous_approval_delivery_in_transaction(
   conn: sqlite3.Connection,
   *,
+  clock_ns: Callable[[], int],
   request: ApprovalRequest,
   delivery: Mapping[str, str],
   approved: bool,
@@ -633,7 +637,7 @@ def _insert_autonomous_approval_delivery_in_transaction(
     source_id=vote.vote_id if vote is not None else "cancellation",
     event_at_ns=decided_at_ns,
   )
-  delivery_now = _dt_to_text(_trusted_utc_now(conn)[1])
+  delivery_now = _dt_to_text(_trusted_utc_now(conn, clock_ns)[1])
   sequence_row = conn.execute(
     """
     SELECT next_value
@@ -1454,6 +1458,7 @@ class SQLiteApprovalStore:
     audit_emitter: _ApprovalAuditEmitter | None = None,
     notification_destination_resolver: ApprovalNotificationDestinationResolver | None = None,
     notification_sender: ApprovalNotificationSender | None = None,
+    clock_ns: Callable[[], int] | None = None,
     expected_device: int | None = None,
     expected_inode: int | None = None,
   ) -> None:
@@ -1492,9 +1497,13 @@ class SQLiteApprovalStore:
     self._audit_emitter: _ApprovalAuditEmitter | None = audit_emitter
     self._notification_destination_resolver = notification_destination_resolver
     self._notification_sender = notification_sender
+    self._clock_ns = clock_ns if clock_ns is not None else lambda: time.time_ns()
     self._notification_delivery_task: asyncio.Task | None = None
     self._lock = asyncio.Lock()
     self._init_schema()
+
+  def _utc_now(self) -> datetime:
+    return _datetime_from_epoch_ns(self._clock_ns())
 
   @property
   def audit_emitter(self) -> _ApprovalAuditEmitter | None:
@@ -2077,7 +2086,7 @@ class SQLiteApprovalStore:
         raise RuntimeError(
           "autonomous approval delivery sequence is inconsistent"
         )
-      _trusted_utc_now(conn)
+      _trusted_utc_now(conn, self._clock_ns)
       columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(approval_requests)").fetchall()}
       if "skill" not in columns:
         conn.execute("ALTER TABLE approval_requests ADD COLUMN skill TEXT")
@@ -2492,8 +2501,8 @@ class SQLiteApprovalStore:
         )
         conn.commit()
 
-  @staticmethod
   def _record_root_turn_locked(
+    self,
     conn: sqlite3.Connection,
     *,
     job_id: str,
@@ -2547,7 +2556,7 @@ class SQLiteApprovalStore:
       ):
         raise RootTurnRecordError("snapshot_mismatch")
       return
-    snapshot["created_at"] = _dt_to_text(created_at or utc_now())
+    snapshot["created_at"] = _dt_to_text(created_at or self._utc_now())
     conn.execute(
       """
       INSERT INTO approval_root_turns (
@@ -3162,7 +3171,7 @@ class SQLiteApprovalStore:
         predecessor,
         state="expired",
         state_version=predecessor.state_version + 1,
-        decided_at=utc_now(),
+        decided_at=self._utc_now(),
         decision="expired",
         decision_reason=_REISSUED_AS + approval_id,
       ))
@@ -3234,7 +3243,7 @@ class SQLiteApprovalStore:
           conn, job_id=job_id, tool_call_id=tool_call_id, nonce=nonce,
           tenant_storage_id=tenant_storage_id,
         )
-        now = utc_now()
+        now = self._utc_now()
         created = revalidate_approval_request(replace(
           request,
           approval_id=new_approval_id(),
@@ -3807,7 +3816,7 @@ class SQLiteApprovalStore:
         current = self._row_to_request(current_row)
         if expected_state_version is not None and current.state_version != expected_state_version:
           raise RuntimeError("approval request state_version changed")
-        decided_at = utc_now() if state in TERMINAL_STATES else current.decided_at
+        decided_at = self._utc_now() if state in TERMINAL_STATES else current.decided_at
         terminal_decision = decision
         if terminal_decision is None and state in TERMINAL_STATES:
           terminal_decision = state
@@ -3949,7 +3958,7 @@ class SQLiteApprovalStore:
           current,
           state="denied",
           state_version=current.state_version + 1,
-          decided_at=utc_now(),
+          decided_at=self._utc_now(),
           decider_id=decider_id if decider_id is not None else current.decider_id,
           decider_role=decider_role if decider_role is not None else current.decider_role,
           decision="denied",
@@ -3974,6 +3983,7 @@ class SQLiteApprovalStore:
         if normalized_delivery is not None:
           _insert_autonomous_approval_delivery_in_transaction(
             conn,
+            clock_ns=self._clock_ns,
             request=updated,
             delivery=normalized_delivery,
             approved=False,
@@ -4011,7 +4021,7 @@ class SQLiteApprovalStore:
     """Deny an admitted request that unwound before live publication."""
     transitioned = False
     revoked_grant_rows: list[sqlite3.Row] = []
-    now = utc_now()
+    now = self._utc_now()
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -4233,6 +4243,7 @@ class SQLiteApprovalStore:
         ):
           _insert_autonomous_approval_delivery_in_transaction(
             conn,
+            clock_ns=self._clock_ns,
             request=updated,
             delivery=normalized_delivery,
             approved=updated.state == "approved",
@@ -4420,7 +4431,7 @@ class SQLiteApprovalStore:
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        _ready_at_ns, ready_at_value = _trusted_utc_now(conn)
+        _ready_at_ns, ready_at_value = _trusted_utc_now(conn, self._clock_ns)
         ready_at = _dt_to_text(ready_at_value)
         current_row = conn.execute(
           """
@@ -4611,7 +4622,7 @@ class SQLiteApprovalStore:
         raise
       else:
         _published_at_ns, published_at_value = _trusted_utc_now(
-          conn
+          conn, self._clock_ns
         )
         published_at = _dt_to_text(published_at_value)
         cursor = conn.execute(
@@ -4717,7 +4728,7 @@ class SQLiteApprovalStore:
             "approved autonomous delivery is fenced for cancellation"
           )
       _published_at_ns, published_at_value = _trusted_utc_now(
-        conn
+        conn, self._clock_ns
       )
       published_at = _dt_to_text(published_at_value)
       cursor = conn.execute(
@@ -4826,7 +4837,7 @@ class SQLiteApprovalStore:
           tool_call_id=authority["tool_call_id"], nonce=authority["nonce"],
         )
         _acknowledged_at_ns, acknowledged_at = (
-          _trusted_utc_now(conn)
+          _trusted_utc_now(conn, self._clock_ns)
         )
         now_text = _dt_to_text(acknowledged_at)
         row = conn.execute(
@@ -4983,7 +4994,7 @@ class SQLiteApprovalStore:
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        observed_at_ns, _now = _trusted_utc_now(conn)
+        observed_at_ns, _now = _trusted_utc_now(conn, self._clock_ns)
         row = conn.execute(
           """
           SELECT COALESCE(MAX(delivery_sequence), 0) AS high_water
@@ -5057,7 +5068,7 @@ class SQLiteApprovalStore:
         if current["state"] in {"acknowledged", "quarantined"}:
           conn.commit()
           return current
-        now_ns, now = _trusted_utc_now(conn)
+        now_ns, now = _trusted_utc_now(conn, self._clock_ns)
         now_text = _dt_to_text(now)
         # A failed publish is recorded and leaves the row in its state: a
         # pending row stays pending for a later drain and a published row
@@ -5171,7 +5182,7 @@ class SQLiteApprovalStore:
           raise RuntimeError(
             "only pending autonomous approval delivery can be quarantined"
           )
-        _now_ns, now = _trusted_utc_now(conn)
+        _now_ns, now = _trusted_utc_now(conn, self._clock_ns)
         now_text = _dt_to_text(now)
         cursor = conn.execute(
           """
@@ -5321,7 +5332,7 @@ class SQLiteApprovalStore:
       source_parameters = ()
     else:
       raise ValueError("unsupported approval_reuse_mode")
-    now_text = _dt_to_text(now or utc_now())
+    now_text = _dt_to_text(now or self._utc_now())
     async with self._lock:
       with self._connection() as conn:
         row = conn.execute(
@@ -5347,7 +5358,7 @@ class SQLiteApprovalStore:
     return self._row_to_grant(row) if row is not None else None
 
   async def revoke_persistent_grant(self, grant_id: str, *, revoked_at: datetime | None = None) -> None:
-    when = revoked_at or utc_now()
+    when = revoked_at or self._utc_now()
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -5375,7 +5386,7 @@ class SQLiteApprovalStore:
     revoked_at: datetime | None = None,
   ) -> int:
     """Atomically revoke every active grant produced by one approval."""
-    when = revoked_at or utc_now()
+    when = revoked_at or self._utc_now()
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -5416,7 +5427,7 @@ class SQLiteApprovalStore:
     expected_channel: str | None,
   ) -> tuple[ApprovalRequest, bool]:
     """Hide and revoke grants at the durable cancellation boundary."""
-    now = utc_now()
+    now = self._utc_now()
     revoked_grant_rows: list[sqlite3.Row] = []
     async with self._lock:
       with self._connection() as conn:
@@ -5533,7 +5544,7 @@ class SQLiteApprovalStore:
     bound_excel_session_id: str,
     now: datetime | None = None,
   ) -> DelegationGrant | None:
-    now_value = now or utc_now()
+    now_value = now or self._utc_now()
     now_text = _dt_to_text(now_value)
     async with self._lock:
       with self._connection() as conn:
@@ -5567,7 +5578,7 @@ class SQLiteApprovalStore:
     return None
 
   async def revoke_delegation_grant(self, delegation_id: str, *, revoked_at: datetime | None = None) -> None:
-    when = revoked_at or utc_now()
+    when = revoked_at or self._utc_now()
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -5804,7 +5815,7 @@ class SQLiteApprovalStore:
   async def enqueue_pending_approval_notification(self, request: ApprovalRequest) -> dict[str, Any] | None:
     if request.state != "pending_user":
       return None
-    now_text = _dt_to_text(utc_now())
+    now_text = _dt_to_text(self._utc_now())
     if approval_notification_policy_for_request(request) == "skip":
       async with self._lock:
         with self._connection() as conn:
@@ -5864,7 +5875,7 @@ class SQLiteApprovalStore:
     rows = await self._claim_pending_notification_rows(limit=max(1, int(limit)))
     delivered_or_failed = 0
     for row in rows:
-      now_text = _dt_to_text(utc_now())
+      now_text = _dt_to_text(self._utc_now())
       try:
         await maybe_await(self._notification_sender(row))
       except Exception as exc:
@@ -5893,7 +5904,7 @@ class SQLiteApprovalStore:
       return self._notification_projection_for_conn(conn, approval_id)
 
   async def retry_failed_approval_notifications(self, approval_id: str) -> dict[str, Any]:
-    now_text = _dt_to_text(utc_now())
+    now_text = _dt_to_text(self._utc_now())
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -5976,7 +5987,7 @@ class SQLiteApprovalStore:
     return normalize_approval_notification_destinations(raw_destinations or [])
 
   async def _claim_pending_notification_rows(self, *, limit: int) -> list[dict[str, Any]]:
-    now_text = _dt_to_text(utc_now())
+    now_text = _dt_to_text(self._utc_now())
     async with self._lock:
       with self._connection() as conn:
         conn.execute("BEGIN IMMEDIATE")

@@ -36,7 +36,7 @@ from agent_gateway.events import (
   event_from_dict,
   event_to_dict,
 )
-from agent_gateway.multi_user.billing import SessionUsageSummary
+from hank_model_transport.multi_user.billing import SessionUsageSummary
 from agent_workflow_contracts import (
   AuthoredDeliverySummary,
   ContentHandle,

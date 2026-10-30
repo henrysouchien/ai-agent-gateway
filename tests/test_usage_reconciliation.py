@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 from model_authority.bind import CapabilityBind
 
-from agent_gateway.multi_user.billing import SessionUsageSummary
+from hank_model_transport.multi_user.billing import SessionUsageSummary
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker
 
 

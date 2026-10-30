@@ -23,12 +23,12 @@ from typing import Any, Awaitable, Callable, Sequence
 from agent_workflow_contracts.tool_registration import McpInputPreparationRoute
 from fastapi import FastAPI
 
-from ._provider_utils import _resolve_provider
+from hank_model_transport._provider_utils import _resolve_provider
 from .agent_session_log import AgentSessionLog, slugify
 from .auth import CredentialsResolver
 from model_authority.binding import CredentialHandle
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
-from .capability_execution import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 from .code_execution import CodeExecutionConfig, build_code_execution
 from .commercial_work_start import CommercialWorkStartGate
 from .dispatcher_factory import (
@@ -38,11 +38,11 @@ from .dispatcher_factory import (
 )
 from .mcp_client import McpClientManager
 from .operation_catalog import AgentOperationCatalog
-from .multi_user.billing import DEFAULT_USAGE_DLQ_PATH, SessionUsageSummary, UsageEvent, UsageLedger
+from hank_model_transport.multi_user.billing import DEFAULT_USAGE_DLQ_PATH, SessionUsageSummary, UsageEvent, UsageLedger
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from model_authority.registry import ModelRegistryEntry
 from model_authority.selection import CapabilityDefault, ProductModelSelectionPolicy, project_tier
-from .providers import AnthropicProvider, ModelProvider
+from hank_model_transport.providers import AnthropicProvider, ModelProvider
 from model_authority.rates import load_rate_table
 from .admission import current_parent_context, root_context
 from .containment_settings import ContainmentSettings

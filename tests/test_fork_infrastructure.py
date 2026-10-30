@@ -36,7 +36,7 @@ from model_authority.selection import (
   CapabilitySelectionPolicy,
   ProductModelSelectionPolicy,
 )
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
   MaterializedCredential,
@@ -60,7 +60,7 @@ from agent_gateway.fork_request_handoff import (
   credential_identity_or_none,
   fork_credential_identity_available,
 )
-from agent_gateway.providers.anthropic import AnthropicProvider
+from hank_model_transport.providers.anthropic import AnthropicProvider
 from agent_gateway.runner_fork_agents import (
   FORK_PLACEHOLDER,
   LearningForkConfig,
@@ -69,8 +69,8 @@ from agent_gateway.runner_fork_agents import (
   spawn_fork_agent,
   spawn_learning_fork,
 )
-from agent_gateway.providers import ModelInfo, ModelProvider
-from agent_gateway.providers.base import StreamEvent
+from hank_model_transport.providers import ModelInfo, ModelProvider
+from hank_model_transport.providers.base import StreamEvent
 from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
 from model_authority.schema import SCHEMA
 from gateway_test_support.model_defaults import compat_for_profile

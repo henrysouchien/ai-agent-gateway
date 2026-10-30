@@ -87,7 +87,7 @@ def _test_autonomous_capability_binding(request):
   from agent_gateway.autonomous_capability_handoff import (
     AutonomousCapabilityBinding,
   )
-  from agent_gateway.capability_execution import (
+  from hank_model_transport.capability_execution import (
     MaterializedCredential,
   )
 
@@ -959,7 +959,7 @@ def _run_real_owned_sentinel_output_canary(
     _OWNED_PROCESS_SENTINEL_SOURCE,
   )
   from model_authority.binding import CredentialHandle
-  from agent_gateway.capability_execution import MaterializedCredential
+  from hank_model_transport.capability_execution import MaterializedCredential
 
   secret = "CUSTOM-ACTIVE-CREDENTIAL-autonomous-output-8f21d7"
   handle = CredentialHandle(
@@ -3821,6 +3821,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "channel",
         "dev_mode",
         "research_file_id",
+        "dispatch_start_decision_id",
         "autonomous_in_flight_at_start",
         "owner_run_limit",
         "credential_handoff_bytes",
@@ -6953,7 +6954,7 @@ def test_sentinel_startup_death_cleanup_is_terminal_and_leak_free(
     AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN,
     encode_autonomous_credential_handoff,
   )
-  from agent_gateway.capability_execution import MaterializedCredential
+  from hank_model_transport.capability_execution import MaterializedCredential
 
   handoff = encode_autonomous_credential_handoff(MaterializedCredential(
     handle=_test_service_credential_handle(),

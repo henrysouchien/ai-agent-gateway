@@ -40,7 +40,7 @@ from model_authority.binding import RunMode
 from pydantic import JsonValue
 from model_authority.selection import SelectionSnapshot
 
-from .capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
   preset_selection_snapshot,
@@ -55,12 +55,12 @@ from .approval_route import (
 )
 from .child_environment import AUTONOMOUS_CHILD_ENVIRONMENT, CHILD_ENVIRONMENT_ALLOWLISTS
 from .containment_settings import ContainmentSettings
-from .policy_imports import require_inherited_role, role_denied_tools_for_session
+from hank_model_transport.policy_imports import require_inherited_role, role_denied_tools_for_session
 from .role_validation import require_exact_role
 from .session import session_owner_user_id
 from .sub_agent_helpers import RUN_AGENT_TOOL_NAME
 from .approval_store import SQLiteApprovalStore
-from .providers.anthropic_oauth import is_anthropic_generation_ref
+from hank_model_transport.providers.anthropic_oauth import is_anthropic_generation_ref
 
 log = logging.getLogger("agent_gateway.admission")
 

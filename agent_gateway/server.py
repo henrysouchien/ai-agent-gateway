@@ -55,7 +55,7 @@ from .approval_route import bind_session_approval_route
 from .dispatcher_factory import GatewayDispatcherDeps
 from .approvals import ApprovalActionError, _record_vote_and_unblock  # noqa: F401
 from .approval_store import maintain_pending_loop
-from .package_info import (
+from .gateway_info import (
   CONTRACT_CHAT_ATTACHMENTS_V1,
   CONTRACT_INVESTMENT_SELECTED_CONTENT_V1,
   package_health,
@@ -63,7 +63,7 @@ from .package_info import (
 from .investment_capability_claim import (
   investment_capability_signing_available,
 )
-from .providers import (
+from hank_model_transport.providers import (
   ModelProvider,
   installed_adapter_providers,
 )
@@ -311,7 +311,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   Returns:
     A FastAPI application ready to serve the gateway HTTP API.
   """
-  from .policy_imports import configure_server_policy
+  from hank_model_transport.policy_imports import configure_server_policy
 
   configure_server_policy(config.server_policy)
   build_chat_runtime = config.build_chat_runtime

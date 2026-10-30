@@ -16,7 +16,7 @@ from hank_contracts.agent_api import canonical_agent_api_claim_bytes
 
 from .auth import ChannelMismatchError, CredentialsTimeoutError, CrossUserReuseError, MissingUserIdError, NoCredentialError
 from .session import AuthManager
-from .user_runtime_credentials import bundle_storage_id, load_user_runtime_credentials
+from hank_model_transport.user_runtime_credentials import bundle_storage_id, load_user_runtime_credentials
 from .claim_signing_authority import GatewayClaimSigningAuthority
 from .server_models import (
   _AGENT_API_CLAIM_AUDIENCE,

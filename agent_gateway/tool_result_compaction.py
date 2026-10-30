@@ -9,7 +9,7 @@ from agent_workflow_contracts.context_refs import project_persist_envelope_delta
 from .autonomous_event_channel import autonomous_event_fits_frame
 from .tool_result_spill import SpillPublication, SpillSink, normalize_spill_sink, write_spill_set
 from .tool_result_semantics import status_error_has_detail
-from .policy_imports import load_server_policy_module
+from hank_model_transport.policy_imports import load_server_policy_module
 
 MODEL_TOOL_RESULT_MAX_CHARS = 60_000
 MODEL_TOOL_RESULT_MAX_CHARS_ENV = "AGENT_GATEWAY_MAX_MODEL_TOOL_RESULT_CHARS"
@@ -336,27 +336,6 @@ def annotate_result(result: Any, tool_name: str = "") -> Any:
 def _status_error_without_detail(result: dict[str, Any]) -> bool:
   status = result.get("status")
   return isinstance(status, str) and status.strip().lower() == "error" and not status_error_has_detail(result)
-
-
-def make_error_result(
-  tool_use_id: str,
-  code: str,
-  message: str,
-  sub_code: str = "",
-  data: Dict[str, Any] | None = None,
-) -> Dict[str, Any]:
-  error_dict: dict[str, Any] = {"code": code, "message": message}
-  if sub_code:
-    error_dict["sub_code"] = sub_code
-  # ``next_call`` is the producer's next action, or an explicit ``None`` when
-  # it named none: every model-visible error answers "what next".
-  error_dict["data"] = {**(data or {}), "next_call": (data or {}).get("next_call")}
-  return {
-    "type": "tool_result",
-    "tool_use_id": tool_use_id,
-    "content": json.dumps({"error": error_dict}),
-    "is_error": True,
-  }
 
 
 def is_error_tool_result_entry(result_entry: Dict[str, Any], content: str) -> bool:

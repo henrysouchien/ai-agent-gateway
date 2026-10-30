@@ -7,15 +7,15 @@ from typing import Any
 import httpx
 import pytest
 
-from agent_gateway.providers.anthropic import _rejection_error_code
-from agent_gateway.providers.codex_helpers import _ResponsesStreamState
-from agent_gateway.providers.copilot import _map_copilot_event
-from agent_gateway.providers.muse import _only_usage_limit
-from agent_gateway.providers.ollama import OllamaLocalProvider
-from agent_gateway.providers.openai_responses_helpers import (
+from hank_model_transport.providers.anthropic import _rejection_error_code
+from hank_model_transport.providers.codex_helpers import _ResponsesStreamState
+from hank_model_transport.providers.copilot import _map_copilot_event
+from hank_model_transport.providers.muse import _only_usage_limit
+from hank_model_transport.providers.ollama import OllamaLocalProvider
+from hank_model_transport.providers.openai_responses_helpers import (
   _ResponsesStreamState as OpenAIResponsesStreamState,
 )
-from agent_gateway.providers.openai_responses_helpers import map_event
+from hank_model_transport.providers.openai_responses_helpers import map_event
 
 
 @pytest.mark.parametrize("code", [42, False, ["oauth_not_allowed_for_organization"]])

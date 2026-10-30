@@ -104,7 +104,7 @@ from .tool_result_spill import (
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CapabilityResolutionError
-from .capability_execution import CapabilityExecutionResolver, materialize_frozen_bind
+from hank_model_transport.capability_execution import CapabilityExecutionResolver, materialize_frozen_bind
 from .child_completion import (
   CompletionTransport,
   build_own_journal_registration,
@@ -123,14 +123,14 @@ from .commercial_work_start import (
   require_commercial_child_account,
 )
 from .event_log import EventLog
-from .multi_user.billing import _UsageAggregator
+from hank_model_transport.multi_user.billing import _UsageAggregator
 from .execution_snapshot import (
   build_agent_execution_snapshot,
   provider_tool_definitions_for_grant,
   render_result_instructions,
   resume_agent_execution_snapshot,
 )
-from .policy_imports import require_inherited_role
+from hank_model_transport.policy_imports import require_inherited_role
 from .mcp_activation import RunAgentMcpActivationError
 from .operation_catalog import (
   AgentOperationCatalog,
@@ -764,10 +764,6 @@ async def _publish_foreground_completion(
   if not runner_id or not gateway_session_id or workspace_dir is None:
     raise RuntimeError(
       "foreground completion requires durable parent session identity"
-    )
-  if result.attempt.physical_task_id != admitted_task.attempt.physical_task_id:
-    raise RuntimeError(
-      "foreground completion result does not settle the admitted task"
     )
 
   now = datetime.datetime.now(datetime.UTC).timestamp()
@@ -3272,7 +3268,9 @@ def make_run_agent_handler(
         # The task's writer session and its delegating parent are distinct.
         registration["parent_session_id"] = runner._gateway_session_id
         await _journal_foreground_registration(runner, foreground_entry, registration)
-      result, error = await _dispatch_sub_agent(tool_input, call_index=call_index)
+      result, error = await _dispatch_sub_agent(
+        tool_input, call_index=call_index, task_entry=foreground_entry,
+      )
       foreground_entry.error = error
       if (
         isinstance(error, dict)
@@ -3371,9 +3369,19 @@ def make_run_agent_handler(
         foreground_entry is not None
         and foreground_entry.registration_persistence_state == "committed"
       ):
-        await _settle_foreground_attempt(
-          runner, foreground_entry, admitted_task, execution.bind.to_json(),
-        )
+        try:
+          await _settle_foreground_attempt(
+            runner, foreground_entry, admitted_task, execution.bind.to_json(),
+          )
+        except Exception as exc:
+          foreground_entry.completion_persistence_state = "uncertain"
+          foreground_entry.completion_persistence_error = (
+            f"{type(exc).__name__}: {exc}"
+          )
+          log.exception(
+            "Foreground task %s settlement failed; preserving its original outcome",
+            foreground_entry.task_id,
+          )
 
   def _build(scope: JobScope):
     async def _scoped_run_agent(tool_input: dict[str, Any], **kwargs: Any):

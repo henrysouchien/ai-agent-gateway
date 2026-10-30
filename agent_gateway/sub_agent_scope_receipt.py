@@ -28,7 +28,7 @@ from .capability_resolution import (
   resolve_operation_authority,
   snapshot_platform_catalog,
 )
-from .policy_imports import (
+from hank_model_transport.policy_imports import (
   load_server_policy_module,
   resolve_server_policy_tool_class,
 )

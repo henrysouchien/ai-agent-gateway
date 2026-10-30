@@ -12,15 +12,15 @@ import urllib.parse
 import httpx
 import pytest
 
-from agent_gateway.auth import CredentialFailureKind, ProviderCredentialFailure
-from agent_gateway.providers.api_key_store import upsert_api_key_record
-from agent_gateway.providers.credential_pool import (
+from hank_model_transport.auth import CredentialFailureKind, ProviderCredentialFailure
+from hank_model_transport.providers.api_key_store import upsert_api_key_record
+from hank_model_transport.providers.credential_pool import (
   ProviderCredentialPool,
   get_provider_credential_pool,
   store_write_lock,
 )
-from agent_gateway.providers.kimi_code import KimiCodeProvider
-from agent_gateway.providers.kimi_code_oauth import (
+from hank_model_transport.providers.kimi_code import KimiCodeProvider
+from hank_model_transport.providers.kimi_code_oauth import (
   extract_kimi_account_identity,
   load_kimi_code_accounts,
   refresh_kimi_code_tokens,
@@ -390,7 +390,7 @@ def test_pool_candidates_keep_both_stores_when_config_auth_store_is_oauth(kimi_e
   # writes the API seat's path to `api_key_store_path` and preserves the OAuth
   # store path, so a subsequent re-resolve still sees both stores.
   api_candidate = next(c for c in candidates if c.auth_mode == "api")
-  from agent_gateway.providers.kimi_code_oauth import _materialize_kimi_code_candidate
+  from hank_model_transport.providers.kimi_code_oauth import _materialize_kimi_code_candidate
 
   rotated_cfg = _materialize_kimi_code_candidate(api_candidate, {"auth_store_path": str(oauth)})
   assert rotated_cfg["api_key_store_path"] == str(api)

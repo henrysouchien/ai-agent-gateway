@@ -14,8 +14,8 @@ from model_authority.binding import CredentialHandle
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.event_log import EventLog, log_has_terminal
-from agent_gateway.providers import AnthropicProvider
-from agent_gateway.server import MaterializedCredential
+from hank_model_transport.providers import AnthropicProvider
+from hank_model_transport.capability_execution import MaterializedCredential
 from agent_gateway.control_run_lifecycle import CONTROL_RUN_STATE_CLASSIFICATION
 from agent_gateway.server_chat_helpers import (
   _chat_turn_state_from_events,

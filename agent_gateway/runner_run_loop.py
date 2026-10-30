@@ -12,6 +12,8 @@ from typing import Awaitable, Callable, Iterable, Literal, Protocol, Sequence, T
 
 from agent_workflow_contracts import AdmittedTask, AgentCompletionEnvelope
 
+from model_authority.spend_ledger import spend_context
+
 from .context_capture import ContextCapture, build_context_manifest_event, canonical_manifest_digest
 from .event_adapter import TerminalDisposition
 from .fork_request_handoff import (
@@ -106,7 +108,6 @@ from .runner_state import (
   model_visible_extra_blocks as _model_visible_extra_blocks,
   no_tool_use_turn_outcome as _no_tool_use_turn_outcome,
   normalized_run_config as _normalized_run_config,
-  select_run_max_tokens as _select_run_max_tokens,
   session_drain_state as _session_drain_state,
   stream_turn_log_summary as _stream_turn_log_summary,
   sub_agent_batch_error as _sub_agent_batch_error,
@@ -116,8 +117,11 @@ from .runner_state import (
   StreamTurnResult,
   StreamTurnFailure,
 )
-from .runner_usage import (
+from hank_model_transport.runtime_helpers import (
   empty_usage_totals as _empty_usage_totals,
+  select_run_max_tokens as _select_run_max_tokens,
+)
+from .runner_usage import (
   turn_usage_payload as _turn_usage_payload,
   usage_delta_state as _usage_delta_state,
   usage_snapshot,
@@ -140,12 +144,12 @@ from .tool_dispatcher_approval_lifecycle import ApprovalPark
 if TYPE_CHECKING:
   from .agent_session_log import AgentSessionLog
   from .agent_session_log_records import LogEntry
-  from .capability_execution import BoundCapabilityExecution
+  from hank_model_transport.capability_execution import BoundCapabilityExecution
   from .containment_settings import ContainmentSettings
   from .context_builder import SessionContextBuilder
   from .event_log import EventLog
-  from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator
-  from .providers.base import CostEstimate, ModelInfo, ModelProvider
+  from hank_model_transport.multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator
+  from hank_model_transport.providers.base import CostEstimate, ModelInfo, ModelProvider
   from .runner_budget import CostAccumulator
   from .runner_tool_execution import AgentRunnerDispatcher
   from .skill_lifecycle import TopLevelSkillLifecycleMetadata
@@ -1009,6 +1013,7 @@ class RunnerRunLoopMixin:
     _sub_agent_id: str | None
     _runner_id: str | None
     _request_id: str
+    _usage_user_id: str
     _active_skill_allow: set[str]
     _aggregator: _UsageAggregator
     _log: EventLog
@@ -3278,14 +3283,15 @@ class RunnerRunLoopMixin:
     its dispatcher's `RunContext` instead.
     """
     admission_token = set_current_skill(None)
-    try:
-      await self._run_chat_loop(
-        messages,
-        system_prompt,
-        resume_initial_messages=resume_initial_messages,
-      )
-    finally:
-      reset_current_skill(admission_token)
+    with spend_context(run_owner=self._usage_user_id):
+      try:
+        await self._run_chat_loop(
+          messages,
+          system_prompt,
+          resume_initial_messages=resume_initial_messages,
+        )
+      finally:
+        reset_current_skill(admission_token)
 
   async def _run_chat_loop(
     self,

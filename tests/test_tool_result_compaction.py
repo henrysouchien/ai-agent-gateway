@@ -2,7 +2,7 @@ import copy
 import json
 from types import SimpleNamespace
 
-from agent_gateway.policy_imports import configure_server_policy, load_server_policy_module
+from hank_model_transport.policy_imports import configure_server_policy, load_server_policy_module
 from agent_gateway.secret_boundary import SecretBoundary, sanitize_boundary_value
 from agent_gateway.tool_result_compaction import (
   compact_model_tool_result_entry,

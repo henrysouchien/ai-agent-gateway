@@ -19,7 +19,7 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import AgentSessionLog, generate_and_append_summary
 import agent_gateway.compaction as compaction
-from agent_gateway.providers import AnthropicProvider, StreamEvent
+from hank_model_transport.providers import AnthropicProvider, StreamEvent
 from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
 )

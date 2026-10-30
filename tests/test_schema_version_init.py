@@ -10,12 +10,14 @@ from agent_gateway.auth import AuthConfig, ResolverResult
 from model_authority.binding import CredentialHandle
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
-from agent_gateway.providers import ModelInfo, ModelProvider, installed_adapter_route_support
+from hank_model_transport.providers import ModelInfo, ModelProvider, installed_adapter_route_support
 from agent_gateway.server import (
   ChatRuntime,
   GatewayServerConfig,
-  MaterializedCredential,
   create_gateway_app,
+)
+from hank_model_transport.capability_execution import (
+  MaterializedCredential,
 )
 
 

@@ -10,7 +10,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from agent_gateway.user_runtime_credentials import (
+from hank_model_transport.user_runtime_credentials import (
   MalformedGatewayUserKeys,
   bundle_to_json,
   gateway_user_key_entries as load_gateway_user_key_entries,

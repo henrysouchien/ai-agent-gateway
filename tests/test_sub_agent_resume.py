@@ -38,8 +38,8 @@ from agent_gateway.execution_snapshot import (
 from agent_gateway.final_narrative_artifact import publish_final_narrative
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.tool_policy_registry import PreparedToolCall
-from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
-from agent_gateway.openai_history_fence import TEXT_SIGNATURE_MARKER
+from hank_model_transport.providers import ModelInfo, ModelProvider, StreamEvent
+from hank_model_transport.openai_history_fence import TEXT_SIGNATURE_MARKER
 from agent_gateway.research_file_activity_lock import (
   try_acquire_research_file_activity,
 )
@@ -130,7 +130,7 @@ from agent_gateway.transcript import (
   reconstruct_messages_for_task,
   reconstruct_parent_messages,
 )
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
 )
@@ -149,7 +149,7 @@ from gateway_test_support.capability_execution_test_support import (
   stub_capability_execution_resolver,
 )
 from gateway_test_support.host_policy import owner_session_host_policy
-from agent_gateway.multi_user.billing import _UsageAggregator
+from hank_model_transport.multi_user.billing import _UsageAggregator
 
 _UNRESOLVED_BLOCK_RE = re.compile(r"\{\{[A-Z][A-Z0-9_]*\}\}")
 
@@ -7357,7 +7357,7 @@ def test_resume_captures_actual_job_and_replay_never_reattributes_custody(
 def test_resume_uses_frozen_anthropic_generation_not_current_selection(
   tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retired: bool,
 ) -> None:
-  from agent_gateway.providers.anthropic_oauth import register_anthropic_static_credential
+  from hank_model_transport.providers.anthropic_oauth import register_anthropic_static_credential
 
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "credentials"))
   # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: the frozen generation is this owner's account.
@@ -7898,7 +7898,7 @@ def test_supplied_workflow_successor_executes_frozen_admission_and_fanout(
   async_completion: bool,
   state: TaskState,
 ) -> None:
-  from agent_gateway.providers.anthropic_oauth import register_anthropic_static_credential
+  from hank_model_transport.providers.anthropic_oauth import register_anthropic_static_credential
 
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "credentials"))
   # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: the frozen generation is this owner's account.
@@ -8355,7 +8355,7 @@ def test_approved_retry_owns_completion_callback_after_unstarted_reservation(
 def test_supplied_successor_replay_precedes_credential_materialization(
   tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  from agent_gateway.capability_execution import CapabilityResolutionError
+  from hank_model_transport.capability_execution import CapabilityResolutionError
 
   async def _case() -> None:
     runner, source, successor = await _trusted_workflow_resume_setup(tmp_path)

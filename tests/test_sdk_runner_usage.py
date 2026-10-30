@@ -11,8 +11,9 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog
-from agent_gateway.multi_user.billing import SessionUsageSummary, UsageEvent
+from hank_model_transport.providers import AgentSDKConfig
+from agent_gateway import AgentSDKRunner, EventLog
+from hank_model_transport.multi_user.billing import SessionUsageSummary, UsageEvent
 from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_capability_execution
 
 

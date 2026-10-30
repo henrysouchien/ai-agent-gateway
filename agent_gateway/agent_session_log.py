@@ -50,7 +50,7 @@ from .descriptor_paths import (
   absolute_lexical_path as _absolute_lexical_path,
   open_directory_chain,
 )
-from .openai_history_fence import (
+from hank_model_transport.openai_history_fence import (
   DURABLE_HISTORY_VERSION_KEY,
   RESPONSES_HISTORY_VERSION,
   contains_openai_responses_history,

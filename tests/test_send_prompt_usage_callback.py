@@ -16,14 +16,15 @@ if str(PKG_DIR) not in sys.path:
 
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CapabilityResolutionError
-from agent_gateway.capability_execution import BoundCapabilityExecution
-from agent_gateway.multi_user.billing import UsageEvent
-from agent_gateway.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
+from hank_model_transport.capability_execution import BoundCapabilityExecution
+from hank_model_transport.multi_user.billing import UsageEvent
+from hank_model_transport.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
 from model_authority.thinking import ThinkingLevel
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
-from agent_gateway.send_prompt import _call_usage_callback
+from gateway_test_support.transport_runtime import TEST_SEND_PROMPT_RUNTIME
+from hank_model_transport.send_prompt import _call_usage_callback
 
-send_prompt_module = importlib.import_module("agent_gateway.send_prompt")
+send_prompt_module = importlib.import_module("hank_model_transport.send_prompt")
 
 
 def test_send_prompt_sync_requires_bound_execution_at_its_public_boundary() -> None:
@@ -203,6 +204,7 @@ def test_send_prompt_usage_event_sets_provider() -> None:
   result = asyncio.run(
     send_prompt_module.send_prompt(
       "hello",
+      runtime=TEST_SEND_PROMPT_RUNTIME,
       capability_execution=_bound_execution(bind=bind, provider_adapter=provider),
       user_id="alice",
       on_usage=events.append,
@@ -264,6 +266,7 @@ def test_send_prompt_sends_model_max_output_regardless_of_auth_config_max_tokens
   result = asyncio.run(
     send_prompt_module.send_prompt(
       "hello",
+      runtime=TEST_SEND_PROMPT_RUNTIME,
       capability_execution=_bound_execution(
         bind=bind,
         provider_adapter=provider,
@@ -327,6 +330,7 @@ def test_send_prompt_emits_partial_commercial_usage_on_terminal_stream_paths(
   with pytest.raises(type(failure)):
     asyncio.run(send_prompt_module.send_prompt(
       "hello",
+      runtime=TEST_SEND_PROMPT_RUNTIME,
       capability_execution=_bound_execution(bind=bind, provider_adapter=provider),
       user_id="alice",
       commercial_usage_producer=producer,
@@ -348,6 +352,7 @@ def test_send_prompt_rejects_blank_commercial_identity_before_provider_call() ->
   with pytest.raises(ValueError, match="commercial send_prompt requires"):
     asyncio.run(send_prompt_module.send_prompt(
       "hello",
+      runtime=TEST_SEND_PROMPT_RUNTIME,
       capability_execution=_bound_execution(bind=bind, provider_adapter=provider),
       user_id="alice",
       commercial_usage_producer=object(), request_id=" ",
@@ -397,6 +402,7 @@ def test_send_prompt_rejects_bound_execution_disagreement_before_client_creation
     asyncio.run(
       send_prompt_module.send_prompt(
         "hello",
+        runtime=TEST_SEND_PROMPT_RUNTIME,
         capability_execution=execution,
         user_id="alice",
         completion_record_root=None,
@@ -424,6 +430,7 @@ def test_send_prompt_does_not_fall_back_to_process_credentials(
     )
     asyncio.run(send_prompt_module.send_prompt(
       "hello",
+      runtime=TEST_SEND_PROMPT_RUNTIME,
       capability_execution=execution,
       user_id="alice",
       completion_record_root=None,

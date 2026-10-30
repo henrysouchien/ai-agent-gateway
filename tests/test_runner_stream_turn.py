@@ -15,18 +15,18 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import AgentRunner, ToolDispatcher  # noqa: E402
 from agent_gateway.agent_session_log import AgentSessionLog  # noqa: E402
-from agent_gateway.auth import ProviderCredentialFailure  # noqa: E402
-from agent_gateway.capability_execution import (  # noqa: E402
+from hank_model_transport.auth import ProviderCredentialFailure  # noqa: E402
+from hank_model_transport.capability_execution import (  # noqa: E402
   CapabilityExecutionResolver,
   ModelFallbackHop,
 )
 from agent_gateway.event_log import EventLog  # noqa: E402
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
-from agent_gateway.multi_user.billing import UsageTotals  # noqa: E402
-from agent_gateway.providers import ModelInfo, ModelProvider
+from hank_model_transport.multi_user.billing import UsageTotals  # noqa: E402
+from hank_model_transport.providers import ModelInfo, ModelProvider
 from model_authority.thinking import ThinkingLevel
-from agent_gateway.providers.base import StreamEvent  # noqa: E402
+from hank_model_transport.providers.base import StreamEvent  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 import agent_gateway.runner_stream_turn as runner_stream_turn  # noqa: E402
 from agent_gateway.runner_stream_turn import RunnerStreamTurnMixin  # noqa: E402
@@ -60,8 +60,8 @@ def test_anthropic_stream_request_measurement_wait_and_retry_isolation(
   import time
   import anthropic
   import httpx2
-  from agent_gateway.providers import AnthropicProvider
-  import agent_gateway.providers.anthropic as adapter
+  from hank_model_transport.providers import AnthropicProvider
+  import hank_model_transport.providers.anthropic as adapter
 
   first = {
     "input_tokens": 100, "cache_read_input_tokens": 200,
@@ -683,7 +683,7 @@ def _refusal_runner(
 
 
 def test_provider_defaults_survive_initial_auth_and_stream_retry(monkeypatch) -> None:
-  from agent_gateway.auth import ProviderCredentialFailure
+  from hank_model_transport.auth import ProviderCredentialFailure
 
   _set_retry_policy(monkeypatch, max_retries=2, base_delay_seconds=0.0)
 
@@ -827,7 +827,7 @@ def test_queued_child_heartbeats_preserve_parent_liveness_and_peer_stall(
 ) -> None:
   import time
 
-  from agent_gateway.rate_limit import AnthropicTokenBucket, locally_queued
+  from hank_model_transport.rate_limit import AnthropicTokenBucket, locally_queued
   import agent_gateway.runner_sub_agents as children
   import agent_gateway.runner_stream_turn as stream_turn_module
 

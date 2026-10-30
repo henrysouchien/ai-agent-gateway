@@ -1163,10 +1163,12 @@ def test_claimed_result_completes_after_expiry_clock_without_changing_approval(
 ) -> None:
   async def case() -> None:
     path = tmp_path / "approvals.sqlite3"
-    store = SQLiteApprovalStore(path)
+    clock = utc_now()
+    def clock_ns() -> int:
+      return int(clock.timestamp()) * 1_000_000_000 + clock.microsecond * 1_000
+    store = SQLiteApprovalStore(path, clock_ns=clock_ns)
     request, _ = await _persist_binding(store)
     clock = request.requested_at
-    monkeypatch.setattr("agent_gateway.approval_store.utc_now", lambda: clock)
     monkeypatch.setattr("agent_gateway.approval_policy.utc_now", lambda: clock)
     expires_at = request.requested_at + timedelta(minutes=20)
     await store.transition_state(
@@ -1213,7 +1215,7 @@ def test_claimed_result_completes_after_expiry_clock_without_changing_approval(
       claim_token="token-original",
       tool_result=result,
     )
-    reopened = SQLiteApprovalStore(path)
+    reopened = SQLiteApprovalStore(path, clock_ns=clock_ns)
     assert await reopened._read_completed_executable_result_for_executor(
       binding=binding,
     ) == result

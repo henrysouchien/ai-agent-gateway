@@ -65,14 +65,15 @@ from agent_workflow_contracts.next_call import NextCall, next_call as build_next
 from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, ValidationError
 
 from ..claim_signing_authority import configured_gateway_claim_signing_authority
-from ..policy_imports import load_server_policy_helpers, resolve_server_policy_tool_class
+from hank_model_transport.policy_imports import load_server_policy_helpers, resolve_server_policy_tool_class
 from ..sdk_runner_helpers import server_for_tool
 from ..runner_background_tasks import jobs_wait
 from ..task_registry import TaskState
 from ..tool_dispatch_declarations import canonical_dispatch_tool_name
-from ..user_runtime_credentials import load_user_runtime_credentials
+from hank_model_transport.user_runtime_credentials import load_user_runtime_credentials
+from agent_gateway.transport_runtime import GATEWAY_SEND_PROMPT_RUNTIME
 
-from ..capability_execution import (
+from hank_model_transport.capability_execution import (
   execute_leaf_model_call,
   list_model_call_operations,
   lookup_model_call_operation,
@@ -870,6 +871,7 @@ class CellChannel:
     try:
       launched = await execute_leaf_model_call(
         op.name,
+        runtime=GATEWAY_SEND_PROMPT_RUNTIME,
         material=material or "",
         role=role,
         effort=effort,
@@ -930,6 +932,7 @@ class CellChannel:
     try:
       launched = await execute_leaf_model_call(
         op.name,
+        runtime=GATEWAY_SEND_PROMPT_RUNTIME,
         state=state,
         questions=questions,
         role=role,
@@ -1308,6 +1311,7 @@ class CellChannel:
       for key, st in states_seq:
         res = await execute_leaf_model_call(
           op_name,
+          runtime=GATEWAY_SEND_PROMPT_RUNTIME,
           state=st,
           questions=questions,
           role=role,

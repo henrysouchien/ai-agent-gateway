@@ -26,7 +26,7 @@ from agent_workflow_contracts import (
   terminal_task_result,
 )
 
-from .capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
   materialize_frozen_bind,

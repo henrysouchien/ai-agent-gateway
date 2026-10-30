@@ -12,9 +12,9 @@ import time
 
 import pytest
 
-from agent_gateway.capability_execution import CapabilityExecutionResolver, MaterializedCredential
-from agent_gateway.providers import ModelProvider
-from agent_gateway.providers.credential_pool import (
+from hank_model_transport.capability_execution import CapabilityExecutionResolver, MaterializedCredential
+from hank_model_transport.providers import ModelProvider
+from hank_model_transport.providers.credential_pool import (
   PoolAccountCandidate,
   ProviderCredentialPool,
   STATIC_ORG_STORE_SPECS,
@@ -28,13 +28,13 @@ from agent_gateway.providers.credential_pool import (
   remove_pool_account,
   upsert_pool_account,
 )
-from agent_gateway.providers.google_antigravity import GoogleAntigravityProvider
-from agent_gateway.providers.google_antigravity_oauth import (
+from hank_model_transport.providers.google_antigravity import GoogleAntigravityProvider
+from hank_model_transport.providers.google_antigravity_oauth import (
   resolve_antigravity_pool_candidates,
   save_antigravity_token_record,
 )
-from agent_gateway.providers.muse import MuseResponsesProvider
-from agent_gateway.providers.muse_oauth import (
+from hank_model_transport.providers.muse import MuseResponsesProvider
+from hank_model_transport.providers.muse_oauth import (
   _materialize_muse_candidate,
   resolve_muse_pool_candidates,
   save_muse_token_record,
@@ -105,7 +105,7 @@ def test_pool_mutations_do_not_self_deadlock_in_subprocess(tmp_path: Path) -> No
 import json
 from pathlib import Path
 import sys
-from agent_gateway.providers.credential_pool import upsert_pool_account, load_pool_accounts, remove_pool_account
+from hank_model_transport.providers.credential_pool import upsert_pool_account, load_pool_accounts, remove_pool_account
 path = Path(sys.argv[1])
 upsert_pool_account(path, {"identity": "first", "access_token": "one"})
 upsert_pool_account(path, {"identity": "second", "access_token": "two"})
@@ -675,7 +675,7 @@ def test_two_xai_device_code_logins_preserve_both_seats(
 ) -> None:
   import asyncio
   import httpx
-  from agent_gateway.providers.xai_oauth import (
+  from hank_model_transport.providers.xai_oauth import (
     DEFAULT_XAI_OAUTH_CLIENT_ID,
     DEFAULT_XAI_OAUTH_ISSUER,
     DEFAULT_XAI_OAUTH_SCOPE,
@@ -731,7 +731,7 @@ def test_two_xai_device_code_logins_preserve_both_seats(
 
 
 def test_xai_enrollment_keeps_quarantined_seat_unchanged(tmp_path: Path) -> None:
-  from agent_gateway.providers.xai_oauth import (
+  from hank_model_transport.providers.xai_oauth import (
     load_xai_token_record,
     upsert_xai_token_record,
   )
@@ -770,7 +770,7 @@ def test_xai_enrollment_keeps_quarantined_seat_unchanged(tmp_path: Path) -> None
 
 
 def test_selected_xai_account_never_inherits_sibling_quarantine(tmp_path: Path) -> None:
-  from agent_gateway.providers.xai_oauth import (
+  from hank_model_transport.providers.xai_oauth import (
     oauth_record_from_config,
     upsert_xai_token_record,
   )
@@ -807,7 +807,7 @@ def test_selected_xai_account_never_inherits_sibling_quarantine(tmp_path: Path) 
 def test_xai_refresh_lock_serializes_with_pool_removal(tmp_path: Path) -> None:
   import asyncio
   import threading
-  from agent_gateway.providers.xai_oauth import _store_lock
+  from hank_model_transport.providers.xai_oauth import _store_lock
 
   store = tmp_path / "xai" / "oauth.json"
   upsert_pool_account(store, {"identity": "seat-a", "access_token": "tok-a"})
@@ -897,7 +897,7 @@ def test_explicit_custom_store_rotation_stays_within_its_own_accounts(
 
 
 def test_whole_store_removal_serializes_with_writers(tmp_path: Path) -> None:
-  from agent_gateway.providers.credential_pool import store_write_lock
+  from hank_model_transport.providers.credential_pool import store_write_lock
   import threading
 
   store = tmp_path / "google" / "credentials.json"
@@ -940,7 +940,7 @@ def test_xai_concurrent_pool_resolution_does_not_deadlock_active_refresh(
 ) -> None:
   import asyncio
   import httpx
-  from agent_gateway.providers.xai_oauth import (
+  from hank_model_transport.providers.xai_oauth import (
     DEFAULT_XAI_OAUTH_CLIENT_ID,
     DEFAULT_XAI_OAUTH_ISSUER,
     DEFAULT_XAI_OAUTH_SCOPE,

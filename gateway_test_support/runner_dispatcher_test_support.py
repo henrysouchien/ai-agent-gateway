@@ -11,6 +11,9 @@ from agent_gateway.tool_policy_registry import PreparedToolCall
 
 
 class CataloglessDispatcherTestSupport:
+  def bind_research_file_activity_owner(self, owner: Any) -> None:
+    self.research_file_activity_owner = owner
+
   @staticmethod
   def redact_raw_tool_input_for_history(
     tool_name: str,

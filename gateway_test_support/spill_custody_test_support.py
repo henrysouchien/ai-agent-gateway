@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from agent_gateway import AgentRunner, AgentSessionLog, EventLog, ModelInfo, ModelProvider, ToolDispatcher
+from agent_gateway import AgentRunner, AgentSessionLog, EventLog, ToolDispatcher
 from agent_gateway.admission import ParentContext
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.providers import StreamEvent
+from hank_model_transport.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.task_registry import RegistryOwner, TaskRegistry
 from agent_gateway.tool_result_spill import SpillSink
 

@@ -23,7 +23,6 @@ from agent_gateway.runner_state import (
   normalized_run_config,
   process_run_agent_batch_results,
   process_single_tool_result,
-  select_run_max_tokens,
   session_drain_state,
   should_execute_run_agent_batch,
   stream_turn_log_summary,
@@ -33,6 +32,9 @@ from agent_gateway.runner_state import (
   turn_reminder_state,
   usage_cache_status,
   user_turn_message,
+)
+from hank_model_transport.runtime_helpers import (
+  select_run_max_tokens,
 )
 from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark
 

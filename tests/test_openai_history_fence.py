@@ -15,7 +15,7 @@ import pytest
 import agent_gateway.autonomous as autonomous_module
 from agent_gateway import AgentSessionLog, SessionContextBuilder
 from agent_gateway.event_log import EventLog
-from agent_gateway.openai_history_fence import (
+from hank_model_transport.openai_history_fence import (
   DURABLE_HISTORY_VERSION_KEY,
   OpenAISessionEpochError,
   REASONING_SIGNATURE_MARKER,
@@ -24,7 +24,7 @@ from agent_gateway.openai_history_fence import (
   contains_openai_responses_history,
   scope_provider_session_id,
 )
-from agent_gateway.providers import OpenAIProvider
+from hank_model_transport.providers import OpenAIProvider
 from agent_gateway.runner_introspection import derive_sub_agent_id
 from agent_gateway.server_chat_transcripts import (
   _compute_session_recap_payload,

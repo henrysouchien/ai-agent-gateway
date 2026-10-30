@@ -15,7 +15,7 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway import AgentRunner, AgentSessionLog, LogEntry  # noqa: E402
 from agent_gateway.agent_session_log_records import EVENT_SCHEMA_VERSION  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
-from agent_gateway.providers import ModelProvider  # noqa: E402
+from hank_model_transport.providers import ModelProvider  # noqa: E402
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND  # noqa: E402
 from agent_gateway.runner_session_events import (  # noqa: E402
   build_assistant_message_event,
@@ -52,7 +52,7 @@ from agent_gateway.runner_session_events import (  # noqa: E402
 from agent_gateway.skill_completion_wal import SkillCompletionWalCorruptError  # noqa: E402
 from agent_gateway.event_adapter import adapt_event  # noqa: E402
 from agent_gateway.event_log import EventLog  # noqa: E402
-from agent_gateway.multi_user.billing import SessionUsageSummary  # noqa: E402
+from hank_model_transport.multi_user.billing import SessionUsageSummary  # noqa: E402
 from agent_gateway.skill_lifecycle import TopLevelSkillLifecycleMetadata  # noqa: E402
 from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark  # noqa: E402
 from agent_gateway.server_chat_helpers import _chat_turn_state_from_events  # noqa: E402
@@ -1053,6 +1053,12 @@ def test_run_interrupted_reason_preserves_shutdown_reason_except_cancelled_sub_a
     shutdown_reason="graceful_shutdown",
     shutdown_extra_fields={},
   ) == ("graceful_shutdown", {})
+  assert run_interrupted_reason(
+    run_error=asyncio.CancelledError("caller_aborted"),
+    role="writer",
+    shutdown_reason="graceful_shutdown",
+    shutdown_extra_fields={},
+  ) == ("caller_aborted", {})
   assert run_interrupted_reason(
     run_error=asyncio.CancelledError(),
     role="sub_agent",

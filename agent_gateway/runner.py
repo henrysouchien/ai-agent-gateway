@@ -15,13 +15,13 @@ from typing import AbstractSet, Any, Awaitable, Callable, Dict, List, Optional, 
 from agent_workflow_contracts import ResultRequirement
 
 from .agent_session_log import AgentSessionLog
-from .capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from .context_builder import SessionContextBuilder
 from .context_capture import ContextCapture
 from .event_log import EventLog
 from .mcp_activation import McpActivationFold
 from .mcp_client import McpClientManager
-from .multi_user.billing import (
+from hank_model_transport.multi_user.billing import (
   DEFAULT_USAGE_DLQ_PATH,
   BillingMode,
   SessionUsageSummary,
@@ -48,9 +48,6 @@ from .runner_run_loop_defaults import (
 )
 from .runner_background_lifecycle import RunnerBackgroundLifecycleMixin
 from .runner_hooks_lifecycle import RunnerHooksLifecycleMixin
-from .runner_auth import (
-  merge_refreshed_auth_config as _merge_refreshed_auth_config,  # noqa: F401 - compatibility alias
-)
 from .runner_background_tasks import (
   background_asyncio_tasks as _background_asyncio_tasks,  # noqa: F401 - compatibility alias
   bounded_background_error as _bounded_background_error,
@@ -157,9 +154,9 @@ from .tool_result_compaction import (
   annotate_result,
   compact_model_tool_result_entry as _compact_model_tool_result_entry,
   is_error_tool_result_entry,
-  make_error_result,
   write_tool_result_spill,
 )
+from hank_model_transport.tool_errors import make_error_result
 from .tool_result_semantics import classify_semantic_tool_error  # noqa: F401 - compatibility alias
 from .tool_result_spill import SpillPublication, SpillSink, normalize_spill_sink
 
@@ -783,6 +780,7 @@ class AgentRunner(
         write_lease_path=top_level_skill_session_log.write_lease_path,
       )
       del self._top_level_skill_session_log
+    dispatcher.bind_research_file_activity_owner(self.ensure_research_file_activity)
 
   @property
   def _background_tasks(self) -> Dict[str, TaskEntry]:

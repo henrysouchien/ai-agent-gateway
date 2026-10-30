@@ -150,7 +150,7 @@ def test_user_server_expansion_uses_projected_env_not_ambient_pool() -> None:
 
 def test_unbound_shared_startup_has_no_pool_and_owner_run_projects_its_seat(monkeypatch) -> None:
   import agent_gateway.mcp_client as mcp_client_module
-  from agent_gateway.providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
+  from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
 
   manager = McpClientManager(
     config_path=None,
@@ -212,7 +212,7 @@ def test_jobs_owner_run_transport_failure_returns_typed_error_and_evicts_child(m
 
   import agent_gateway.mcp_client as mcp_client_module
   from agent_gateway.mcp_client import _PerUserServerState
-  from agent_gateway.providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
+  from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
 
   async def scenario() -> None:
     manager = McpClientManager(

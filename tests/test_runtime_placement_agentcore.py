@@ -32,7 +32,7 @@ from agent_gateway.runtime_placement_agentcore import (
   generate_ws_connection,
 )
 from agent_gateway.runtime_tunnel import TunnelEndpoint, TunnelRequest, TunnelResponse
-from agent_gateway.user_runtime_credentials import (
+from hank_model_transport.user_runtime_credentials import (
   DeskReplica,
   USER_RUNTIME_CREDENTIALS_FILE_ENV,
   UserRuntimeIdentity,

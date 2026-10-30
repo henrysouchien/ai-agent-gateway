@@ -19,17 +19,17 @@ import agent_gateway.autonomous as autonomous  # noqa: E402
 import agent_gateway.autonomous_output as autonomous_output  # noqa: E402
 from agent_gateway import EventLog  # noqa: E402
 from agent_gateway.events import event_to_dict  # noqa: E402
-from agent_gateway.multi_user.billing import SessionUsageSummary  # noqa: E402
+from hank_model_transport.multi_user.billing import SessionUsageSummary  # noqa: E402
 from agent_gateway.session_recap import compute_recap, emit_recap_then_terminal  # noqa: E402
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CapabilityEffort, CredentialHandle
-from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
+from hank_model_transport.capability_execution import BoundCapabilityExecution  # noqa: E402
 from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
 from model_authority.schema import SCHEMA
 from gateway_test_support.model_defaults import compat_for_profile  # noqa: E402
 from gateway_test_support.host_policy import owner_session_host_policy  # noqa: E402, F401
 from agent_gateway.mcp_client import _ServerState  # noqa: E402
-from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent  # noqa: E402
+from hank_model_transport.providers import ModelInfo, ModelProvider, StreamEvent  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.skill_limits import SkillExecutionLimits  # noqa: E402
 from agent_gateway.tool_policy_registry import (  # noqa: E402

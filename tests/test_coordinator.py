@@ -21,22 +21,24 @@ from agent_gateway import (
   COORDINATOR_DEFAULT_PREAMBLE,
   CoordinatorConfig,
   EventLog,
-  ModelInfo,
-  ModelProvider,
   ToolDispatcher,
   make_run_agent_handler,
+)
+from hank_model_transport.providers import (
+  ModelInfo,
+  ModelProvider,
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CapabilityId, ModelSelectionIntent
 from model_authority.selection import SelectionSnapshot
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
 )
 from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.mcp_client import McpClientManager
 from model_authority.current import INITIAL_MODEL_REGISTRY
-from agent_gateway.providers import AnthropicProvider, StreamEvent
+from hank_model_transport.providers import AnthropicProvider, StreamEvent
 from gateway_test_support.capability_execution_test_support import (
   stub_capability_execution_resolver,
   stub_runner_capability_execution,

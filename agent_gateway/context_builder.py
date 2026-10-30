@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from .agent_session_log import AgentSessionLog, LogEntry
-from .providers.base import truncate_to_last_compaction
+from hank_model_transport.providers.base import truncate_to_last_compaction
 from .research_file_current_projection import (
   ResearchFileCurrentProjection,
   load_research_file_current_projection,

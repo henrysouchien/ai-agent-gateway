@@ -26,7 +26,7 @@ from agent_gateway.admission import (
   root_context,
   root_context_from_identity,
 )
-from agent_gateway.capability_execution import CapabilityExecutionResolver
+from hank_model_transport.capability_execution import CapabilityExecutionResolver
 from agent_gateway.capability_resolution import OperationDeclaration, resolve_operation_authority
 from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority

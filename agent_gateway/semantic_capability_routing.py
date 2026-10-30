@@ -25,7 +25,7 @@ from agent_workflow_contracts.tool_registration import (
   validate_registered_tool_identity,
 )
 
-from .policy_imports import load_server_policy_module
+from hank_model_transport.policy_imports import load_server_policy_module
 
 
 # ---------------------------------------------------------------------------

@@ -49,7 +49,7 @@ from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
-from agent_gateway.capability_execution import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 from agent_gateway.control_plane import approvals as approvals_module
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app

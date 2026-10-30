@@ -13,9 +13,9 @@ from uuid import UUID
 import pytest
 import yaml
 
-from agent_gateway.capability_execution import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 from agent_gateway.model_preferences import ModelPreferenceStore
-from agent_gateway.providers import ModelInfo, ModelProvider
+from hank_model_transport.providers import ModelInfo, ModelProvider
 from agent_gateway.server import ChatTurnInputs
 from agent_gateway.server_chat_helpers import (
   bind_init_capability_selections,

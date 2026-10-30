@@ -8,13 +8,13 @@ from fastapi.testclient import TestClient
 from agent_gateway import AgentRunner, EventLog, McpClientManager, ToolDispatcher
 from agent_gateway.auth import AuthConfig, ResolverResult
 from model_authority.binding import CredentialHandle
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   MaterializedCredential,
 )
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
-from agent_gateway.providers import ModelInfo, ModelProvider, installed_adapter_route_support
+from hank_model_transport.providers import ModelInfo, ModelProvider, installed_adapter_route_support
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from gateway_test_support.model_defaults import SESSION_DRIVER
 

@@ -51,7 +51,7 @@ def _pin_ollama_daemon_absent():
   needs a present daemon requests ``ollama_daemon_present``. The probe's own tests
   (``test_ollama_local_presence.py``) reset the cache and probe through their fake transports.
   """
-  from agent_gateway.providers import ollama as ollama_provider
+  from hank_model_transport.providers import ollama as ollama_provider
 
   ollama_provider._reset_presence_cache()
   ollama_provider._presence_cache[ollama_provider._DAEMON_ORIGIN] = False
@@ -62,14 +62,14 @@ def _pin_ollama_daemon_absent():
 @pytest.fixture
 def ollama_daemon_present():
   """Opt in: the loopback Ollama daemon answers its presence probe."""
-  from agent_gateway.providers import ollama as ollama_provider
+  from hank_model_transport.providers import ollama as ollama_provider
 
   ollama_provider._presence_cache[ollama_provider._DAEMON_ORIGIN] = True
 
 
 @pytest.fixture(autouse=True)
 def _isolated_server_policy():
-  from agent_gateway.policy_imports import configure_server_policy, load_server_policy_module
+  from hank_model_transport.policy_imports import configure_server_policy, load_server_policy_module
 
   previous = load_server_policy_module()
   configure_server_policy(None)

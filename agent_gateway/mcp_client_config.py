@@ -11,7 +11,7 @@ from typing import Any, Callable, Final, Iterable, Literal, Mapping, Sequence
 from mcp import MCPError
 from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT
 
-from .user_runtime_credentials import USER_STORAGE_ID_ENV
+from hank_model_transport.user_runtime_credentials import USER_STORAGE_ID_ENV
 
 
 class _McpConfigPathUnset(Enum):
@@ -25,7 +25,7 @@ ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 STREAMABLE_HTTP_TYPES = {"streamable-http", "streamable_http", "http", "streamable"}
 SUPPORTED_SERVER_TYPES = {"stdio"} | STREAMABLE_HTTP_TYPES
 # HANK_MODEL_AUTHORITY_DIR: a stdio child that imports the model authority
-# (Risk and Investment servers through agent_gateway.providers) must load the
+# (Risk and Investment servers through hank_model_transport.providers) must load the
 # directory its parent loaded, not its own packaged copy.
 # USER_STORAGE_ID_ENV and INVESTMENT_TOOLS_STATE_DIR: a placed runtime's gateway
 # carries its desk's storage id and Investment state root

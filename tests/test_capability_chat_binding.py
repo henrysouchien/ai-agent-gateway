@@ -8,11 +8,11 @@ from pydantic import ValidationError
 from agent_gateway import AgentRunner
 
 from model_authority.binding import CapabilityResolutionError, CredentialHandle
-from agent_gateway.capability_execution import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 from agent_gateway.event_log import EventLog
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
-from agent_gateway.providers import ModelInfo, ModelProvider
+from hank_model_transport.providers import ModelInfo, ModelProvider
 from agent_gateway.server import ChatRuntime, ChatTurnInputs
 from agent_gateway.server_chat_helpers import (
   _dispatch_chat_turn,
@@ -530,7 +530,7 @@ async def test_dispatch_attaches_turn_context_message_on_differ_only() -> None:
 
 
 def test_session_creation_preserves_selected_anthropic_generation(tmp_path, monkeypatch):
-  from agent_gateway.providers.anthropic_oauth import register_anthropic_static_credential
+  from hank_model_transport.providers.anthropic_oauth import register_anthropic_static_credential
 
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
   def enroll(material):

@@ -15,7 +15,7 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.multi_user.billing import (  # noqa: E402
+from hank_model_transport.multi_user.billing import (  # noqa: E402
   SqliteUsageLedger,
   UsageEvent,
   _UsageAggregator,
@@ -23,21 +23,21 @@ from agent_gateway.multi_user.billing import (  # noqa: E402
 from agent_gateway.events import _session_usage_summary  # noqa: E402
 from model_authority.binding import CapabilityResolutionError
 from model_authority.registry import ProductModelRegistry
-from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402
-from agent_gateway.providers.codex_helpers import (  # noqa: E402
+from hank_model_transport.providers.anthropic import AnthropicProvider  # noqa: E402
+from hank_model_transport.providers.codex_helpers import (  # noqa: E402
   _ResponsesStreamState as CodexStreamState,
   _map_event as map_codex_event,
 )
-from agent_gateway.providers.openai_responses_helpers import (  # noqa: E402
+from hank_model_transport.providers.openai_responses_helpers import (  # noqa: E402
   _ResponsesStreamState as OpenAIStreamState,
   map_event as map_openai_event,
 )
-from agent_gateway.providers.xai_helpers import map_event as map_xai_event  # noqa: E402
+from hank_model_transport.providers.xai_helpers import map_event as map_xai_event  # noqa: E402
 from agent_gateway.provider_summarize import provider_summarize  # noqa: E402
 from agent_gateway.runner_usage import build_usage_event, usage_delta  # noqa: E402
 from agent_gateway.runner_run_loop import _merge_usage_totals  # noqa: E402
-from agent_gateway.send_prompt import send_prompt  # noqa: E402
-from agent_gateway.providers import (  # noqa: E402
+from hank_model_transport.send_prompt import send_prompt  # noqa: E402
+from hank_model_transport.providers import (  # noqa: E402
   ModelInfo,
   ModelProvider,
   StreamEvent,
@@ -46,6 +46,7 @@ from gateway_test_support.capability_execution_test_support import (  # noqa: E4
   stub_bound_capability_execution,
 )
 from model_authority.bind import CapabilityBind
+from gateway_test_support.transport_runtime import TEST_SEND_PROMPT_RUNTIME  # noqa: E402
 
 
 class _StaticStream:
@@ -418,6 +419,7 @@ def test_send_prompt_validates_and_emits_reported_identity_without_rebinding() -
   result = asyncio.run(
     send_prompt(
       "hello",
+      runtime=TEST_SEND_PROMPT_RUNTIME,
       capability_execution=execution,
       user_id="user-1",
       on_usage=events.append,
@@ -440,6 +442,7 @@ def test_send_prompt_rejects_unadmitted_reported_identity() -> None:
     asyncio.run(
       send_prompt(
         "hello",
+        runtime=TEST_SEND_PROMPT_RUNTIME,
         capability_execution=execution,
         user_id="user-1",
         completion_record_root=None,

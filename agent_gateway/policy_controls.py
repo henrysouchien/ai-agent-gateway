@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-from .policy_imports import load_server_policy_module
+from hank_model_transport.policy_imports import load_server_policy_module
 
 
 def effective_allow_tool_type(

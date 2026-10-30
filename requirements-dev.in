@@ -8,6 +8,7 @@ PyJWT>=2.14.0
 PyYAML
 mcp>=2,<3  # raw client API: typed pagination, float timeouts, httpx2 transport
 fastmcp>=4,<5  # paired with MCP 2
+hank-model-transport>=1.0.2,<2
 httpx>=0.28.1
 httpx2>=2.5,<3
 pydantic
@@ -15,7 +16,7 @@ pydantic
 # Optional deps we use locally (must match pyproject.toml [project.optional-dependencies])
 anthropic>=1.6,<2  # SDK transport uses httpx2
 openai>=3.14,<4  # SDK transport uses httpx2
-# Supported version is enforced by agent_gateway/providers/agent_sdk.py.
+# Supported version is enforced by hank_model_transport/providers/agent_sdk.py.
 claude-agent-sdk==0.2.153
 
 # Build-system deps (used with --no-isolation to keep builds inside the hashed env)

@@ -10,7 +10,7 @@ for path in (str(ROOT), str(PKG_DIR)):
     sys.path.insert(0, path)
 
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
-from agent_gateway.providers.base import ModelInfo  # noqa: E402
+from hank_model_transport.providers.base import ModelInfo  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_limits import (  # noqa: E402
   ContextPressureReminderDecision,

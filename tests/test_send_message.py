@@ -17,14 +17,16 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway import (
   AgentRunner,
   AgentSessionLog,
-  CostEstimate,
   EventLog,
   McpClientManager,
-  ModelInfo,
   ParentMessage,
   TaskRegistry,
   TaskState,
   ToolDispatcher,
+)
+from hank_model_transport.providers import (
+  CostEstimate,
+  ModelInfo,
 )
 from agent_gateway.sub_agent_messages import make_send_message_handler
 from agent_gateway.runner import StreamTurnResult
@@ -1561,7 +1563,7 @@ def test_spawned_child_message_is_consumed_by_historical_root_writer(
 
   from agent_gateway.admission import current_parent_context, root_context
   from agent_gateway.approval_route import bind_session_approval_route
-  from agent_gateway.providers import ModelProvider, StreamEvent
+  from hank_model_transport.providers import ModelProvider, StreamEvent
   from agent_gateway.session import GatewaySession
   from agent_gateway.skills import SkillLoader
   from agent_gateway.sub_agent import make_run_agent_handler, make_send_message_tool_def

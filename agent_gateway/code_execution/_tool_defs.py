@@ -142,7 +142,7 @@ def _bridge_operation_names() -> str:
 
 def _model_call_operation_names() -> str:
   """Registered leaf model-call operations."""
-  from ..capability_execution import list_model_call_operations
+  from hank_model_transport.capability_execution import list_model_call_operations
 
   return ", ".join(op.name for op in list_model_call_operations())
 

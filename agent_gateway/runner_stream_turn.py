@@ -8,15 +8,15 @@ import sys
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
-from .auth import ProviderCredentialFailure
-from .providers.anthropic import referenced_tool_names
-from .providers.anthropic_oauth import AnthropicSourceError
-from .providers.codex import CodexCredentialExpired
-from .capability_execution import CapabilityExecutionResolver, FallbackSkip, ModelFallbackHop
+from hank_model_transport.auth import ProviderCredentialFailure
+from hank_model_transport.providers.anthropic import referenced_tool_names
+from hank_model_transport.providers.anthropic_oauth import AnthropicSourceError
+from hank_model_transport.providers.codex import CodexCredentialExpired
+from hank_model_transport.capability_execution import CapabilityExecutionResolver, FallbackSkip, ModelFallbackHop
 from model_authority.binding import validate_reported_identity
-from .providers import ModelInfo
-from .rate_limit import local_queue_left_at, locally_queued
-from .providers.anthropic_helpers import _format_anthropic_rejection_detail
+from hank_model_transport.providers import ModelInfo
+from hank_model_transport.rate_limit import local_queue_left_at, locally_queued
+from hank_model_transport.providers.anthropic_helpers import _format_anthropic_rejection_detail
 from model_authority.thinking import EffortResolution, ThinkingLevel, parse_effort
 from .runner_introspection import format_exc as _format_exc
 from .runner_limits import (
@@ -35,8 +35,14 @@ from .runner_cleanup import attach_cleanup_failure
 from .runner_session_lifecycle import _runner_attr
 from .commercial_work_start import commercial_budget_stop_fields
 from .skill_context import current_skill
-from .spend_metering import ProviderCallMeter, SpendBudgetBlocked
-from .runner_state import StreamTurnFailure, StreamTurnResult, select_run_max_tokens
+from hank_model_transport.spend_metering import ProviderCallMeter, SpendBudgetBlocked
+from .transport_runtime import GATEWAY_SEND_PROMPT_RUNTIME
+from .runner_state import StreamTurnFailure, StreamTurnResult
+from hank_model_transport.runtime_helpers import (
+  apply_message_start_usage as _apply_message_start_usage,
+  apply_usage_update as _apply_usage_update,
+  select_run_max_tokens,
+)
 from .tool_dispatch_classification import TRANSPORT_RETRY_POLICY, retry_backoff_seconds
 from .runner_streaming import (
   STREAM_STALL_TIMEOUT,
@@ -47,8 +53,6 @@ from .runner_streaming import (
   thinking_level,
 )
 from .runner_usage import (
-  apply_message_start_usage as _apply_message_start_usage,
-  apply_usage_update as _apply_usage_update,
   PROVIDER_DIAGNOSTIC_KEYS,
   apply_provider_diagnostics,
   apply_thinking_event,
@@ -57,10 +61,10 @@ from .runner_usage import (
 )
 
 if TYPE_CHECKING:
-  from .capability_execution import BoundCapabilityExecution
+  from hank_model_transport.capability_execution import BoundCapabilityExecution
   from .containment_settings import ContainmentSettings
-  from .multi_user.billing import UsageEvent, UsageState
-  from .providers import ModelProvider
+  from hank_model_transport.multi_user.billing import UsageEvent, UsageState
+  from hank_model_transport.providers import ModelProvider
   from .runner_hooks_lifecycle import _UsageTotals
   from .runner_tool_execution import AgentRunnerDispatcher
   from .session import RequestToolPrefix
@@ -622,6 +626,7 @@ class RunnerStreamTurnMixin:
       """
       bind = self._capability_execution.bind
       return ProviderCallMeter(
+        runtime=GATEWAY_SEND_PROMPT_RUNTIME,
         provider=self._provider,
         provider_name=bind.provider,
         model=config["model"],

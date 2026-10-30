@@ -81,7 +81,7 @@ def _stub_anthropic_stream():
     )
 
   with patch(
-    "agent_gateway.providers.AnthropicProvider.create_client",
+    "hank_model_transport.providers.AnthropicProvider.create_client",
     new=_create_client,
   ):
     yield
@@ -314,7 +314,7 @@ def test_billing_ledger() -> None:
 
   import tempfile
   import time
-  from agent_gateway.multi_user.billing import (
+  from hank_model_transport.multi_user.billing import (
     BillingMode,
     SqliteUsageLedger,
     UsageEvent,
@@ -421,7 +421,7 @@ def test_on_usage_fires_with_ledger() -> None:
 
   import tempfile
   from agent_gateway import create_agent
-  from agent_gateway.multi_user.billing import SqliteUsageLedger
+  from hank_model_transport.multi_user.billing import SqliteUsageLedger
   from agent_gateway.auth import AuthConfig, ResolverResult
   from starlette.testclient import TestClient
 

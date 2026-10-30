@@ -37,8 +37,10 @@ from agent_gateway.runner import AgentRunner
 from agent_gateway.server import (
   ChatRuntime,
   GatewayServerConfig,
-  MaterializedCredential,
   create_gateway_app,
+)
+from hank_model_transport.capability_execution import (
+  MaterializedCredential,
 )
 from agent_gateway.skill_limits import AutonomousSkillAdmissionPolicy, SkillExecutionLimits
 

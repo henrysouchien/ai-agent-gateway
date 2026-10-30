@@ -30,41 +30,45 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import (  # noqa: E402
+from agent_gateway import (
   AgentRunner,
   AgentSessionLog,
   EventLog,
   GatewaySession,
-  ModelInfo,
-  ModelProvider,
   ToolDispatcher,
 )
-from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
+from hank_model_transport.providers import (
+  ModelInfo,
+  ModelProvider,
+)
+from hank_model_transport.capability_execution import BoundCapabilityExecution  # noqa: E402
 from agent_gateway.commercial_usage import CommercialUsageProducer  # noqa: E402
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 import agent_gateway.runner_stream_turn as runner_stream_turn  # noqa: E402
-from agent_gateway.multi_user.billing import (  # noqa: E402
+from hank_model_transport.multi_user.billing import (  # noqa: E402
   SessionUsageSummary,
   UsageEvent,
   _UsageAggregator,
 )
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
-from agent_gateway.providers import CodexProvider, CostEstimate, OpenAIProvider, StreamEvent  # noqa: E402
-from agent_gateway.runner_usage import (  # noqa: E402
-  apply_message_start_usage,
-  apply_usage_update,
+from hank_model_transport.providers import CodexProvider, CostEstimate, OpenAIProvider, StreamEvent  # noqa: E402
+from agent_gateway.runner_usage import (
   build_usage_event,
   call_late_usage_event_hook,
   call_session_summary_hook,
   call_usage_event_hook,
-  empty_usage_totals,
-  estimate_usage_cost,
   turn_usage_payload,
   usage_delta,
   usage_delta_state,
   usage_has_tokens,
   usage_snapshot,
+)
+from hank_model_transport.runtime_helpers import (
+  apply_message_start_usage,
+  apply_usage_update,
+  empty_usage_totals,
+  estimate_usage_cost,
 )
 from agent_gateway.runner_budget import CostAccumulator  # noqa: E402
 from agent_gateway.task_registry import TaskRegistry, TaskState  # noqa: E402
@@ -609,7 +613,7 @@ def test_apply_message_start_usage_mutates_existing_totals() -> None:
 
 
 def test_provider_wait_is_measured_on_turn_usage_not_refused() -> None:
-  from agent_gateway.rate_limit import AnthropicTokenBucket
+  from hank_model_transport.rate_limit import AnthropicTokenBucket
 
   bucket = AnthropicTokenBucket(rpm=600)
   bucket._rpm_tokens = 0.0

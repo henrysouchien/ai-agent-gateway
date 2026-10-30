@@ -19,9 +19,9 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 
-from agent_gateway.providers.xai import XAIProvider
-from agent_gateway.providers import xai_oauth
-from agent_gateway.providers.xai_oauth import (
+from hank_model_transport.providers.xai import XAIProvider
+from hank_model_transport.providers import xai_oauth
+from hank_model_transport.providers.xai_oauth import (
   DEFAULT_XAI_OAUTH_CLIENT_ID,
   DEFAULT_XAI_OAUTH_SCOPE,
   _record_is_valid,

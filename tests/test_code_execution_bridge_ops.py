@@ -18,7 +18,7 @@ from typing import Any, AsyncIterator
 from agent_gateway import AgentRunner, SessionStore, ToolDispatcher
 from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution
 from agent_gateway.code_execution._tool_defs import CODE_EXECUTION_DELEGATION_TOOL_DEFS
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   ModelCallOperation,
   execute_leaf_model_call,
   list_model_call_operations,
@@ -28,9 +28,10 @@ from agent_gateway.capability_execution import (
 )
 from agent_gateway.code_execution._tool_defs import make_code_execute_tool_def
 from agent_gateway.event_log import EventLog
-from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
+from hank_model_transport.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.task_registry import TaskRegistry, TaskState
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
+from gateway_test_support.transport_runtime import TEST_SEND_PROMPT_RUNTIME
 sys.path.insert(0, str(Path(__file__).parent))
 from test_code_execution_bridge import _CODE_CALLABLE, OUTER_ID, _CaptureMcp, _tool_definitions  # noqa: E402
 
@@ -364,6 +365,7 @@ def test_direct_host_door_and_kernel_door_produce_identical_bind_provenance_and_
   # Direct host door: no runner, the resolver alone.
   direct_res = asyncio.run(execute_leaf_model_call(
     "general_completion",
+    runtime=TEST_SEND_PROMPT_RUNTIME,
     material="equivalence test material",
     resolver=runner.capability_execution.resolver,
   ))

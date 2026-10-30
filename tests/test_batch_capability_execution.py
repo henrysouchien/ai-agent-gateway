@@ -13,7 +13,7 @@ for path in (ROOT, PKG_DIR):
     sys.path.insert(0, str(path))
 
 from model_authority.binding import ModelSelectionIntent
-from agent_gateway.capability_execution import derive_batch_capability_execution
+from hank_model_transport.capability_execution import derive_batch_capability_execution
 from gateway_test_support.capability_execution_test_support import (
   stub_capability_execution_resolver,
 )

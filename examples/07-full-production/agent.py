@@ -4,19 +4,9 @@ import os
 import time
 from pathlib import Path
 
-from agent_gateway import (
-  AgentRunner,
-  AnthropicProvider,
-  ApprovalDecision,
-  AuthManager,
-  ChatRuntime,
-  GatewayServerConfig,
-  GatewaySession,
-  McpClientManager,
-  ToolDispatcher,
-  UsageEvent,
-  create_gateway_app,
-)
+from agent_gateway import AgentRunner, ApprovalDecision, AuthManager, ChatRuntime, GatewayServerConfig, GatewaySession, McpClientManager, ToolDispatcher, create_gateway_app
+from hank_model_transport.providers import AnthropicProvider
+from hank_model_transport.multi_user.billing import UsageEvent
 from model_authority.binding import CredentialHandle
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY, RATE_TABLES
 from model_authority.selection import project_capability_default

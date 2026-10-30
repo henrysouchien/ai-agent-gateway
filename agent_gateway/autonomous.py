@@ -44,7 +44,7 @@ from .autonomous_output import (
   run_output_outcome as _run_output_outcome,
 )
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
-from .capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
 )
@@ -53,8 +53,8 @@ from .code_execution import CodeExecutionBundle
 from .event_log import EventLog
 from .mcp_client import McpClientManager
 from .operation_catalog import AgentOperationCatalog
-from .multi_user.billing import SessionUsageSummary, UsageEvent
-from .openai_history_fence import (
+from hank_model_transport.multi_user.billing import SessionUsageSummary, UsageEvent
+from hank_model_transport.openai_history_fence import (
   OPENAI_SESSION_EPOCH_ENV,
   scope_provider_session_id,
 )

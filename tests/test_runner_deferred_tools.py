@@ -20,8 +20,8 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentRunner, AgentSessionLog, EventLog, SessionContextBuilder  # noqa: E402
-from agent_gateway.multi_user.billing import UsageTotals  # noqa: E402
-from agent_gateway.providers import AnthropicProvider, CodexProvider, StreamEvent  # noqa: E402
+from hank_model_transport.multi_user.billing import UsageTotals  # noqa: E402
+from hank_model_transport.providers import AnthropicProvider, CodexProvider, StreamEvent  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.tool_dispatch_classification import settle_catalogless_tool_result  # noqa: E402
 from agent_gateway.tool_policy_registry import PreparedToolCall  # noqa: E402

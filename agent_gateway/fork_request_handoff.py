@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from model_authority.bind import CapabilityBind
 from .execution_identity import resolved_execution_identity
-from .runner_state import select_run_max_tokens
+from hank_model_transport.runtime_helpers import select_run_max_tokens
 
 if TYPE_CHECKING:
   from .tool_dispatcher import _SpawningTurn

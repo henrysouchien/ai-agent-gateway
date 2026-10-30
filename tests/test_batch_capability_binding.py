@@ -16,12 +16,12 @@ from model_authority.binding import (
   ModelSelectionIntent,
   resolve_capability_model,
 )
-from agent_gateway.capability_execution import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )
 from agent_gateway.control_plane import batches
-from agent_gateway.providers import ModelInfo, ModelProvider
+from hank_model_transport.providers import ModelInfo, ModelProvider
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.session import AuthManager, GatewaySession, SessionStore
 from agent_gateway.admission import AdmittedContext, root_context

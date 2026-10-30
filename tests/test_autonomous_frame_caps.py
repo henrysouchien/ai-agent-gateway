@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import FastAPI
@@ -252,7 +253,10 @@ def test_oversized_claim_send_preserves_typed_error_on_prefix_failure(
 
   monkeypatch.setattr(broker_module, "_send_all", fail_write)
   if failure_site == "pack":
-    monkeypatch.setattr(broker_module.struct, "pack", fail_pack)
+    monkeypatch.setattr(
+      broker_module, "struct", SimpleNamespace(pack=fail_pack, unpack=struct.unpack),
+    )
+  assert struct.pack("!I", 1) == b"\x00\x00\x00\x01"
   payload = "x" * (broker_module.AUTONOMOUS_CLAIM_BROKER_MAX_FRAME_BYTES + 1)
   actual_body_bytes = len(broker_module._canonical_json(payload))
   parent, child = socket.socketpair()

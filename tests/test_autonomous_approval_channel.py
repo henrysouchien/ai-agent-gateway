@@ -53,7 +53,7 @@ from agent_gateway.control_plane.autonomous_approval_delivery import (
   record_continued_executable_result,
 )
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
+from hank_model_transport.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.sub_agent import ApprovedCallRef
 from agent_gateway.tool_dispatcher_approval_lifecycle import (
   ApprovalPark,
@@ -581,7 +581,7 @@ def parked_detached_approval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
   assert workload.session_log_authority is not None
   # Use the journal path the authenticated launch's own layout resolves.
   from agent_gateway.agent_session_log_records import AgentSessionRef, resolve_agent_session_id
-  from agent_gateway.openai_history_fence import scope_provider_session_id
+  from hank_model_transport.openai_history_fence import scope_provider_session_id
   agent_id = scope_provider_session_id(
     workload.profile, provider=execution.bind.provider, durable=True, openai_epoch=None,
   )

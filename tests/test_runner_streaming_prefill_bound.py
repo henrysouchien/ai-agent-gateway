@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from agent_gateway.providers.base import ModelInfo
-from agent_gateway.providers.ollama import OllamaLocalProvider
+from hank_model_transport.providers.base import ModelInfo
+from hank_model_transport.providers.ollama import OllamaLocalProvider
 from agent_gateway.runner_streaming import (
   LOCAL_PREFILL_TOKENS_PER_SECOND,
   STREAM_STALL_TIMEOUT,

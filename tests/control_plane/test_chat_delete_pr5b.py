@@ -15,7 +15,7 @@ from agent_gateway.approval_policy import ApprovalRequest, ApprovalRequestPayloa
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.audit_writer import JSONLAuditWriter
 from model_authority.binding import CredentialHandle
-from agent_gateway.capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.event_log import EventLog
@@ -24,8 +24,10 @@ from agent_gateway.server import (
   ChatRequest,
   ChatRuntime,
   GatewayServerConfig,
-  MaterializedCredential,
   create_gateway_app,
+)
+from hank_model_transport.capability_execution import (
+  MaterializedCredential,
 )
 from agent_gateway.session import AuthManager, GatewaySession
 

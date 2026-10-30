@@ -5,7 +5,7 @@ import inspect
 from pathlib import Path
 from typing import Any, Callable, Dict
 
-from .multi_user.billing import (
+from hank_model_transport.multi_user.billing import (
   BillingMode,
   SessionUsageSummary,
   UsageEvent,
@@ -13,6 +13,10 @@ from .multi_user.billing import (
   write_dlq,
 )
 from .commercial_usage import CommercialUsageProducer, CommercialUsageReconciler
+from hank_model_transport.usage_diagnostics import (
+  apply_provider_diagnostics,
+  apply_thinking_event,
+)
 
 USAGE_TOKEN_KEYS = (
   "input_tokens",
@@ -43,18 +47,6 @@ THINKING_COUNT_KEYS = (
 class UsageDeltaState:
   usage: Dict[str, Any]
   has_tokens: bool
-
-
-def empty_usage_totals() -> Dict[str, Any]:
-  return {
-    "input_tokens": 0,
-    "output_tokens": 0,
-    "reasoning_tokens_observed": 0,
-    "provider_units": 0,
-    "provider_unit_deltas": {},
-    "cache_creation_input_tokens": 0,
-    "cache_read_input_tokens": 0,
-  }
 
 
 def usage_snapshot(usage_totals: Dict[str, Any]) -> Dict[str, Any]:
@@ -132,99 +124,6 @@ def record_compaction(aggregator: Any) -> None:
     )
 
 
-def apply_message_start_usage(
-  usage_totals: Dict[str, Any],
-  *,
-  input_tokens: int,
-  cache_creation_tokens: int,
-  cache_read_tokens: int,
-  provider_units: int = 0,
-  provider_unit_deltas: dict[str, int] | None = None,
-  provider_wait_ms: int = 0,
-) -> Dict[str, Any]:
-  usage_totals["input_tokens"] += input_tokens
-  usage_totals["cache_creation_input_tokens"] += cache_creation_tokens
-  usage_totals["cache_read_input_tokens"] += cache_read_tokens
-  usage_totals["provider_units"] = int(usage_totals.get("provider_units", 0) or 0) + provider_units
-  accumulated_units = usage_totals.setdefault("provider_unit_deltas", {})
-  for operation, count in (provider_unit_deltas or {}).items():
-    accumulated_units[operation] = int(accumulated_units.get(operation, 0) or 0) + int(count)
-  # A measurement, not a token: the provider rate bucket's wait before this
-  # call (rate_limit.py). It rides turn usage only when a wait happened.
-  if provider_wait_ms:
-    usage_totals["provider_wait_ms"] = (
-      int(usage_totals.get("provider_wait_ms", 0) or 0) + provider_wait_ms
-    )
-  return usage_totals
-
-
-def apply_usage_update(
-  usage_totals: Dict[str, Any],
-  *,
-  input_tokens: int = 0,
-  output_tokens: int,
-  reasoning_tokens: int = 0,
-  cache_creation_tokens: int = 0,
-  cache_read_tokens: int = 0,
-  provider_units: int = 0,
-  provider_unit_deltas: dict[str, int] | None = None,
-) -> Dict[str, Any]:
-  usage_totals["input_tokens"] += input_tokens
-  usage_totals["cache_creation_input_tokens"] += cache_creation_tokens
-  usage_totals["cache_read_input_tokens"] += cache_read_tokens
-  usage_totals["output_tokens"] += output_tokens
-  usage_totals["reasoning_tokens_observed"] = (
-    int(usage_totals.get("reasoning_tokens_observed", 0) or 0) + reasoning_tokens
-  )
-  usage_totals["provider_units"] = int(usage_totals.get("provider_units", 0) or 0) + provider_units
-  accumulated_units = usage_totals.setdefault("provider_unit_deltas", {})
-  for operation, count in (provider_unit_deltas or {}).items():
-    accumulated_units[operation] = int(accumulated_units.get(operation, 0) or 0) + int(count)
-  return usage_totals
-
-
-def apply_provider_diagnostics(usage_totals: Dict[str, Any], event: Any) -> None:
-  """Record the ids, tier and rate-limit headers a message_start/message_end carries.
-
-  Point values: a later event in the same call overwrites an earlier one.
-  """
-  for key in ("provider_response_id", "provider_request_id", "service_tier"):
-    value = getattr(event, key, None)
-    if value is not None:
-      usage_totals[key] = value
-  rate_limit = getattr(event, "rate_limit", None)
-  if rate_limit:
-    usage_totals["rate_limit"] = dict(rate_limit)
-
-
-def apply_thinking_event(
-  usage_totals: Dict[str, Any], event: Any, streamed_block_chars: int,
-) -> int:
-  """Count a thinking_delta/thinking_end event into thinking_chars and
-  redacted_thinking_blocks; returns the running char count of the open block.
-
-  A provider that sends only the final block never streams deltas, so
-  ``thinking_end`` reconciles to the raw block's text length.
-  """
-  if event.type == "thinking_delta":
-    chars = len(str(event.thinking_text or ""))
-    usage_totals["thinking_chars"] = int(usage_totals.get("thinking_chars", 0) or 0) + chars
-    return streamed_block_chars + chars
-  block = event.raw_block if isinstance(event.raw_block, dict) else None
-  block_text = block.get("thinking") if block is not None else None
-  final_chars = max(
-    len(block_text) if isinstance(block_text, str) else 0,
-    len(str(event.thinking_text or "")),
-  )
-  if final_chars > streamed_block_chars:
-    usage_totals["thinking_chars"] = (
-      int(usage_totals.get("thinking_chars", 0) or 0) + final_chars - streamed_block_chars
-    )
-  if block is not None and block.get("type") == "redacted_thinking":
-    usage_totals["redacted_thinking_blocks"] = (
-      int(usage_totals.get("redacted_thinking_blocks", 0) or 0) + 1
-    )
-  return 0
 
 
 def turn_usage_payload(
@@ -236,20 +135,6 @@ def turn_usage_payload(
   if estimated_cost is not None:
     payload["estimated_cost"] = round(estimated_cost, 4)
   return payload
-
-
-def estimate_usage_cost(provider: Any, model: str, usage_totals: Dict[str, Any]) -> Any:
-  uncached_input = max(0, usage_totals["input_tokens"])
-  cost = provider.estimate_cost(
-    model,
-    uncached_input,
-    usage_totals["output_tokens"],
-    cache_read_tokens=usage_totals["cache_read_input_tokens"],
-    cache_creation_tokens=usage_totals["cache_creation_input_tokens"],
-  )
-  if hasattr(cost, "cost_known"):
-    usage_totals["cost_known"] = bool(cost.cost_known)
-  return cost
 
 
 _UNPRICED_PROVIDERS = frozenset({

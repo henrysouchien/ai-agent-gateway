@@ -8,9 +8,9 @@ import re
 from typing import Any
 
 from .auth import PUBLIC_AUTH_CONFIG_FIELDS
-from .capability_execution import BoundCapabilityExecution
-from .providers.anthropic_oauth import ANTHROPIC_PUBLIC_AUTH_CONFIG_FIELDS
-from .providers.credential_pool import POOL_PUBLIC_AUTH_CONFIG_FIELDS
+from hank_model_transport.capability_execution import BoundCapabilityExecution
+from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_PUBLIC_AUTH_CONFIG_FIELDS
+from hank_model_transport.providers.credential_pool import POOL_PUBLIC_AUTH_CONFIG_FIELDS
 from .ui_blocks_metrics import record as record_package_counter
 
 

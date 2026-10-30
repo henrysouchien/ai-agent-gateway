@@ -19,22 +19,24 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway import (
   AgentRunner,
   EventLog,
-  ModelInfo,
-  ModelProvider,
   SkillLoader,
   ToolDispatcher,
   make_run_agent_handler,
   make_run_agent_tool_def,
   parse_skill_file,
 )
+from hank_model_transport.providers import (
+  ModelInfo,
+  ModelProvider,
+)
 from model_authority.binding import CapabilityResolutionError
 from model_authority.current import INITIAL_MODEL_REGISTRY
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
 )
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.providers import CodexProvider, OpenAIProvider, StreamEvent, XAIProvider
+from hank_model_transport.providers import CodexProvider, OpenAIProvider, StreamEvent, XAIProvider
 from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
   stub_capability_execution_resolver,
@@ -408,7 +410,7 @@ def test_long_context_tier_counts_all_prompt_tokens(
 
 @pytest.mark.parametrize("provider_type", [CodexProvider, OpenAIProvider, XAIProvider])
 def test_unknown_rate_model_keeps_warn_and_zero(provider_type, monkeypatch, caplog) -> None:
-  import agent_gateway.providers.base as provider_base
+  import hank_model_transport.providers.base as provider_base
 
   support = provider_type.adapter_route_support()
   template = next(entry for entry in INITIAL_MODEL_REGISTRY.models.values() if support.supports(entry))

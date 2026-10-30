@@ -13,7 +13,7 @@ import pytest
 
 from agent_gateway import usage_outbox as usage_outbox_module
 from agent_gateway.commercial_contract import canonical_usage_payload_sha256
-from agent_gateway.multi_user.billing import SessionUsageSummary
+from hank_model_transport.multi_user.billing import SessionUsageSummary
 from agent_gateway.usage_outbox import CommercialUsageOutbox
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker
 from hank_contracts.usage import (

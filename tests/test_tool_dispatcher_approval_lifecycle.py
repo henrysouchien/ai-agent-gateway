@@ -23,7 +23,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentRunner, EventLog, ToolDispatcher
-from agent_gateway import policy_imports
+from hank_model_transport import policy_imports
 from agent_gateway import tool_dispatcher as dispatcher_module
 from agent_gateway import tool_dispatcher_approval_lifecycle as lifecycle_helpers
 from agent_gateway.admission import (
@@ -34,9 +34,9 @@ from agent_gateway.admission import (
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.approvals import _approval_request_to_dict
 from agent_gateway.agent_session_log import AgentSessionLog
-from agent_gateway.capability_execution import CapabilityExecutionResolver
+from hank_model_transport.capability_execution import CapabilityExecutionResolver
 from agent_gateway.execution_identity import DispatchIdentity
-from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
+from hank_model_transport.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.skills import SkillLoader
 from agent_gateway.sub_agent import make_run_agent_handler
 from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
@@ -1792,8 +1792,8 @@ def test_native_parks_before_and_after_rotation_capture_their_original_generatio
   owner_session_host_policy: Any,
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  from agent_gateway.providers.anthropic import AnthropicProvider
-  from agent_gateway.providers.anthropic_oauth import ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD, resolve_anthropic_credentials
+  from hank_model_transport.providers.anthropic import AnthropicProvider
+  from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD, resolve_anthropic_credentials
   from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 
   token_a = "sk-ant-oat01-capture-member-A"

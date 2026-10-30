@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from .agent_session_log import AgentSessionLog, LogEntry
-from .capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from .child_result_trust import UNTRUSTED_CHILD_RESULTS_POLICY
 from .product_config import gateway_product_id
 from .provider_summarize import DEFAULT_SUMMARY_SYSTEM_PROMPT, _provider_summarize

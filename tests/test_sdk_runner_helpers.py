@@ -15,11 +15,12 @@ if str(PKG_DIR) not in sys.path:
 
 
 
-from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog  # noqa: E402
+from hank_model_transport.providers import AgentSDKConfig
+from agent_gateway import AgentSDKRunner, EventLog  # noqa: E402
 import agent_gateway.sdk_runner as sdk_runner  # noqa: E402
 import agent_gateway.sdk_runner_approval as sdk_runner_approval  # noqa: E402
 import agent_gateway.sdk_runner_context as sdk_runner_context  # noqa: E402
-from agent_gateway import policy_imports  # noqa: E402
+from hank_model_transport import policy_imports  # noqa: E402
 from agent_gateway import sdk_runner_helpers  # noqa: E402
 from agent_gateway.sdk_runner_stream import ToolCallInfo  # noqa: E402
 from agent_gateway.tool_dispatch_classification import ToolResultSettlement  # noqa: E402

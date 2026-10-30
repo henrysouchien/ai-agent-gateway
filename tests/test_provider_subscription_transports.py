@@ -8,13 +8,14 @@ from typing import Any
 import httpx
 import pytest
 
-from agent_gateway.auth import AuthConfig, ProviderCredentialFailure
-from agent_gateway.providers import installed_adapter_route_support
-from agent_gateway.providers import base as provider_base
-from agent_gateway.providers.google_antigravity import GoogleAntigravityProvider
-from agent_gateway.providers.google import GoogleGenerateContentProvider
-from agent_gateway.providers.ollama_cloud import OllamaCloudProvider
-from agent_gateway.providers.ollama import OllamaLocalProvider
+from agent_gateway.auth import AuthConfig
+from hank_model_transport.auth import ProviderCredentialFailure
+from hank_model_transport.providers import installed_adapter_route_support
+from hank_model_transport.providers import base as provider_base
+from hank_model_transport.providers.google_antigravity import GoogleAntigravityProvider
+from hank_model_transport.providers.google import GoogleGenerateContentProvider
+from hank_model_transport.providers.ollama_cloud import OllamaCloudProvider
+from hank_model_transport.providers.ollama import OllamaLocalProvider
 from gateway_test_support.model_defaults import compat_for_profile
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
@@ -464,7 +465,7 @@ def test_antigravity_tool_schemas_are_reduced_to_the_wire_subset() -> None:
   `exclusiveMinimum` and `uniqueItems` (live 2026-10-11, 31 violations over
   11 tools). The adapter inlines refs and drops what the Schema proto has no
   field for, instead of passing `input_schema` through."""
-  from agent_gateway.providers.google_antigravity import _convert_tools
+  from hank_model_transport.providers.google_antigravity import _convert_tools
 
   tools = [{
     "name": "probe",
@@ -514,9 +515,9 @@ def test_both_gemini_adapters_reduce_the_fms_persist_shape_to_the_wire_subset() 
   (api/agent/shared/tool_defs/fms_persist.py ``_FORECAST_SET_*``), inlined so the
   package test runs without the product checkout. Both google.generate_content
   adapters share one reducer, so the public wire cannot regress separately."""
-  from agent_gateway.providers import google as google_public
-  from agent_gateway.providers.google_tool_schema import WIRE_DROPPED_SCHEMA_KEYS
-  from agent_gateway.providers.google_antigravity import _convert_tools as antigravity_convert
+  from hank_model_transport.providers import google as google_public
+  from hank_model_transport.providers.google_tool_schema import WIRE_DROPPED_SCHEMA_KEYS
+  from hank_model_transport.providers.google_antigravity import _convert_tools as antigravity_convert
 
   period_map = {
     "type": "object",
@@ -619,7 +620,7 @@ def test_ollama_cloud_compacted_and_empty_assistant_turns_never_serialize_nil_co
 
 
 def test_ollama_tool_call_accumulator_preserves_repeated_brace_prefix_deltas() -> None:
-  from agent_gateway.providers.ollama import _ToolCallAccumulator
+  from hank_model_transport.providers.ollama import _ToolCallAccumulator
 
   acc = _ToolCallAccumulator(0)
   deltas = [
@@ -772,7 +773,7 @@ def test_antigravity_stream_reports_response_id_and_response_headers() -> None:
 
 
 def test_response_diagnostics_yields_nothing_without_the_headers() -> None:
-  from agent_gateway.providers.response_diagnostics import response_diagnostics
+  from hank_model_transport.providers.response_diagnostics import response_diagnostics
 
   assert response_diagnostics(httpx.Headers({"content-type": "text/event-stream"})) == (None, None)
   assert response_diagnostics(None) == (None, None)

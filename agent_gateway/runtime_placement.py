@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from hank_contracts.user_claims import derive_user_claim_key
 
-from .user_runtime_credentials import (
+from hank_model_transport.user_runtime_credentials import (
   DeskReplica,
   USER_RUNTIME_CREDENTIALS_FILE_ENV,
   USER_STORAGE_ID_ENV,
@@ -121,15 +121,15 @@ os.execvp(sys.argv[2], sys.argv[2:])
 """
 
 def _personal_credential_env_names() -> frozenset[str]:
-  from .providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES, ANTHROPIC_STORE_BASE_ENV
-  from .providers.codex import CODEX_PERSONAL_OAUTH_ENV_NAMES
-  from .providers.copilot_oauth import COPILOT_PERSONAL_OAUTH_ENV_NAMES
-  from .providers.openai import OPENAI_PERSONAL_OAUTH_ENV_NAMES
-  from .providers.google_antigravity_oauth import GOOGLE_ANTIGRAVITY_PERSONAL_OAUTH_ENV_NAMES
-  from .providers.google_oauth import GOOGLE_PERSONAL_OAUTH_ENV_NAMES
-  from .providers.kimi_code_oauth import KIMI_CODE_PERSONAL_OAUTH_ENV_NAMES
-  from .providers.muse_oauth import MUSE_PERSONAL_OAUTH_ENV_NAMES
-  from .providers.xai_oauth import XAI_PERSONAL_OAUTH_ENV_NAMES
+  from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES, ANTHROPIC_STORE_BASE_ENV
+  from hank_model_transport.providers.codex import CODEX_PERSONAL_OAUTH_ENV_NAMES
+  from hank_model_transport.providers.copilot_oauth import COPILOT_PERSONAL_OAUTH_ENV_NAMES
+  from hank_model_transport.providers.openai import OPENAI_PERSONAL_OAUTH_ENV_NAMES
+  from hank_model_transport.providers.google_antigravity_oauth import GOOGLE_ANTIGRAVITY_PERSONAL_OAUTH_ENV_NAMES
+  from hank_model_transport.providers.google_oauth import GOOGLE_PERSONAL_OAUTH_ENV_NAMES
+  from hank_model_transport.providers.kimi_code_oauth import KIMI_CODE_PERSONAL_OAUTH_ENV_NAMES
+  from hank_model_transport.providers.muse_oauth import MUSE_PERSONAL_OAUTH_ENV_NAMES
+  from hank_model_transport.providers.xai_oauth import XAI_PERSONAL_OAUTH_ENV_NAMES
 
   # Environment names that carry one person's OAuth identity or store path,
   # exported beside each provider adapter; `api/credentials.py` reads OpenAI/Codex.
@@ -491,7 +491,7 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
       "AGENT_API_USER_CLAIM_HMAC_KEY", "GATEWAY_USER_KEYS", "GATEWAY_API_KEY_WEB",
     ):
       environ.pop(name, None)
-    from .providers.credential_pool import scope_admits_operator_seats
+    from hank_model_transport.providers.credential_pool import scope_admits_operator_seats
 
     if not scope_admits_operator_seats(storage_id, environ=self._extra_env):
       for name in _personal_credential_env_names():
@@ -532,8 +532,8 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
     seats belong to deployment owners: for any other `storage_id` they are
     neither copied nor bound, and org/API-key stores still seed.
     """
-    from .providers.anthropic_oauth import seed_non_rotating_org_store
-    from .providers.credential_pool import (
+    from hank_model_transport.providers.anthropic_oauth import seed_non_rotating_org_store
+    from hank_model_transport.providers.credential_pool import (
       first_org_credential_source,
       scope_admits_operator_seats,
       seed_org_credential_stores,

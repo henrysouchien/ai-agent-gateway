@@ -7,19 +7,21 @@ from mcp.types import CallToolResult
 
 from agent_gateway import (
   AgentRunner,
-  AgentSDKConfig,
   AgentSDKRunner,
   EventLog,
   McpClientManager,
-  ModelInfo,
-  ModelProvider,
   ToolDispatcher,
   ToolResultContext,
+)
+from hank_model_transport.providers import (
+  AgentSDKConfig,
+  ModelInfo,
+  ModelProvider,
 )
 from agent_gateway.mcp_client import _ServerState
 from agent_gateway.mcp_client_connections import McpToolCallResult
 from agent_gateway.tool_dispatcher_helpers import ToolResult
-from agent_gateway.providers import StreamEvent
+from hank_model_transport.providers import StreamEvent
 from agent_gateway.transcript import _tool_result_blocks_from_event
 from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,

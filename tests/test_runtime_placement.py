@@ -41,24 +41,24 @@ from agent_gateway.runtime_placement import (
   pid_birth_token,
 )
 import agent_gateway.runtime_placement as placement_module
-from agent_gateway.providers import api_key_store
-from agent_gateway.providers.anthropic_oauth import (
+from hank_model_transport.providers import api_key_store
+from hank_model_transport.providers.anthropic_oauth import (
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
   ANTHROPIC_STORE_BASE_ENV,
   AnthropicOAuthRecord,
   load_anthropic_oauth_store,
   upsert_anthropic_oauth_record,
 )
-from agent_gateway.providers.codex import CODEX_PERSONAL_OAUTH_ENV_NAMES
-from agent_gateway.providers.copilot_oauth import COPILOT_PERSONAL_OAUTH_ENV_NAMES
-from agent_gateway.providers.google_antigravity_oauth import GOOGLE_ANTIGRAVITY_PERSONAL_OAUTH_ENV_NAMES
-from agent_gateway.providers.openai import OPENAI_PERSONAL_OAUTH_ENV_NAMES
-from agent_gateway.providers.google_oauth import GOOGLE_PERSONAL_OAUTH_ENV_NAMES
-from agent_gateway.providers.kimi_code_oauth import KIMI_CODE_PERSONAL_OAUTH_ENV_NAMES
-from agent_gateway.providers.muse_oauth import MUSE_PERSONAL_OAUTH_ENV_NAMES
-from agent_gateway.providers.xai_oauth import XAI_PERSONAL_OAUTH_ENV_NAMES
-from agent_gateway.providers.ollama_cloud import resolve_ollama_cloud_pool_candidates
-from agent_gateway.user_runtime_credentials import (
+from hank_model_transport.providers.codex import CODEX_PERSONAL_OAUTH_ENV_NAMES
+from hank_model_transport.providers.copilot_oauth import COPILOT_PERSONAL_OAUTH_ENV_NAMES
+from hank_model_transport.providers.google_antigravity_oauth import GOOGLE_ANTIGRAVITY_PERSONAL_OAUTH_ENV_NAMES
+from hank_model_transport.providers.openai import OPENAI_PERSONAL_OAUTH_ENV_NAMES
+from hank_model_transport.providers.google_oauth import GOOGLE_PERSONAL_OAUTH_ENV_NAMES
+from hank_model_transport.providers.kimi_code_oauth import KIMI_CODE_PERSONAL_OAUTH_ENV_NAMES
+from hank_model_transport.providers.muse_oauth import MUSE_PERSONAL_OAUTH_ENV_NAMES
+from hank_model_transport.providers.xai_oauth import XAI_PERSONAL_OAUTH_ENV_NAMES
+from hank_model_transport.providers.ollama_cloud import resolve_ollama_cloud_pool_candidates
+from hank_model_transport.user_runtime_credentials import (
   DeskReplica,
   USER_RUNTIME_CREDENTIALS_FILE_ENV,
   USER_STORAGE_ID_ENV,
@@ -193,7 +193,7 @@ def backend(tmp_path: Path) -> Iterator[LocalProcessRuntimeBackend]:
     from starlette.responses import JSONResponse
     from starlette.routing import Route
     from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority, configured_gateway_claim_signing_authority
-    from agent_gateway.user_runtime_credentials import load_user_runtime_credentials
+    from hank_model_transport.user_runtime_credentials import load_user_runtime_credentials
 
     async def health(request):
       return JSONResponse({"status": "ok"})

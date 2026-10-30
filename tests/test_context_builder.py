@@ -10,7 +10,8 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentSessionLog, AnthropicProvider, SessionContextBuilder
+from agent_gateway import AgentSessionLog, SessionContextBuilder
+from hank_model_transport.providers import AnthropicProvider
 import agent_gateway.agent_session_log as agent_session_log_module
 
 

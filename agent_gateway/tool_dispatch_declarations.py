@@ -1,7 +1,7 @@
 """Dispatch-semantics value types and the bare-name dispatch projection.
 
 ``agent_gateway`` never imports product policy modules — every policy read goes
-through :mod:`agent_gateway.policy_imports` explicit application binding — and
+through :mod:`hank_model_transport.policy_imports` explicit application binding — and
 it owns no per-tool list: the dispatch semantics of each exact registered
 route are declared by that route's registration owner and read from the bound
 policy module (``get_dispatch_semantics_overrides``).
@@ -52,7 +52,7 @@ from agent_workflow_contracts.tool_registration import (
   validate_registered_tool_identity,
 )
 
-from .policy_imports import load_server_policy_module
+from hank_model_transport.policy_imports import load_server_policy_module
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +159,7 @@ def _derive_tool_effect(tool_name: str) -> CatalogToolEffect | None:
   """
 
   from .sub_agent_scope_receipt import _normalized_effect
-  from .policy_imports import (
+  from hank_model_transport.policy_imports import (
     load_server_policy_module,
     resolve_server_policy_tool_class,
   )

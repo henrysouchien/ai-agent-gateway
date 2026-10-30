@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_gateway.policy_imports import (
+from hank_model_transport.policy_imports import (
   configure_server_policy,
   load_server_policy_module,
 )

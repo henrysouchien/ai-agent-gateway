@@ -29,11 +29,10 @@ from agent_gateway.approval_store import (
   _restore_executable_result,
 )
 from agent_gateway.tool_policy_registry import PreparedToolCall
-from agent_gateway.providers.anthropic_oauth import is_anthropic_generation_ref
 from agent_gateway.admission import root_context
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.agent_session_log_records import AgentSessionRef, resolve_agent_session_id
-from agent_gateway.openai_history_fence import scope_provider_session_id
+from hank_model_transport.openai_history_fence import scope_provider_session_id
 
 
 log = logging.getLogger("agent_gateway.autonomous_approval_delivery")
@@ -192,18 +191,17 @@ def admit_delegated_executable_capture(
     )
     tenant = context.tenant
     job_id = launch["job_id"] if launch is not None else context.job_id
-  generation_ref = (
-    envelope.bind.credential_ref
-    if is_anthropic_generation_ref(envelope.bind.credential_ref)
-    else None
-  )
+  credential_generation_ref = payload.get("credential_generation_ref")
   if (
     tenant is None
     or job_id is None
     or payload.get("job_id") != job_id
     or payload.get("tenant_storage_id") != tenant.storage_id
     or tenant.storage_id != envelope.owner_user_id
-    or payload.get("credential_generation_ref") != generation_ref
+    or (
+      credential_generation_ref is not None
+      and type(credential_generation_ref) is not str
+    )
     or any(
       type(payload.get(key)) is not str or not payload[key]
       for key in ("approval_id", "tool_call_id", "nonce", "tool_name")
@@ -251,7 +249,7 @@ def admit_delegated_executable_capture(
     tool_name=payload["tool_name"],
     job_id=job_id,
     tenant_storage_id=tenant.storage_id,
-    credential_generation_ref=generation_ref,
+    credential_generation_ref=credential_generation_ref,
     prepared_call=prepared_call,
     dispatch_context=dispatch_context,
     session_log_path=session_log_path,

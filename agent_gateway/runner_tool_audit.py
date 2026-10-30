@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict
 
-from .policy_imports import load_server_policy_module
+from hank_model_transport.policy_imports import load_server_policy_module
 from .secret_boundary import sanitization_failure_tool_input
 from .tool_redaction import get_audit_hmac_secret, redact_tool_input
 

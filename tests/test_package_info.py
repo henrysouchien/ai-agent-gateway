@@ -17,9 +17,9 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway
-from agent_gateway import package_info
+from agent_gateway import gateway_info as package_info
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
-from agent_gateway.package_info import (
+from agent_gateway.gateway_info import (
   CONTRACT_AUTONOMOUS_OPERATOR_MESSAGES_V1,
   CONTRACT_CHAT_ATTACHMENTS_V1,
   CONTRACT_INVESTMENT_SELECTED_CONTENT_V1,

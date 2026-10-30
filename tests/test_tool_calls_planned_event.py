@@ -8,12 +8,14 @@ from agent_gateway import (
   AgentRunner,
   EventLog,
   McpClientManager,
-  ModelInfo,
-  ModelProvider,
   ToolDispatcher,
 )
+from hank_model_transport.providers import (
+  ModelInfo,
+  ModelProvider,
+)
 from agent_gateway.event_adapter import adapt_event
-from agent_gateway.providers import StreamEvent
+from hank_model_transport.providers import StreamEvent
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 from agent_gateway.tool_display import resolve_display
 from gateway_test_support.capability_execution_test_support import (

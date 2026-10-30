@@ -532,6 +532,7 @@ class AutonomousTask:
   events_evidence_status: str = "missing"
   manifest_version: int = _TASK_MANIFEST_VERSION
   research_file_id: int | None = None
+  dispatch_start_decision_id: int | None = None
   autonomous_in_flight_at_start: int | None = None
   owner_run_limit: int | None = None
   credential_handoff_bytes: int | None = None
@@ -1231,6 +1232,7 @@ class AutonomousRegistryStateMixin:
       "channel": record.channel,
       "dev_mode": record.dev_mode,
       "research_file_id": record.research_file_id,
+      "dispatch_start_decision_id": record.dispatch_start_decision_id,
       "autonomous_in_flight_at_start": record.autonomous_in_flight_at_start,
       "owner_run_limit": record.owner_run_limit,
       "credential_handoff_bytes": record.credential_handoff_bytes,
@@ -2140,6 +2142,16 @@ class AutonomousRegistryStateMixin:
     record_research_file_id = _positive_int(
       manifest.get("research_file_id")
     )
+    record_dispatch_start_decision_id = manifest.get("dispatch_start_decision_id")
+    if record_dispatch_start_decision_id is not None and (
+      type(record_dispatch_start_decision_id) is not int
+      or record_dispatch_start_decision_id < 0
+    ):
+      self._warn_once(
+        manifest_path,
+        "Skipping autonomous manifest with invalid dispatch_start_decision_id: %s",
+      )
+      return None
     record_autonomous_in_flight_at_start = _positive_int(
       manifest.get("autonomous_in_flight_at_start")
     )
@@ -2236,6 +2248,7 @@ class AutonomousRegistryStateMixin:
         admitted_skill_execution_limits=admitted_skill_execution_limits,
         manifest_version=manifest_version,
         research_file_id=record_research_file_id,
+        dispatch_start_decision_id=record_dispatch_start_decision_id,
         autonomous_in_flight_at_start=record_autonomous_in_flight_at_start,
         owner_run_limit=record_owner_run_limit,
         credential_handoff_bytes=record_credential_handoff_bytes,

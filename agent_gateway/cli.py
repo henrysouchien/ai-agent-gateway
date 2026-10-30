@@ -414,7 +414,7 @@ def _anthropic_store_path(args: argparse.Namespace) -> Path:
   deployment's org pool, which every user's pool ends with.
   """
 
-  from .providers.anthropic_oauth import resolve_anthropic_auth_store_path
+  from hank_model_transport.providers.anthropic_oauth import resolve_anthropic_auth_store_path
 
   return resolve_anthropic_auth_store_path(
     _xai_auth_config(args),
@@ -441,7 +441,7 @@ def _auth_login_anthropic(args: argparse.Namespace, *, stdout: TextIO) -> int:
   ones already enrolled alone.
   """
 
-  from .providers.anthropic_oauth import (
+  from hank_model_transport.providers.anthropic_oauth import (
     AnthropicOAuthError,
     complete_anthropic_login,
     mask_anthropic_token,
@@ -482,7 +482,7 @@ def _auth_enroll(args: argparse.Namespace, *, stdout: TextIO) -> int:
   as-is, parked by its account key when a limiter rejects it.
   """
 
-  from .providers.anthropic_oauth import (
+  from hank_model_transport.providers.anthropic_oauth import (
     AnthropicOAuthError,
     enroll_anthropic_setup_token,
     mask_anthropic_token,
@@ -545,7 +545,7 @@ def _auth_status(args: argparse.Namespace, *, stdout: TextIO) -> int:
   except Exception as exc:
     raise AgentProjectError(str(exc)) from exc
 def _auth_status_anthropic(args: argparse.Namespace, *, stdout: TextIO) -> int:
-  from .providers.anthropic_oauth import (
+  from hank_model_transport.providers.anthropic_oauth import (
     anthropic_token_store_is_private,
     load_anthropic_oauth_store,
   )
@@ -568,14 +568,14 @@ def _auth_status_anthropic(args: argparse.Namespace, *, stdout: TextIO) -> int:
 def _resolve_pool_store_target(
   args: argparse.Namespace,
 ) -> tuple[Path, str, tuple[str, ...]]:
-  from .providers.api_key_store import resolve_api_key_store_path
-  from .providers.copilot_oauth import resolve_copilot_oauth_settings
-  from .providers.credential_pool import USER_SCOPE_FIELD, resolve_provider_store_path
-  from .providers.google_antigravity_oauth import resolve_antigravity_store_path
-  from .providers.google_oauth import resolve_google_oauth_settings
-  from .providers.kimi_code_oauth import resolve_kimi_code_store_path
-  from .providers.muse_oauth import resolve_muse_store_path
-  from .providers.xai_oauth import resolve_xai_oauth_settings
+  from hank_model_transport.providers.api_key_store import resolve_api_key_store_path
+  from hank_model_transport.providers.copilot_oauth import resolve_copilot_oauth_settings
+  from hank_model_transport.providers.credential_pool import USER_SCOPE_FIELD, resolve_provider_store_path
+  from hank_model_transport.providers.google_antigravity_oauth import resolve_antigravity_store_path
+  from hank_model_transport.providers.google_oauth import resolve_google_oauth_settings
+  from hank_model_transport.providers.kimi_code_oauth import resolve_kimi_code_store_path
+  from hank_model_transport.providers.muse_oauth import resolve_muse_store_path
+  from hank_model_transport.providers.xai_oauth import resolve_xai_oauth_settings
 
   provider = str(getattr(args, "provider", "") or "").strip().lower()
   store = str(getattr(args, "store", None) or "").strip()
@@ -674,7 +674,7 @@ def _auth_list(args: argparse.Namespace, *, stdout: TextIO) -> int:
   if args.usage and args.provider != "anthropic":
     raise AgentProjectError("--usage is only available for the anthropic provider")
   if args.provider == "anthropic":
-    from .providers.anthropic_oauth import (
+    from hank_model_transport.providers.anthropic_oauth import (
       load_anthropic_oauth_store,
       mask_anthropic_token,
     )
@@ -686,7 +686,7 @@ def _auth_list(args: argparse.Namespace, *, stdout: TextIO) -> int:
       return 1
     now = time.time()
     state = None
-    from .providers.anthropic_quota import (
+    from hank_model_transport.providers.anthropic_quota import (
       describe_account_usage,
       load_selection_state,
       locator_for_record,
@@ -715,7 +715,7 @@ def _auth_list(args: argparse.Namespace, *, stdout: TextIO) -> int:
         )
     return 0
 
-  from .providers.credential_pool import load_pool_accounts
+  from hank_model_transport.providers.credential_pool import load_pool_accounts
 
   path, prefix, req_keys = _resolve_pool_store_target(args)
   accounts = load_pool_accounts(path, default_prefix=prefix, required_any_keys=req_keys)
@@ -736,8 +736,8 @@ def _auth_list(args: argparse.Namespace, *, stdout: TextIO) -> int:
 def _auth_policy(args: argparse.Namespace, *, stdout: TextIO) -> int:
   """Write or clear one enrolled account's selection policy in its store's sidecar."""
 
-  from .providers.anthropic_oauth import load_anthropic_oauth_store
-  from .providers.anthropic_quota import (
+  from hank_model_transport.providers.anthropic_oauth import load_anthropic_oauth_store
+  from hank_model_transport.providers.anthropic_quota import (
     locator_for_record,
     reset_account_policy,
     selection_sidecar_path,
@@ -780,7 +780,7 @@ def _auth_policy(args: argparse.Namespace, *, stdout: TextIO) -> int:
 def _auth_remove(args: argparse.Namespace, *, stdout: TextIO) -> int:
   identity = str(args.identity or "").strip()
   if args.provider == "anthropic":
-    from .providers.anthropic_oauth import remove_anthropic_oauth_record
+    from hank_model_transport.providers.anthropic_oauth import remove_anthropic_oauth_record
 
     path = _anthropic_store_path(args)
     if not remove_anthropic_oauth_record(path, identity):
@@ -790,7 +790,7 @@ def _auth_remove(args: argparse.Namespace, *, stdout: TextIO) -> int:
     stdout.write("Claude Code's saved login was not modified.\n")
     return 0
 
-  from .providers.credential_pool import remove_pool_account
+  from hank_model_transport.providers.credential_pool import remove_pool_account
 
   path, prefix, req_keys = _resolve_pool_store_target(args)
   if not remove_pool_account(path, identity, default_prefix=prefix, required_any_keys=req_keys):

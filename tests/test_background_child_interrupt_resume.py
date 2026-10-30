@@ -14,8 +14,8 @@ if str(TESTS_DIR) not in sys.path:
   sys.path.insert(0, str(TESTS_DIR))
 
 from agent_gateway import AgentRunner, AgentSessionLog, TaskRegistry, TaskState
-from agent_gateway.capability_execution import CapabilityExecutionResolver
-from agent_gateway.providers import ModelInfo, StreamEvent
+from hank_model_transport.capability_execution import CapabilityExecutionResolver
+from hank_model_transport.providers import ModelInfo, StreamEvent
 from agent_gateway.session import GatewaySession
 from agent_gateway.skills import SkillLoader
 from agent_gateway.sub_agent import (

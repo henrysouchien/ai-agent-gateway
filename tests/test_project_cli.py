@@ -14,8 +14,8 @@ import yaml
 
 from agent_gateway import cli as agent_cli
 from agent_gateway import project
-from agent_gateway.providers import anthropic_quota, xai_oauth
-from agent_gateway.providers.anthropic_oauth import (
+from hank_model_transport.providers import anthropic_quota, xai_oauth
+from hank_model_transport.providers.anthropic_oauth import (
   AnthropicOAuthRecord,
   upsert_anthropic_oauth_record,
 )

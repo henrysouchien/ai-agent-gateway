@@ -19,17 +19,19 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import (  # noqa: E402
+from agent_gateway import (
   AgentRunner,
   EventLog,
   McpClientManager,
+  ToolDispatcher,
+)
+from hank_model_transport.providers import (
   ModelInfo,
   ModelProvider,
-  ToolDispatcher,
 )
 import agent_gateway.runner as gateway_runner  # noqa: E402
 import agent_gateway.runner_stream_turn as runner_stream_turn  # noqa: E402
-from agent_gateway.auth import ProviderCredentialFailure  # noqa: E402
+from hank_model_transport.auth import ProviderCredentialFailure  # noqa: E402
 from agent_gateway.autonomous_credential_handoff import (  # noqa: E402
   encode_autonomous_credential_handoff,
   read_autonomous_credential_handoff,
@@ -39,10 +41,10 @@ from agent_gateway.autonomous_runner_start import (  # noqa: E402
 )
 from model_authority.binding import CredentialHandle
 from model_authority.selection import CapabilityDefault
-from agent_gateway.capability_execution import MaterializedCredential  # noqa: E402
-from agent_gateway.providers import StreamEvent  # noqa: E402
-from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402
-from agent_gateway.providers.anthropic_oauth import (  # noqa: E402
+from hank_model_transport.capability_execution import MaterializedCredential  # noqa: E402
+from hank_model_transport.providers import StreamEvent  # noqa: E402
+from hank_model_transport.providers.anthropic import AnthropicProvider  # noqa: E402
+from hank_model_transport.providers.anthropic_oauth import (  # noqa: E402
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
   ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
   ANTHROPIC_USER_SCOPE_FIELD,
@@ -54,7 +56,7 @@ from agent_gateway.providers.anthropic_oauth import (  # noqa: E402
   select_anthropic_credential_source,
   upsert_anthropic_oauth_record,
 )
-from agent_gateway.runner_auth import merge_refreshed_auth_config  # noqa: E402
+from hank_model_transport.runtime_helpers import merge_refreshed_auth_config  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_bound_capability_execution,
 )
@@ -264,15 +266,14 @@ def _make_runner() -> AgentRunner:
   )
 
 
-def test_runner_auth_wrappers_resolve_parent_module_helpers(monkeypatch: Any) -> None:
+def test_runner_credential_refresh_uses_host_merge_binding(monkeypatch: Any) -> None:
   runner = _make_runner()
   original_execution = runner.capability_execution
   config = dict(original_execution.auth_config)
   config["api_key"] = "request-old"
 
   monkeypatch.setattr(
-    gateway_runner,
-    "_merge_refreshed_auth_config",
+    "agent_gateway.runner_hooks_lifecycle._merge_refreshed_auth_config",
     lambda original, refreshed: {
       **original,
       "api_key": f"{original['api_key']}->{refreshed['api_key']}",
@@ -1469,7 +1470,7 @@ def test_stream_loop_rotates_on_superseded_source_error_like_a_401(
   the run continues on it. A frozen generation bind would instead fail typed at
   materialization (materialize_frozen_bind), before any turn.
   """
-  from agent_gateway.providers.anthropic_oauth import AnthropicSourceError
+  from hank_model_transport.providers.anthropic_oauth import AnthropicSourceError
 
   class _SupersededSourceProvider(_PooledAnthropicProvider):
     """A is live at turn start, retired before the retry rebuilds its client.
@@ -1530,8 +1531,8 @@ def test_frozen_generation_bind_fails_typed_with_no_sibling_fallback(
 ) -> None:
   """Regression d (frozen): a frozen generation bind never rotates to a sibling."""
   from model_authority.binding import CapabilityResolutionError
-  from agent_gateway.capability_execution import materialize_frozen_bind
-  from agent_gateway.providers.anthropic_oauth import register_anthropic_static_credential
+  from hank_model_transport.capability_execution import materialize_frozen_bind
+  from hank_model_transport.providers.anthropic_oauth import register_anthropic_static_credential
 
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
   frozen = register_anthropic_static_credential(

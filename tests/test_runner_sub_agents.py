@@ -16,19 +16,19 @@ from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.agent_session_log_records import LogEntry as SessionLogEntry, QueryCursor
 from agent_gateway.mcp_activation import McpActivationFold
 from agent_gateway import AgentRunner, ToolDispatcher
-from agent_gateway.capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.event_log import EventLog
 from agent_gateway.session import GatewaySession
-from agent_gateway.providers import ModelInfo, ModelProvider
-from agent_gateway.providers.base import StreamEvent
-from agent_gateway.providers.anthropic import (
+from hank_model_transport.providers import ModelInfo, ModelProvider
+from hank_model_transport.providers.base import StreamEvent
+from hank_model_transport.providers.anthropic import (
   AnthropicProvider,
   _is_cacheable_message_block,
 )
 from agent_gateway.runner_budget import CostAccumulator
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.multi_user.billing import _UsageAggregator
+from hank_model_transport.multi_user.billing import _UsageAggregator
 import agent_gateway.runner as gateway_runner
 import agent_gateway.runner_sub_agents as runner_sub_agents
 import agent_gateway.runner_stream_turn as runner_stream_turn

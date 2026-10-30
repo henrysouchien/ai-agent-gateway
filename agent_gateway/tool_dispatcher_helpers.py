@@ -5,13 +5,13 @@ import logging
 from collections.abc import Sequence as AbcSequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Protocol, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, Protocol, Sequence, Tuple, TYPE_CHECKING, cast
 
 from agent_workflow_contracts.next_call import next_call as build_next_call
 if TYPE_CHECKING:
   from .ui_blocks_run import UiBlocksRunContext
 
-from .policy_imports import deferred_local_tool_pack as _deferred_local_tool_pack
+from hank_model_transport.policy_imports import deferred_local_tool_pack as _deferred_local_tool_pack
 _log = logging.getLogger("agent_gateway.dispatcher")
 
 class EventLogWriter(Protocol):
@@ -153,6 +153,7 @@ def active_local_tool_schema(
   tool_name: str,
   *,
   channel: str | None = None,
+  profile_name: str | None = None,
 ) -> tuple[Mapping[str, Any] | None, Dict[str, Any] | None]:
   if get_tool_definitions is None:
     return None, None
@@ -195,7 +196,7 @@ def active_local_tool_schema(
       "fix": "Retry after the active tool definition includes its input schema.",
     }
 
-  pack = _deferred_local_tool_pack(tool_name, channel)
+  pack = _deferred_local_tool_pack(tool_name, channel, profile_name=profile_name)
   if pack is not None:
     next_call = build_next_call("load_tools", {"pack": pack})
     fix = f'Load tool pack "{pack}" with load_tools(pack="{pack}") and retry.'
@@ -644,9 +645,9 @@ class ToolExecutionContext:
   ) -> bool:
     """Fence one research identity through this context's constructed run."""
 
-    owner = self.research_file_activity_owner
-    assert owner is not None, "research tool context has no run activity owner"
-    return owner(workspace_dir, research_file_id)
+    return cast(Callable[[Path, int], bool], self.research_file_activity_owner)(
+      workspace_dir, research_file_id
+    )
 
   def emit(self, event: Dict[str, Any]) -> None:
     """Append a custom event to the active event log.

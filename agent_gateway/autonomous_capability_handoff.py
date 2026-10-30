@@ -9,7 +9,7 @@ from model_authority.binding import RunMode
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from agent_workflow_contracts import OperationUnavailable, ResolvedAuthority
 from .admission import AdmittedContext, ParentContext, Refusal
-from .capability_execution import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 
 
 AutonomousCapabilityBindingSource: TypeAlias = Literal["start", "resume", "schedule"]

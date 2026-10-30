@@ -1,16 +1,12 @@
 import os
 from pathlib import Path
 
-from agent_gateway import (
-  BoundCapabilityExecution,
-  DeliveryConfig,
-  GatewaySession,
-  run_autonomous_sync,
-)
+from hank_model_transport.capability_execution import BoundCapabilityExecution
+from agent_gateway import DeliveryConfig, GatewaySession, run_autonomous_sync
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
-from agent_gateway.providers import AnthropicProvider
+from hank_model_transport.providers import AnthropicProvider
 
 
 BASE_DIR = Path(__file__).parent

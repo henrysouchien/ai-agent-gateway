@@ -10,16 +10,16 @@ from typing import Literal
 
 import pytest
 
-from agent_gateway.auth import ProviderCredentialFailure
-from agent_gateway.providers import anthropic as anthropic_provider
-from agent_gateway.capability_execution import CapabilityExecutionResolver
-from agent_gateway.providers import anthropic_oauth
-from agent_gateway.providers.anthropic_quota import Cooldown, record_cooldown
+from hank_model_transport.auth import ProviderCredentialFailure
+from hank_model_transport.providers import anthropic as anthropic_provider
+from hank_model_transport.capability_execution import CapabilityExecutionResolver
+from hank_model_transport.providers import anthropic_oauth
+from hank_model_transport.providers.anthropic_quota import Cooldown, record_cooldown
 from model_authority.key_pool import fingerprint, load_key_pool, pool_config_path, pool_state_path
 from model_authority.spend_ledger import SpendLedgerUnavailable
 from model_authority.spend_settings import SpendBreach, SpendSettingsError
-from agent_gateway.providers.anthropic import AnthropicProvider
-from agent_gateway.providers.anthropic_oauth import (
+from hank_model_transport.providers.anthropic import AnthropicProvider
+from hank_model_transport.providers.anthropic_oauth import (
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
   ANTHROPIC_DEPLOYMENT_API_KEY_FIELD,
   ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
@@ -36,7 +36,7 @@ from agent_gateway.providers.anthropic_oauth import (
   resolve_anthropic_credentials,
   select_anthropic_credential_source,
 )
-from agent_gateway.runner_auth import merge_refreshed_auth_config
+from hank_model_transport.runtime_helpers import merge_refreshed_auth_config
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 
 

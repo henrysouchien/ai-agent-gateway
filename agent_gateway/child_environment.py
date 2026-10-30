@@ -5,7 +5,7 @@ from typing import Dict, Mapping
 from .agent_session_log_layout import SESSION_LOG_LAYOUT_ENV
 from .gateway_address import GATEWAY_BASE_URL_ENV
 from .run_settings import SETTINGS_PATH_ENV
-from .user_runtime_credentials import USER_STORAGE_ID_ENV
+from hank_model_transport.user_runtime_credentials import USER_STORAGE_ID_ENV
 
 
 RUN_BASH_ENVIRONMENT = "run_bash"

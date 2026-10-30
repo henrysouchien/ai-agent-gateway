@@ -28,15 +28,15 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AnthropicProvider, ModelInfo
+from hank_model_transport.providers import AnthropicProvider, ModelInfo
 from model_authority.thinking import ThinkingLevel
-import agent_gateway.providers.anthropic as anthropic_provider_module
-from agent_gateway.providers.anthropic import (
+import hank_model_transport.providers.anthropic as anthropic_provider_module
+from hank_model_transport.providers.anthropic import (
   CREDENTIAL_MODEL_FAMILY_FIELD,
   _format_anthropic_rejection_detail,
 )
-from agent_gateway.providers import anthropic_oauth, anthropic_quota
-from agent_gateway.providers.anthropic_oauth import (
+from hank_model_transport.providers import anthropic_oauth, anthropic_quota
+from hank_model_transport.providers.anthropic_oauth import (
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
   ANTHROPIC_DEPLOYMENT_API_KEY_FIELD,
   ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
@@ -46,7 +46,7 @@ from agent_gateway.providers.anthropic_oauth import (
   anthropic_credential_blocked_until,
   resolve_anthropic_credentials,
 )
-from agent_gateway.providers import StreamEvent
+from hank_model_transport.providers import StreamEvent
 
 
 @pytest.mark.parametrize("env_name", [
@@ -266,7 +266,7 @@ def test_build_request_params_normalizes_bare_string_final_content_for_marker() 
 def test_build_request_params_skips_marker_without_cacheable_final_block(
   caplog: pytest.LogCaptureFixture,
 ) -> None:
-  caplog.set_level(logging.DEBUG, logger="agent_gateway.providers.anthropic")
+  caplog.set_level(logging.DEBUG, logger="hank_model_transport.providers.anthropic")
 
   params = AnthropicProvider().build_request_params(
     model="claude-sonnet-5",
@@ -902,7 +902,7 @@ def _sonnet_5_5_registry(monkeypatch) -> None:
   # setting; forced tool_choice is a 400 under every thinking setting.
   from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
   from model_authority.schema import SCHEMA, AnthropicMessagesCompat, AnthropicThinking
-  import agent_gateway.providers.base as provider_base
+  import hank_model_transport.providers.base as provider_base
 
   entry = ModelRegistryEntry(
     key="anthropic.claude-sonnet-5-5",
@@ -1007,7 +1007,7 @@ def test_tool_forcing_follows_compat_and_effective_thinking(
   from dataclasses import replace
   from model_authority.registry import ProductModelRegistry
   from model_authority.schema import SCHEMA, AnthropicMessagesCompat
-  import agent_gateway.providers.base as provider_base
+  import hank_model_transport.providers.base as provider_base
 
   entry = _registry_entry("output_config")
   data = entry.compat.model_dump()
@@ -1135,7 +1135,7 @@ def test_new_authority_entry_is_served_from_its_compat_alone(
   # and no rate row is served, its limits and thinking shape read from compat.
   from model_authority.registry import ProductModelRegistry
   from model_authority.schema import SCHEMA
-  import agent_gateway.providers.base as provider_base
+  import hank_model_transport.providers.base as provider_base
 
   entry = _registry_entry(effort_control)
   monkeypatch.setattr(
@@ -1636,7 +1636,7 @@ def test_stream_wraps_anthropic_rejection_with_sanitized_context_and_typed_code(
     "_provider_auth_mode": "oauth",
   }
 
-  with caplog.at_level(logging.WARNING, logger="agent_gateway.providers.anthropic"):
+  with caplog.at_level(logging.WARNING, logger="hank_model_transport.providers.anthropic"):
     with pytest.raises(RuntimeError) as exc_info:
       asyncio.run(_drain_stream(provider, client, params))
 
@@ -2304,7 +2304,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from agent_gateway.providers import anthropic_quota
+from hank_model_transport.providers import anthropic_quota
 
 store_path, namespace, identity, generation, now = sys.argv[1:]
 started = time.monotonic()
@@ -2983,7 +2983,7 @@ def test_normalize_messages_compaction_keeps_tool_pairing_after_anchor() -> None
 
 
 def test_truncate_helper_converts_compaction_to_text_for_foreign_providers() -> None:
-  from agent_gateway.providers.base import truncate_to_last_compaction
+  from hank_model_transport.providers.base import truncate_to_last_compaction
 
   messages = [
     {"role": "user", "content": "big history"},
@@ -3007,7 +3007,7 @@ def test_truncate_helper_converts_compaction_to_text_for_foreign_providers() -> 
 
 
 def test_truncate_helper_drops_orphaned_tool_results_from_anchor_prefix() -> None:
-  from agent_gateway.providers.base import truncate_to_last_compaction
+  from hank_model_transport.providers.base import truncate_to_last_compaction
 
   messages = [
     {"role": "user", "content": "q"},
@@ -3036,7 +3036,7 @@ def test_truncate_helper_drops_orphaned_tool_results_from_anchor_prefix() -> Non
 
 
 def test_truncate_helper_as_text_summary_ends_with_separator() -> None:
-  from agent_gateway.providers.base import truncate_to_last_compaction
+  from hank_model_transport.providers.base import truncate_to_last_compaction
 
   messages = [
     {

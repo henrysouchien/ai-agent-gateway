@@ -8,7 +8,7 @@ from .approval_policy import MONEY_BOUNDARY_TOOL_CLASSES, RunContext
 from .approval_enrichment import enrich_trade_approval_args
 from .approval_route import NoApprovalRoute, route_ledger
 from .mcp_client import registered_mcp_dispatch_scope
-from .policy_imports import resolve_effective_role, resolve_server_policy_tool_class
+from hank_model_transport.policy_imports import resolve_effective_role, resolve_server_policy_tool_class
 from .sdk_runner_helpers import (
   catalogless_policy_owner_mismatch,
   catalogless_tool_name,
@@ -16,7 +16,7 @@ from .sdk_runner_helpers import (
 )
 from .skill_limits import ActiveSkillAdmission
 from . import tool_dispatcher_approval_lifecycle as _approval_lifecycle_helpers
-from .tool_result_compaction import make_error_result
+from hank_model_transport.tool_errors import make_error_result
 from . import tool_redaction as _redaction
 
 log = logging.getLogger("agent_gateway.sdk_runner_approval")

@@ -38,7 +38,7 @@ from .batch_approval_projection import (
   acquire_batch_approval_admission,
   require_batch_stage_run_seq,
 )
-from .policy_imports import resolve_server_policy_tool_class
+from hank_model_transport.policy_imports import resolve_server_policy_tool_class
 from .secret_boundary import (
   SANITIZATION_FAILED,
   SecretBoundary,

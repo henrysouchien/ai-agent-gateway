@@ -62,7 +62,7 @@ class _CanvasBuildPreflightConfig:
 
 
 _CANVAS_BUILD_PREFLIGHT_CACHE: dict[
-  _CanvasBuildPreflightConfig, CanvasBuildPreflight | None,
+  _CanvasBuildPreflightConfig, CanvasBuildPreflight,
 ] = {}
 _CANVAS_BUILD_PREFLIGHT_LOCK = threading.Lock()
 
@@ -76,6 +76,27 @@ class CanvasBuildFailure(Exception):
   def payload(self) -> dict[str, Any]:
     return {"validation_failed": {"stage": self.stage, "diagnostics": self.diagnostics}}
 
+
+class CanvasBuildUnavailable(RuntimeError):
+  def __init__(self, cause: str, detail: str):
+    self.cause = cause
+    super().__init__(f"Canvas build preflight failed ({cause}): {detail}")
+
+  def payload(self) -> dict[str, Any]:
+    next_step = (
+      "Retry emit_canvas_artifact; the next call probes the toolchain again. "
+      "If the timeout persists, ask the operator to check CANVAS_BUILD_DIR and CANVAS_NODE_BINARY."
+      if self.cause == "preflight_timeout" else
+      "Ask the operator to configure or repair the Canvas toolchain with "
+      "canvas_build/provision.sh, then retry emit_canvas_artifact."
+    )
+    return {
+      "canvas_build_unavailable": {
+        "cause": self.cause,
+        "message": str(self),
+        "next_step": next_step,
+      }
+    }
 
 # Capability by construction: the build directory configured for this runtime
 # determines whether canvas building exists; it is not a per-run behaviour gate.
@@ -175,7 +196,7 @@ def _validate_canvas_build_environment(
 def preflight_canvas_build_environment(
   env: Mapping[str, str] | None = None,
 ) -> CanvasBuildPreflight | None:
-  """Return the process-owned Canvas capability snapshot for this configuration."""
+  """Return a cached successful probe, or raise a typed per-call availability failure."""
 
   values = os.environ if env is None else env
   raw_dir = str(values.get(CANVAS_BUILD_DIR_ENV, "")).strip()
@@ -193,14 +214,21 @@ def preflight_canvas_build_environment(
     try:
       preflight = _validate_canvas_build_environment(config)
     except subprocess.TimeoutExpired as exc:
-      log.warning(
-        "Canvas toolchain preflight timed out; Canvas artifacts are disabled "
-        "for this process configuration: %s",
-        exc,
-      )
-      preflight = None
+      log.warning("Canvas toolchain preflight timed out; the next call will probe again: %s", exc)
+      raise CanvasBuildUnavailable("preflight_timeout", str(exc)) from exc
+    except (OSError, RuntimeError) as exc:
+      raise CanvasBuildUnavailable("preflight_unavailable", str(exc)) from exc
     _CANVAS_BUILD_PREFLIGHT_CACHE[config] = preflight
     return preflight
+
+
+def require_canvas_build_environment(
+  env: Mapping[str, str] | None = None,
+) -> CanvasBuildPreflight:
+  preflight = preflight_canvas_build_environment(env)
+  if preflight is None:
+    raise CanvasBuildUnavailable("preflight_unavailable", "CANVAS_BUILD_DIR is not configured")
+  return preflight
 
 
 def sanitized_subprocess_env(
@@ -517,8 +545,9 @@ async def build_canvas_bundle_async(source: str, preflight: CanvasBuildPreflight
 
 __all__ = [
   "CANVAS_BUILD_DIR_ENV", "CANVAS_RUNTIME_SUPPORT_FILES",
-  "CanvasBuildFailure", "CanvasBuildPreflight",
+  "CanvasBuildFailure", "CanvasBuildPreflight", "CanvasBuildUnavailable",
   "build_canvas_bundle", "build_canvas_bundle_async", "canvas_build_enabled", "check_module_policy",
   "packaged_build_directory", "preflight_canvas_build_environment",
+  "require_canvas_build_environment",
   "sanitized_subprocess_env",
 ]

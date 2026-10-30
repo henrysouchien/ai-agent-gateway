@@ -58,13 +58,13 @@ from .claim_signing_authority import (
   configured_gateway_claim_signing_authority,
   sign_gateway_user_claim,
 )
-from .policy_imports import load_server_policy_helpers, update_mcp_tool_metadata
-from .providers.anthropic_oauth import (
+from hank_model_transport.policy_imports import load_server_policy_helpers, update_mcp_tool_metadata
+from hank_model_transport.providers.anthropic_oauth import (
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
   ANTHROPIC_STORE_BASE_ENV,
 )
-from .providers.credential_pool import scope_admits_operator_seats
-from .user_runtime_credentials import load_user_runtime_credentials
+from hank_model_transport.providers.credential_pool import scope_admits_operator_seats
+from hank_model_transport.user_runtime_credentials import load_user_runtime_credentials
 from .tool_definition import LiveToolRouteBinding, OriginatedToolDefinition
 from .tool_dispatch_classification import (
   OUTCOME_OK,

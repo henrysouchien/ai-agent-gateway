@@ -7,12 +7,19 @@ approval, and execution infrastructure around the model loop. Requires Python
 ## Ownership
 
 This package owns the generic FastAPI chat surface, sessions and JWTs, SSE event
-stream, provider/run loop, tool dispatch, approvals, code execution, skills,
+stream, model/tool run loop, tool dispatch, approvals, code execution, skills,
 sub-agents, autonomous execution, and heartbeat support.
 
 It does not own an embedding product's profiles, prompts, channel policy,
 domain tools, research data, or business schemas. Applications supply those
 through `create_gateway_app()` or the higher-level `create_agent()` inputs.
+
+Provider adapters, credential stores, transport types, and one-shot completion
+calls belong to [`hank_model_transport`](../model-transport/hank_model_transport/),
+not this package. The gateway retains `AuthConfig`, capability resolvers, and
+the host adapter `transport_runtime.GATEWAY_SEND_PROMPT_RUNTIME`. Host package
+metadata lives in `agent_gateway.gateway_info`; transport `package_info` describes
+only the transport package identity and version.
 
 The wheel imports without an application checkout. Product integrations bind
 policy and identity callbacks plus optional batch/operator-schedule backends in
@@ -76,9 +83,9 @@ A second approval park is a turn terminal, not the end of the continued run.
 | [`agent_gateway/containment_settings.py`](agent_gateway/containment_settings.py) | `ContainmentSettings` | Every containment bound (spawn depth, concurrent children, soft ladder per session kind, hung-child silence, context thresholds) as a live view over the operator run-settings file (`agent_gateway/run_settings.py`, `HANK_RUN_SETTINGS_PATH`); `ContainmentSettings(**overrides)` is the pinned form |
 | [`agent_gateway/heartbeat.py`](agent_gateway/heartbeat.py) | `HeartbeatLoop` | Repeated prebound autonomous work with quiet windows and backoff |
 | [`agent_gateway/cli.py`](agent_gateway/cli.py) | `main()` (`agent init` / `agent run`) | Scaffold and run a package project |
-| [`agent_gateway/send_prompt.py`](agent_gateway/send_prompt.py) | `send_prompt()` / `send_prompt_sync()` | One already-bound prompt→completion call returning text. `completion_record_root` is required keyword-only: pass a directory to append one `completion_record` v1 row per provider attempt, or `None` to state the call is not captured |
-| [`agent_gateway/completion_record.py`](agent_gateway/completion_record.py) | `build_completion_record()` / `append_completion_record()` | The `completion_record` v1 row for one-shot companion-repo model calls (contract: `contracts/completion-record-v1/completion_record.schema.json`); day-sharded `<root>/<YYYY-MM-DD>.jsonl`, append-only, never fails the call it records |
-| [`agent_gateway/runner_usage.py`](agent_gateway/runner_usage.py) | `apply_provider_diagnostics()` / `apply_thinking_event()` | Fold each provider call's `provider_response_id`, `provider_request_id`, `service_tier`, `rate_limit` (headers read once by `providers/response_diagnostics.py`) and the thinking tallies `thinking_chars` / `redacted_thinking_blocks` into a turn's usage, so `assistant_message.usage`, `turn_complete.usage`, the spend-row attrs and the completion record carry them; thinking blocks, `redacted_thinking` included, stay uncapped in `content_blocks` as the provider replay record |
+| [`hank_model_transport/send_prompt.py`](../model-transport/hank_model_transport/send_prompt.py) | `send_prompt()` / `send_prompt_sync()` | One already-bound prompt→completion call returning text. Supply `runtime=GATEWAY_SEND_PROMPT_RUNTIME` from `agent_gateway.transport_runtime`. `completion_record_root` is required keyword-only: pass a directory to append one `completion_record` v1 row per provider attempt, or `None` to state the call is not captured |
+| [`hank_model_transport/completion_record.py`](../model-transport/hank_model_transport/completion_record.py) | `build_completion_record()` / `append_completion_record()` | The `completion_record` v1 row for one-shot companion-repo model calls; day-sharded `<root>/<YYYY-MM-DD>.jsonl`, append-only, never fails the call it records |
+| [`agent_gateway/runner_usage.py`](agent_gateway/runner_usage.py) | `apply_provider_diagnostics()` / `apply_thinking_event()` | Fold each provider call's `provider_response_id`, `provider_request_id`, `service_tier`, `rate_limit` (headers read once by `hank_model_transport.providers.response_diagnostics`) and the thinking tallies `thinking_chars` / `redacted_thinking_blocks` into a turn's usage, so `assistant_message.usage`, `turn_complete.usage`, the spend-row attrs and the completion record carry them; thinking blocks, `redacted_thinking` included, stay uncapped in `content_blocks` as the provider replay record |
 | [`agent_gateway/gateway_address.py`](agent_gateway/gateway_address.py) | `gateway_base_url()` | The origin of the gateway a process talks to: the one reader of `GATEWAY_BASE_URL` and the one place its default is spelled |
 
 `run_gateway_server()` is the serving entry on both local supported launches, not
@@ -116,8 +123,8 @@ attempts; the runner emits `model_fallback`. The authenticated resolver
 remembers failed chain positions for fresh child runners, which resume at the
 first remaining entry without re-probing them. Declared resets and credential
 changes revive their entries; a newly prepared root turn starts at its primary.
-[`agent_gateway/providers/`](agent_gateway/providers/README.md) builds each request
-from the bound entry. Mechanism: [model authority](../../docs/reference/model-authority.md).
+[`hank_model_transport.providers`](../model-transport/hank_model_transport/providers/)
+builds each request from the bound entry. Mechanism: [model authority](../../docs/reference/model-authority.md).
 
 `admit(SpawnRequest(...), parent, owners=AdmissionOwners(...))` returns the
 selected context and exact `ResolvedAuthority`, without materializing credentials.
@@ -291,6 +298,23 @@ Serve the module with `uvicorn agent:app`. The default is the stable
 `session.driver` entry in the configured model registry; applications can pass
 another eligible stable `model_key`.
 
+For a one-shot call, pass an already-bound execution from the gateway's
+capability resolver and explicitly supply the gateway host runtime:
+
+```python
+from hank_model_transport.send_prompt import send_prompt
+from agent_gateway.transport_runtime import GATEWAY_SEND_PROMPT_RUNTIME
+
+async def complete(prompt, capability_execution, user_id):
+    return await send_prompt(
+        prompt,
+        capability_execution=capability_execution,
+        runtime=GATEWAY_SEND_PROMPT_RUNTIME,
+        user_id=user_id,
+        completion_record_root=None,
+    )
+```
+
 For OpenAI, install `ai-agent-gateway[openai]` and set `OPENAI_API_KEY`.
 Managed provider login flows are available through `agent auth login
 <provider> [--api-key]`. Supported doors:
@@ -309,7 +333,7 @@ Use `agent auth status <provider>` to inspect stored credentials without secret 
 
 Repeated `agent auth login <provider>` enrollments append accounts to the
 provider's multi-account credential pool, or update an existing account by
-identity without overwriting other seats. `providers/credential_pool.py` owns
+identity without overwriting other seats. `hank_model_transport.providers.credential_pool` owns
 the shared `"accounts"` store envelope, legacy single-record migration, and
 cooldowns for every pool provider except Anthropic. A scoped user's accounts
 lead the deployment pool; a usage limit that declares its reset parks that seat

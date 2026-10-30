@@ -13,7 +13,7 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway._provider_utils import _classify_anthropic_credential
+from hank_model_transport._provider_utils import _classify_anthropic_credential
 from agent_gateway.auth import (
   AuthConfig,
   AuthExpiredError,
@@ -26,7 +26,7 @@ from agent_gateway.auth import (
 )
 from agent_gateway.fork_request_handoff import ForkRequestHandoff
 from agent_gateway.tool_dispatcher import _SpawningTurn
-from agent_gateway.providers import AnthropicProvider
+from hank_model_transport.providers import AnthropicProvider
 from agent_gateway.session import GatewaySession
 from gateway_test_support.capability_execution_test_support import stub_runner_capability_execution
 from model_authority.capabilities import CAPABILITY_IDS

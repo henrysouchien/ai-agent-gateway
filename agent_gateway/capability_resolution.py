@@ -52,7 +52,7 @@ from agent_workflow_contracts import (
 )
 from agent_workflow_contracts.models import CatalogToolEffect
 
-from .policy_imports import load_server_policy_module
+from hank_model_transport.policy_imports import load_server_policy_module
 from .semantic_capability_routing import capability_for_tool
 from .semantic_capabilities import (
   DEFAULT_SEMANTIC_CAPABILITY_REGISTRY,

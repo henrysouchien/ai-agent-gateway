@@ -503,7 +503,7 @@ def test_placed_runtime_investment_children_inherit_the_desk_and_shared_children
   tmp_path, server_name
 ) -> None:
   from agent_gateway.runtime_placement import investment_state_dir, runtime_state_environment
-  from agent_gateway.user_runtime_credentials import USER_STORAGE_ID_ENV
+  from hank_model_transport.user_runtime_credentials import USER_STORAGE_ID_ENV
 
   launch = {
     "PATH": "/usr/bin:/bin",
@@ -561,7 +561,7 @@ def test_scoped_server_env_delivers_declared_passthrough_from_the_run_mapping() 
 
 
 def test_jobs_oauth_requires_the_bound_run_owner(monkeypatch) -> None:
-  from agent_gateway.providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
+  from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
 
   manager = McpClientManager(
     config_path=None,

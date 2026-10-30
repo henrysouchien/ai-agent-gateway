@@ -23,7 +23,7 @@ from agent_gateway.autonomous_runner_state import (
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
-from agent_gateway.capability_execution import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )
@@ -928,7 +928,7 @@ from agent_gateway.admission import root_context
 from agent_gateway.approval_policy import (
   ApprovalRequest, approval_request_projection, sha256_args, utc_now,
 )
-from agent_gateway.providers.anthropic_oauth import is_anthropic_generation_ref
+from hank_model_transport.providers.anthropic_oauth import is_anthropic_generation_ref
 envelope=json.loads(__import__("pathlib").Path(os.environ["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE"]).read_text(encoding="utf-8"))
 channel=adopt_inherited_autonomous_event_channel(
   int(os.environ[AUTONOMOUS_EVENT_CHANNEL_FD_ENV]), channel_id=envelope["channel_id"],
@@ -1109,10 +1109,97 @@ def test_private_child_operands_are_cold_readable_before_publication(
   asyncio.run(case())
 
 
+def test_rebound_capture_is_admitted_but_executor_requires_its_live_generation(
+  tmp_path: Path,
+) -> None:
+  from agent_gateway import ToolDispatcher
+  from agent_gateway.admission import capture_job_context, root_context
+  from agent_gateway.approval_route import DurableLocalApprovalRoute
+  from agent_gateway.mcp_client import McpClientManager
+  from agent_gateway.autonomous_launch_envelope import AutonomousLaunchEnvelope
+  from gateway_test_support.approval_policy_test_support import FixedOutcomeApprovalPolicy
+
+  async def case() -> None:
+    generation = "anthropic-generation-rebound"
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    source = _PRIVATE_CAPTURE_CHILD.replace(
+      "PRIVATE_PAYLOAD_OVERRIDE",
+      f"assert generation is None; private['credential_generation_ref']={generation!r}",
+    ).replace("for index in (1,2):", "for index in (1,):")
+    envelopes: list[AutonomousLaunchEnvelope] = []
+
+    class PublicationObserver:
+      async def publish(self, user_id, control_run_id, event) -> None:
+        if event.get("type") == "tool_approval_request":
+          child = registry._find_by_control_run_id(control_run_id)
+          assert child is not None and child.claim_broker is not None
+          envelopes.append(child.claim_broker.envelope)
+
+      async def cleanup_run(self, user_id, control_run_id) -> None:
+        return None
+
+    registry = _registry(
+      tmp_path / "runs", child_source=source, approval_store=store,
+      user_event_bus=PublicationObserver(),
+    )
+    started = await _start(registry)
+    status = await registry.wait(started["task_id"], timeout_sec=60)
+    assert status["state"] == "completed"
+    record = registry._tasks[started["task_id"]]
+    binding, request = await store._read_executable_binding_for_executor(
+      job_id=record.task_id, tool_call_id="private-call-1",
+      nonce="original-private-nonce-1", tenant_storage_id="owner-1",
+    )
+    assert binding.credential_generation_ref == generation
+    await store.transition_state(
+      request.approval_id, "approved",
+      expected_state_version=request.state_version, decider_id="owner-1", decider_role="owner",
+    )
+    assert len(envelopes) == 1
+    envelope = envelopes[0]
+    session = envelope.session_authority.to_gateway_session()
+    capture_job_context(session, replace(
+      root_context(session, withheld_tools=frozenset(), research_file_id=None),
+      job_id=record.task_id,
+    ))
+    executions: list[dict[str, Any]] = []
+
+    async def handler(tool_input: dict[str, Any], **_kwargs: Any):
+      executions.append(tool_input)
+      return {"ok": True}, None
+
+    route = DurableLocalApprovalRoute(
+      store, FixedOutcomeApprovalPolicy("request_user_approval"), session,
+    )
+    dispatcher = ToolDispatcher(
+      capability_bind=envelope.bind.model_copy(update={
+        "credential_ref": "anthropic-generation-different-live-bind",
+      }),
+      mcp_client=McpClientManager(config_path=None),
+      local_tool_handlers={"place_order": handler},
+      session=session, role="owner", approval_route=route,
+    )
+    result, error = await dispatcher.execute_approved_binding(
+      job_id=record.task_id, tool_call_id="private-call-1",
+      nonce="original-private-nonce-1", abort_event=None, on_executed_prepared_call=None,
+    )
+    assert result is None
+    assert error is not None
+    assert error["code"] == "approval_credential_generation_mismatch"
+    assert executions == []
+    assert await store._read_completed_executable_result_for_executor(binding=binding) is None
+
+  asyncio.run(case())
+
+
+
 @pytest.mark.parametrize("field,replacement", [
   ("job_id", "parent-job-not-child"),
   ("tenant_storage_id", "another-owner"),
-  ("credential_generation_ref", "anthropic-generation-another-source"),
+  ("credential_generation_ref", 1),
+  ("credential_generation_ref", True),
+  ("credential_generation_ref", []),
+  ("credential_generation_ref", {}),
   ("nonce", "different-from-public-nonce"),
   ("tool_name", "different-from-public-tool"),
   ("approval_id", "different-from-public-approval"),
@@ -1121,7 +1208,7 @@ def test_private_child_operands_are_cold_readable_before_publication(
 def test_private_capture_rejects_forged_child_identity_without_storing_request(
   tmp_path: Path,
   field: str,
-  replacement: str,
+  replacement: Any,
 ) -> None:
   async def case() -> None:
     store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")

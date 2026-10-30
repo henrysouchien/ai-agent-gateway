@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_gateway.auth import AuthConfig, ResolverResult
-from agent_gateway.capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from agent_gateway.event_log import EventLog
 from agent_gateway.mcp_client import McpClientManager
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY

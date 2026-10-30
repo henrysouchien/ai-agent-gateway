@@ -30,7 +30,7 @@ from .event_log import EventLog, log_has_terminal
 from .mcp_activation import McpActivationFold
 from .session_event_history import SessionEventHistory
 from .session_capabilities import normalize_session_capabilities
-from .policy_imports import require_inherited_role
+from hank_model_transport.policy_imports import require_inherited_role
 from .ttl_policy import SESSION_TTL, TtlResolver, default_ttl_resolver, resolve_ttl_seconds
 
 if TYPE_CHECKING:
@@ -46,7 +46,7 @@ if TYPE_CHECKING:
   from .code_execution._frame_reader import FrameReader
   from .runner_fork_agents import LearningForkConfig
   from .operation_catalog import AgentOperationCatalog
-  from .multi_user.billing import SessionUsageSummary
+  from hank_model_transport.multi_user.billing import SessionUsageSummary
   from .tool_result_spill import SpillSink
   from .dispatcher_factory import GatewayDispatcherDeps
 

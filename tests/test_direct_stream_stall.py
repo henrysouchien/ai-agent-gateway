@@ -15,15 +15,16 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.capability_execution import BoundCapabilityExecution
-from agent_gateway.multi_user.billing import UsageEvent
+from hank_model_transport.capability_execution import BoundCapabilityExecution
+from hank_model_transport.multi_user.billing import UsageEvent
 from agent_gateway.provider_summarize import ProviderSummarizeResult, provider_summarize
-from agent_gateway.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
-from agent_gateway.rate_limit import AnthropicTokenBucket
+from hank_model_transport.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
+from hank_model_transport.rate_limit import AnthropicTokenBucket
 from agent_gateway import runner_streaming
-from agent_gateway.send_prompt import send_prompt
+from hank_model_transport.send_prompt import send_prompt
 from model_authority.binding import CapabilityEffort
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
+from gateway_test_support.transport_runtime import TEST_SEND_PROMPT_RUNTIME
 
 summary_module = importlib.import_module("agent_gateway.provider_summarize")
 
@@ -151,6 +152,7 @@ async def _call_direct(
     )
   return await send_prompt(
     "hello",
+    runtime=TEST_SEND_PROMPT_RUNTIME,
     capability_execution=execution,
     user_id="alice",
     on_usage=usage_events.append,

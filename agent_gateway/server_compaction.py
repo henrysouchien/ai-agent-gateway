@@ -9,11 +9,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from .child_result_trust import UNTRUSTED_CHILD_RESULTS_POLICY
 from .provider_summarize import provider_summarize
-from .providers.base import ModelProvider
-from .runner_state import select_run_max_tokens
+from hank_model_transport.providers.base import ModelProvider
+from hank_model_transport.runtime_helpers import select_run_max_tokens
 from .runner_limits import compressible_message_tokens, estimate_tokens
 from model_authority.thinking import ThinkingLevel, parse_effort
 

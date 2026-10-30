@@ -6,7 +6,8 @@ from typing import Any
 
 import pytest
 
-from agent_gateway import AgentRunner, CostEstimate, EventLog, ModelInfo, ModelProvider
+from agent_gateway import AgentRunner, EventLog
+from hank_model_transport.providers import CostEstimate, ModelInfo, ModelProvider
 from agent_gateway.approval_policy import RunContext
 from agent_gateway.runner import StreamTurnResult
 from agent_gateway.run_identity import (

@@ -8,11 +8,12 @@ from typing import Any
 import httpx
 import pytest
 
-from agent_gateway import AuthConfig, OpenAIProvider, XAIProvider
-from agent_gateway._provider_utils import _resolve_provider, resolve_auth_config
+from agent_gateway import AuthConfig
+from hank_model_transport.providers import OpenAIProvider, XAIProvider
+from hank_model_transport._provider_utils import _resolve_provider, resolve_auth_config
 from model_authority.thinking import ThinkingLevel
-from agent_gateway.providers.xai_helpers import _ResponsesStreamState, map_event, resolve_responses_url
-from agent_gateway.providers.xai_oauth import (
+from hank_model_transport.providers.xai_helpers import _ResponsesStreamState, map_event, resolve_responses_url
+from hank_model_transport.providers.xai_oauth import (
   DEFAULT_XAI_OAUTH_CLIENT_ID,
   DEFAULT_XAI_OAUTH_SCOPE,
   save_xai_token_record,

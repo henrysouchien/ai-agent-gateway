@@ -29,9 +29,9 @@ from agent_workflow_contracts import (
 )
 
 from .admission import current_parent_context
-from .capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from .event_log import EventLog
-from .providers.anthropic import _is_cacheable_message_block
+from hank_model_transport.providers.anthropic import _is_cacheable_message_block
 from .runner_introspection import derive_sub_agent_id as _derive_sub_agent_id
 from .runner_session_lifecycle import _runner_attr
 from .runner_cleanup import cleanup_failure_notes
@@ -73,7 +73,7 @@ if TYPE_CHECKING:
   from .containment_settings import ContainmentSettings
   from .mcp_activation import McpActivationFold
   from .mcp_client import McpClientManager
-  from .multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator
+  from hank_model_transport.multi_user.billing import SessionUsageSummary, UsageEvent, _UsageAggregator
   from .runner_state import SubAgentConfig, ToolResultContext
   from .tool_result_spill import SpillSink
 
@@ -484,7 +484,6 @@ class RunnerSubAgentMixin:
       spill_sink=child_spill_sink,
       bind_job_runner=bind_job_runner,
     )
-    dispatcher.bind_research_file_activity_owner(sub_runner.ensure_research_file_activity)
     stalled = False
     runtime_exception_detail: str | None = None
     cancelled_error: asyncio.CancelledError | None = None
@@ -836,7 +835,6 @@ class RunnerSubAgentMixin:
       sub_runner.bind_resume_approved_call(
         approved_call, dispatcher.execute_approved_binding,
       )
-    dispatcher.bind_research_file_activity_owner(sub_runner.ensure_research_file_activity)
     if bind_research_file_activity_lease_func is not None:
       bind_research_file_activity_lease_func(sub_runner)
     sub_runner._resume_parent_messages_for_ack = tuple(parent_messages)

@@ -9,7 +9,7 @@ import pytest
 
 from agent_gateway import server_artifact_helpers
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
-from agent_gateway.user_runtime_credentials import (
+from hank_model_transport.user_runtime_credentials import (
   APPROVAL_CLAIM_KEY_SCHEME, USER_RUNTIME_CREDENTIALS_FILE_ENV, DeskReplica, UserRuntimeIdentity,
   bundle_from_json, bundle_storage_id, bundle_to_json, derive_approval_claim_key,
   load_user_runtime_credentials, mint_user_runtime_credentials, write_user_runtime_credentials,

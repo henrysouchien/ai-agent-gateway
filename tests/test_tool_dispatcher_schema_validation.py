@@ -448,40 +448,47 @@ def test_local_tool_schema_validation_rechecks_approval_modified_args(tmp_path: 
 
 def test_deferred_local_tool_missing_schema_names_pack_and_load_tools_next_call() -> None:
   from types import SimpleNamespace
-  from agent_gateway.policy_imports import configure_server_policy, load_server_policy_module
-  from agent_gateway.tool_dispatcher_helpers import active_local_tool_schema
+  from hank_model_transport.policy_imports import configure_server_policy, load_server_policy_module
+
+  policy_calls: list[tuple[str, str, str | None]] = []
+
+  def deferred_pack(name: str, channel: str, *, profile_name: str | None = None) -> str:
+    policy_calls.append((name, channel, profile_name))
+    return "research"
 
   previous_policy = load_server_policy_module()
-  configure_server_policy(
-    SimpleNamespace(
-      deferred_local_tool_pack=lambda name, channel="cli": (
-        "fms-analysis"
-        if name == "fms_propose_critical_factors" and channel == "web"
-        else None
-      )
-    )
-  )
+  configure_server_policy(SimpleNamespace(deferred_local_tool_pack=deferred_pack))
   try:
-    schema, error = active_local_tool_schema(
-      lambda: [],
-      "fms_propose_critical_factors",
-      channel="web",
+    dispatcher = ToolDispatcher(
+      capability_bind=TEST_CAPABILITY_BIND,
+      mcp_client=_NullMcpClient(),
+      local_tool_handlers={},
+      run_context=RunContext(
+        user_id="alice",
+        request_id="deferred-hint-request",
+        channel="web",
+        profile_name="researcher",
+      ),
+      session=SimpleNamespace(channel="web"),
+      get_tool_definitions=lambda: [],
     )
+    schema, error = dispatcher._active_local_tool_schema("deferred_research_tool")
   finally:
     configure_server_policy(previous_policy)
 
   assert schema is None
+  assert policy_calls == [("deferred_research_tool", "web", "researcher")]
   assert error == {
     "code": "tool_schema_unavailable",
     "message": (
-      "Cannot validate local tool 'fms_propose_critical_factors': "
-      "its definition is absent from the active tool catalog (deferred in pack 'fms-analysis')."
+      "Cannot validate local tool 'deferred_research_tool': "
+      "its definition is absent from the active tool catalog (deferred in pack 'research')."
     ),
     "details": {
-      "tool_name": "fms_propose_critical_factors",
+      "tool_name": "deferred_research_tool",
       "reason": "tool_definition_missing",
-      "pack": "fms-analysis",
+      "pack": "research",
     },
-    "fix": 'Load tool pack "fms-analysis" with load_tools(pack="fms-analysis") and retry.',
-    "next_call": {"tool_name": "load_tools", "arguments": {"pack": "fms-analysis"}},
+    "fix": 'Load tool pack "research" with load_tools(pack="research") and retry.',
+    "next_call": {"tool_name": "load_tools", "arguments": {"pack": "research"}},
   }

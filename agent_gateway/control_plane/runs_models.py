@@ -254,6 +254,7 @@ class AutonomousDispatchRequest(BaseModel):
   context: str | None = None
   channel: str | None = None
   research_file_id: int | None = Field(default=None, ge=1)
+  dispatch_start_decision_id: int | None = Field(default=None, ge=0, strict=True)
   dispatch_scope: DispatchScope | None = None
   # A published preset name the skill launch's subtree admits under.
   model_preset: str | None = None

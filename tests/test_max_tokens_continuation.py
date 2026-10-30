@@ -16,16 +16,18 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import (  # noqa: E402
+from agent_gateway import (
   AgentRunner,
-  AgentSDKConfig,
   AgentSDKRunner,
   AgentSessionLog,
-  CostEstimate,
   EventLog,
   McpClientManager,
-  ModelInfo,
   ToolDispatcher,
+)
+from hank_model_transport.providers import (
+  AgentSDKConfig,
+  CostEstimate,
+  ModelInfo,
 )
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 from agent_gateway.runner import _MAX_TOKENS_NUDGE, StreamTurnResult  # noqa: E402

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from agent_gateway.user_identity_mapping import RunOwnerUnresolved, risk_user_id_for
-from agent_gateway.user_runtime_credentials import (
+from hank_model_transport.user_runtime_credentials import (
   USER_RUNTIME_CREDENTIALS_FILE_ENV,
   DeskReplica,
   UserRuntimeIdentity,

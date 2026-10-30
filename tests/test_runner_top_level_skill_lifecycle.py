@@ -22,8 +22,8 @@ for path in (PKG_DIR, TESTS_DIR):
 from agent_gateway import AgentRunner, AgentSessionLog, EventLog  # noqa: E402
 from agent_gateway.agent_session_log_records import EVENT_SCHEMA_VERSION  # noqa: E402
 import agent_gateway.skill_completion_wal as completion_wal_module  # noqa: E402
-from agent_gateway.providers import StreamEvent  # noqa: E402
-from agent_gateway.providers.anthropic import AnthropicProvider  # noqa: E402
+from hank_model_transport.providers import StreamEvent  # noqa: E402
+from hank_model_transport.providers.anthropic import AnthropicProvider  # noqa: E402
 from agent_gateway.runner_run_loop_defaults import MAX_TOKENS_NUDGE  # noqa: E402
 from agent_gateway.runner_session_events import (  # noqa: E402
   build_skill_run_started_event,
@@ -2411,7 +2411,7 @@ def test_resume_assistant_tail_without_tool_use_builds_user_final_request(
       assert messages[:-1] == resume
       assert messages[-1] == {"role": "user", "content": expect_nudge}
     caplog.clear()
-    caplog.set_level(logging.ERROR, logger="agent_gateway.providers.anthropic")
+    caplog.set_level(logging.ERROR, logger="hank_model_transport.providers.anthropic")
     provider = AnthropicProvider()
     normalized = provider.normalize_messages(
       messages,

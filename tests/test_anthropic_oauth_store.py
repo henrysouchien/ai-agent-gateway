@@ -20,9 +20,9 @@ import pytest
 
 from agent_gateway import create_agent
 from agent_gateway import cli as agent_cli
-from agent_gateway.providers import anthropic_oauth
-from agent_gateway.providers import anthropic_quota as quota
-from agent_gateway.providers.anthropic_oauth import (
+from hank_model_transport.providers import anthropic_oauth
+from hank_model_transport.providers import anthropic_quota as quota
+from hank_model_transport.providers.anthropic_oauth import (
   ANTHROPIC_OAUTH_CLIENT_ID,
   ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
   ANTHROPIC_USER_SCOPE_FIELD,
@@ -1544,7 +1544,7 @@ def test_exact_lookup_and_read_paths_never_write_a_read_only_store(
   assert path.read_bytes() == saved
   # A pool resolve reconciles env and therefore writes: an unwritable store is
   # the owner's typed error, never a raw PermissionError.
-  from agent_gateway.providers.anthropic_oauth import AnthropicStoreError
+  from hank_model_transport.providers.anthropic_oauth import AnthropicStoreError
 
   with pytest.raises(AnthropicStoreError) as unreadable:
     resolve_anthropic_credentials(
@@ -2029,7 +2029,7 @@ def test_distinct_custom_stores_in_one_directory_have_independent_state(tmp_path
 _REFRESH_WORKER = textwrap.dedent('''
   import sys, time
   from pathlib import Path
-  from agent_gateway.providers import anthropic_oauth as oauth
+  from hank_model_transport.providers import anthropic_oauth as oauth
 
   store, ready, exchanges, name = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
   [record] = oauth.load_anthropic_oauth_store(store)

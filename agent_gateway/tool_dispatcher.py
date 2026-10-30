@@ -29,7 +29,7 @@ from agent_workflow_contracts.tool_registration import (
 from .admission import ParentContext
 from . import admission
 from .events import ApprovalDecisionSource
-from .providers.anthropic_oauth import is_anthropic_generation_ref
+from hank_model_transport.providers.anthropic_oauth import is_anthropic_generation_ref
 from .approval_policy import (
   ApprovalConstraint,
   ApprovalConstraintError,
@@ -72,7 +72,7 @@ from .investment_capability_claim import (
 )
 from .mcp_client_catalog import tool_argument_guidance
 from .mcp_client import McpInvocationReport, RegisteredMcpPlannedToolCall, RegisteredMcpToolCall, registered_mcp_dispatch_scope
-from .policy_imports import (
+from hank_model_transport.policy_imports import (
   load_server_policy_module,
   authority_policy_denies_tool,
   resolve_effective_role,
@@ -567,7 +567,7 @@ class ToolDispatcher:
     self._source_pack_session = session
     self._session = session
     self._run_context = run_context
-    self._research_file_activity_owner: Callable[[Path, int], bool] | None = None
+    self._research_file_activity_owner: Callable[[Path, int], bool]
     self._get_tool_definitions = get_tool_definitions
     self._mcp_scope_context = mcp_scope_context
     self._describe_mcp_scope_block = describe_mcp_scope_block
@@ -649,18 +649,7 @@ class ToolDispatcher:
   def _ensure_research_file_activity(
     self, workspace_dir: Path, research_file_id: int
   ) -> bool:
-    # Interactive construction precedes the runner. The active turn supplies
-    # that same owner by the time a tool can execute; autonomous and delegated
-    # dispatchers bind their exact runner before starting it.
-    ensure_activity = self._research_file_activity_owner
-    if ensure_activity is None:
-      session = self._session
-      assert session is not None, "interactive activity requires its session"
-      active_turn = session.active_turn
-      assert active_turn is not None, "interactive activity requires its live turn"
-      assert active_turn.runtime_owner is not None, "live turn has no runner owner"
-      ensure_activity = active_turn.runtime_owner.ensure_research_file_activity
-    return ensure_activity(workspace_dir, research_file_id)
+    return self._research_file_activity_owner(workspace_dir, research_file_id)
 
   @property
   def run_context(self) -> RunContext | None:
@@ -782,6 +771,7 @@ class ToolDispatcher:
       self._get_tool_definitions,
       tool_name,
       channel=getattr(self._session, "channel", None),
+      profile_name=getattr(self._run_context, "profile_name", None),
     )
 
   @staticmethod

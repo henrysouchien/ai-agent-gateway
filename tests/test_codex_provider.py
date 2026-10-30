@@ -15,10 +15,10 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.providers import CodexProvider
+from hank_model_transport.providers import CodexProvider
 from model_authority.thinking import ThinkingLevel
-import agent_gateway.providers.codex_helpers as codex_helpers
-from agent_gateway.providers.codex import (
+import hank_model_transport.providers.codex_helpers as codex_helpers
+from hank_model_transport.providers.codex import (
   CodexCredentialExpired,
   _ResponsesStreamState,
   _convert_messages,
@@ -28,7 +28,7 @@ from agent_gateway.providers.codex import (
   _parse_sse,
   _resolve_codex_url,
 )
-from agent_gateway.providers.codex_helpers import (
+from hank_model_transport.providers.codex_helpers import (
   JWT_CLAIM_PATH,
   _encode_text_signature_v1,
 )
@@ -163,7 +163,7 @@ def test_new_authority_entry_is_served_from_its_compat_alone(monkeypatch) -> Non
   from gateway_test_support.model_defaults import compat_for_profile
   from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
   from model_authority.schema import SCHEMA
-  import agent_gateway.providers.base as provider_base
+  import hank_model_transport.providers.base as provider_base
 
   entry = ModelRegistryEntry(
     key="codex.gpt-5-7-sol",

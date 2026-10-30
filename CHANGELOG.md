@@ -2,8 +2,25 @@
 
 ## Unreleased
 
+## 0.31.1 (2026-10-30)
+
+### Fixed
+
+- Migrate the remaining `sub_agent` product and facade test consumers to
+  `hank_model_transport`, and require transport `>=1.0.2` so installed consumers
+  carry the run-owner/credential-tier spend attribution repair.
+- Use CLI `0.8.18` for the matching gateway/transport runtime cohort.
+
+## 0.31.0 (2026-10-30)
+
 ### Changed
 
+- BREAKING: provider adapters, credential stores, transport contracts, execution
+  binding, and one-shot completion calls move to `hank-model-transport>=1,<2`
+  (import `hank_model_transport`). Import them from their new owner; the removed
+  gateway modules have no compatibility reexports. The gateway keeps host
+  authentication, capability resolution, and `transport_runtime.GATEWAY_SEND_PROMPT_RUNTIME`.
+  Use CLI `0.8.17` for local execution against this package layout.
 - Fixed the publish-before-park approval race: original-token votes for durable parks use durable continuation even before pending cleanup, preserving exactly-once execution of the original call.
 - BREAKING: `GatewayServerConfig.service_auth_config_resolver` is called as `resolver(handle, user_scope=<effective run scope>)`. Implementations must accept the keyword; static already-resolved service configs may ignore it. Chat and authenticated or standalone batch runs pass their actual session/user scope, and startup-bound service materialization keeps the startup owner scope established at registration.
 

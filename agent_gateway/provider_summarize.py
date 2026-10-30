@@ -6,13 +6,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from model_authority.binding import validate_reported_identity
-from .capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from .runner_hooks_lifecycle import prepare_session_id, rebind_refreshed_credential
 from model_authority.thinking import parse_effort
 from .runner_stream_turn import STREAM_PROGRESS_LOG_INTERVAL
-from .runner_state import select_run_max_tokens
+from hank_model_transport.runtime_helpers import select_run_max_tokens
 from .runner_streaming import _stream_with_stall_timeout
-from .spend_metering import ProviderCallMeter
+from hank_model_transport.spend_metering import ProviderCallMeter
+from .transport_runtime import GATEWAY_SEND_PROMPT_RUNTIME
 
 
 DEFAULT_SUMMARY_SYSTEM_PROMPT = "You write cumulative narrative summaries of autonomous analyst sessions."
@@ -163,6 +164,7 @@ async def provider_summarize(
       run_config["auth_mode"] = str(run_config.get("auth_mode", "api")).strip().lower() or "api"
   bind = capability_execution.bind
   meter = ProviderCallMeter(
+    runtime=GATEWAY_SEND_PROMPT_RUNTIME,
     provider=provider,
     provider_name=bind.provider,
     model=model,

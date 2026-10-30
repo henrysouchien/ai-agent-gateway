@@ -22,15 +22,15 @@ if str(PKG_DIR) not in sys.path:
 from agent_gateway import AgentRunner, EventLog, ToolDispatcher
 from model_authority.binding import CapabilityResolutionError
 from agent_gateway.agent_session_log import AgentSessionLog
-from agent_gateway.openai_history_fence import REASONING_SIGNATURE_MARKER, TEXT_SIGNATURE_MARKER
+from hank_model_transport.openai_history_fence import REASONING_SIGNATURE_MARKER, TEXT_SIGNATURE_MARKER
 from model_authority.current import INITIAL_MODEL_REGISTRY
 from model_authority.registry import ProductModelRegistry
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.provider_summarize import provider_summarize
-from agent_gateway.providers import OpenAIProvider
+from hank_model_transport.providers import OpenAIProvider
 from model_authority.thinking import ThinkingLevel
-from agent_gateway.providers.openai import OpenAIConfigurationError
-from agent_gateway.providers.openai_responses_helpers import _ResponsesStreamState, map_event
+from hank_model_transport.providers.openai import OpenAIConfigurationError
+from hank_model_transport.providers.openai_responses_helpers import _ResponsesStreamState, map_event
 from agent_gateway.tool_policy_registry import PreparedToolCall
 from gateway_test_support.capability_execution_test_support import (
   stub_runner_capability_execution,
@@ -500,7 +500,7 @@ def test_new_authority_entry_is_served_from_its_compat_alone(monkeypatch) -> Non
   from gateway_test_support.model_defaults import compat_for_profile
   from model_authority.registry import ModelRegistryEntry
   from model_authority.schema import SCHEMA
-  import agent_gateway.providers.base as provider_base
+  import hank_model_transport.providers.base as provider_base
 
   entry = ModelRegistryEntry(
     key="openai.gpt-6",

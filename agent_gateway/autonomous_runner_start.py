@@ -87,7 +87,7 @@ from .child_environment import (
 )
 from .role_validation import require_exact_role
 from .named_refusal import NamedRefusal
-from .providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
+from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
 from .ttl_policy import (
   AUTONOMOUS_SESSION_AUTHORITY_TTL,
   default_ttl_resolver,
@@ -1359,6 +1359,7 @@ class AutonomousRegistryStartMixin:
     context: str | None = None,
     ticker: str | None = None,
     research_file_id: int | None = None,
+    dispatch_start_decision_id: int | None = None,
     channel: str | None = None,
     dispatch_scope: dict[str, Any] | None = None,
     resumed_from: str | None = None,
@@ -1368,6 +1369,11 @@ class AutonomousRegistryStartMixin:
     model_preset: str | None = None,
     approval_continuation: dict[str, Any] | None = None,
   ) -> dict[str, Any]:
+    if dispatch_start_decision_id is not None and (
+      type(dispatch_start_decision_id) is not int
+      or dispatch_start_decision_id < 0
+    ):
+      raise ValueError("dispatch_start_decision_id must be a non-negative integer")
     with self._admission_lease():
       in_flight_at_start = await self._reserve_slot()
     task_id = self._next_task_id()
@@ -1721,6 +1727,7 @@ class AutonomousRegistryStartMixin:
         skill_resume_allowed=skill_resume_allowed,
         admitted_skill_execution_limits=admitted_skill_execution_limits,
         research_file_id=normalized_research_file_id,
+        dispatch_start_decision_id=dispatch_start_decision_id,
         autonomous_in_flight_at_start=in_flight_at_start,
         state="starting",
         log_handle=log_handle,

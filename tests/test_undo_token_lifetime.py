@@ -17,7 +17,8 @@ if str(TESTS_DIR) not in sys.path:
   sys.path.insert(0, str(TESTS_DIR))
 
 import test_session_resume as resume_helpers  # noqa: E402
-from agent_gateway import AgentRunner, StreamEvent, ToolDispatcher, ToolResultContext  # noqa: E402
+from agent_gateway import AgentRunner, ToolDispatcher, ToolResultContext
+from hank_model_transport.providers import StreamEvent  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.undo_token_lifetime import (  # noqa: E402
   UndoTokenLifetimeRegistry,

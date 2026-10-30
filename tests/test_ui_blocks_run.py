@@ -7,17 +7,17 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from agent_gateway.capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from agent_gateway.approval_policy import RunContext
 from model_authority.binding import CredentialHandle
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.event_log import EventLog
 from agent_gateway.events import UiBlocksReadyEvent, event_from_dict, event_to_dict
-from agent_gateway.providers import AnthropicProvider
+from hank_model_transport.providers import AnthropicProvider
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.runner import AgentRunner
-from agent_gateway.server import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 from agent_gateway.server_chat_helpers import _dispatch_chat_turn
 from agent_gateway.server_models import (
   ChatMessage,

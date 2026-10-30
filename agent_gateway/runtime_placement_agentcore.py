@@ -29,7 +29,7 @@ from .runtime_placement import (
   WriterRecord, _storage_id,
 )
 from .runtime_tunnel import Handler, TunnelClosed, TunnelEndpoint, TunnelRequest, TunnelResponse
-from .user_runtime_credentials import (
+from hank_model_transport.user_runtime_credentials import (
   DeskReplica, USER_RUNTIME_CREDENTIALS_FILE_ENV,
   UserRuntimeIdentity, bundle_to_json, load_user_runtime_credentials,
 )

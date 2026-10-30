@@ -92,7 +92,7 @@ sys.path.insert(0, str(installed))
 import agent_gateway
 import agent_workflow_contracts
 from agent_gateway import ToolDispatcher
-from agent_gateway import policy_imports
+from hank_model_transport import policy_imports
 from model_authority.bind import CapabilityBind
 
 TEST_CAPABILITY_BIND = CapabilityBind(

@@ -9,7 +9,7 @@ from uuid import UUID
 
 from model_authority.bind import CapabilityBind
 
-from .multi_user.billing import SessionUsageSummary
+from hank_model_transport.multi_user.billing import SessionUsageSummary
 
 from hank_contracts.usage import (
   UsageDurability,

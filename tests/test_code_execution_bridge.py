@@ -37,7 +37,7 @@ from agent_gateway.claim_signing_authority import (
   LEGACY_CLAIM_HMAC_KEY_ENV,
   install_gateway_claim_signing_authority,
 )
-from agent_gateway.user_runtime_credentials import (
+from hank_model_transport.user_runtime_credentials import (
   DeskReplica,
   USER_RUNTIME_CREDENTIALS_FILE_ENV,
   UserRuntimeIdentity,
@@ -53,7 +53,7 @@ from agent_gateway.code_execution._backends._kernel import KernelBackend
 from agent_gateway.code_execution._frame_codec import decode_frame
 from agent_gateway.event_log import EventLog
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.policy_imports import configure_server_policy, load_server_policy_module
+from hank_model_transport.policy_imports import configure_server_policy, load_server_policy_module
 from agent_gateway.session import SessionStream
 from agent_gateway.task_registry import TaskEntry, TaskState
 from agent_gateway.tool_dispatcher_helpers import ToolResult

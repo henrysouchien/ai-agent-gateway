@@ -39,7 +39,7 @@ from .approval_remote import (
   BlockingApprovalsEgressTransport,
   BoundApprovalRemoteClient,
 )
-from .user_runtime_credentials import UserRuntimeCredentials, load_user_runtime_credentials
+from hank_model_transport.user_runtime_credentials import UserRuntimeCredentials, load_user_runtime_credentials
 
 StoreT = TypeVar(
   "StoreT", bound=ApprovalRequestStore, default=SQLiteApprovalStore, covariant=True,

@@ -27,7 +27,7 @@ from agent_gateway.login_flows import (
   get_login_flow,
   run_loopback_oauth_flow,
 )
-from agent_gateway.providers import (
+from hank_model_transport.providers import (
   google_oauth,
   copilot_oauth,
   google_antigravity_oauth,

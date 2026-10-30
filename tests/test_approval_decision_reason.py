@@ -10,6 +10,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from agent_gateway import AgentRunner
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.approval_audit import ApprovalAuditEmitter
 from agent_gateway.approval_policy import RunContext
@@ -26,7 +27,6 @@ from agent_gateway.server_models import ToolApprovalRequest
 from agent_gateway.server_tool_routes import tool_approval_response
 from agent_gateway.session import SessionStore
 from agent_gateway.tool_dispatcher import ToolDispatcher
-from agent_gateway.tool_policy_registry import PreparedToolCall
 from gateway_test_support.approval_policy_test_support import FixedOutcomeApprovalPolicy
 from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
 from gateway_test_support.host_policy import owner_session_host_policy
@@ -60,8 +60,9 @@ def test_interactive_reason_reaches_audit_session_projection_and_tool_result(
       executed.append(tool_input)
       return {"ok": True}, None
 
+    execution = stub_capability_execution_resolver().resolve("session.driver")
     dispatcher = ToolDispatcher(
-      capability_bind=stub_capability_execution_resolver().resolve("session.driver").bind,
+      capability_bind=execution.bind,
       mcp_client=McpClientManager(config_path=None),
       local_tool_handlers={"write_tool": write_tool},
       needs_approval=lambda *_args: True,
@@ -72,9 +73,21 @@ def test_interactive_reason_reaches_audit_session_projection_and_tool_result(
       run_context=RunContext(user_id="alice", request_id="request-1", session_id=session.session_id),
     )
     dispatcher.bind_secret_boundary(SecretBoundary(()))
-    call = asyncio.create_task(dispatcher.dispatch_prepared(
-      "call-1", "write_tool", PreparedToolCall({"ticker": "MSFT"}),
-      advertised_tool_names=frozenset({"write_tool"}),
+    runner = AgentRunner(
+      event_log=event_log,
+      dispatcher=dispatcher,
+      session_id=session.session_id,
+      capability_execution=execution,
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+      agent_session_log=session.agent_session_log,
+    )
+    # Match the real-tool journal fixture: normal run() binds this at attach.
+    runner._runner_id = "writer-approval-reason"
+    call = asyncio.create_task(runner._execute_single_tool(
+      "call-1", "write_tool", {"ticker": "MSFT"},
+      {"tools": [], "_request_advertised_tool_names": frozenset({"write_tool"})},
     ))
 
     async def wait_for_approval() -> dict[str, Any]:
@@ -99,15 +112,26 @@ def test_interactive_reason_reaches_audit_session_projection_and_tool_result(
         ),
       )
       assert response.status_code == 200
-      result, error = await asyncio.wait_for(call, 10)
+      model_result, tool_name, _extras = await asyncio.wait_for(call, 10)
+      assert tool_name == "write_tool"
       assert bool(executed) is approved
+      completion = next(
+        entry.event for entry in reversed(event_log.entries)
+        if entry.event["type"] == "tool_call_complete"
+      )
       if approved:
-        assert result == {"ok": True} and error is None
+        assert completion["result"] == {"ok": True} and completion["error"] is None
+        assert not model_result.get("is_error")
       else:
-        assert result is None
-        assert error is not None
-        assert error["code"] == "user_denied"
-        assert error["message"] == f"Tool call denied by user: {reason}"
+        assert completion["result"] is None
+        assert completion["error"]["code"] == "user_denied"
+        assert completion["error"]["message"] == f"Tool call denied by user: {reason}"
+        assert model_result["is_error"] is True
+        model_error = json.loads(model_result["content"])["error"]
+        assert model_error["code"] == "user_denied"
+        assert model_error["message"] == completion["error"]["message"]
+      completions, _ = await session.agent_session_log.query(event_types={"tool_call_complete"})
+      assert completions[-1].event["error"] == completion["error"]
 
       approval_id = pending["approval_id"]
       stored = await store.get(approval_id)

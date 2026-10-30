@@ -14,7 +14,8 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog
+from hank_model_transport.providers import AgentSDKConfig
+from agent_gateway import AgentSDKRunner, EventLog
 from model_authority.binding import CapabilityResolutionError
 from model_authority.registry import ProductModelRegistry
 import agent_gateway.sdk_runner as sdk_runner  # noqa: E402

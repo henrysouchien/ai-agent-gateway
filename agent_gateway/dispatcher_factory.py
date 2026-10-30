@@ -10,7 +10,7 @@ from .approval_route import (
   DurableLocalApprovalRoute,
 )
 from .session import GatewaySession
-from .policy_imports import resolve_effective_role
+from hank_model_transport.policy_imports import resolve_effective_role
 from .tool_dispatcher import (
   ApprovalKeyQualifier,
   ToolDispatcher,

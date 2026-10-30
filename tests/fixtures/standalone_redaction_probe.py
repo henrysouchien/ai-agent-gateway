@@ -19,12 +19,12 @@ sys.path.insert(0, str(installed))
 import agent_gateway
 from agent_gateway import AgentRunner, EventLog, ToolDispatcher
 from agent_gateway.agent_session_log import AgentSessionLog
-from agent_gateway.capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from agent_gateway.mcp_client import McpClientManager
 from model_authority.registry import ModelRegistryEntry, ProductModelRegistry
 from model_authority.current import INITIAL_MODEL_REGISTRY
 from model_authority.schema import SCHEMA
-from agent_gateway.providers import OpenAIProvider
+from hank_model_transport.providers import OpenAIProvider
 from model_authority.bind import CapabilityBind
 
 

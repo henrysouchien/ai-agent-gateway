@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, BinaryIO, Callable
 
 from model_authority.binding import CredentialHandle
-from .capability_execution import MaterializedCredential
+from hank_model_transport.capability_execution import MaterializedCredential
 
 
 AUTONOMOUS_CREDENTIAL_HANDOFF_ENV = (

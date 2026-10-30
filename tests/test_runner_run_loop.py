@@ -18,18 +18,20 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import (  # noqa: E402
+from agent_gateway import (
   AgentRunner,
   AgentSessionLog,
   CoordinatorConfig,
-  CostEstimate,
   EventLog,
-  ModelInfo,
-  ModelProvider,
   TaskNotification,
   TaskState,
   ToolResultContext,
   ToolDispatcher,
+)
+from hank_model_transport.providers import (
+  CostEstimate,
+  ModelInfo,
+  ModelProvider,
 )
 from model_authority.binding import CapabilityResolutionError, CredentialHandle
 from agent_gateway.containment_settings import ContainmentSettings
@@ -382,7 +384,7 @@ class _RetiredGenerationProvider(_CredentialProvider):
 
   def create_client(self, config: dict[str, Any], *, timeout: float | None = None) -> Any:
     _ = config, timeout
-    from agent_gateway.providers.anthropic_oauth import AnthropicSourceError
+    from hank_model_transport.providers.anthropic_oauth import AnthropicSourceError
 
     raise AnthropicSourceError("superseded")
 

@@ -15,7 +15,8 @@ if str(PKG_DIR) not in sys.path:
 
 import agent_gateway.runner_usage as runner_usage  # noqa: E402
 from agent_gateway.commercial_usage import CommercialUsageProducer  # noqa: E402
-from agent_gateway.multi_user.billing import SessionUsageSummary  # noqa: E402
+from hank_model_transport.multi_user.billing import SessionUsageSummary  # noqa: E402
+from hank_model_transport.runtime_helpers import empty_usage_totals  # noqa: E402
 from model_authority.bind import CapabilityBind
 
 
@@ -33,7 +34,7 @@ class _FailingProducer(CommercialUsageProducer):
 
 
 def _usage_event():
-  totals = runner_usage.empty_usage_totals()
+  totals = empty_usage_totals()
   totals["input_tokens"] = 1
   totals["capability_bind"] = CapabilityBind(
     schema_version="1.0",

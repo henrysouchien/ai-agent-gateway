@@ -22,10 +22,10 @@ from agent_gateway import AgentRunner, ToolDispatcher
 from agent_gateway.event_log import EventLog
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.provider_summarize import provider_summarize
-from agent_gateway.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
+from hank_model_transport.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.sdk_runner import AgentSDKRunner
-from agent_gateway.send_prompt import send_prompt
-from agent_gateway.spend_metering import (
+from hank_model_transport.send_prompt import send_prompt
+from hank_model_transport.spend_metering import (
   ProviderCallMeter,
   SpendBudgetBlocked,
   spend_credential,
@@ -35,6 +35,7 @@ from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution,
 )
 from model_authority.spend_ledger import fingerprint_credential, ledger_path, spend_context
+from gateway_test_support.transport_runtime import TEST_SEND_PROMPT_RUNTIME
 
 API_CONFIG = {"provider": "anthropic", "auth_mode": "api", "api_key": "sk-ant-api-key-1"}
 OAUTH_CONFIG = {
@@ -141,7 +142,7 @@ def _meter(provider: ModelProvider, config: dict[str, Any] = API_CONFIG, **chang
     request_id="req-1",
   )
   kwargs.update(changes)
-  return ProviderCallMeter(**kwargs)
+  return ProviderCallMeter(runtime=TEST_SEND_PROMPT_RUNTIME, **kwargs)
 
 
 async def _drain(meter: ProviderCallMeter) -> None:
@@ -152,18 +153,26 @@ async def _drain(meter: ProviderCallMeter) -> None:
 # ── credential classification ────────────────────────────────────────────────────
 
 
-def test_credential_kind_follows_the_wire_mechanism_not_billing_mode() -> None:
+def test_credential_kind_tier_and_fingerprint_follow_the_resolved_credential() -> None:
   api = spend_credential("anthropic", API_CONFIG)
+  byok = spend_credential("anthropic", {**API_CONFIG, "entitlement_kind": "commercial_byok"})
   oauth = spend_credential("anthropic", OAUTH_CONFIG)
+  org_oauth = spend_credential("anthropic", {**OAUTH_CONFIG, "entitlement_kind": "org_commercial"})
   local = spend_credential("ollama", {"provider": "ollama", "auth_mode": "api"})
   plan = spend_credential("ollama_cloud", {"provider": "ollama_cloud", "auth_mode": "api", "api_key": "k"})
 
-  assert (api.auth_kind, api.fingerprint) == ("payg_api_key", fingerprint_credential("sk-ant-api-key-1"))
-  assert (oauth.auth_kind, oauth.fingerprint) == (
-    "oauth_subscription", fingerprint_credential("sk-ant-oat-token-1"),
+  assert (api.auth_kind, api.tier, api.fingerprint) == (
+    "payg_api_key", "deployment_payg", fingerprint_credential("sk-ant-api-key-1"),
   )
-  assert (local.auth_kind, local.fingerprint) == ("local_or_free", None)
-  assert plan.auth_kind == "plan_api_key"
+  assert byok.tier == "byok_payg"
+  byok_oauth = spend_credential("anthropic", {**OAUTH_CONFIG, "entitlement_kind": "commercial_byok"})
+  assert byok_oauth.tier == "personal_seat"
+  assert (oauth.auth_kind, oauth.tier, oauth.fingerprint) == (
+    "oauth_subscription", "personal_seat", fingerprint_credential("sk-ant-oat-token-1"),
+  )
+  assert org_oauth.tier == "org_seat"
+  assert (local.auth_kind, local.tier, local.fingerprint) == ("local_or_free", "local_or_free", None)
+  assert (plan.auth_kind, plan.tier) == ("plan_api_key", "plan_key")
 
 
 # ── the metered stream: one row per call ─────────────────────────────────────────
@@ -171,7 +180,9 @@ def test_credential_kind_follows_the_wire_mechanism_not_billing_mode() -> None:
 
 def test_a_completed_stream_writes_one_row_with_normalized_tokens_and_the_adapter_cost() -> None:
   provider = _Provider(_ok_step())
-  asyncio.run(_drain(_meter(provider)))
+  with spend_context(run_owner="alice"):
+    meter = _meter(provider)
+  asyncio.run(_drain(meter))
 
   [row] = _rows()
   assert (row["api_category"], row["provider"], row["model_or_endpoint"]) == (
@@ -180,6 +191,8 @@ def test_a_completed_stream_writes_one_row_with_normalized_tokens_and_the_adapte
   assert row["model_key"] == "claude-sonnet-4-6"
   assert row["auth_kind"] == "payg_api_key"
   assert row["credential_fingerprint"] == fingerprint_credential("sk-ant-api-key-1")
+  assert row["credential_tier"] == "deployment_payg"
+  assert row["run_owner"] == "alice"
   assert (row["session_id"], row["request_id"], row["call_site"]) == ("sess-1", "req-1", "chat_turn")
   assert (
     row["input_tokens"], row["cache_read_tokens"], row["cache_write_tokens"],
@@ -242,6 +255,7 @@ def test_a_failure_raised_before_the_stream_starts_writes_nothing() -> None:
   with pytest.raises(ValueError, match="cannot build"):
     asyncio.run(send_prompt(
       "hello",
+      runtime=TEST_SEND_PROMPT_RUNTIME,
       capability_execution=_execution(provider),
       user_id="alice",
       completion_record_root=None,
@@ -433,6 +447,7 @@ def test_a_retried_runner_turn_writes_one_row_per_upstream_attempt(monkeypatch) 
   assert {row["session_id"] for row in (failed, served)} == {"sess-spend"}
   assert failed["model_key"] == served["model_key"]
   assert failed["request_id"] == served["request_id"]
+  assert {row["run_owner"] for row in (failed, served)} == {"alice"}
 
 
 def test_a_runner_turn_refused_by_a_freeze_never_starts_the_provider_call_or_retries(monkeypatch) -> None:
@@ -484,6 +499,7 @@ def test_send_prompt_writes_one_row_for_its_provider_call() -> None:
 
   result = asyncio.run(send_prompt(
     "hello",
+    runtime=TEST_SEND_PROMPT_RUNTIME,
     capability_execution=_execution(provider),
     user_id="alice",
     session_id="sess-sp",
@@ -497,6 +513,9 @@ def test_send_prompt_writes_one_row_for_its_provider_call() -> None:
   assert (row["call_site"], row["session_id"], row["request_id"]) == ("send_prompt:mcp", "sess-sp", "req-sp")
   assert (row["status"], row["input_tokens"], row["output_tokens"]) == ("ok", 10, 4)
   assert json.loads(row["attrs_json"])["capability_id"]
+  assert row["run_owner"] == "alice"
+  assert row["credential_tier"] == "deployment_payg"
+  assert row["credential_fingerprint"] == fingerprint_credential("k")
 
 
 def test_send_prompt_refuses_a_frozen_payg_call_before_creating_a_client() -> None:
@@ -506,6 +525,7 @@ def test_send_prompt_refuses_a_frozen_payg_call_before_creating_a_client() -> No
   with pytest.raises(SpendBudgetBlocked):
     asyncio.run(send_prompt(
       "hello",
+      runtime=TEST_SEND_PROMPT_RUNTIME,
       capability_execution=_execution(provider),
       user_id="alice",
       completion_record_root=None,
@@ -521,6 +541,7 @@ def test_send_prompt_on_oauth_credentials_runs_under_a_freeze() -> None:
 
   asyncio.run(send_prompt(
     "hello",
+    runtime=TEST_SEND_PROMPT_RUNTIME,
     capability_execution=_execution(provider, auth_mode="oauth", auth_mechanism="oauth_bearer",
                                     auth_token="tok", api_key=""),
     user_id="alice",
@@ -537,6 +558,7 @@ def test_send_prompt_failure_with_usage_writes_one_error_row() -> None:
   with pytest.raises(RuntimeError, match="boom"):
     asyncio.run(send_prompt(
       "hello",
+      runtime=TEST_SEND_PROMPT_RUNTIME,
       capability_execution=_execution(provider),
       user_id="alice",
       completion_record_root=None,
@@ -651,7 +673,7 @@ def _unstamped_material(**material: Any) -> dict[str, Any]:
 
 
 def test_a_seat_rotated_to_an_api_key_is_classified_and_refused_as_payg() -> None:
-  from agent_gateway.runner_auth import merge_refreshed_auth_config
+  from hank_model_transport.runtime_helpers import merge_refreshed_auth_config
 
   merged = merge_refreshed_auth_config(
     SEAT, _unstamped_material(auth_mode="api", api_key="sk-ant-api-key-1", auth_token=""),
@@ -667,7 +689,7 @@ def test_a_seat_rotated_to_an_api_key_is_classified_and_refused_as_payg() -> Non
 
 
 def test_an_api_key_rotated_to_a_seat_is_classified_as_a_subscription_and_not_refused() -> None:
-  from agent_gateway.runner_auth import merge_refreshed_auth_config
+  from hank_model_transport.runtime_helpers import merge_refreshed_auth_config
 
   merged = merge_refreshed_auth_config(
     KEY, _unstamped_material(auth_mode="oauth", api_key="", auth_token="sk-ant-oat-seat"),
@@ -686,7 +708,7 @@ def test_an_api_key_rotated_to_a_seat_is_classified_as_a_subscription_and_not_re
 
 
 def test_a_refresh_that_restamps_its_class_keeps_the_stamp_it_supplied() -> None:
-  from agent_gateway.runner_auth import merge_refreshed_auth_config
+  from hank_model_transport.runtime_helpers import merge_refreshed_auth_config
 
   merged = merge_refreshed_auth_config(
     SEAT,
@@ -697,7 +719,7 @@ def test_a_refresh_that_restamps_its_class_keeps_the_stamp_it_supplied() -> None
 
 
 def test_a_refresh_of_the_same_material_keeps_its_stamps() -> None:
-  from agent_gateway.runner_auth import merge_refreshed_auth_config
+  from hank_model_transport.runtime_helpers import merge_refreshed_auth_config
 
   merged = merge_refreshed_auth_config(KEY, _unstamped_material(account_identity="acct"))
 
@@ -714,8 +736,8 @@ def test_a_refresh_of_the_same_material_keeps_its_stamps() -> None:
 def test_anthropic_rotation_material_stamps_the_class_of_the_member_it_names(
   record_kind: str, token: str, expected: tuple[str, str],
 ) -> None:
-  from agent_gateway.providers.anthropic import _credential_material
-  from agent_gateway.providers.anthropic_oauth import AnthropicCredential, AnthropicOAuthRecord
+  from hank_model_transport.providers.anthropic import _credential_material
+  from hank_model_transport.providers.anthropic_oauth import AnthropicCredential, AnthropicOAuthRecord
 
   selected = AnthropicCredential(
     key="acct",
@@ -833,7 +855,7 @@ def _openai_meter(provider: ModelProvider, model: str = "gpt-5.6") -> ProviderCa
 
 
 def test_openai_response_failed_after_inference_is_one_error_row_with_its_usage() -> None:
-  from agent_gateway.providers import OpenAIProvider
+  from hank_model_transport.providers import OpenAIProvider
 
   client = _OpenAIClient([{
     "type": "response.failed",
@@ -858,7 +880,7 @@ def test_openai_response_failed_after_inference_is_one_error_row_with_its_usage(
 
 
 def test_openai_error_after_response_created_is_one_error_row() -> None:
-  from agent_gateway.providers import OpenAIProvider
+  from hank_model_transport.providers import OpenAIProvider
 
   client = _OpenAIClient([
     {"type": "response.created", "response": {"model": "gpt-5.6"}},
@@ -888,8 +910,8 @@ def test_codex_failure_after_the_request_was_sent_is_one_error_row(failure_event
 
   import httpx
 
-  from agent_gateway.providers import CodexProvider
-  from agent_gateway.providers.codex_helpers import JWT_CLAIM_PATH
+  from hank_model_transport.providers import CodexProvider
+  from hank_model_transport.providers.codex_helpers import JWT_CLAIM_PATH
 
   def segment(value: dict[str, Any]) -> str:
     raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
@@ -938,7 +960,7 @@ def test_codex_failure_after_the_request_was_sent_is_one_error_row(failure_event
 def _install_sdk(monkeypatch: pytest.MonkeyPatch, messages: list[Any]) -> SimpleNamespace:
   import types
 
-  from agent_gateway.providers.agent_sdk import SDK_PINNED_VERSION
+  from hank_model_transport.providers.agent_sdk import SDK_PINNED_VERSION
 
   state = SimpleNamespace(clients=0)
 
@@ -999,14 +1021,15 @@ def _sdk_result() -> Any:
 
 
 def _sdk_runner(**auth: Any) -> AgentSDKRunner:
-  from agent_gateway import AgentSDKConfig, EventLog
+  from hank_model_transport.providers import AgentSDKConfig
+  from agent_gateway import EventLog
   from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_capability_execution
 
   return AgentSDKRunner(
     event_log=EventLog(),
     session_id="sess-sdk-spend",
     sdk_config=AgentSDKConfig(
-      user_id="alice", billing_mode="byok", rate_table_version="unknown", request_id="req-sdk-spend",
+      user_id=" alice ", billing_mode="byok", rate_table_version="unknown", request_id="req-sdk-spend",
     ),
     capability_execution=stub_sdk_capability_execution(**auth),
     system_prompt="test",
@@ -1022,6 +1045,8 @@ def test_an_sdk_run_writes_one_row_from_its_result_message(monkeypatch: pytest.M
   [row] = _rows()
   assert (row["call_site"], row["session_id"], row["request_id"]) == ("agent_sdk", "sess-sdk-spend", "req-sdk-spend")
   assert (row["status"], row["auth_kind"], row["api_calls"]) == ("ok", "payg_api_key", 2)
+  assert row["run_owner"] == "alice"
+  assert row["credential_tier"] == "deployment_payg"
   assert (row["input_tokens"], row["cache_read_tokens"], row["cache_write_tokens"], row["output_tokens"]) == (
     100, 300, 20, 40,
   )

@@ -11,15 +11,18 @@ from typing import (
   List,
 )
 
-from .capability_execution import BoundCapabilityExecution, CapabilityExecutionResolver
-from .multi_user.billing import (
+from hank_model_transport.capability_execution import BoundCapabilityExecution, CapabilityExecutionResolver
+from hank_model_transport.multi_user.billing import (
   BillingMode,
   SessionUsageSummary,
   UsageEvent,
   UsageState,
   UsageTotals as _UsageTotals,
 )
-from .runner_auth import merge_refreshed_auth_config as _merge_refreshed_auth_config
+from hank_model_transport.runtime_helpers import (
+  estimate_usage_cost as _estimate_usage_cost,
+  merge_refreshed_auth_config as _merge_refreshed_auth_config,
+)
 from .secret_boundary import SecretBoundary
 from .runner_callbacks import (
   call_before_stream_complete_hook as _call_before_stream_complete_hook,
@@ -35,7 +38,6 @@ from .runner_usage import (
   call_late_usage_event_hook as _call_late_usage_event_hook,
   call_session_summary_hook as _call_session_summary_hook,
   call_usage_event_hook as _call_usage_event_hook,
-  estimate_usage_cost as _estimate_usage_cost,
   usage_delta as _usage_delta,
   usage_has_tokens as _usage_has_tokens,
 )
@@ -46,10 +48,10 @@ if TYPE_CHECKING:
 
   from .agent_session_log import AgentSessionLog
   from .session import GatewaySession
-  from .capability_execution import ModelFallbackHop
+  from hank_model_transport.capability_execution import ModelFallbackHop
   from .event_log import EventLog
-  from .multi_user.billing import _UsageAggregator
-  from .providers.base import ModelProvider
+  from hank_model_transport.multi_user.billing import _UsageAggregator
+  from hank_model_transport.providers.base import ModelProvider
   from .runner_tool_execution import AgentRunnerDispatcher
 
 log = logging.getLogger("agent_gateway.runner")
@@ -204,7 +206,7 @@ class RunnerHooksLifecycleMixin:
       execution,
       active_config,
       refreshed,
-      merge=_runner_attr(self, "_merge_refreshed_auth_config", _merge_refreshed_auth_config),
+      merge=_merge_refreshed_auth_config,
     )
     if refreshed_execution is None:
       return False

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Sequence, Set, Tuple
 
@@ -12,8 +11,6 @@ from .runner_budget import (
 from model_authority.thinking import parse_effort
 from .tool_dispatcher_approval_lifecycle import ApprovalPark
 from .tool_result_compaction import model_tool_result_max_chars
-
-log = logging.getLogger("agent_gateway.runner_state")
 
 
 def normalized_run_config(
@@ -59,50 +56,6 @@ def normalized_run_config(
   else:
     config["max_tokens"] = int(raw_max_tokens)
   return config
-
-
-@dataclass(frozen=True)
-class MaxTokensSelection:
-  value: int
-  requested: int
-  model_max_output: int
-  clamped: bool
-
-
-def select_run_max_tokens(
-  config: Dict[str, Any],
-  *,
-  model_info: Any,
-  requested: int | None = None,
-) -> MaxTokensSelection:
-  """Owner of every output-token request: the one fit to the model ceiling.
-
-  A run requests the bound model's registry output ceiling. A caller that
-  sizes its own output (a summary, a one-shot prompt) passes `requested`; the
-  owner fits it to the ceiling and records `requested`, `model_max_output` and
-  `clamped` on the selection, logging the fit when it lowers the request. No
-  provider or call site fits it again. Credential `config["max_tokens"]` is
-  read only when the provider reports no ceiling and no `requested` is given.
-  Nothing invents a default.
-  """
-  model_max_output = int(getattr(model_info, "max_output_tokens", 0) or 0)
-  if requested is None:
-    requested = model_max_output if model_max_output > 0 else int(config["max_tokens"])
-  value = min(requested, model_max_output) if model_max_output > 0 else requested
-  clamped = value != requested
-  if clamped:
-    log.info(
-      "max_tokens fitted to model ceiling | requested=%d model_max_output=%d value=%d",
-      requested,
-      model_max_output,
-      value,
-    )
-  return MaxTokensSelection(
-    value=value,
-    requested=requested,
-    model_max_output=model_max_output,
-    clamped=clamped,
-  )
 
 
 def assistant_turn_message(

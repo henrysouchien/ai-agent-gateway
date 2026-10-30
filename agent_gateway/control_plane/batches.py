@@ -36,7 +36,7 @@ from agent_gateway.batch_approval_projection import (
 from model_authority.bind import CapabilityBind
 from model_authority.binding import AuthContext, CapabilityResolutionError, CredentialHandle
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityAdapterResolver,
   CapabilityExecutionResolver,

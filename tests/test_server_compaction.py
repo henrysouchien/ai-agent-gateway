@@ -13,12 +13,14 @@ from agent_gateway import (
   AgentRunner,
   AgentSessionLog,
   EventLog,
-  ModelInfo,
-  ModelProvider,
   ToolDispatcher,
 )
+from hank_model_transport.providers import (
+  ModelInfo,
+  ModelProvider,
+)
 from model_authority.thinking import EffortResolution
-from agent_gateway.providers import (
+from hank_model_transport.providers import (
   AnthropicProvider,
   CodexProvider,
   OpenAIProvider,
@@ -37,14 +39,14 @@ from model_authority.binding import (
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from model_authority.selection import CapabilityDefault, CapabilitySelectionPolicy, TierModelsDefault
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
   MaterializedCredential,
 )
-from agent_gateway.providers import installed_adapter_providers
+from hank_model_transport.providers import installed_adapter_providers
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.providers.base import truncate_to_last_compaction
+from hank_model_transport.providers.base import truncate_to_last_compaction
 from agent_gateway.context_builder import SessionContextBuilder
 from agent_gateway.server_compaction import (
   CONTINUATION_NUDGE,
@@ -1229,7 +1231,7 @@ def test_server_compaction_summarize_usage_reported() -> None:
 def test_portable_compaction_merges_anthropic_capacity_wait_once(
   monkeypatch: pytest.MonkeyPatch, tmp_path,
 ) -> None:
-  import agent_gateway.providers.anthropic as adapter
+  import hank_model_transport.providers.anthropic as adapter
 
   summary_usage = {
     "input_tokens": 31, "cache_read_input_tokens": 2,

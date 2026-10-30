@@ -12,14 +12,15 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway.completion_record import (
+from hank_model_transport.completion_record import (
   append_completion_record,
   build_completion_record,
   completion_record_schema_path,
 )
-from agent_gateway.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
-from agent_gateway.send_prompt import send_prompt
+from hank_model_transport.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
+from hank_model_transport.send_prompt import send_prompt
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
+from gateway_test_support.transport_runtime import TEST_SEND_PROMPT_RUNTIME
 
 
 def _schema() -> dict[str, Any]:
@@ -88,6 +89,7 @@ def test_send_prompt_records_the_stream_and_returns_the_same_text(tmp_path: Path
   ])
   text = asyncio.run(send_prompt(
     "What was the gross margin?",
+    runtime=TEST_SEND_PROMPT_RUNTIME,
     capability_execution=_execution(provider),
     user_id="alice",
     session_id="newsletter-1",
@@ -134,6 +136,7 @@ def test_send_prompt_records_provider_diagnostics_and_reaches_the_usage_event(tm
   usage_events: list[Any] = []
   asyncio.run(send_prompt(
     "q",
+    runtime=TEST_SEND_PROMPT_RUNTIME,
     capability_execution=_execution(provider),
     user_id="alice",
     completion_record_root=tmp_path,
@@ -167,6 +170,7 @@ def test_send_prompt_records_a_failed_attempt_with_no_response(tmp_path: Path) -
   with pytest.raises(RuntimeError, match="upstream reset"):
     asyncio.run(send_prompt(
       "q",
+      runtime=TEST_SEND_PROMPT_RUNTIME,
       capability_execution=_execution(provider),
       user_id="alice",
       completion_record_root=tmp_path,
@@ -183,6 +187,7 @@ def test_send_prompt_without_a_root_writes_nothing(tmp_path: Path) -> None:
   provider = _Provider([StreamEvent(type="text_delta", text="x"), StreamEvent(type="message_end", stop_reason="end_turn")])
   assert asyncio.run(send_prompt(
     "q", capability_execution=_execution(provider), user_id="alice", completion_record_root=None,
+    runtime=TEST_SEND_PROMPT_RUNTIME,
   )) == "x"
   assert list(tmp_path.iterdir()) == []
 
@@ -217,9 +222,10 @@ def test_unwritable_root_never_fails_the_call(tmp_path: Path, caplog: pytest.Log
   blocker = tmp_path / "not-a-dir"
   blocker.write_text("file", encoding="utf-8")
   provider = _Provider([StreamEvent(type="text_delta", text="y"), StreamEvent(type="message_end", stop_reason="end_turn")])
-  with caplog.at_level("ERROR", logger="agent_gateway.completion_record"):
+  with caplog.at_level("ERROR", logger="hank_model_transport.completion_record"):
     assert asyncio.run(send_prompt(
       "q", capability_execution=_execution(provider), user_id="alice", completion_record_root=blocker,
+      runtime=TEST_SEND_PROMPT_RUNTIME,
     )) == "y"
   assert "completion_record_write_failed" in caplog.text
 

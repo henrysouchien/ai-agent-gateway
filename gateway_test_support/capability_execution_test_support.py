@@ -14,12 +14,12 @@ from model_authority.selection import (
   ProductModelSelectionPolicy,
 )
 from model_authority.binding import CapabilityEffort
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
   MaterializedCredential,
 )
-from agent_gateway.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
+from hank_model_transport.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
 from model_authority.thinking import ThinkingLevel
 from model_authority.schema import SCHEMA
 from model_authority.thinking import EffortResolution

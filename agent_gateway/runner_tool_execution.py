@@ -25,7 +25,7 @@ from .runner_session_events import (
   build_tool_call_start_event as _build_tool_call_start_event,
 )
 from .runner_session_lifecycle import _runner_attr
-from .policy_imports import role_policy_denies_tool
+from hank_model_transport.policy_imports import role_policy_denies_tool
 from .runner_state import (
   ToolResultContext,
   append_deferred_tool_extras,
@@ -120,6 +120,10 @@ class AgentRunnerDispatcher(Protocol):
   """Dispatcher surface consumed by the runner and tool-execution mixin."""
 
   def bind_secret_boundary(self, boundary: SecretBoundary) -> None: ...
+
+  def bind_research_file_activity_owner(
+    self, ensure_activity: Callable[[Path, int], bool]
+  ) -> None: ...
 
   def replace_capability_bind(self, bind: CapabilityBind) -> None: ...
 
@@ -496,6 +500,7 @@ class RunnerToolExecutionMixin:
       WorkflowOutputAttachment,
     ]
     _request_id: str
+    _usage_user_id: str
     _secret_boundary: SecretBoundary
     _sid: str
     _skill_run_id: str | None
@@ -643,6 +648,7 @@ class RunnerToolExecutionMixin:
     # Every vendor call a tool makes (HTTP headers, ledger rows) reads this turn's
     # attribution from `spend_context`, the same ids the provider meter stamps.
     with spend_context(
+      run_owner=self._usage_user_id,
       session_id=self._full_session_id,
       request_id=self._request_id,
       run_id=self._skill_run_id or None,

@@ -4,13 +4,13 @@ import pytest
 from dataclasses import replace
 from pathlib import Path
 
-from agent_gateway import resolve_auth_config
+from hank_model_transport._provider_utils import resolve_auth_config
 from model_authority.thinking import ThinkingLevel
 from model_authority.thinking import EffortResolution
-from agent_gateway.providers.anthropic import AnthropicProvider
-from agent_gateway.providers.codex import CodexProvider
-from agent_gateway.providers.openai import OpenAIProvider
-from agent_gateway.runner_auth import merge_refreshed_auth_config
+from hank_model_transport.providers.anthropic import AnthropicProvider
+from hank_model_transport.providers.codex import CodexProvider
+from hank_model_transport.providers.openai import OpenAIProvider
+from hank_model_transport.runtime_helpers import merge_refreshed_auth_config
 from agent_gateway.runner import AgentRunner
 from agent_gateway.runner_state import normalized_run_config
 from agent_gateway.runner_streaming import effective_stream_stall_timeout

@@ -19,25 +19,25 @@ import webbrowser
 
 import httpx
 
-from .providers.google_oauth import (
+from hank_model_transport.providers.google_oauth import (
   load_google_token_record,
   resolve_google_oauth_settings,
   save_google_token_record,
 )
-from .providers.copilot_oauth import (
+from hank_model_transport.providers.copilot_oauth import (
   CopilotOAuthSettings,
   load_copilot_token_record,
   poll_copilot_device_token,
   request_copilot_device_code,
   resolve_copilot_oauth_settings,
 )
-from .providers.credential_pool import (
+from hank_model_transport.providers.credential_pool import (
   USER_SCOPE_FIELD,
   derive_account_identity,
   load_pool_accounts,
   remove_pool_account,
 )
-from .providers.google_antigravity_oauth import (
+from hank_model_transport.providers.google_antigravity_oauth import (
   ANTIGRAVITY_AUTH_URL,
   ANTIGRAVITY_CLIENT_ID,
   ANTIGRAVITY_CLIENT_SECRET,
@@ -52,7 +52,7 @@ from .providers.google_antigravity_oauth import (
   save_antigravity_token_record,
   token_needs_refresh as antigravity_token_needs_refresh,
 )
-from .providers.muse_oauth import (
+from hank_model_transport.providers.muse_oauth import (
   load_muse_token_record,
   mint_muse_api_key,
   poll_muse_device_token,
@@ -60,14 +60,14 @@ from .providers.muse_oauth import (
   resolve_muse_store_path,
   save_muse_token_record,
 )
-from .providers.kimi_code_oauth import (
+from hank_model_transport.providers.kimi_code_oauth import (
   extract_kimi_account_identity,
   poll_kimi_code_device_token,
   request_kimi_code_device_code,
   resolve_kimi_code_store_path,
   save_kimi_code_token_record,
 )
-from .providers.api_key_store import (
+from hank_model_transport.providers.api_key_store import (
   load_api_key_record,
   resolve_api_key_store_path,
   save_api_key_record,
@@ -1139,7 +1139,7 @@ class AnthropicLoginFlow:
 
   def logout(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
     from .cli import _anthropic_store_path
-    from .providers.anthropic_oauth import remove_anthropic_oauth_record
+    from hank_model_transport.providers.anthropic_oauth import remove_anthropic_oauth_record
     path = _anthropic_store_path(args)
     account = str(getattr(args, "account", None) or "").strip()
     if account:
@@ -1189,7 +1189,7 @@ class XAILoginFlow:
   kind = "device_code"
 
   def login(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
-    from .providers.xai_oauth import XAIDeviceCode, login_xai_device_code
+    from hank_model_transport.providers.xai_oauth import XAIDeviceCode, login_xai_device_code
 
     store = str(getattr(args, "store", None) or "").strip()
     cfg: dict[str, Any] = {"auth_store_path": store} if store else {}
@@ -1215,7 +1215,7 @@ class XAILoginFlow:
     return 0
 
   def status(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
-    from .providers.xai_oauth import (
+    from hank_model_transport.providers.xai_oauth import (
       load_xai_token_record,
       resolve_xai_oauth_settings,
       token_needs_refresh,
@@ -1259,7 +1259,7 @@ class XAILoginFlow:
     return 0
 
   def logout(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
-    from .providers.xai_oauth import (
+    from hank_model_transport.providers.xai_oauth import (
       _store_lock,
       _write_reauth_tombstone,
       resolve_xai_oauth_settings,
@@ -1304,7 +1304,7 @@ class OpenAILoginFlow:
     )
 
   def status(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
-    from .providers.openai import OPENAI_AUTH_TOKEN_ENV
+    from hank_model_transport.providers.openai import OPENAI_AUTH_TOKEN_ENV
 
     api_key_present = bool(os.environ.get("OPENAI_API_KEY", "").strip())
     access_token_present = bool(os.environ.get(OPENAI_AUTH_TOKEN_ENV, "").strip())

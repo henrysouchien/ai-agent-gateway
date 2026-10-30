@@ -17,32 +17,33 @@ from typing import Any, Literal
 
 import pytest
 
-from agent_gateway import AgentRunner, EventLog, McpClientManager, ModelInfo, ModelProvider, ToolDispatcher
+from agent_gateway import AgentRunner, EventLog, McpClientManager, ToolDispatcher
+from hank_model_transport.providers import ModelInfo, ModelProvider
 import agent_gateway.runner as gateway_runner
 import agent_gateway.runner_stream_turn as runner_stream_turn
-import agent_gateway.capability_execution as capability_execution
+import hank_model_transport.capability_execution as capability_execution
 from agent_gateway.admission import root_context
-from agent_gateway.auth import ProviderCredentialFailure
-from agent_gateway.providers.codex import CodexCredentialExpired, CodexProvider
+from hank_model_transport.auth import ProviderCredentialFailure
+from hank_model_transport.providers.codex import CodexCredentialExpired, CodexProvider
 from agent_gateway.execution_identity import DispatchIdentity
 from agent_gateway.fork_request_handoff import (
   ForkRequestHandoff,
   build_mid_turn_handoff,
   fork_credential_identity_available,
 )
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
   MaterializedCredential,
 )
-from agent_gateway.providers import StreamEvent
+from hank_model_transport.providers import StreamEvent
 from hank_contracts.commercial_work import WorkStartSpendLedger
-from agent_gateway.providers.anthropic_oauth import (
+from hank_model_transport.providers.anthropic_oauth import (
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
   ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD,
   resolve_anthropic_credentials,
 )
-from agent_gateway.providers.anthropic_quota import Cooldown, record_cooldown
+from hank_model_transport.providers.anthropic_quota import Cooldown, record_cooldown
 from agent_gateway.runner_sub_agents import _build_child_event_log, _ChildActivity
 from agent_gateway.session import GatewaySession
 from agent_gateway.tool_dispatcher_helpers import ToolResult

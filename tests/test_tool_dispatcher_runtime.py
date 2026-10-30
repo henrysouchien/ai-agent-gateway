@@ -386,7 +386,7 @@ def _dispatch_corpus(dispatcher, tool_input):
 
 
 def test_mcp_call_without_research_file_id_defaults_to_session_active_file() -> None:
-  from agent_gateway.policy_imports import configure_server_policy, load_server_policy_module
+  from hank_model_transport.policy_imports import configure_server_policy, load_server_policy_module
 
   client = _CorpusStateMcpClient()
   session = SimpleNamespace(role="owner", admitted_job_context=SimpleNamespace(
@@ -442,7 +442,7 @@ def test_unparsable_or_wrong_typed_stringified_input_passes_through_to_its_owner
 def test_local_required_file_and_mcp_omission_use_same_session_binding(
   local_name, monkeypatch,
 ) -> None:
-  from agent_gateway import policy_imports
+  from hank_model_transport import policy_imports
   from agent_gateway.session import session_research_binding
   from agent_workflow_contracts.models import AdmittedResearchBinding
 

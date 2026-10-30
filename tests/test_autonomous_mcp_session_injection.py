@@ -11,7 +11,7 @@ if str(PKG_DIR) not in sys.path:
 
 import agent_gateway.autonomous as autonomous  # noqa: E402
 from agent_workflow_contracts import AgentOperationRef  # noqa: E402
-from agent_gateway import BoundCapabilityExecution  # noqa: E402
+from hank_model_transport.capability_execution import BoundCapabilityExecution  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.operation_catalog import (  # noqa: E402
   AgentOperationCatalog,

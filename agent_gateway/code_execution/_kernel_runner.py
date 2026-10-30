@@ -303,7 +303,8 @@ def _summarize_user_ns(user_ns: dict[str, object]) -> dict[str, str]:
         key_suffix = f"({','.join(keys)})" if keys else ""
         summary[bounded_name] = f"dict[{len(value)}]{key_suffix}"
       elif isinstance(value, (list, tuple, set)):
-        summary[bounded_name] = f"{cls_name}[{len(value)}]"
+        container_name = "list" if isinstance(value, list) else cls_name
+        summary[bounded_name] = f"{container_name}[{len(value)}]"
       else:
         summary[bounded_name] = cls_name
       if len(summary) >= 40:

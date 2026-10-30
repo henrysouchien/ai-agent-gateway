@@ -1013,6 +1013,12 @@ def run_interrupted_reason(
 ) -> tuple[str, Dict[str, Any]]:
   if isinstance(run_error, asyncio.CancelledError) and role == "sub_agent":
     return "sub_agent_cancelled", {}
+  if (
+    isinstance(run_error, asyncio.CancelledError)
+    and role == "writer"
+    and str(run_error) == "caller_aborted"
+  ):
+    return "caller_aborted", {}
   return shutdown_reason, shutdown_extra_fields
 
 

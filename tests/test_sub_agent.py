@@ -35,7 +35,7 @@ from agent_gateway.code_execution import (
   build_code_execution,
   cleanup_code_execution,
 )
-from agent_gateway.providers import ModelInfo, ModelProvider, StreamEvent
+from hank_model_transport.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_workflow_contracts import (
   ActivityHandle,
   AdmittedTask,
@@ -62,7 +62,7 @@ from agent_workflow_contracts import (
   sha256_digest,
 )
 from agent_workflow_contracts.ticker_contract import TICKER_INPUT_CONTRACT
-from agent_gateway.capability_execution import (
+from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityBind,
   CapabilityExecutionResolver,
@@ -365,7 +365,9 @@ class _Runner:
   ) -> dict[str, Any] | None:
     return dict(event) if event in self.durable_events else None
 
-  async def spawn_sub_agent(self, task: str, **kwargs: Any):
+  async def spawn_sub_agent(
+    self, task: str, **kwargs: Any,
+  ) -> tuple[TaskResult | None, dict[str, Any] | None]:
     call = {"task": task, **kwargs}
     self.spawn_calls.append(call)
     return _spawn_result(call), None
@@ -4936,6 +4938,7 @@ def test_foreground_lifecycle_persistence_error_restores_actual_terminal_result(
 
   async def record_result(task: str, **kwargs: Any):
     result, error = await spawn(task, **kwargs)
+    assert result is not None
     successful_results.append(result)
     return result, error
 
@@ -5043,6 +5046,270 @@ def test_foreground_envelope_exception_restores_actual_canonical_status_once(
       }[execution_status],
     )
     assert canonical == canonical_results[0]
+
+  asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("mismatch", [
+  "physical_task_id", "attempt_id", "attempt_number", "logical_task",
+  "admitted_task_digest", "model_bind_digest", "capability_binding_digest",
+  "tool_grant_digest", "entry_task_id",
+])
+@pytest.mark.parametrize("already_committed", [False, True])
+def test_registered_child_settlement_rejects_foreign_identity_before_append(
+  tmp_path: Path,
+  mismatch: str,
+  already_committed: bool,
+) -> None:
+  from agent_gateway.child_completion import CompletionTransport, publish_registered_child_settlement
+  from agent_gateway.task_registry import TaskEntry, TaskResultSettlementError
+
+  runner = _DurableRegistryForegroundRunner(tmp_path)
+
+  async def spawn(task: str, **kwargs: Any):
+    runner.spawn_calls.append({"task": task, **kwargs})
+    canonical = _spawn_result(kwargs)
+    admitted = kwargs["admitted_task"]
+    entry = TaskEntry(
+      task_id=admitted.attempt.physical_task_id,
+      task_type="foreground_agent",
+      admitted_task=admitted,
+      capability_bind_receipt=runner.capability_execution.bind.to_json(),
+    )
+    assert entry.capability_bind_receipt is not None
+    foreign = canonical
+    if mismatch in {"physical_task_id", "attempt_id", "attempt_number"}:
+      value = 2 if mismatch == "attempt_number" else "foreign-attempt"
+      foreign = canonical.model_copy(update={
+        "attempt": canonical.attempt.model_copy(update={mismatch: value}),
+      })
+    elif mismatch == "logical_task":
+      foreign = canonical.model_copy(update={
+        "logical_task": _settled_task_result("foreign").logical_task,
+      })
+    elif mismatch != "entry_task_id":
+      foreign = canonical.model_copy(update={
+        "provenance": canonical.provenance.model_copy(update={
+          mismatch: sha256_digest({"foreign": mismatch}),
+        }),
+      })
+    original_id = entry.task_id
+    if mismatch == "entry_task_id":
+      entry.task_id = "foreign-entry"
+    entry.completion_persistence_state = "committed" if already_committed else "not_started"
+    entry.completed_at = 123.0 if already_committed else None
+    before, _ = await runner.session_log.query(order="asc")
+    try:
+      with pytest.raises(
+        RuntimeError if mismatch == "entry_task_id" else TaskResultSettlementError,
+        match="entry does not name|exact admitted task",
+      ):
+        await publish_registered_child_settlement(
+          transport=CompletionTransport(
+            append=runner._append_durable_event, workspace_dir=str(tmp_path),
+            parent_session_id=runner._gateway_session_id, principal_id=runner._runner_id,
+          ),
+          entry=entry, admitted_task=admitted, result=foreign,
+          capability_bind_receipt=entry.capability_bind_receipt,
+        )
+      after, _ = await runner.session_log.query(order="asc")
+      assert [item.event for item in after] == [item.event for item in before]
+      assert all(item.event["type"] != "task_completed" for item in after)
+      assert entry.task_result is None
+    finally:
+      entry.task_id = original_id
+      entry.completion_persistence_state = "not_started"
+      entry.completed_at = None
+    return canonical, None
+
+  runner.spawn_sub_agent = spawn
+
+  async def exercise() -> None:
+    await _handler(runner, loader=SkillLoader(tmp_path / "skills"))({
+      "objective": "Return the complete evidence report.", "background": False,
+    })
+    await _assert_foreground_terminal_restore(
+      runner, expected_status="succeeded", expected_state=TaskState.COMPLETED,
+    )
+
+  asyncio.run(exercise())
+
+
+def test_registered_child_settlement_ambiguous_append_retries_identical_event_and_restores(
+  tmp_path: Path,
+) -> None:
+  from agent_gateway.child_completion import CompletionTransport, publish_registered_child_settlement
+  from agent_gateway.task_registry import TaskEntry
+
+  runner = _DurableRegistryForegroundRunner(tmp_path)
+  settlement_log = AgentSessionLog(tmp_path / "ambiguous-settlement.jsonl")
+  attempts: list[dict[str, Any]] = []
+  canonical_results: list[TaskResult] = []
+
+  async def spawn(task: str, **kwargs: Any):
+    runner.spawn_calls.append({"task": task, **kwargs})
+    canonical = _spawn_result(kwargs)
+    canonical_results.append(canonical)
+    admitted = kwargs["admitted_task"]
+    registrations, _ = await runner.session_log.query(
+      event_types={"task_registered"}, order="asc",
+    )
+    assert len(registrations) == 1
+    registration = registrations[0].event
+    await settlement_log.append(registration)
+    entry = TaskEntry(
+      task_id=admitted.attempt.physical_task_id,
+      task_type="foreground_agent",
+      started_at=registration["started_at"],
+      admitted_task=admitted,
+      metadata={"admitted_task": admitted.model_dump(mode="json")},
+      capability_bind_receipt=runner.capability_execution.bind.to_json(),
+    )
+    assert entry.capability_bind_receipt is not None
+
+    async def ambiguous_append(event: dict[str, Any]) -> object:
+      attempts.append(dict(event))
+      receipt = await settlement_log.append(event)
+      if len(attempts) == 1:
+        raise OSError("append committed but acknowledgement was lost")
+      return receipt
+
+    transport = CompletionTransport(
+      append=ambiguous_append, workspace_dir=str(tmp_path),
+      parent_session_id=runner._gateway_session_id, principal_id=runner._runner_id,
+    )
+    settlement = {
+      "transport": transport, "entry": entry,
+      "admitted_task": kwargs["admitted_task"], "result": canonical,
+      "capability_bind_receipt": entry.capability_bind_receipt,
+    }
+    with pytest.raises(OSError, match="acknowledgement was lost"):
+      await publish_registered_child_settlement(**settlement, completed_at=123.0)
+    assert entry.completed_at == 123.0
+    assert entry.completion_persistence_state != "committed"
+    completed_at = await publish_registered_child_settlement(
+      **settlement, completed_at=456.0,
+    )
+    assert completed_at == entry.completed_at == 123.0
+    assert entry.completion_persistence_state == "committed"
+    assert attempts[0] == attempts[1]
+    return canonical, None
+
+  runner.spawn_sub_agent = spawn
+
+  async def exercise() -> None:
+    await _handler(runner, loader=SkillLoader(tmp_path / "skills"))({
+      "objective": "Return the complete evidence report.", "background": False,
+    })
+    reopened = AgentSessionLog(settlement_log.path)
+    entries, _ = await reopened.query(
+      event_types={"task_registered", "task_completed"}, order="asc",
+    )
+    events = [item.event for item in entries]
+    assert [event["type"] for event in events] == [
+      "task_registered", "task_completed", "task_completed",
+    ]
+    assert events[1] == events[2]
+    restored = TaskRegistry()
+    restored.load_from_events(events)
+    tasks = restored.list_tasks()
+    assert len(tasks) == 1
+    assert tasks[0].reconstructed_from_log
+    assert tasks[0].state == TaskState.COMPLETED
+    assert tasks[0].completed_at == 123.0
+    assert TaskResult.model_validate(tasks[0].result) == canonical_results[0]
+
+  asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("boundary", [
+  "cancelled", "runtime_error", "returned_error", "materialization_error",
+  "cancelled_during_append",
+])
+def test_foreground_final_settlement_failure_preserves_original_outcome(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  boundary: str,
+) -> None:
+  import agent_gateway.sub_agent as sub_agent_mod
+
+  runner = _DurableRegistryForegroundRunner(tmp_path)
+  dispatch_entered = asyncio.Event()
+  append_entered = asyncio.Event()
+  release_append = asyncio.Event()
+  append = runner._append_durable_event
+  original_error = RuntimeError("original child dispatch failure")
+  tool_error = {"code": "child_execution_failed", "message": "Original child tool error."}
+  append_attempts: list[dict[str, Any]] = []
+  foreground_entries: list[Any] = []
+
+  async def fail_settlement(event: dict[str, Any]) -> object:
+    if event["type"] == "task_completed":
+      append_attempts.append(dict(event))
+      append_entered.set()
+      if boundary == "cancelled_during_append":
+        await release_append.wait()
+      raise OSError("terminal settlement journal unavailable")
+    return await append(event)
+
+  async def spawn(task: str, **kwargs: Any):
+    runner.spawn_calls.append({"task": task, **kwargs})
+    foreground_entries.append(kwargs["task_entry"])
+    dispatch_entered.set()
+    if boundary == "cancelled":
+      await asyncio.Event().wait()
+    if boundary == "runtime_error":
+      raise original_error
+    if boundary == "returned_error":
+      return None, tool_error
+    return _spawn_result(kwargs), None
+
+  async def fail_materialization(**_kwargs: Any):
+    raise ParentResultMaterializationError("original parent result unavailable")
+
+  runner._append_durable_event = fail_settlement
+  runner.spawn_sub_agent = spawn
+  if boundary == "materialization_error":
+    monkeypatch.setattr(sub_agent_mod, "_publish_foreground_completion", fail_materialization)
+
+  async def exercise() -> None:
+    caller = asyncio.create_task(_handler(
+      runner, loader=SkillLoader(tmp_path / "skills"),
+    )({
+      "objective": "Return the complete evidence report.", "background": False,
+    }))
+    if boundary in {"cancelled", "cancelled_during_append"}:
+      await (append_entered if boundary == "cancelled_during_append" else dispatch_entered).wait()
+      caller.cancel("original cancellation")
+      release_append.set()
+      with pytest.raises(asyncio.CancelledError, match="original cancellation"):
+        await caller
+    elif boundary == "runtime_error":
+      with pytest.raises(RuntimeError) as raised:
+        await caller
+      assert raised.value is original_error
+    else:
+      result, error = await caller
+      assert result is None
+      assert error is not None
+      if boundary == "returned_error":
+        assert error == tool_error
+      else:
+        assert error["code"] == "agent_completion_materialization_failed"
+        assert "ParentResultMaterializationError" in error["message"]
+    assert append_attempts
+    reopened = AgentSessionLog(runner.session_log.path)
+    entries, _ = await reopened.query(
+      event_types={"task_registered", "task_completed"}, order="asc",
+    )
+    assert [item.event["type"] for item in entries] == ["task_registered"]
+    restored = TaskRegistry()
+    restored.load_from_events([item.event for item in entries])
+    assert len(restored.list_tasks()) == 1
+    live_entry = foreground_entries[0]
+    if boundary != "cancelled_during_append":
+      assert live_entry.completion_persistence_state == "uncertain"
+      assert live_entry.completion_persistence_error is not None
 
   asyncio.run(exercise())
 

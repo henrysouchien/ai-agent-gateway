@@ -35,26 +35,28 @@ if str(PKG_DIR) not in sys.path:
 
 from gateway_test_support.host_policy import owner_session_host_policy  # noqa: E402
 
-from agent_gateway import (  # noqa: E402
+from agent_gateway import (
   AgentRunner,
   AgentSessionLog,
   McpClientManager,
   EventLog,
   GatewaySession,
-  ModelInfo,
-  ModelProvider,
   SessionContextBuilder,
   TaskRegistry,
   TaskState,
   ToolDispatcher,
 )
-from agent_gateway.auth import ProviderCredentialFailure  # noqa: E402
-from agent_gateway.providers import StreamEvent  # noqa: E402
-from agent_gateway.providers.base import truncate_to_last_compaction  # noqa: E402
+from hank_model_transport.providers import (
+  ModelInfo,
+  ModelProvider,
+)
+from hank_model_transport.auth import ProviderCredentialFailure  # noqa: E402
+from hank_model_transport.providers import StreamEvent  # noqa: E402
+from hank_model_transport.providers.base import truncate_to_last_compaction  # noqa: E402
 import agent_gateway.server_compaction as server_compaction  # noqa: E402
 from agent_gateway.runner_state import assistant_turn_message  # noqa: E402
 from agent_gateway.selected_content import SelectedContentBinding  # noqa: E402
-from agent_gateway.capability_execution import BoundCapabilityExecution  # noqa: E402
+from hank_model_transport.capability_execution import BoundCapabilityExecution  # noqa: E402
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
 import agent_gateway.runner_stream_turn as runner_stream_turn  # noqa: E402
@@ -1112,7 +1114,7 @@ def test_followup_replays_complete_tool_batch_before_user_text(
   tmp_path: Path,
   ending: str,
 ) -> None:
-  from agent_gateway.providers.anthropic import AnthropicProvider
+  from hank_model_transport.providers.anthropic import AnthropicProvider
 
   async def _case() -> None:
     log = AgentSessionLog(path=tmp_path / "sessions" / "followup.jsonl")
@@ -1887,8 +1889,8 @@ def test_runner_stale_recovery_synthesizes_orphan_tool_and_prior_writer_interrup
   recovery_delay: int,
   owner_session_host_policy,
 ) -> None:
-  from agent_gateway.providers.codex import CodexProvider
-  from agent_gateway.providers.openai import OpenAIProvider
+  from hank_model_transport.providers.codex import CodexProvider
+  from hank_model_transport.providers.openai import OpenAIProvider
   owner_session_host_policy.get_tool_risk_value = {"file_read": "read_only"}.__getitem__
 
   now = gateway_runner.time.time()

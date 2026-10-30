@@ -21,7 +21,7 @@ from .commercial_contract import (
   packaged_usage_v3_contract_directory,
 )
 from hank_contracts.commercial_work import CommercialWorkStartContext
-from .multi_user.billing import (
+from hank_model_transport.multi_user.billing import (
   BillingMode,
   SessionUsageSummary,
   UsageEvent,

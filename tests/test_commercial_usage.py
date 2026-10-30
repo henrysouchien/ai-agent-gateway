@@ -25,10 +25,10 @@ from agent_gateway.commercial_usage import (
   CommercialUsageObservation,
   CommercialUsageProducer,
 )
-from agent_gateway.multi_user.billing import SessionUsageSummary, UsageEvent
+from hank_model_transport.multi_user.billing import SessionUsageSummary, UsageEvent
 from agent_gateway.usage_reconciliation import CommercialUsageReconciliationTracker
 from agent_gateway.runner_usage import call_usage_event_hook
-from agent_gateway.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
+from hank_model_transport.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.usage_resilience import (
   CommercialUsageDurability,
 )
@@ -36,9 +36,10 @@ from agent_gateway.work_authorization_consumption import (
   WorkAuthorizationConsumptionRecord,
 )
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
+from gateway_test_support.transport_runtime import TEST_SEND_PROMPT_RUNTIME
 
 
-send_prompt_module = importlib.import_module("agent_gateway.send_prompt")
+send_prompt_module = importlib.import_module("hank_model_transport.send_prompt")
 
 
 NOW = 1_780_000_000
@@ -1041,6 +1042,7 @@ async def test_send_prompt_real_producer_emits_metered_canonical_identity() -> N
 
   await send_prompt_module.send_prompt(
     "hello",
+    runtime=TEST_SEND_PROMPT_RUNTIME,
     capability_execution=capability_execution,
     user_id="alice",
     session_id="sess-1",

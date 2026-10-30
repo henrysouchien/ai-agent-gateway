@@ -18,7 +18,8 @@ if str(PKG_DIR) not in sys.path:
 
 
 
-from agent_gateway import AgentSDKConfig, AgentSDKRunner, EventLog, SessionStore  # noqa: E402
+from hank_model_transport.providers import AgentSDKConfig
+from agent_gateway import AgentSDKRunner, EventLog, SessionStore  # noqa: E402
 from agent_gateway import sdk_runner_approval  # noqa: E402
 from agent_gateway.admission import (
   admit_root_turn,
@@ -42,7 +43,7 @@ from agent_gateway.batch_approval_projection import (  # noqa: E402
   BatchApprovalProjectionRegistry,
   BatchApprovalScope,
 )
-from agent_gateway.providers.agent_sdk import SDK_PINNED_VERSION  # noqa: E402
+from hank_model_transport.providers.agent_sdk import SDK_PINNED_VERSION  # noqa: E402
 from agent_gateway.runner import _ACTIVE_SKILL_ALLOW_RESULT_KEY  # noqa: E402
 from agent_gateway.skill_context import clear_current_skill, current_skill, set_current_skill  # noqa: E402
 from agent_gateway.skill_limits import ActiveSkillAdmission, SkillExecutionLimits  # noqa: E402

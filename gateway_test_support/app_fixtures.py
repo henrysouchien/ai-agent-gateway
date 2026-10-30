@@ -41,15 +41,15 @@ def make_test_app():
     ProductModelSelectionPolicy,
   )
   from agent_gateway.auth import AuthConfig, ResolverResult
-  from agent_gateway.providers.agent_sdk import AgentSDKConfig
-  from agent_gateway.providers import AnthropicProvider
+  from hank_model_transport.capability_execution import MaterializedCredential
+  from hank_model_transport.providers.agent_sdk import AgentSDKConfig
+  from hank_model_transport.providers import AnthropicProvider
   from agent_gateway.mcp_client import McpClientManager
   from agent_gateway.runner import AgentRunner
   from agent_gateway.sdk_runner import AgentSDKRunner
   from agent_gateway.server import (
     ChatRuntime,
     GatewayServerConfig,
-    MaterializedCredential,
     create_gateway_app,
   )
   from agent_gateway.tool_dispatcher import ToolDispatcher

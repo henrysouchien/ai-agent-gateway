@@ -33,9 +33,10 @@ AUTONOMOUS_CLAIM_BROKER_FD_ENV = (
 AUTONOMOUS_CLAIM_BROKER_PROTOCOL_VERSION = 3
 # Hang bound on the private gateway↔child frame channel: a runaway child or
 # corrupt length prefix must not make the gateway allocate or read without limit.
-# FRAME-CAPS-ARE-CONTAINMENT (Henry, 723db4743e); precedent e9d4dc138c:
-# a 2.49 MB tool result killed bg_353. Keep the durable record at full fidelity,
-# stream its compacted projection, and warn/drop an undeliverable non-terminal.
+# FRAME-CAPS-ARE-CONTAINMENT (Henry, 723db4743e); precedent e9d4dc138c.
+# Broker admissions and claim replies are refused above this body ceiling.
+# An over-cap sender forwards only the declared length so the receiver can
+# count its refusal without reading the oversized body.
 # This broker ceiling counts JSON body bytes; the four-byte header is separate.
 AUTONOMOUS_CLAIM_BROKER_MAX_FRAME_BYTES = 6 * 1024 * 1024
 AUTONOMOUS_CLAIM_BROKER_MAX_TTL_SECONDS = 600

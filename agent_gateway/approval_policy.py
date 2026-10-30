@@ -14,7 +14,7 @@ from typing import Any, Literal, Mapping, NoReturn, Protocol, get_args
 
 from .ui_blocks_run import UiBlocksRunContext, current_ui_blocks_run
 from .skill_limits import SkillExecutionLimits
-from .policy_imports import load_server_policy_module
+from hank_model_transport.policy_imports import load_server_policy_module
 
 
 ToolClass = Literal[

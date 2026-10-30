@@ -21,7 +21,7 @@ from .events import (
   ToolApprovalRequestEvent,
   event_from_dict,
 )
-from .multi_user.billing import SessionUsageSummary
+from hank_model_transport.multi_user.billing import SessionUsageSummary
 
 
 log = logging.getLogger("agent_gateway.session_recap")

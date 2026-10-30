@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 
 from agent_gateway.auth import AuthConfig, ResolverResult
-from agent_gateway.capability_execution import BoundCapabilityExecution
+from hank_model_transport.capability_execution import BoundCapabilityExecution
 from model_authority.binding import CredentialHandle
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
@@ -30,8 +30,10 @@ from agent_gateway.server import (
   ChatRequest,
   ChatRuntime,
   GatewayServerConfig,
-  MaterializedCredential,
   create_gateway_app,
+)
+from hank_model_transport.capability_execution import (
+  MaterializedCredential,
 )
 from agent_gateway.session import AuthManager, GatewaySession, SessionStream
 

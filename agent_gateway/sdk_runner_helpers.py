@@ -4,7 +4,7 @@ import json
 import sys
 from typing import Any, Dict, List, Mapping
 
-from .policy_imports import load_server_policy_helpers
+from hank_model_transport.policy_imports import load_server_policy_helpers
 
 _PARENT_MODULE = "agent_gateway.sdk_runner"
 

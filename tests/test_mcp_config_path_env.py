@@ -10,7 +10,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import McpClientManager, create_agent
-from agent_gateway.providers.agent_sdk import load_mcp_config_for_sdk
+from hank_model_transport.providers.agent_sdk import load_mcp_config_for_sdk
 
 
 def _write_mcp_config(path: Path, server_name: str, command: str) -> None:

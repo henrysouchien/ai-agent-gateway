@@ -13,16 +13,18 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import (  # noqa: E402
+from agent_gateway import (
   AgentRunner,
   EventLog,
-  ModelProvider,
   NotificationQueue,
   TaskEntry,
   TaskNotification,
   TaskProgress,
   TaskRegistry,
   WorkflowTaskMetadata,
+)
+from hank_model_transport.providers import (
+  ModelProvider,
 )
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402

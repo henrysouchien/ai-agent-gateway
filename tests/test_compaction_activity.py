@@ -18,7 +18,7 @@ import agent_gateway.runner_sub_agents as runner_sub_agents  # noqa: E402
 import agent_gateway.server_compaction as server_compaction  # noqa: E402
 from agent_gateway.agent_session_log import AgentSessionLog  # noqa: E402
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
-from agent_gateway.providers.base import StreamEvent  # noqa: E402
+from hank_model_transport.providers.base import StreamEvent  # noqa: E402
 from agent_workflow_contracts import TaskResult  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_bound_capability_execution,

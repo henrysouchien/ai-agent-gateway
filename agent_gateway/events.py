@@ -9,7 +9,7 @@ from .skill_lifecycle import GateCode, TopLevelSkillLifecycleMetadata
 from .workflow_output_attachment import WorkflowOutputAttachment
 
 if TYPE_CHECKING:
-  from .multi_user.billing import SessionUsageSummary
+  from hank_model_transport.multi_user.billing import SessionUsageSummary
 
 
 RunId: TypeAlias = str
@@ -740,7 +740,7 @@ def _recap_failure(payload: dict[str, Any]) -> RecapFailure:
 
 
 def _session_usage_summary(value: Any) -> SessionUsageSummary | None:
-  from .multi_user.billing import SessionUsageSummary as _SessionUsageSummary
+  from hank_model_transport.multi_user.billing import SessionUsageSummary as _SessionUsageSummary
 
   if value is None:
     return None
