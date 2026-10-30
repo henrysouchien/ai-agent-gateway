@@ -5,7 +5,7 @@ import logging
 import time
 from dataclasses import replace
 from collections.abc import Iterable
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from .event_log import LogEntry, log_has_terminal
 from .events import (
@@ -17,8 +17,9 @@ from .events import (
   RecapVerdict,
   SessionRecapEvent,
   ToolCallsSummary,
-  _approval_decision_source,
-  _approval_outcome,
+  ToolApprovalDecidedEvent,
+  ToolApprovalRequestEvent,
+  event_from_dict,
 )
 from .multi_user.billing import SessionUsageSummary
 
@@ -182,7 +183,7 @@ def compute_recap_from_events(
   usage: SessionUsageSummary | None = None,
 ) -> SessionRecapEvent:
   entries = [
-    LogEntry(seq=index, timestamp=_event_ts(event, time.time()), event=dict(event))
+    LogEntry(seq=index, timestamp=time.time(), event=dict(event))
     for index, event in enumerate(events, start=1)
   ]
   return _compute_recap_entries(
@@ -211,7 +212,7 @@ def _compute_recap_entries(
 
   artifacts: list[RecapArtifact] = []
   verdicts: list[RecapVerdict] = []
-  approvals: list[RecapApproval] = []
+  approval_records = _ApprovalAccumulator()
   failures: list[RecapFailure] = []
   tool_calls_summary = _ToolCallAccumulator()
 
@@ -248,18 +249,18 @@ def _compute_recap_entries(
           ts=_event_ts(event, entry.timestamp),
         )
       )
-    elif event_type == "tool_approval_decided":
-      approvals.append(
-        RecapApproval(
-          tool_call_id=str(event.get("tool_call_id") or ""),
-          tool_name=str(event.get("tool_name") or ""),
-          outcome=_approval_outcome(event.get("outcome")),
-          decision_source=_approval_decision_source(event.get("decision_source")),
-          allow_tool_type_applied=bool(event.get("allow_tool_type_applied", False)),
-          emitted_at_seq=entry.seq,
-          ts=_event_ts(event, entry.timestamp),
+    elif event_type in {"tool_approval_request", "tool_approval_decided"}:
+      try:
+        approval_records.record(entry)
+      except (KeyError, TypeError, ValueError, OverflowError):
+        failures.append(
+          RecapFailure(
+            failure_type="approval_record_unreadable",
+            detail=f"{event_type} at seq {entry.seq}: approval projection unreadable",
+            emitted_at_seq=entry.seq,
+            ts=entry.timestamp,
+          )
         )
-      )
     elif event_type == "tool_call_start":
       tool_calls_summary.record_start(event)
     elif event_type == "tool_call_complete":
@@ -316,7 +317,7 @@ def _compute_recap_entries(
     trigger=trigger,
     artifacts=artifacts,
     verdicts=verdicts,
-    approvals=approvals,
+    approvals=list(approval_records.approvals.values()),
     tool_calls_summary=tool_calls_summary.to_summary(),
     failures=failures,
     usage=usage,
@@ -400,6 +401,70 @@ def _terminal_failure(event: dict[str, Any], emitted_at_seq: int) -> RecapFailur
     emitted_at_seq=emitted_at_seq,
     ts=_event_ts(event, time.time()),
   )
+
+
+class _ApprovalAccumulator:
+  """Fold requests and decisions by their event owner's approval identity."""
+
+  def __init__(self) -> None:
+    self.approvals: dict[tuple[str, str], RecapApproval] = {}
+    self._call_keys: dict[str, tuple[str, str]] = {}
+
+  def record(self, entry: LogEntry) -> None:
+    approval = cast(
+      ToolApprovalRequestEvent | ToolApprovalDecidedEvent,
+      event_from_dict(entry.event),
+    )
+    ts = _event_ts(entry.event, entry.timestamp)
+    # A stated approval id is authoritative. Call association joins a historical
+    # record whose id is absent, never records carrying different stated ids.
+    key = (
+      ("approval", approval.approval_id)
+      if approval.approval_id is not None
+      else self._call_keys.get(approval.tool_call_id, ("call", approval.tool_call_id))
+    )
+    previous = self.approvals.get(key)
+    if previous is None and isinstance(approval, ToolApprovalDecidedEvent):
+      previous = self.approvals.pop(("call", approval.tool_call_id), None)
+    if isinstance(approval, ToolApprovalRequestEvent):
+      record = RecapApproval(
+        tool_call_id=approval.tool_call_id,
+        tool_name=approval.tool_name,
+        approval_id=approval.approval_id,
+        state="pending",
+        outcome=None,
+        decision_source=None,
+        allow_tool_type_applied=None,
+        requested_at=ts,
+        decided_at=None,
+        request_emitted_at_seq=entry.seq,
+        decision_emitted_at_seq=None,
+        emitted_at_seq=entry.seq,
+        ts=ts,
+      )
+    else:
+      record = RecapApproval(
+        tool_call_id=approval.tool_call_id,
+        tool_name=approval.tool_name,
+        approval_id=(
+          approval.approval_id if approval.approval_id is not None
+          else previous.approval_id if previous is not None else None
+        ),
+        state="decided",
+        outcome=approval.outcome,
+        decision_source=approval.decision_source,
+        allow_tool_type_applied=approval.allow_tool_type_applied,
+        requested_at=previous.requested_at if previous is not None else None,
+        decided_at=ts,
+        request_emitted_at_seq=(
+          previous.request_emitted_at_seq if previous is not None else None
+        ),
+        decision_emitted_at_seq=entry.seq,
+        emitted_at_seq=entry.seq,
+        ts=ts,
+      )
+    self.approvals[key] = record
+    self._call_keys[approval.tool_call_id] = key
 
 
 class _ToolCallAccumulator:

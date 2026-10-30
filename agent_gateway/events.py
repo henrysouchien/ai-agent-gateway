@@ -47,11 +47,13 @@ ApprovalDecisionSource: TypeAlias = Literal[
   "approval_timeout",
 ]
 RecapTrigger: TypeAlias = Literal["turn_end", "explicit", "session_gc"]
+RecapApprovalState: TypeAlias = Literal["pending", "decided"]
 RecapFailureType: TypeAlias = Literal[
   "terminal_error",
   "artifact_failed",
   "artifact_unavailable",
   "soft_budget_abort",
+  "approval_record_unreadable",
 ]
 DEFAULT_SCHEMA_VERSION = 1
 SUPPORTED_SCHEMA_VERSIONS: frozenset[int] = frozenset({DEFAULT_SCHEMA_VERSION})
@@ -264,6 +266,7 @@ class ToolApprovalRequestEvent:
   reason: str
   allow_persistent_approval: bool
   ts: float
+  approval_id: str | None = None
   type: Literal["tool_approval_request"] = field(default="tool_approval_request", init=False)
 
 
@@ -308,11 +311,17 @@ class RecapVerdict:
 class RecapApproval:
   tool_call_id: str
   tool_name: str
-  outcome: ApprovalOutcome
-  decision_source: ApprovalDecisionSource
-  allow_tool_type_applied: bool
+  outcome: ApprovalOutcome | None
+  decision_source: ApprovalDecisionSource | None
+  allow_tool_type_applied: bool | None
   emitted_at_seq: int
   ts: float
+  approval_id: str | None
+  state: RecapApprovalState
+  requested_at: float | None
+  decided_at: float | None
+  request_emitted_at_seq: int | None
+  decision_emitted_at_seq: int | None
 
 
 @dataclass(frozen=True)
@@ -603,24 +612,25 @@ def event_from_dict(payload: dict[str, Any]) -> TypedEvent:
     if not isinstance(tool_input, dict):
       raise ValueError("tool_approval_request.tool_input must be a mapping")
     return ToolApprovalRequestEvent(
-      tool_call_id=str(payload["tool_call_id"]),
+      tool_call_id=_approval_identity(payload["tool_call_id"], "tool_call_id"),
       nonce=str(payload["nonce"]),
-      tool_name=str(payload["tool_name"]),
+      tool_name=_approval_identity(payload["tool_name"], "tool_name"),
       tool_input=tool_input,
       resolved_qualifier=str(payload.get("resolved_qualifier", "")),
       reason=str(payload.get("reason", "")),
       allow_persistent_approval=bool(payload.get("allow_persistent_approval", False)),
       ts=_event_ts(payload),
+      approval_id=_approval_id(payload.get("approval_id")),
     )
   if event_type == "tool_approval_decided":
     return ToolApprovalDecidedEvent(
-      tool_call_id=str(payload["tool_call_id"]),
-      tool_name=str(payload["tool_name"]),
+      tool_call_id=_approval_identity(payload["tool_call_id"], "tool_call_id"),
+      tool_name=_approval_identity(payload["tool_name"], "tool_name"),
       outcome=_approval_outcome(payload["outcome"]),
       decision_source=_approval_decision_source(payload["decision_source"]),
       allow_tool_type_applied=bool(payload.get("allow_tool_type_applied", False)),
       ts=_event_ts(payload),
-      approval_id=_optional_str(payload.get("approval_id")),
+      approval_id=_approval_id(payload.get("approval_id")),
       decision_reason=_optional_str(payload.get("decision_reason")),
     )
   if event_type == "session_recap":
@@ -701,13 +711,22 @@ def _recap_verdict(payload: dict[str, Any]) -> RecapVerdict:
 
 def _recap_approval(payload: dict[str, Any]) -> RecapApproval:
   return RecapApproval(
-    tool_call_id=str(payload["tool_call_id"]),
-    tool_name=str(payload["tool_name"]),
-    outcome=_approval_outcome(payload["outcome"]),
-    decision_source=_approval_decision_source(payload["decision_source"]),
-    allow_tool_type_applied=bool(payload["allow_tool_type_applied"]),
+    tool_call_id=_approval_identity(payload["tool_call_id"], "tool_call_id"),
+    tool_name=_approval_identity(payload["tool_name"], "tool_name"),
+    outcome=None if payload["outcome"] is None else _approval_outcome(payload["outcome"]),
+    decision_source=(
+      None if payload["decision_source"] is None
+      else _approval_decision_source(payload["decision_source"])
+    ),
+    allow_tool_type_applied=payload["allow_tool_type_applied"],
     emitted_at_seq=int(payload["emitted_at_seq"]),
     ts=float(payload["ts"]),
+    approval_id=_approval_id(payload.get("approval_id")),
+    state=_recap_approval_state(payload["state"]),
+    requested_at=_optional_float(payload["requested_at"]),
+    decided_at=_optional_float(payload["decided_at"]),
+    request_emitted_at_seq=payload["request_emitted_at_seq"],
+    decision_emitted_at_seq=payload["decision_emitted_at_seq"],
   )
 
 
@@ -827,10 +846,28 @@ def _approval_outcome(value: Any) -> ApprovalOutcome:
   raise ValueError(f"Unknown approval outcome: {value!r}")
 
 
+def _approval_identity(value: Any, field_name: str) -> str:
+  if isinstance(value, str) and value:
+    return value
+  raise ValueError(f"approval.{field_name} must be a nonempty string")
+
+
+def _approval_id(value: Any) -> str | None:
+  if value is None:
+    return None
+  return _approval_identity(value, "approval_id")
+
+
 def _approval_decision_source(value: Any) -> ApprovalDecisionSource:
   if value in get_args(ApprovalDecisionSource):
     return str(value)  # type: ignore[return-value]
   raise ValueError(f"Unknown approval decision source: {value!r}")
+
+
+def _recap_approval_state(value: Any) -> RecapApprovalState:
+  if value in get_args(RecapApprovalState):
+    return cast(RecapApprovalState, value)
+  raise ValueError(f"Unknown recap approval state: {value!r}")
 
 
 def _recap_trigger(value: Any) -> RecapTrigger:
@@ -840,12 +877,7 @@ def _recap_trigger(value: Any) -> RecapTrigger:
 
 
 def _recap_failure_type(value: Any) -> RecapFailureType:
-  if value in {
-    "terminal_error",
-    "artifact_failed",
-    "artifact_unavailable",
-    "soft_budget_abort",
-  }:
+  if value in get_args(RecapFailureType):
     return str(value)  # type: ignore[return-value]
   raise ValueError(f"Unknown session recap failure type: {value!r}")
 
@@ -867,6 +899,7 @@ __all__ = [
   "DEFAULT_SCHEMA_VERSION",
   "RUN_SCOPED_EVENT_TYPES",
   "RecapApproval",
+  "RecapApprovalState",
   "RecapArtifact",
   "RecapFailure",
   "RecapFailureType",

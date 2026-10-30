@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
@@ -36,6 +37,7 @@ from agent_gateway.server_models import SystemPrompt
 from agent_gateway.session import SessionStream
 from agent_gateway.session_recap import (
   compute_recap,
+  compute_recap_from_events,
   emit_recap_then_terminal,
   fold_run_measurements,
 )
@@ -164,6 +166,272 @@ def test_recap_keeps_every_produced_decision_source() -> None:
     ("call-replan", "approved", "planned_write_reinvocation_required"),
     ("call-bm-resume", "approved", "prepared_business_model_resume"),
   ]
+  assert all(approval.state == "decided" for approval in recap.approvals)
+  assert all(approval.approval_id is None for approval in recap.approvals)
+  assert all(approval.requested_at is None for approval in recap.approvals)
+  assert all(approval.request_emitted_at_seq is None for approval in recap.approvals)
+  assert all(approval.decided_at == 1.0 for approval in recap.approvals)
+  assert event_from_dict(event_to_dict(recap)) == recap
+
+
+def test_recap_keeps_pending_request_then_folds_its_later_decision() -> None:
+  approval_id = "e5058f2c-d5fc-4630-89aa-d94e2f2913aa"
+  request = {
+    "type": "tool_approval_request",
+    "approval_id": approval_id,
+    "tool_call_id": "call_m7rb8fso",
+    "tool_name": "code_execute",
+    "nonce": "request-nonce",
+    "tool_input": {"code": "private tool input"},
+    "resolved_qualifier": "kernel",
+    "reason": "Kernel execution needs approval",
+    "allow_persistent_approval": False,
+    "ts": 1001.25,
+  }
+  # Exercise the public event schema before the terminal recap consumes it.
+  request_wire = event_to_dict(event_from_dict(request))
+  assert request_wire["approval_id"] == approval_id
+  event_log = EventLog(
+    session_id="session-park",
+    first_seq=24,
+    defer_terminal_close=True,
+  )
+  event_log.append(request_wire)
+
+  emit_recap_then_terminal(
+    event_log,
+    {"type": "stream_complete", "usage": {}},
+    session_id="session-park",
+    started_at=1000.0,
+  )
+
+  assert [entry.event["type"] for entry in event_log.entries] == [
+    "tool_approval_request", "session_recap", "stream_complete",
+  ]
+  pending = event_from_dict(event_log.entries[1].event)
+  assert isinstance(pending, SessionRecapEvent)
+  assert len(pending.approvals) == 1
+  approval = pending.approvals[0]
+  assert (approval.approval_id, approval.tool_call_id, approval.tool_name) == (
+    approval_id, "call_m7rb8fso", "code_execute",
+  )
+  assert approval.state == "pending"
+  assert approval.outcome is None
+  assert approval.decision_source is None
+  assert approval.allow_tool_type_applied is None
+  assert approval.requested_at == 1001.25
+  assert approval.decided_at is None
+  assert approval.request_emitted_at_seq == 24
+  assert approval.decision_emitted_at_seq is None
+  assert approval.emitted_at_seq == 24
+  assert approval.ts == 1001.25
+  assert event_from_dict(event_to_dict(pending)) == pending
+
+  event_log.append(event_to_dict(event_from_dict({
+    "type": "tool_approval_decided",
+    "approval_id": approval_id,
+    "tool_call_id": "call_m7rb8fso",
+    "tool_name": "code_execute",
+    "outcome": "denied",
+    "decision_source": "user_denied",
+    "allow_tool_type_applied": False,
+    "ts": 1004.5,
+  })))
+  decided = compute_recap(
+    event_log, session_id="session-park", started_at=1000.0, trigger="explicit",
+  )
+
+  assert len(decided.approvals) == 1
+  approval = decided.approvals[0]
+  assert (approval.approval_id, approval.tool_call_id, approval.tool_name) == (
+    approval_id, "call_m7rb8fso", "code_execute",
+  )
+  assert (approval.state, approval.outcome, approval.decision_source) == (
+    "decided", "denied", "user_denied",
+  )
+  assert approval.allow_tool_type_applied is False
+  assert approval.requested_at == 1001.25
+  assert approval.decided_at == 1004.5
+  assert approval.request_emitted_at_seq == 24
+  assert approval.decision_emitted_at_seq == 27
+  assert approval.emitted_at_seq == 27
+  assert approval.ts == 1004.5
+  assert event_from_dict(event_to_dict(decided)) == decided
+
+
+def test_recap_preserves_distinct_approval_ids_for_the_same_call() -> None:
+  requests = [
+    {
+      "type": "tool_approval_request",
+      "approval_id": approval_id,
+      "tool_call_id": call_id,
+      "tool_name": tool_name,
+      "nonce": f"nonce-{approval_id}",
+      "tool_input": {},
+      "ts": ts,
+    }
+    for approval_id, call_id, tool_name, ts in (
+      ("approval-first", "call-reused", "code_execute", 10.0),
+      ("approval-second", "call-reused", "code_execute", 11.0),
+      ("approval-third", "call-other", "memory_write", 12.0),
+    )
+  ]
+  recap = compute_recap_from_events(
+    [*requests, {
+      "type": "tool_approval_decided",
+      "approval_id": "approval-first",
+      "tool_call_id": "call-reused",
+      "tool_name": "code_execute",
+      "outcome": "approved",
+      "decision_source": "user_approved",
+      "allow_tool_type_applied": True,
+      "ts": 13.0,
+    }],
+    session_id="session-multiple", started_at=9.0, trigger="explicit",
+  )
+
+  assert [
+    (a.approval_id, a.tool_call_id, a.state, a.outcome, a.requested_at, a.decided_at)
+    for a in recap.approvals
+  ] == [
+    ("approval-first", "call-reused", "decided", "approved", 10.0, 13.0),
+    ("approval-second", "call-reused", "pending", None, 11.0, None),
+    ("approval-third", "call-other", "pending", None, 12.0, None),
+  ]
+  assert recap.failures == []
+  assert event_from_dict(event_to_dict(recap)) == recap
+
+
+@pytest.mark.parametrize(("request_id", "decision_id"), [
+  ("approval-raised", None),
+  (None, "approval-raised"),
+  (None, None),
+])
+def test_recap_associates_historical_records_with_an_absent_approval_id(
+  request_id: str | None, decision_id: str | None,
+) -> None:
+  recap = compute_recap_from_events(
+    [{
+      "type": "tool_approval_request",
+      "approval_id": request_id,
+      "tool_call_id": "call-historical",
+      "tool_name": "run_bash",
+      "nonce": "nonce-historical",
+      "tool_input": {},
+      "ts": 10.0,
+    }, {
+      "type": "tool_approval_decided",
+      "approval_id": decision_id,
+      "tool_call_id": "call-historical",
+      "tool_name": "run_bash",
+      "outcome": "approved",
+      "decision_source": "user_approved",
+      "allow_tool_type_applied": False,
+      "ts": 11.0,
+    }],
+    session_id="session-historical", started_at=9.0, trigger="explicit",
+  )
+
+  assert len(recap.approvals) == 1
+  approval = recap.approvals[0]
+  assert approval.approval_id == (decision_id if decision_id is not None else request_id)
+  assert approval.state == "decided"
+  assert approval.requested_at == 10.0
+  assert approval.decided_at == 11.0
+  assert event_from_dict(event_to_dict(recap)) == recap
+
+
+@pytest.mark.parametrize(("event_type", "patch"), [
+  ("tool_approval_request", {"approval_id": True}),
+  ("tool_approval_request", {"tool_call_id": 7}),
+  ("tool_approval_request", {"tool_input": "DO_NOT_EXPOSE_PRIVATE_INPUT"}),
+  ("tool_approval_decided", {"approval_id": 42}),
+  ("tool_approval_decided", {"tool_name": False}),
+  ("tool_approval_decided", {"outcome": "DO_NOT_EXPOSE_PRIVATE_INPUT"}),
+  ("tool_approval_decided", {"decision_source": {"DO_NOT_EXPOSE_PRIVATE_INPUT": 1}}),
+  ("tool_approval_decided", {"ts": "DO_NOT_EXPOSE_PRIVATE_INPUT"}),
+])
+def test_unreadable_approval_is_a_finding_not_a_missing_terminal_recap(
+  event_type: str, patch: dict[str, Any],
+) -> None:
+  event_log = EventLog(session_id="session-unreadable", first_seq=41)
+  malformed = {
+    "type": event_type,
+    "approval_id": "approval-malformed",
+    "tool_call_id": "call-malformed",
+    "tool_name": "code_execute",
+    "nonce": "private-nonce",
+    "tool_input": {"code": "DO_NOT_EXPOSE_PRIVATE_INPUT"},
+    "outcome": "denied",
+    "decision_source": "user_denied",
+    "allow_tool_type_applied": False,
+    "ts": 10.0,
+    **patch,
+  }
+  source = event_log.append(malformed)
+  assert source is not None
+
+  emit_recap_then_terminal(
+    event_log,
+    {"type": "stream_complete", "usage": {}},
+    session_id="session-unreadable",
+    started_at=9.0,
+  )
+
+  assert [entry.event["type"] for entry in event_log.entries] == [
+    event_type, "session_recap", "stream_complete",
+  ]
+  recap = event_from_dict(event_log.entries[1].event)
+  assert isinstance(recap, SessionRecapEvent)
+  assert recap.approvals == []
+  assert recap.failures == [RecapFailure(
+    failure_type="approval_record_unreadable",
+    detail=f"{event_type} at seq 41: approval projection unreadable",
+    emitted_at_seq=41,
+    ts=source.timestamp,
+  )]
+  assert "DO_NOT_EXPOSE_PRIVATE_INPUT" not in json.dumps(event_to_dict(recap))
+  assert "private-nonce" not in json.dumps(event_to_dict(recap))
+  assert event_from_dict(event_to_dict(recap)) == recap
+
+  restored = compute_recap_from_events(
+    [malformed], session_id="session-unreadable", started_at=9.0, trigger="explicit",
+  )
+  assert restored.approvals == []
+  assert restored.failures[0].failure_type == "approval_record_unreadable"
+  assert restored.failures[0].emitted_at_seq == 1
+
+
+def test_unreadable_decision_does_not_erase_its_pending_request() -> None:
+  recap = compute_recap_from_events(
+    [{
+      "type": "tool_approval_request",
+      "approval_id": "approval-pending",
+      "tool_call_id": "call-pending",
+      "tool_name": "code_execute",
+      "nonce": "pending-nonce",
+      "tool_input": {},
+      "ts": 10.0,
+    }, {
+      "type": "tool_approval_decided",
+      "approval_id": False,
+      "tool_call_id": "call-pending",
+      "tool_name": "code_execute",
+      "outcome": "denied",
+      "decision_source": "user_denied",
+      "allow_tool_type_applied": False,
+      "ts": 11.0,
+    }],
+    session_id="session-pending", started_at=9.0, trigger="explicit",
+  )
+
+  assert len(recap.approvals) == 1
+  assert recap.approvals[0].approval_id == "approval-pending"
+  assert recap.approvals[0].state == "pending"
+  assert recap.approvals[0].outcome is None
+  assert recap.approvals[0].decided_at is None
+  assert recap.failures[0].failure_type == "approval_record_unreadable"
+  assert recap.failures[0].emitted_at_seq == 2
 
 
 

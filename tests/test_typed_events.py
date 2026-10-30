@@ -304,7 +304,8 @@ def test_tool_approval_request_event_accepts_legacy_missing_ts() -> None:
 
   assert isinstance(event, ToolApprovalRequestEvent)
   assert event.ts == 0.0
-  assert event_to_dict(event) == {**payload, "ts": 0.0}
+  assert event.approval_id is None
+  assert event_to_dict(event) == {**payload, "ts": 0.0, "approval_id": None}
 
 
 def test_typed_recommendations_extracted_event_round_trip() -> None:
@@ -620,6 +621,7 @@ def test_session_recap_event_supports_all_failure_types() -> None:
     "artifact_failed",
     "artifact_unavailable",
     "soft_budget_abort",
+    "approval_record_unreadable",
   ]
 
   for failure_type in failure_types:
@@ -716,6 +718,12 @@ def _session_recap_event(
         allow_tool_type_applied=True,
         emitted_at_seq=5,
         ts=1005.0,
+        approval_id=None,
+        state="decided",
+        requested_at=None,
+        decided_at=1005.0,
+        request_emitted_at_seq=None,
+        decision_emitted_at_seq=5,
       )
     ],
     tool_calls_summary=ToolCallsSummary(
