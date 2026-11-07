@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- The `agent-workflow-contracts` floor is `>=1.3.0` (was `>=1`), released as 0.32.1. 0.32.0 imports `SelectionLane` and `project_report_envelope_receipt`, new in 1.3.0, so it fails at import where an older contracts release is already installed.
+
 - Web session creation no longer posts the legacy v1 resolver body. User-key drivers always lease through the v2 user-key client, so Risk's `user_key_missing` becomes the typed `SessionDriverUserKeyMissing` ("connect your Anthropic API key") instead of `401 auth_failed` surfaced as `credential resolver unavailable (stage=web)`. Non-user-key web drivers use direct operator config with `allow_service_for_interactive=False`; no legacy web resolver branch remains.
 
 ### Added

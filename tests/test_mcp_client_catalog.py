@@ -191,7 +191,67 @@ def test_corpus_read_overlay_teaches_document_frame_and_never_recommends_scoped(
   assert "pass offset_frame='document' with hit offsets" in published["description"]
 
 
+def test_outline_overlay_teaches_finding_a_section_then_reading_it_by_id_or_bounds() -> None:
+  published = {
+    tool_name: materialize_published_tool_definition(
+      {"name": tool_name, "description": "", "input_schema": {"type": "object", "properties": {"document_id": {}}}},
+      prefix="",
+      strip_input_fields=set(),
+    )["description"]
+    for tool_name in ("filings_outline", "transcripts_outline")
+  }
 
+  assert "section=<section_id>" in published["filings_outline"]
+  assert "char_start/char_end" in published["filings_outline"]
+  assert "offset_frame='document'" in published["filings_outline"]
+  assert "transcripts_search hit" in published["transcripts_outline"]
+  assert "offset_frame='document'" in published["transcripts_outline"]
+  assert all("not a citation source" in text for text in published.values())
+
+
+
+
+
+def _published_search_tool(tool_name: str, property_names: tuple[str, ...]) -> dict:
+  return materialize_published_tool_definition(
+    {
+      "name": tool_name,
+      "description": "Search hosted corpus content.",
+      "input_schema": {"type": "object", "properties": {name: {} for name in property_names}},
+    },
+    prefix="",
+    strip_input_fields=set(),
+  )
+
+
+def test_corpus_search_overlay_teaches_scoping_paging_and_newest_order() -> None:
+  shared = ("document_id", "cursor", "hits_per_section", "order", "date_from")
+  for tool_name, property_names in (
+    ("filings_search", (*shared, "section")),
+    ("transcripts_search", shared),
+  ):
+    published = _published_search_tool(tool_name, property_names)
+    description = published["description"]
+    properties = published["input_schema"]["properties"]
+
+    assert description.startswith("Search hosted corpus content.")
+    for taught in ("document_id", "next_call", "has_more", "order='newest'", "instead of guessing date_from"):
+      assert taught in description, (tool_name, taught)
+    assert "copied from a" in properties["document_id"]["description"]
+    assert "next_cursor" in properties["cursor"]["description"]
+    assert "1 to 5" in properties["hits_per_section"]["description"]
+    assert "newest" in properties["order"]["description"]
+    assert properties["date_from"] == {}
+  assert "section_id" in _published_search_tool("filings_search", ("section",))["input_schema"]["properties"][
+    "section"
+  ]["description"]
+  assert "speaker_name" in _published_search_tool("transcripts_search", ())["description"]
+
+
+def test_corpus_search_overlay_invents_no_property_a_server_does_not_publish() -> None:
+  published = _published_search_tool("filings_search", ("query", "limit"))
+
+  assert published["input_schema"]["properties"] == {"query": {}, "limit": {}}
 
 
 def test_apply_collision_filtering_preserves_gsheets_producer_descriptions() -> None:

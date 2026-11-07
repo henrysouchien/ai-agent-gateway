@@ -42,6 +42,7 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   "filings_search": _spec("Searching filings", "ticker", "query"),
   "filings_read": _spec("Reading filing excerpts", "ticker", "form"),
   "filings_list": _spec("Finding filings", "ticker", "form"),
+  "filings_outline": _spec("Outlining filing", "ticker", "form"),
   # Market data.
   "check_market_cap": _spec("Checking {ticker} market cap", "symbol", "ticker"),
   "get_quote": _spec("Pulling a market quote", "ticker"),
@@ -83,6 +84,7 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   "transcripts_read": _spec("Reading earnings transcripts", "ticker", "period"),
   "transcripts_search": _spec("Searching earnings transcripts", "ticker", "query"),
   "transcripts_list": _spec("Finding earnings transcripts", "ticker", "period"),
+  "transcripts_outline": _spec("Outlining earnings transcript", "ticker", "period"),
   "memory_write": _spec("Writing {file}", "mode"),
   "memory_read": _spec("Reading {file}"),
   "memory_recall": _spec("Recalling memory", "query", "ticker"),

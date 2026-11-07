@@ -12,10 +12,28 @@ from .tool_definition import (
 
 
 _MCP_TOOL_DESCRIPTION_GUIDANCE: dict[str, str] = {
+  "filings_search": (
+    "Argument guidance: scope and page a search instead of rewording it. To search one filing, pass "
+    "document_id copied from a filings_search hit or filings_list; to search one section, pass section "
+    "(a hit's section or section_id). When a response has has_more=true, call its next_call (the same "
+    "arguments plus cursor) until has_more is false; total_matches counts every matching section. For the "
+    "newest filings first pass order='newest' instead of guessing date_from. hits_per_section (1-5) "
+    "returns more match windows from one long section."
+  ),
+  "transcripts_search": (
+    "Argument guidance: scope and page a search instead of rewording it. To search one call, pass "
+    "document_id copied from a transcripts_search hit or transcripts_list. When a response has "
+    "has_more=true, call its next_call (the same arguments plus cursor) until has_more is false; "
+    "total_matches counts every matching speaker turn. For the newest calls first pass order='newest' "
+    "instead of guessing date_from. hits_per_section (1-5) returns more match windows from one long turn. "
+    "Each hit names speaker_name, speaker_role and turn, and carries offset_frame='document'."
+  ),
   "filings_read": (
     "Argument guidance: read from corpus search/list results only. Copy document_id and section "
     "from filings_search or filings_list results. For text windows, copy char_start/char_end from "
-    "filings_search hits and set offset_frame='document'; omit offsets if uncertain. Do not invent "
+    "filings_search hits and set offset_frame='document'; omit offsets if uncertain, but a read with "
+    "no window over about 60,000 characters is refused with a next_call, so name a section. Follow a "
+    "result's continuation.next_call to read the next window. Do not invent "
     "or normalize section names such as 'Notes to Consolidated Financial Statements' or "
     "'Part I, Item 8'; use the exact returned section, or omit section/offsets and rediscover with "
     "filings_search/filings_list. Do not pass transcript document_ids such as fmp_transcripts:*; "
@@ -27,7 +45,29 @@ _MCP_TOOL_DESCRIPTION_GUIDANCE: dict[str, str] = {
     "char_start, char_end and offset_frame ('document'); pass offset_frame='document' with hit offsets "
     "even when a hit omits it. With no window, read one "
     "section instead: the only supported section values are prepared_remarks and qa; omit section if "
-    "uncertain. Do not use filings_read for transcript document_ids."
+    "uncertain, but a read with no window over about 60,000 characters is refused with a next_call. "
+    "Follow a result's continuation.next_call to read the next window. Do not use filings_read for "
+    "transcript document_ids."
+  ),
+  "filings_outline": (
+    "Argument guidance: copy document_id from filings_search or filings_list results. Use the outline "
+    "to find where a topic sits instead of searching blind or paging by hand: it lists each section "
+    "with a section_id and char_start/char_end. Then read it with filings_read(document_id, "
+    "section=<section_id>), or read part of a section by copying char_start/char_end from the "
+    "outline and setting offset_frame='document'. depth=2 also lists the headings and note titles "
+    "inside each section with their own char_start/char_end. The outline holds no filing text and "
+    "is not a citation source: cite from the read. Do not pass transcript document_ids such as "
+    "fmp_transcripts:*; use transcripts_outline for transcripts."
+  ),
+  "transcripts_outline": (
+    "Argument guidance: copy document_id from transcripts_search or transcripts_list results. Use the "
+    "outline to find a speaker's turn or a Q&A exchange instead of searching blind: it lists every "
+    "turn with speaker_name, speaker_role, char_start/char_end and qa_exchange (the turn number is "
+    "the one a transcripts_search hit carries). Then read a turn with transcripts_read(document_id, "
+    "char_start, char_end, offset_frame='document') using the turn's char_start/char_end, or read "
+    "a section (prepared_remarks or qa) or one speaker. The outline holds no transcript text and is "
+    "not a citation source: cite from the read. Do not use filings_outline for transcript "
+    "document_ids."
   ),
   "get_filings": (
     "Argument guidance: this is not a broad filing-list endpoint. Call only after deriving a "
@@ -120,6 +160,28 @@ _MCP_TOOL_DESCRIPTION_GUIDANCE: dict[str, str] = {
 
 
 _MCP_TOOL_PROPERTY_DESCRIPTION_GUIDANCE: dict[str, dict[str, str]] = {
+  "filings_search": {
+    "document_id": (
+      "Optional document_id, or a list of them, copied from a filings_search hit or filings_list. Searches "
+      "only those filings."
+    ),
+    "section": (
+      "Optional section to search inside: the section or section_id returned on a hit, such as "
+      "'Item 1A. Risk Factors' or 'item_1a'. Do not invent names."
+    ),
+    "cursor": "The next_cursor of the previous response, unchanged. Prefer calling its next_call.",
+    "hits_per_section": "Match windows returned per matching section, 1 to 5 (default 1).",
+    "order": "'relevance' (default) or 'newest' (latest filing first). Use newest instead of guessing date_from.",
+  },
+  "transcripts_search": {
+    "document_id": (
+      "Optional transcript document_id, or a list of them, copied from a transcripts_search hit or "
+      "transcripts_list. Searches only those calls."
+    ),
+    "cursor": "The next_cursor of the previous response, unchanged. Prefer calling its next_call.",
+    "hits_per_section": "Match windows returned per matching speaker turn, 1 to 5 (default 1).",
+    "order": "'relevance' (default) or 'newest' (latest call first). Use newest instead of guessing date_from.",
+  },
   "filings_read": {
     "document_id": (
       "Exact document_id copied from filings_search or filings_list. Do not synthesize it. "
