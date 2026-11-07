@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import logging
 import time
@@ -46,7 +47,8 @@ from .runner_introspection import detect_keyword_param as _detect_keyword_param
 from .runner_background_lifecycle import _RunResearchFileActivityLease
 from hank_model_transport.runtime_helpers import select_run_max_tokens
 from .run_identity import RunIdentityCarrier
-from .runner_session_events import build_user_message_event
+from .registry_scope import DeclaredRegistryScope, NoRegistryScope, RegistryScope
+from .runner_session_events import ANALYST_CONTENT_UNSET, build_user_message_event
 from .selected_content import (
   SelectedContentBinding,
   serialize_selected_content_bindings,
@@ -796,6 +798,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     self._agent_session_log = agent_session_log
     self._selected_content_bindings: tuple[SelectedContentBinding, ...] = ()
     self._selected_content_bindings_bound = False
+    self._analyst_content: Any = ANALYST_CONTENT_UNSET
     self._research_file_activity_lease: _RunResearchFileActivityLease | None = None
     self._selected_content_activity_lease: Any | None = None
     # One admitted route, read as a value; the handles below are its
@@ -824,6 +827,13 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       raise TypeError("selected content must be an immutable binding tuple")
     self._selected_content_bindings = bindings
     self._selected_content_bindings_bound = True
+
+  def bind_analyst_content(self, content: str | list[dict[str, Any]]) -> None:
+    if self._analyst_content is not ANALYST_CONTENT_UNSET:
+      raise RuntimeError("analyst content is already bound for this runner")
+    if not isinstance(content, (str, list)):
+      raise TypeError("analyst content must be text or a content block list")
+    self._analyst_content = content
 
   def bind_research_file_activity_lease(self, lease: Any) -> None:
     if lease is None or not callable(getattr(lease, "release", None)):
@@ -984,6 +994,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     result: Any | None,
     error: Dict[str, Any] | None,
     completion_event: Mapping[str, Any],
+    registry_scope: DeclaredRegistryScope,
   ) -> str | None:
     return await _sdk_runner_context.build_hook_additional_context(
       self,
@@ -994,6 +1005,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       result=result,
       error=error,
       completion_event=completion_event,
+      registry_scope=registry_scope,
       logger=log,
     )
 
@@ -1267,8 +1279,18 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       carrier = RunIdentityCarrier(normalized)
     except Exception:
       return
+    run_context = self._resolve_run_context()
     self._skill_run_id = carrier.run_id
     self._run_identity_carrier = carrier
+    match (run_context.registry_scope, self._workspace_dir):
+      case (RegistryScope(scope_type="session"), _):
+        pass
+      case (RegistryScope(scope_type="run") | NoRegistryScope(), str() as workspace_dir):
+        self._run_context = replace(
+          run_context,
+          run_id=carrier.run_id,
+          registry_scope=RegistryScope("run", carrier.run_id, workspace_dir),
+        )
 
   def _consume_private_tool_result_fields(self, result: Any, *, tool_name: str | None = None) -> Any:
     if isinstance(result, dict):
@@ -1362,6 +1384,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       result=result,
       error=None,
       completion_event=completion_event,
+      registry_scope=completed_call.registry_scope,
     )
     additional_context = (
       str(
@@ -1441,6 +1464,7 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       result=None,
       error=error,
       completion_event=completion_event,
+      registry_scope=completed_call.registry_scope,
     )
     # The failure message is authored by the tool's server and the hook's
     # additional context is authored here: both are bounded text, the same
@@ -1483,13 +1507,23 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     return hooks
 
   def _resolve_run_context(self) -> RunContext:
+    run_id = (
+      self._run_identity_carrier.run_id
+      if self._run_identity_carrier is not None
+      else None
+    )
+    declared_run_id = run_id or self._skill_run_id
+    registry_scope: DeclaredRegistryScope = (
+      self._run_context.registry_scope
+      if self._run_context is not None
+      else RegistryScope("run", declared_run_id, self._workspace_dir)
+      if declared_run_id is not None and self._workspace_dir is not None
+      else NoRegistryScope()
+    )
     return _sdk_runner_approval.resolve_run_context(
       run_context=self._run_context,
-      run_id=(
-        self._run_identity_carrier.run_id
-        if self._run_identity_carrier is not None
-        else None
-      ),
+      registry_scope=registry_scope,
+      run_id=run_id,
       usage_user_id=self._usage_user_id,
       session=self._session,
       approval_policy=self._approval_policy,
@@ -1939,7 +1973,10 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
   ) -> None:
     if self._summary_emitted:
       raise RuntimeError("AgentSDKRunner is single-use; construct a new runner for subsequent runs")
-    if self._selected_content_bindings:
+    if self._selected_content_bindings or (
+      self._analyst_content is not ANALYST_CONTENT_UNSET
+      and self._agent_session_log is not None
+    ):
       agent_session_log = self._agent_session_log
       append = getattr(agent_session_log, "append", None)
       user_content = next(
@@ -1952,16 +1989,20 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
       )
       if agent_session_log is None or not callable(append) or user_content is None:
         raise RuntimeError(
-          "Selected content was not durably committed before model work."
+          "User message was not durably committed before model work."
         )
-      await agent_session_log.append(build_user_message_event(
+      user_event = build_user_message_event(
         content=user_content,
+        analyst_content=self._analyst_content,
         client_kind=self._channel or "chat",
         received_at=time.time(),
         selected_content=serialize_selected_content_bindings(
           self._selected_content_bindings
         ),
-      ))
+      )
+      if self._analyst_content is not ANALYST_CONTENT_UNSET:
+        user_event["role"] = "writer"
+      await agent_session_log.append(user_event)
     self._capability_execution.revalidate()
     capability_bind = self._capability_execution.bind
     effective_model = capability_bind.upstream_model
@@ -2041,7 +2082,12 @@ class AgentSDKRunner(_sdk_runner_stream._SDKRunnerStreamMixin):
     options_kwargs = {key: value for key, value in options_kwargs.items() if value is not None}
 
     bind = self._capability_execution.bind
-    with spend_context(run_owner=self._usage_user_id):
+    run_owner = (
+      str(self._session.risk_user_id)
+      if self._session is not None and self._session.risk_user_id > 0
+      else self._usage_user_id
+    )
+    with spend_context(run_owner=run_owner):
       spend_meter = ProviderCallMeter(
         runtime=GATEWAY_SEND_PROMPT_RUNTIME,
         provider=None,

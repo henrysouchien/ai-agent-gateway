@@ -41,6 +41,7 @@ from .claim_signing_authority import GatewayClaimSigningAuthority
 from model_authority.binding import CredentialHandle
 from model_authority.selection import ProductModelSelectionPolicy
 from .session import GatewaySession
+from .user_identity_mapping import parse_storage_identity
 from .autonomous_event_channel import (
   AutonomousEventRecord,
   AutonomousPrivateExecutableCapture,
@@ -89,6 +90,7 @@ from .session_recap import fold_run_measurements
 from .named_refusal import NamedRefusal
 from .approval_continuation import ChildContinueOutcome, ContinueStatus
 from .approval_store import ApprovalExecutableBindingError, SQLiteApprovalStore
+from .single_user_policy import ApprovalSettingsPinError
 
 _STATUS_TAIL_LINES = 40
 _POST_EXIT_SETTLE_SECONDS = 5.0
@@ -108,6 +110,39 @@ class AutonomousAdmissionClosed(NamedRefusal):
       transport="unavailable",
     )
 
+
+
+class AutonomousCancelUnsettledError(NamedRefusal):
+  """An autonomous cancel could not confirm process or reaper settlement within its grace window."""
+
+  def __init__(
+    self,
+    code: str,
+    message: str,
+    *,
+    run_id: str,
+    pid: int | None = None,
+    process_group_id: int | None = None,
+    settlement_pending: bool = False,
+  ) -> None:
+    self.run_id = run_id
+    self.pid = pid
+    self.process_group_id = process_group_id
+    self.settlement_pending = settlement_pending
+    self.next_call = {"method": "GET", "path": f"/control/runs/{run_id}"}
+    super().__init__(code, message, transport="conflict")
+
+  def to_detail(self) -> dict[str, Any]:
+    return {
+      "error": self.code,
+      "code": self.code,
+      "message": str(self),
+      "run_id": self.run_id,
+      "pid": self.pid,
+      "process_group_id": self.process_group_id,
+      "settlement_pending": self.settlement_pending,
+      "next_call": self.next_call,
+    }
 
 def _required_control_text(
   value: Any,
@@ -460,6 +495,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     skill: str | None,
     pack: str | None = None,
     deliver: bool = True,
+    context: str | None = None,
     ticker: str | None = None,
     research_file_id: int | None = None,
   ) -> list[str]:
@@ -471,6 +507,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       skill=skill,
       pack=pack,
       deliver=deliver,
+      context=context,
       ticker=ticker,
       research_file_id=research_file_id,
       normalize_autonomous_profile_func=normalize_autonomous_profile,
@@ -1359,11 +1396,22 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         if cleanup_error is None:
           cleanup_error = exc
 
-    def interrupt_event_channel() -> None:
+    def interrupt_event_channel(*, collateral: bool = False) -> None:
       nonlocal cleanup_error
       if record.event_channel is None:
         return
       try:
+        # Aborting the endpoint makes its blocked reader raise a transport or
+        # protocol error, not a cancellation. When the abort is cleanup for an
+        # already-failed or cancelled run, mark the pending reader before it
+        # so that error is collateral and cannot replace the run's cause. A
+        # reader that outlived a clean process exit is still a channel failure.
+        if (
+          collateral
+          and channel_task is not None
+          and not channel_task.done()
+        ):
+          interrupted_channel_tasks.add(channel_task)
         record.event_channel.interrupt()
       except Exception as exc:
         if cleanup_error is None:
@@ -1375,6 +1423,8 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     record.sentinel_status_task = process_status_task
     channel_task = record.event_channel_task
     wait_tasks: set[asyncio.Task[Any]] = {process_status_task}
+    cleanup_cancelled_tasks: set[asyncio.Task[Any]] = set()
+    interrupted_channel_tasks: set[asyncio.Task[Any]] = set()
     if channel_task is None:
       channel_error = RuntimeError(
         "autonomous event channel drain task is unavailable"
@@ -1403,7 +1453,17 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
           try:
             task.result()
           except BaseException as exc:
-            if channel_error is None:
+            # Only an error the aborted reader raises because cleanup
+            # interrupted it, or the cancellation cleanup itself delivers, is
+            # collateral; an error raised before cleanup began is a genuine
+            # channel failure.
+            collateral = (
+              task in interrupted_channel_tasks and isinstance(exc, Exception)
+            ) or (
+              isinstance(exc, asyncio.CancelledError)
+              and task in cleanup_cancelled_tasks
+            )
+            if channel_error is None and not collateral:
               channel_error = exc
 
     accepted_cancellation = (
@@ -1470,7 +1530,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
       or channel_error is not None
     ):
       close_approval_channel()
-      interrupt_event_channel()
+      interrupt_event_channel(collateral=True)
       if record.proc.returncode is None:
         try:
           self._signal_owned_process_group(record, signal.SIGTERM)
@@ -1522,6 +1582,18 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
         cleanup_error = exc
 
     if (
+      accepted_cancellation
+      and exit_code is None
+      and record.proc.returncode is not None
+    ):
+      # The cancellation kill takes the sentinel with its child, so its status
+      # line never arrives (EOF), or the read is still pending when the cleanup
+      # window closes under load: no child status is harvested. The observed
+      # process-group exit is then the run's exit, so "killed" always reports
+      # how the process ended.
+      exit_code = record.proc.returncode
+
+    if (
       sentinel_was_live_for_cleanup
       and not group_fence_confirmed
       and record.proc.returncode != -signal.SIGKILL
@@ -1535,6 +1607,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     close_approval_channel()
     for task in wait_tasks:
       if not task.done():
+        cleanup_cancelled_tasks.add(task)
         task.cancel()
     await asyncio.gather(*wait_tasks, return_exceptions=True)
     harvest({task for task in wait_tasks if task.done()})
@@ -1896,6 +1969,13 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
           "outcome_unknown"
           if exc.code == "execution_outcome_unknown" else "not_restorable"
         )
+      except ApprovalSettingsPinError as exc:
+        # start() refused before spawning anything: the park carries no launch
+        # approval settings. The source stays parked; the operator re-runs it.
+        _LOGGER.error("Autonomous approval continuation refused | %s", exc)
+        return ChildContinueOutcome(
+          "not_restorable", job_id, tool_call_id, detail=str(exc),
+        )
       source.resumed_as.append(started["run_id"])
       source.state = "continued"
       source.completed_at = time.time()
@@ -2129,12 +2209,38 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
           await self._cleanup_run_buffer(record)
         return self._status_payload(record)
     if self._is_active_process_state(record):
+      post_exit_settle_sec = max(_POST_EXIT_SETTLE_SECONDS, _SPAWN_CLEANUP_GRACE_SEC)
       if record.event_channel_ack_started:
         if record.reaper_task is None:
           raise RuntimeError(
             "acknowledged autonomous run has no direct-process reaper"
           )
-        await asyncio.shield(record.reaper_task)
+        try:
+          await asyncio.wait_for(
+            asyncio.shield(record.reaper_task),
+            timeout=post_exit_settle_sec,
+          )
+        except asyncio.TimeoutError as exc:
+          pid = getattr(record.proc, "pid", None)
+          if record.proc is not None and record.proc.returncode is None:
+            raise AutonomousCancelUnsettledError(
+              "cancel_process_unsettled",
+              "cancelled autonomous run did not settle after final process-group kill "
+              f"(run_id={record.control_run_id}, pid={pid}, pgid={record.process_group_id}); "
+              f"poll GET /control/runs/{record.control_run_id}",
+              run_id=record.control_run_id,
+              pid=pid,
+              process_group_id=record.process_group_id,
+              settlement_pending=False,
+            ) from exc
+          raise AutonomousCancelUnsettledError(
+            "cancel_settlement_pending",
+            f"cancelled autonomous run {record.control_run_id} exited but post-exit reaper settlement is still pending; poll GET /control/runs/{record.control_run_id}",
+            run_id=record.control_run_id,
+            pid=pid,
+            process_group_id=record.process_group_id,
+            settlement_pending=True,
+          ) from exc
         return self._status_payload(record)
       if not record.event_channel_ack_started:
         record.cancellation_requested = True
@@ -2176,14 +2282,37 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
           record.error = (
             f"{record.error}; process-group kill failed: {exc}"
           )
+        if record.proc is not None and record.proc.returncode is None:
+          try:
+            await asyncio.wait_for(
+              record.proc.wait(),
+              timeout=_SPAWN_CLEANUP_GRACE_SEC,
+            )
+          except asyncio.TimeoutError as exc:
+            pid = getattr(record.proc, "pid", None)
+            raise AutonomousCancelUnsettledError(
+              "cancel_process_unsettled",
+              "cancelled autonomous run did not settle after final process-group kill "
+              f"(run_id={record.control_run_id}, pid={pid}, pgid={record.process_group_id}); "
+              f"poll GET /control/runs/{record.control_run_id}",
+              run_id=record.control_run_id,
+              pid=pid,
+              process_group_id=record.process_group_id,
+              settlement_pending=False,
+            ) from exc
         try:
           await asyncio.wait_for(
             asyncio.shield(record.reaper_task),
-            timeout=_SPAWN_CLEANUP_GRACE_SEC,
+            timeout=post_exit_settle_sec,
           )
         except asyncio.TimeoutError as exc:
-          raise RuntimeError(
-            "cancelled autonomous run did not settle after final process-group kill"
+          raise AutonomousCancelUnsettledError(
+            "cancel_settlement_pending",
+            f"cancelled autonomous run {record.control_run_id} exited but post-exit reaper settlement is still pending; poll GET /control/runs/{record.control_run_id}",
+            run_id=record.control_run_id,
+            pid=getattr(record.proc, "pid", None),
+            process_group_id=record.process_group_id,
+            settlement_pending=True,
           ) from exc
     return self._status_payload(record)
 
@@ -2200,9 +2329,7 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     their in-flight runs, stops their pending approval deliveries, and disables
     their owned schedules. A second user's runs, deliveries, and schedules are untouched.
     """
-    owner = str(user_id or "").strip()
-    if not owner:
-      raise ValueError("user_id must not be blank")
+    owner = parse_storage_identity(user_id).storage_id
 
     cancelled_tasks: list[str] = []
     live_records = [
@@ -2268,8 +2395,8 @@ class AutonomousRegistry(AutonomousRegistryStartMixin, AutonomousRegistryStateMi
     ]
     seen_revoked_users: set[str] = set()
     for record in active:
-      owner_id = str(record.owner_user_id or "").strip()
-      if not owner_id or owner_id in seen_revoked_users:
+      owner_id = parse_storage_identity(record.owner_user_id).storage_id
+      if owner_id in seen_revoked_users:
         continue
       role = self.live_user_role(owner_id, record.user_email)
       if role is None:

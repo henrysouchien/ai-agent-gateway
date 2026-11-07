@@ -403,6 +403,11 @@ class OperationDeclaration:
   only when the declaration named it as an MCP route — the workflow path's
   rule, preserved exactly.  ``None`` means the caller imposes no extra rule
   (the ordinary-delegation path).
+
+  ``essential_routes`` are the exact tool ids the operation cannot perform its
+  own operation without, in the same id form as ``tool_ceiling``. Resolution
+  is unavailable when the principal's admitted routes do not include them,
+  even when another route satisfies every declared capability.
   """
 
   operation_name: str
@@ -412,6 +417,7 @@ class OperationDeclaration:
   tool_ceiling: frozenset[str] = frozenset()
   mcp_tool_ceiling: frozenset[str] | None = None
   inputs: tuple[AdmittedInputBinding, ...] = ()
+  essential_routes: frozenset[str] = frozenset()
 
 
 class AdmittedCatalogRoute(Protocol):
@@ -540,6 +546,24 @@ def _unsatisfied_capabilities(
   return tuple(unsatisfied)
 
 
+def _missing_essential_routes(
+  declaration: OperationDeclaration,
+  *,
+  routes: Sequence[SemanticToolRoute],
+) -> tuple[str, ...]:
+  """Name which routes the operation cannot run without that the principal lacks.
+
+  A capability is served by any compatible route, so a held route that shares
+  the effect (a tenant-scoped decision-log write) satisfies it while the
+  operation's own door (``start_quant_research``) is withheld. The operation
+  declares that door; ``routes`` are exactly the ones the ceiling, effects,
+  exclusions and the principal's denials left admitted.
+  """
+
+  held = frozenset(route.tool_id for route in routes)
+  return tuple(sorted(declaration.essential_routes - held))
+
+
 def inherited_operation_declaration(
   catalog: PlatformToolCatalog,
   *,
@@ -653,6 +677,11 @@ def resolve_operation_authority(
     )
     for entry in admitted
   )
+  missing_routes = _missing_essential_routes(declaration, routes=routes)
+  essential_detail = (
+    f"operation {declaration.operation_name!r} cannot run without "
+    f"{', '.join(missing_routes)}, which this session does not hold"
+  )
   try:
     compiled = compile_semantic_capabilities(
       declaration.required_capabilities,
@@ -665,12 +694,22 @@ def resolve_operation_authority(
     return OperationUnavailable(
       operation_name=declaration.operation_name,
       code="missing_route",
-      detail=str(exc)[:2_048],
+      detail=(
+        f"{essential_detail}; {exc}" if missing_routes else str(exc)
+      )[:2_048],
+      missing_routes=missing_routes,
       unsatisfied=_unsatisfied_capabilities(
         declaration,
         routes=routes,
         registry=registry,
       ),
+    )
+  if missing_routes:
+    return OperationUnavailable(
+      operation_name=declaration.operation_name,
+      code="missing_route",
+      detail=essential_detail[:2_048],
+      missing_routes=missing_routes,
     )
   granted = compiled.tool_ids
   return ResolvedAuthority(

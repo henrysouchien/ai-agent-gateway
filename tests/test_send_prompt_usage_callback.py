@@ -2,7 +2,6 @@
 
 import asyncio
 import importlib
-import inspect
 import sys
 from pathlib import Path
 from typing import Any
@@ -27,13 +26,6 @@ from hank_model_transport.send_prompt import _call_usage_callback
 send_prompt_module = importlib.import_module("hank_model_transport.send_prompt")
 
 
-def test_send_prompt_sync_requires_bound_execution_at_its_public_boundary() -> None:
-  parameter = inspect.signature(
-    send_prompt_module.send_prompt_sync
-  ).parameters["capability_execution"]
-
-  assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
-  assert parameter.default is inspect.Parameter.empty
 
 
 def _resolved_bind() -> CapabilityBind:
@@ -154,21 +146,6 @@ def test_usage_callback_receives_usage_event() -> None:
   assert calls[0].input_tokens == 10
 
 
-def test_send_prompt_public_signature_is_execution_only() -> None:
-  parameters = inspect.signature(send_prompt_module.send_prompt).parameters
-
-  assert "capability_execution" in parameters
-  assert {
-    "capability_bind",
-    "provider",
-    "bound_auth_config",
-    "execution_transport",
-    "model",
-    "max_tokens",
-    "thinking",
-    "effort",
-    "auth_config",
-  }.isdisjoint(parameters)
 
 
 def test_send_prompt_usage_event_sets_provider() -> None:

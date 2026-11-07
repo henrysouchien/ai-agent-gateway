@@ -22,6 +22,7 @@ from hank_contracts.commercial_work import (
   WORK_AUTHORIZATION_ISSUER,
   WORK_AUTHORIZATION_REQUIRED_FIELDS as WORK_AUTHORIZATION_REQUIRED_FIELDS,
   WORK_AUTHORIZATION_V3_REQUIRED_FIELDS as WORK_AUTHORIZATION_V3_REQUIRED_FIELDS,
+  WORK_AUTHORIZATION_V4_REQUIRED_FIELDS as WORK_AUTHORIZATION_V4_REQUIRED_FIELDS,
   WorkAuthorizationError as WorkAuthorizationError,
   WorkAuthorizationTrustSnapshot as WorkAuthorizationTrustSnapshot,
   VerifiedWorkAuthorization as VerifiedWorkAuthorization,
@@ -66,12 +67,7 @@ class WorkAuthorizationVerifier:
     capability_id: str | None,
     credential_principal: str,
   ) -> VerifiedWorkAuthorization:
-    current = self._clock()
-    if type(current) is not int:
-      raise WorkAuthorizationError("invalid_verification_time")
-    for name, value in (("request", request_id), ("session", session_id)):
-      if not isinstance(value, str) or not _OPAQUE_ID.fullmatch(value):
-        raise WorkAuthorizationError(f"invalid_{name}_id")
+    current = self._verification_time(request_id=request_id, session_id=session_id)
     if not isinstance(operation, str) or not _CODE.fullmatch(operation):
       raise WorkAuthorizationError("invalid_operation")
     if billing_mode not in {"byok", "metered"}:
@@ -80,7 +76,80 @@ class WorkAuthorizationVerifier:
       not isinstance(capability_id, str) or not _CODE.fullmatch(capability_id)
     ):
       raise WorkAuthorizationError("invalid_capability_id")
+    authorization = self._verify_bound_token(
+      token,
+      current=current,
+      execution_claim=execution_claim,
+      request_id=request_id,
+      session_id=session_id,
+    )
+    if authorization.operation != operation:
+      raise WorkAuthorizationError("operation_mismatch")
+    if authorization.billing_mode != billing_mode:
+      raise WorkAuthorizationError("billing_mode_mismatch")
+    if authorization.capability_id != capability_id:
+      raise WorkAuthorizationError("capability_mismatch")
+    # Money: a commercial start may run only the capabilities and operations
+    # the signed claim's scopes fund, else one paid claim funds unpriced work.
+    required_scopes = self._capability_required_scopes.get(
+      authorization.capability_id or ""
+    )
+    if required_scopes is None or not required_scopes.issubset(
+      execution_claim.effective_scopes
+    ):
+      raise WorkAuthorizationError("capability_not_authorized")
+    allowed_operations = self._capability_allowed_operations[
+      authorization.capability_id or ""
+    ]
+    if authorization.operation not in allowed_operations:
+      raise WorkAuthorizationError("operation_not_authorized")
+    # Money (rulings-index WA-ACCOUNT-BUDGET): the ticket binds the account,
+    # not the provider or model the call happens to use.
+    if authorization.credential_principal != credential_principal:
+      raise WorkAuthorizationError("credential_principal_mismatch")
+    return authorization
 
+  def verify_token(
+    self,
+    token: str,
+    *,
+    execution_claim: VerifiedCommercialClaim,
+    request_id: str,
+    session_id: str,
+  ) -> VerifiedWorkAuthorization:
+    """Verify a token's signature, window, claim, request and session binding.
+
+    The prepared request's money facts are not checked here: a caller that
+    selects the turn's credential from this authorization (the metered paid
+    seat) still attaches only through ``verify_for_attach``.
+    """
+    current = self._verification_time(request_id=request_id, session_id=session_id)
+    return self._verify_bound_token(
+      token,
+      current=current,
+      execution_claim=execution_claim,
+      request_id=request_id,
+      session_id=session_id,
+    )
+
+  def _verification_time(self, *, request_id: str, session_id: str) -> int:
+    current = self._clock()
+    if type(current) is not int:
+      raise WorkAuthorizationError("invalid_verification_time")
+    for name, value in (("request", request_id), ("session", session_id)):
+      if not isinstance(value, str) or not _OPAQUE_ID.fullmatch(value):
+        raise WorkAuthorizationError(f"invalid_{name}_id")
+    return current
+
+  def _verify_bound_token(
+    self,
+    token: str,
+    *,
+    current: int,
+    execution_claim: VerifiedCommercialClaim,
+    request_id: str,
+    session_id: str,
+  ) -> VerifiedWorkAuthorization:
     encoded = self._validate_compact_token(token)
     header = self._header(token)
     key_id = header.get("kid")
@@ -141,30 +210,6 @@ class WorkAuthorizationVerifier:
       raise WorkAuthorizationError("request_mismatch")
     if authorization.session_id != session_id:
       raise WorkAuthorizationError("session_mismatch")
-    if authorization.operation != operation:
-      raise WorkAuthorizationError("operation_mismatch")
-    if authorization.billing_mode != billing_mode:
-      raise WorkAuthorizationError("billing_mode_mismatch")
-    if authorization.capability_id != capability_id:
-      raise WorkAuthorizationError("capability_mismatch")
-    # Money: a commercial start may run only the capabilities and operations
-    # the signed claim's scopes fund, else one paid claim funds unpriced work.
-    required_scopes = self._capability_required_scopes.get(
-      authorization.capability_id or ""
-    )
-    if required_scopes is None or not required_scopes.issubset(
-      execution_claim.effective_scopes
-    ):
-      raise WorkAuthorizationError("capability_not_authorized")
-    allowed_operations = self._capability_allowed_operations[
-      authorization.capability_id or ""
-    ]
-    if authorization.operation not in allowed_operations:
-      raise WorkAuthorizationError("operation_not_authorized")
-    # Money (rulings-index WA-ACCOUNT-BUDGET): the ticket binds the account,
-    # not the provider or model the call happens to use.
-    if authorization.credential_principal != credential_principal:
-      raise WorkAuthorizationError("credential_principal_mismatch")
     return authorization
 
   @staticmethod
@@ -206,14 +251,16 @@ class WorkAuthorizationVerifier:
   ) -> VerifiedWorkAuthorization:
     fields = set(payload)
     version = payload.get("schema_version")
-    # V1 and V2 tickets are not accepted. The gate is off, so none are live.
-    if type(version) is int and version in (1, 2):
+    # V1 and V2 tickets are not accepted. V3 remains valid for BYOK.
+    if type(version) is not int or version not in (3, 4):
       raise WorkAuthorizationError("unknown_schema")
-    if fields != WORK_AUTHORIZATION_V3_REQUIRED_FIELDS:
+    required_fields = (
+      WORK_AUTHORIZATION_V4_REQUIRED_FIELDS if version == 4
+      else WORK_AUTHORIZATION_V3_REQUIRED_FIELDS
+    )
+    if fields != required_fields:
       raise WorkAuthorizationError("unknown_or_missing_claim")
-    if type(version) is not int or version != 3:
-      raise WorkAuthorizationError("unknown_schema")
-    schema_version = 3
+    schema_version = version
     if payload.get("kid") != key_id:
       raise WorkAuthorizationError("key_id_mismatch")
     if payload.get("iss") != WORK_AUTHORIZATION_ISSUER:
@@ -265,6 +312,15 @@ class WorkAuthorizationVerifier:
         raise WorkAuthorizationError("invalid_authority_shape")
     elif type(reserved_spend) is not int or reserved_spend < 0:
       raise WorkAuthorizationError("invalid_authority_shape")
+    credential_route = None
+    credential_owner_kind = None
+    if schema_version == 4:
+      credential_route = _require_code(payload, "credential_route")
+      credential_owner_kind = payload.get("credential_owner_kind")
+      if not isinstance(credential_owner_kind, str) or credential_owner_kind not in (
+        "customer", "hank", "flat_subscription",
+      ):
+        raise WorkAuthorizationError("invalid_credential_owner_kind")
     return VerifiedWorkAuthorization(
       schema_version=schema_version,
       key_id=key_id,
@@ -290,6 +346,8 @@ class WorkAuthorizationVerifier:
       expires_at=expires_at,
       reserved_spend_microusd=reserved_spend,
       credential_principal=credential_principal,
+      credential_route=credential_route,
+      credential_owner_kind=credential_owner_kind,
     )
 
 
@@ -376,6 +434,7 @@ __all__ = [
   "WORK_AUTHORIZATION_ISSUER",
   "WORK_AUTHORIZATION_REQUIRED_FIELDS",
   "WORK_AUTHORIZATION_V3_REQUIRED_FIELDS",
+  "WORK_AUTHORIZATION_V4_REQUIRED_FIELDS",
   "WorkAuthorizationError",
   "WorkAuthorizationTrustSnapshot",
   "WorkAuthorizationVerifier",

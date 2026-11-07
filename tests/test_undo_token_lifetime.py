@@ -1,9 +1,9 @@
 """Undo holders follow durable conversations, not authentication-session expiry."""
+from agent_gateway.registry_scope import NoRegistryScope
 
 import asyncio
 import inspect
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,9 +12,6 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-TESTS_DIR = Path(__file__).resolve().parent
-if str(TESTS_DIR) not in sys.path:
-  sys.path.insert(0, str(TESTS_DIR))
 
 import test_session_resume as resume_helpers  # noqa: E402
 from agent_gateway import AgentRunner, ToolDispatcher, ToolResultContext
@@ -359,6 +356,7 @@ def test_observe_runner_results_preserves_hook_return_and_factory_signature(
   # The runtime may bind its durable log after construction, before a result arrives.
   session.resume_log_path = tmp_path / "bound-after-construction.jsonl"
   ctx = ToolResultContext(
+    registry_scope=NoRegistryScope(),
     tool_name="write_cells", tool_input={}, redacted_tool_input={},
     result={"content": [{"type": "text", "text": '{"undo_token": "hook-token"}'}]},
     error=None, duration_ms=1, tool_call_id="call-one", session_id=session.session_id,

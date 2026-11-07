@@ -920,6 +920,138 @@ def test_parked_call_replays_awaiting_approval_until_its_real_result(
   assert "17 times 23" in json.dumps(continued[calling + 2]["content"])
 
 
+@pytest.fixture
+def approved_code_execute_replay_entries() -> list[dict]:
+  # Retained session agentsess_sess_69cbab909e884b8c92051e1d313332f0_henry,
+  # seq 47–54, isolated evidence 20261104T050822Z-p8010-aifc697f4ecca8.
+  # Only the unrelated, large session_recap at seq 51 is omitted.
+  fixture = Path(__file__).parent / "fixtures" / "r112-approved-code-execute-replay.json"
+  return json.loads(fixture.read_text(encoding="utf-8"))
+
+
+def _assert_replay_results_follow_calls(messages: list[dict], calls: list[dict]) -> dict[str, dict]:
+  call_ids = {call["id"] for call in calls}
+  calling = next(
+    index for index, message in enumerate(messages)
+    if message["role"] == "assistant"
+    and isinstance(message["content"], list)
+    and any(block.get("type") == "tool_use" and block.get("id") in call_ids for block in message["content"])
+  )
+  replayed_calls = [
+    block for block in messages[calling]["content"] if block.get("type") == "tool_use"
+  ]
+  assert [
+    {key: call[key] for key in ("id", "name", "input")} for call in replayed_calls
+  ] == [
+    {key: call[key] for key in ("id", "name", "input")} for call in calls
+  ]
+  following = messages[calling + 1]
+  assert following["role"] == "user"
+  results = [block for block in following["content"] if block.get("type") == "tool_result"]
+  assert len(results) == len(calls)
+  assert {block["tool_use_id"] for block in results} == call_ids
+  # Anthropic requires all results before the citation text emitted by
+  # code_execute; appending a provider-repaired result after it is too late.
+  assert following["content"][:len(results)] == results
+  for result in results:
+    assert _tool_results(messages, result["tool_use_id"]) == [result]
+  return {block["tool_use_id"]: block for block in results}
+
+
+@pytest.mark.parametrize("last_seq", [52, 54], ids=["parked-before-result", "continued-after-result"])
+def test_retained_approval_replay_pairs_unstarted_sibling_with_explicit_error(
+  tmp_path: Path, approved_code_execute_replay_entries: list[dict], last_seq: int,
+) -> None:
+  entries = approved_code_execute_replay_entries
+  log = AgentSessionLog(path=tmp_path / "sessions" / "approved-code-execute.jsonl")
+  for entry in entries:
+    if entry["seq"] <= last_seq:
+      _run(log.append(entry["event"]))
+  calls = [
+    block for block in entries[0]["event"]["content_blocks"] if block["type"] == "tool_use"
+  ]
+  approved_id, sibling_id = "toolu_01XqaP1Z8T3U6W6NzkRa93nZ", "toolu_01VGJUEsBG1ntdYvJai91W3a"
+  assert [call["id"] for call in calls] == [approved_id, sibling_id]
+  before = _files(log.path.parent)
+
+  replay = _run(SessionContextBuilder(agent_session_log=log).build())
+  provider = AnthropicProvider()
+  normalized = provider.normalize_messages(replay, provider.get_model_info("claude-opus-5"))
+
+  # The builder itself must supply a complete batch; provider repair must not
+  # hide a missing result or replace the successfully approved execution.
+  for messages in (replay, normalized):
+    results = _assert_replay_results_follow_calls(messages, calls)
+    assert results[sibling_id]["is_error"] is True
+    assert json.loads(results[sibling_id]["content"]) == {
+      "error": {
+        "code": "tool_interrupted",
+        "message": "The run ended without a tool result; execution may not have completed.",
+      },
+    }
+    if last_seq == 52:
+      assert not results[approved_id].get("is_error")
+      assert json.loads(results[approved_id]["content"]) == {
+        "status": "awaiting_approval",
+        "approval_id": "4f490448-8a2e-409d-a88e-6b5bc149c190",
+      }
+    else:
+      real = entries[-1]["event"]["final_tool_result_blocks"][0]
+      assert results[approved_id] == real
+      assert not results[approved_id].get("is_error")
+      assert "awaiting_approval" not in json.dumps(messages)
+    assert "missing_tool_result" not in json.dumps(messages)
+  # Neither approval placeholders nor interrupted sibling results are durable.
+  assert _files(log.path.parent) == before
+
+
+def test_retained_approval_replay_late_sibling_result_replaces_synthetic_error(
+  tmp_path: Path, approved_code_execute_replay_entries: list[dict],
+) -> None:
+  entries = approved_code_execute_replay_entries
+  log = AgentSessionLog(path=tmp_path / "sessions" / "late-sibling.jsonl")
+  for entry in entries:
+    _run(log.append(entry["event"]))
+  calls = [
+    block for block in entries[0]["event"]["content_blocks"] if block["type"] == "tool_use"
+  ]
+  approved_id, sibling_id = "toolu_01XqaP1Z8T3U6W6NzkRa93nZ", "toolu_01VGJUEsBG1ntdYvJai91W3a"
+  builder = SessionContextBuilder(agent_session_log=log)
+  provider = AnthropicProvider()
+  model = provider.get_model_info("claude-opus-5")
+  before = _files(log.path.parent)
+  initial = _run(builder.build())
+  for messages in (initial, provider.normalize_messages(initial, model)):
+    results = _assert_replay_results_follow_calls(messages, calls)
+    assert results[sibling_id]["is_error"] is True
+    assert json.loads(results[sibling_id]["content"])["error"]["code"] == "tool_interrupted"
+  assert _files(log.path.parent) == before
+
+  # A real settlement arriving after replay was already built must win on
+  # the next build, without duplicating the tool result or moving its batch.
+  _run(log.append({"type": "user_message", "content": "Continue the peer analysis."}))
+  sibling_result = {"matches": [{"query": "revenue ttm", "metric_id": "revenue_ttm"}]}
+  real = {"type": "tool_result", "tool_use_id": sibling_id, "content": json.dumps(sibling_result)}
+  _run(log.append({
+    "type": "tool_call_complete",
+    "tool_call_id": sibling_id,
+    "tool_name": "sf_search",
+    "result": sibling_result,
+    "error": None,
+    "final_tool_result_blocks": [real],
+  }))
+  settled_before = _files(log.path.parent)
+  continued = _run(builder.build())
+  for messages in (continued, provider.normalize_messages(continued, model)):
+    results = _assert_replay_results_follow_calls(messages, calls)
+    assert results[sibling_id] == real
+    assert results[approved_id] == entries[-1]["event"]["final_tool_result_blocks"][0]
+    assert "tool_interrupted" not in json.dumps(messages)
+    assert "missing_tool_result" not in json.dumps(messages)
+    assert messages[-1] == {"role": "user", "content": "Continue the peer analysis."}
+  assert _files(log.path.parent) == settled_before
+
+
 def _files(root: Path) -> dict[str, bytes]:
   return {
     str(path.relative_to(root)): path.read_bytes()

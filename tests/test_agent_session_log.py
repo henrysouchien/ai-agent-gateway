@@ -1,11 +1,15 @@
 # ruff: noqa: E402
 
 import asyncio
+import hashlib
 import json
 import logging
+import multiprocessing
 import sys
 import threading
 import time
+from io import BufferedRandom
+from multiprocessing.synchronize import Event as ProcessEvent
 from pathlib import Path
 
 import pytest
@@ -57,6 +61,439 @@ def test_terminal_pair_rolls_back_a_failed_fsync_before_retry(
   assert (recap.seq, detach.seq) == (first.seq + 1, first.seq + 2)
   entries, _ = _run(log.query(order="asc"))
   assert [entry.event for entry in entries[1:]] == [recap.event, detach.event]
+
+
+def test_terminal_pair_does_not_overwrite_a_line_longer_than_the_reverse_scan_chunk(
+  tmp_path: Path,
+) -> None:
+  # The seq scan reads the active handle backwards in 64KiB chunks and
+  # returns as soon as it parses the last line. When that line is longer
+  # than one chunk, the handle is left inside it. The pair must still
+  # append at the end captured before the scan.
+  log = AgentSessionLog(tmp_path / "long-tail.jsonl")
+  log.append_sync({"type": "attach", "runner_id": "parent"})
+  text = "A" * (session_log_records._REVERSE_SCAN_CHUNK_SIZE + 4096)
+  captured = log.append_sync({
+    "type": "skill_result_captured",
+    "text": text,
+  })
+  assert len(log.path.read_bytes().splitlines()[-1]) > (
+    session_log_records._REVERSE_SCAN_CHUNK_SIZE
+  )
+
+  recap, detach = log.append_terminal_pair_sync(
+    {"type": "session_recap", "session_id": "sess", "text": "recap"},
+    {"type": "detach", "reason": "completed"},
+  )
+
+  rows = _load_jsonl(log.path)
+  assert [row["seq"] for row in rows] == [
+    1,
+    captured.seq,
+    recap.seq,
+    detach.seq,
+  ]
+  assert rows[1]["event"]["text"] == text
+  assert [row["event"]["type"] for row in rows[2:]] == [
+    "session_recap",
+    "detach",
+  ]
+  strict_entries, _ = _run(log.query_current_strict(order="asc"))
+  assert [entry.seq for entry in strict_entries] == [
+    1,
+    captured.seq,
+    recap.seq,
+    detach.seq,
+  ]
+  assert log.latest_seq_current_strict_sync() == detach.seq
+
+
+class _MisplacedWriteHandle:
+  """The writable active handle with every write parked inside old bytes.
+
+  The pre-fix terminal pair wrote where its reverse scan had left the
+  handle, one chunk short of the end.
+  """
+
+  def __init__(self, inner: BufferedRandom) -> None:
+    self._inner = inner
+
+  def write(self, data: bytes) -> int:
+    self._inner.seek(max(0, self._inner.tell() - 70_000))
+    return self._inner.write(data)
+
+  def __getattr__(self, name: str) -> object:
+    return getattr(self._inner, name)
+
+  def __enter__(self) -> "_MisplacedWriteHandle":
+    return self
+
+  def __exit__(self, *_exc: object) -> None:
+    self._inner.close()
+
+
+def _arm_growth_interference(
+  monkeypatch: pytest.MonkeyPatch,
+  log: AgentSessionLog,
+  interference: str,
+) -> None:
+  import os
+
+  if interference == "misplaced_write":
+    open_active = log._open_active_file
+
+    def open_misplaced(**kwargs: bool):
+      opened = open_active(**kwargs)
+      if opened is None or not kwargs.get("writable"):
+        return opened
+      handle, info, created = opened
+      return _MisplacedWriteHandle(handle), info, created
+
+    monkeypatch.setattr(log, "_open_active_file", open_misplaced)
+    return
+  inode = log.path.stat().st_ino
+  fsync = os.fsync
+  disturbed = False
+
+  def disturb_then_fsync(fd: int) -> None:
+    nonlocal disturbed
+    info = os.fstat(fd)
+    if info.st_ino == inode and not disturbed:
+      disturbed = True
+      if interference == "unlocked_writer_appends":
+        with log.path.open("ab") as other:
+          other.write(b"{}\n")
+      else:
+        os.ftruncate(fd, info.st_size - 1)
+    fsync(fd)
+
+  monkeypatch.setattr(os, "fsync", disturb_then_fsync)
+
+
+def _append_once(log: AgentSessionLog, append: str) -> None:
+  if append == "append_sync":
+    log.append_sync({"type": "assistant_message", "text": "next"})
+    return
+  log.append_terminal_pair_sync(
+    {"type": "session_recap", "text": "recap"},
+    {"type": "detach", "reason": "completed"},
+  )
+
+
+def _log_with_a_long_last_line(tmp_path: Path) -> AgentSessionLog:
+  log = AgentSessionLog(tmp_path / "growth.jsonl")
+  log.append_sync({"type": "attach", "runner_id": "run-1"})
+  log.append_sync({
+    "type": "skill_result_captured",
+    "text": "A" * (session_log_records._REVERSE_SCAN_CHUNK_SIZE + 4096),
+  })
+  return log
+
+
+@pytest.mark.parametrize("append", ("append_sync", "terminal_pair"))
+@pytest.mark.parametrize(
+  "interference",
+  ("misplaced_write", "unlocked_writer_appends", "file_shrinks"),
+)
+def test_append_fails_closed_unless_the_file_grew_by_exactly_the_bytes_written(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  append: str,
+  interference: str,
+) -> None:
+  log = _log_with_a_long_last_line(tmp_path)
+  _arm_growth_interference(monkeypatch, log, interference)
+
+  with pytest.raises(
+    session_log_module.AgentSessionLogCurrentIntegrityError,
+    match="grew the active file by",
+  ):
+    _append_once(log, append)
+
+
+@pytest.mark.parametrize(
+  "interference",
+  ("unlocked_writer_appends", "file_shrinks"),
+)
+def test_terminal_pair_growth_mismatch_rolls_back_both_lines_before_retry(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  interference: str,
+) -> None:
+  log = _log_with_a_long_last_line(tmp_path)
+  before = log.path.read_bytes()
+  _arm_growth_interference(monkeypatch, log, interference)
+
+  with pytest.raises(
+    session_log_module.AgentSessionLogCurrentIntegrityError,
+    match="grew the active file by",
+  ):
+    _append_once(log, "terminal_pair")
+  assert log.path.read_bytes() == before
+
+  recap, detach = log.append_terminal_pair_sync(
+    {"type": "session_recap", "text": "retry"},
+    {"type": "detach", "reason": "completed"},
+  )
+  assert (recap.seq, detach.seq) == (3, 4)
+  assert log.latest_seq_current_strict_sync() == detach.seq
+
+
+def _record(seq: int, **event: object) -> bytes:
+  return session_log_records._encode_entry(
+    session_log_records.LogEntry(
+      seq=seq,
+      timestamp=float(seq),
+      event={"type": "assistant_message", **event},
+    )
+  )
+
+
+def _spliced_torn_line(seq: int) -> bytes:
+  """Record ``seq`` cut mid-JSON with record ``seq + 1`` spliced in whole."""
+
+  return _record(seq, text="A" * 400)[:200] + _record(seq + 1)
+
+
+def _log_with_one_torn_mid_file_line(
+  tmp_path: Path,
+) -> tuple[AgentSessionLog, bytes, int]:
+  log = AgentSessionLog(tmp_path / "torn-mid-file.jsonl")
+  log.append_sync({"type": "attach", "runner_id": "run-1"})
+  log.append_sync({"type": "assistant_message", "runner_id": "run-1"})
+  offset = log.path.stat().st_size
+  torn = _spliced_torn_line(3)
+  with log.path.open("ab") as handle:
+    handle.write(torn + _record(5))
+  return log, torn, offset
+
+
+def test_strict_scan_quarantines_one_torn_mid_file_line_and_terminal_pairs_still_append(
+  tmp_path: Path,
+) -> None:
+  log, torn, offset = _log_with_one_torn_mid_file_line(tmp_path)
+  assert log.latest_seq_current_strict_sync() == 5
+
+  recap, detach = log.append_terminal_pair_sync(
+    {"type": "session_recap", "failures": []},
+    {"type": "detach", "reason": "completed"},
+  )
+
+  assert (recap.seq, detach.seq) == (6, 7)
+  strict_entries, _ = _run(log.query_current_strict(order="asc"))
+  assert [entry.seq for entry in strict_entries] == [1, 2, 5, 6, 7]
+  assert log.latest_seq_current_strict_sync() == detach.seq
+  (finding,) = log.quarantined_lines
+  assert finding.path == log.path
+  assert (finding.offset, finding.length) == (offset, len(torn))
+  assert finding.sha256 == hashlib.sha256(torn).hexdigest()
+  assert (finding.after_seq, finding.before_seq) == (2, 5)
+  assert finding.reason
+  assert log.path.read_bytes()[offset:offset + len(torn)] == torn
+
+
+@pytest.mark.parametrize("second", ("adjacent", "after_a_valid_line"))
+def test_strict_scan_rejects_a_second_torn_line(
+  tmp_path: Path,
+  second: str,
+) -> None:
+  active = tmp_path / "second-torn.jsonl"
+  log = AgentSessionLog(active)
+  first = _record(1) + _record(2) + _spliced_torn_line(3)
+  tail = (
+    _spliced_torn_line(5) + _record(7)
+    if second == "adjacent"
+    else _record(5) + _spliced_torn_line(6) + _record(8)
+  )
+  active.write_bytes(first + tail)
+
+  # Callers report the error by class name; it must stay the public type.
+  with pytest.raises(
+    session_log_module.AgentSessionLogCurrentIntegrityError
+  ) as latest_failure:
+    log.latest_seq_current_strict_sync()
+  assert latest_failure.type is (
+    session_log_module.AgentSessionLogCurrentIntegrityError
+  )
+  with pytest.raises(
+    session_log_module.AgentSessionLogCurrentIntegrityError
+  ) as query_failure:
+    _run(log.query_current_strict(order="asc"))
+  assert query_failure.type is (
+    session_log_module.AgentSessionLogCurrentIntegrityError
+  )
+  assert log.quarantined_lines == ()
+  # The writer's own scan is lenient, so the terminal pair is not blocked.
+  recap, detach = log.append_terminal_pair_sync(
+    {"type": "session_recap", "failures": []},
+    {"type": "detach", "reason": "completed"},
+  )
+  assert detach.seq == recap.seq + 1
+
+
+@pytest.mark.parametrize(
+  ("tail_seqs", "accepted"),
+  (
+    pytest.param((3,), [1, 2, 3], id="advance-by-one"),
+    pytest.param((5, 6), [1, 2, 5, 6], id="advance-across-the-torn-sequences"),
+    pytest.param((2,), None, id="no-advance"),
+    pytest.param((5, 7), None, id="second-gap"),
+    pytest.param((5, 5), None, id="duplicate-after-the-bridge"),
+  ),
+)
+def test_quarantine_bridges_only_the_sequences_the_torn_line_carried(
+  tmp_path: Path,
+  tail_seqs: tuple[int, ...],
+  accepted: list[int] | None,
+) -> None:
+  active = tmp_path / "bridge.jsonl"
+  log = AgentSessionLog(active)
+  active.write_bytes(
+    _record(1)
+    + _record(2)
+    + _spliced_torn_line(3)
+    + b"".join(_record(seq) for seq in tail_seqs)
+  )
+
+  if accepted is None:
+    with pytest.raises(
+      session_log_module.AgentSessionLogCurrentIntegrityError,
+      match="sequence order is ambiguous",
+    ):
+      _run(log.query_current_strict(order="asc"))
+    return
+  strict_entries, _ = _run(log.query_current_strict(order="asc"))
+  assert [entry.seq for entry in strict_entries] == accepted
+
+
+def test_strict_scan_quarantines_a_torn_final_line_until_the_next_append(
+  tmp_path: Path,
+) -> None:
+  active = tmp_path / "final-torn.jsonl"
+  log = AgentSessionLog(active)
+  active.write_bytes(_record(1) + _record(2) + _spliced_torn_line(3))
+
+  assert log.latest_seq_current_strict_sync() == 2
+  (finding,) = log.quarantined_lines
+  assert (finding.after_seq, finding.before_seq) == (2, None)
+
+  appended = log.append_sync({"type": "assistant_message", "text": "next"})
+  assert appended.seq == 3
+  assert log.latest_seq_current_strict_sync() == 3
+  (finding,) = log.quarantined_lines
+  assert (finding.after_seq, finding.before_seq) == (2, 3)
+
+
+_PROCESS_STEP_TIMEOUT_S = 60.0
+_LONG_LINE_TEXT = "L" * 178_000
+_RECAP_TEXT = "R" * 1_000
+
+
+def _append_in_two_process_race(
+  path: str,
+  role: str,
+  holds_the_append_mutex: bool,
+  waiter_ready: ProcessEvent,
+  holder_locked: ProcessEvent,
+  waiter_at_flock: ProcessEvent,
+) -> None:
+  # The holder pauses inside the append mutex, right after acquiring it,
+  # until the waiter reports it is about to block on that same mutex. The
+  # waiter's append therefore starts only after the holder's has finished.
+  import fcntl
+
+  log = AgentSessionLog(Path(path))
+  real_flock = fcntl.flock
+
+  def hold_after_acquiring(fd: int, operation: int) -> None:
+    real_flock(fd, operation)
+    if operation == fcntl.LOCK_EX:
+      setattr(fcntl, "flock", real_flock)
+      holder_locked.set()
+      assert waiter_at_flock.wait(_PROCESS_STEP_TIMEOUT_S)
+
+  def announce_before_blocking(fd: int, operation: int) -> None:
+    if operation == fcntl.LOCK_EX:
+      waiter_at_flock.set()
+    real_flock(fd, operation)
+
+  if holds_the_append_mutex:
+    assert waiter_ready.wait(_PROCESS_STEP_TIMEOUT_S)
+    setattr(fcntl, "flock", hold_after_acquiring)
+  else:
+    waiter_ready.set()
+    assert holder_locked.wait(_PROCESS_STEP_TIMEOUT_S)
+    setattr(fcntl, "flock", announce_before_blocking)
+  if role == "long_line":
+    log.append_sync({
+      "type": "skill_result_captured",
+      "runner_id": role,
+      "text": _LONG_LINE_TEXT,
+    })
+  else:
+    log.append_terminal_pair_sync(
+      {"type": "session_recap", "runner_id": role, "text": _RECAP_TEXT},
+      {"type": "detach", "runner_id": role, "reason": "completed"},
+    )
+
+
+@pytest.mark.parametrize("holder", ("long_line", "terminal_pair"))
+def test_two_processes_appending_a_178kb_line_never_overwrite_or_splice(
+  tmp_path: Path,
+  holder: str,
+) -> None:
+  path = tmp_path / "two-process.jsonl"
+  AgentSessionLog(path).append_sync({"type": "attach", "runner_id": "seed"})
+  context = multiprocessing.get_context("spawn")
+  waiter_ready = context.Event()
+  holder_locked = context.Event()
+  waiter_at_flock = context.Event()
+  waiter = "terminal_pair" if holder == "long_line" else "long_line"
+  processes = [
+    context.Process(
+      target=_append_in_two_process_race,
+      args=(
+        str(path),
+        role,
+        holds_the_append_mutex,
+        waiter_ready,
+        holder_locked,
+        waiter_at_flock,
+      ),
+    )
+    for role, holds_the_append_mutex in ((holder, True), (waiter, False))
+  ]
+  for process in processes:
+    process.start()
+  for process in processes:
+    process.join(2 * _PROCESS_STEP_TIMEOUT_S)
+    if process.is_alive():
+      process.terminate()
+      process.join(10)
+  assert [process.exitcode for process in processes] == [0, 0]
+
+  # Whichever process appended last, its successor must scan back past the
+  # 178 KB line: run one more terminal pair from a third instance.
+  AgentSessionLog(path).append_terminal_pair_sync(
+    {"type": "session_recap", "runner_id": "final", "text": _RECAP_TEXT},
+    {"type": "detach", "runner_id": "final", "reason": "completed"},
+  )
+
+  rows = _load_jsonl(path)
+  assert path.read_bytes().count(b"\n") == len(rows)
+  assert [row["seq"] for row in rows] == list(range(1, len(rows) + 1))
+  assert [row["event"]["runner_id"] for row in rows[1:]] == (
+    ["long_line", "terminal_pair", "terminal_pair", "final", "final"]
+    if holder == "long_line"
+    else ["terminal_pair", "terminal_pair", "long_line", "final", "final"]
+  )
+  long_row = next(row for row in rows if row["event"]["runner_id"] == "long_line")
+  assert long_row["event"]["text"] == _LONG_LINE_TEXT
+  assert [row["event"]["type"] for row in rows[1:]].count("session_recap") == 2
+  log = AgentSessionLog(path)
+  strict_entries, _ = _run(log.query_current_strict(order="asc"))
+  assert [entry.seq for entry in strict_entries] == [row["seq"] for row in rows]
+  assert log.quarantined_lines == ()
 
 
 def test_session_rotation_unset_uses_64_mib_default(

@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import NoRegistryScope, RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import json
@@ -56,6 +58,7 @@ async def _dispatch_bundle_tool(
     needs_approval=lambda _name, _tool_input, _qualifier: False,
     event_log=event_log or EventLog(),
     approval_key_qualifier=bundle.approval_qualifier,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   return await dispatcher.dispatch(f"{tool_name}_call", tool_name, tool_input)
 
@@ -167,6 +170,7 @@ def _job_runner() -> AgentRunner:
       local_tool_handlers={},
       event_log=event_log,
       session_id="sess-code-provenance",
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     ),
     session_id="sess-code-provenance",
     capability_execution=stub_runner_capability_execution(
@@ -284,6 +288,7 @@ def test_sanitize_hook_strips_computations_from_result_entry_only_for_code_execu
     }
     result_entry = {"content": json.dumps(result)}
     ctx = ToolResultContext(
+      registry_scope=NoRegistryScope(),
       tool_name=tool_name,
       tool_input={},
       redacted_tool_input={},

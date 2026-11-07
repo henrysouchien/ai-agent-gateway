@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import json
@@ -184,6 +186,7 @@ def _dispatcher(event_log: EventLog, handlers: dict[str, Any]) -> ToolDispatcher
     event_log=event_log,
     session_id="sess-event-only",
     role="owner",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
@@ -298,6 +301,7 @@ def test_runner_context_uses_trusted_router_provider_not_payload_claim(owner_ses
       event_log=event_log,
       session_id="sess-provider-identity",
       role="owner",
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     ),
     session_id="sess-provider-identity",
     capability_execution=_dispatcher_execution_291,

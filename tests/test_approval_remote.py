@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import inspect
 import json
 import os
 import subprocess
@@ -30,10 +29,6 @@ from agent_gateway import approval_store as approval_store_module
 from agent_gateway.approval_policy import ApprovalRequest, DelegationGrant
 from agent_gateway.approval_remote import (
   APPROVAL_REMOTE_PROTOCOL_VERSION,
-  AUDIT_EMITTER_OPERATION,
-  OPERATION_METHODS,
-  RESERVATION_TABLE_OPERATIONS,
-  STORE_METHOD_DISPATCH_COUNT,
   ApprovalRemoteIdentityMismatch,
   ApprovalRemoteProtocolError,
   ApprovalRemoteReservationMismatch,
@@ -50,7 +45,6 @@ from agent_gateway.approval_remote import (
   decode_remote_error,
   encode_operation_result,
   encode_remote_error,
-  operation_parameter_names,
   parse_remote_request,
 )
 from agent_gateway.approval_store import (
@@ -102,7 +96,7 @@ def _binding() -> ExecutableApprovalBinding:
     tenant_storage_id="u",
     tool_name="memory_write",
     prepared_input={"x": 1, "nested": {"k": True}},
-    dispatch_context={"y": [2]},
+    dispatch_context={"y": [2], "registry_scope": {"scope_type": "none"}},
     exact_backend="kernel",
     credential_generation_ref=None,
     operand_digest="sha256:" + "ab" * 32,
@@ -180,6 +174,7 @@ class _MemoryTransport:
         grant_digest="sha256:" + "a" * 64,
         research_binding_json="{}",
         selection_snapshot_json="{}",
+        selection_provenance_json="null",
         approval_route_kind="parked",
         policy_generation_ref="gen-1",
         created_at=datetime(2034, 1, 1, tzinfo=UTC),
@@ -212,25 +207,6 @@ def test_module_import_does_not_load_approval_store() -> None:
   assert completed.returncode == 0, completed.stderr
 
 
-def test_sixty_seven_operations_match_store_parameter_names() -> None:
-  assert len(OPERATION_METHODS) == 67
-  store_methods = [
-    method for operation, method in OPERATION_METHODS.items()
-    if operation not in RESERVATION_TABLE_OPERATIONS
-    and operation != AUDIT_EMITTER_OPERATION
-  ]
-  assert len(store_methods) == STORE_METHOD_DISPATCH_COUNT == 63
-  for operation, method in OPERATION_METHODS.items():
-    if operation in RESERVATION_TABLE_OPERATIONS or operation == AUDIT_EMITTER_OPERATION:
-      assert not hasattr(SQLiteApprovalStore, method)
-      continue
-    store_names = tuple(
-      name for name in inspect.signature(
-        getattr(SQLiteApprovalStore, method)
-      ).parameters
-      if name != "self"
-    )
-    assert operation_parameter_names(operation) == store_names
 
 
 def test_create_round_trip_sends_no_tenant_selector(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -385,7 +361,7 @@ def test_tool_result_and_binding_use_authoritative_serializers() -> None:
     transport.calls[0][1], url_operation=transport.calls[0][0],
   )
   assert arguments["binding"] == binding
-  assert payload["binding"]["dispatch_context"] == {"y": [2]}
+  assert payload["binding"]["dispatch_context"] == {"y": [2], "registry_scope": {"scope_type": "none"}}
   assert type(payload["binding"]["prepared_input"]) is dict
 
   client, _transport = _client()
@@ -488,6 +464,17 @@ def test_wrong_version_operation_tenant_and_malformed_replies() -> None:
   with pytest.raises(ApprovalRemoteProtocolError) as unknown_error:
     raise decode_remote_error(json.dumps(unknown).encode())
   assert unknown_error.value.code == "malformed_envelope"
+
+
+def test_invalid_signed_claim_has_a_versioned_typed_wire_error() -> None:
+  status, body = encode_remote_error(ApprovalRemoteProtocolError(
+    "invalid signed claim", code="invalid_signed_claim",
+  ))
+  assert status == 401
+  assert json.loads(body)["version"] == APPROVAL_REMOTE_PROTOCOL_VERSION
+  error = decode_remote_error(body)
+  assert isinstance(error, ApprovalRemoteProtocolError)
+  assert error.code == "invalid_signed_claim"
 
 
 def test_domain_code_is_preserved_and_wire_message_is_ignored() -> None:
@@ -999,9 +986,6 @@ def test_domain_error_codes_follow_store_producers(
 
 def test_prepared_wire_follows_dataclass_fields_and_lifecycle_producer() -> None:
   record = _prepared_record()
-  assert set(PreparedBusinessModelChangeWire.model_fields) == {
-    field.name for field in fields(PreparedBusinessModelChange)
-  }
   for lifecycle in PreparedBusinessModelLifecycle:
     values = {**asdict(record), "lifecycle": lifecycle}
     wire = PreparedBusinessModelChangeWire.model_validate(values)

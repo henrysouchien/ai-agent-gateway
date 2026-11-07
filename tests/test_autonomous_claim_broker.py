@@ -65,7 +65,7 @@ _CLAIM_ENV_TO_FIELD = {
 @dataclass
 class _BrokerRuntime:
   claim_broker: AutonomousClaimBroker
-  claim_signer: AutonomousClaimSigner
+  claim_signer: Any
   envelope_json: str
   resources: ExitStack
 
@@ -78,6 +78,7 @@ def _broker_runtime(
   broker_max_ttl_seconds: int = 600,
   ttl_resolver: TtlResolver | None = None,
   session_ttl_seconds: int = 600,
+  create_signer: bool = True,
 ) -> _BrokerRuntime:
   now_ns = time.time_ns()
   now_seconds = now_ns // 1_000_000_000
@@ -122,11 +123,13 @@ def _broker_runtime(
       max_ttl_seconds=broker_max_ttl_seconds,
     )
     resources.callback(broker.close)
-    signer = AutonomousClaimSigner(
-      broker.take_child_fd(),
-      envelope_json=envelope_json,
-    )
-    resources.callback(signer.close)
+    signer = None
+    if create_signer:
+      signer = AutonomousClaimSigner(
+        broker.take_child_fd(),
+        envelope_json=envelope_json,
+      )
+      resources.callback(signer.close)
     return _BrokerRuntime(broker, signer, envelope_json, resources.pop_all())
 
 
@@ -169,7 +172,100 @@ def test_broker_serves_past_the_retired_request_ceiling() -> None:
         _SECRET,
         _claim_headers(claim),
       ) is not None
+    runtime.close()
     assert runtime.claim_broker.claims_served == served
+  finally:
+    runtime.close()
+
+
+def test_close_publishes_a_response_paused_before_the_count_increment(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  runtime = _broker_runtime()
+  original_send = broker_module._send_frame
+  response_sent = threading.Event()
+  continue_serve = threading.Event()
+
+  def pause_after_sign_response(
+    sock: socket.socket,
+    payload: dict[str, Any],
+    *,
+    deadline: float,
+  ) -> None:
+    original_send(sock, payload, deadline=deadline)
+    if payload.get("op") == "sign" and payload.get("ok") is True:
+      response_sent.set()
+      if not continue_serve.wait(timeout=5):
+        raise OSError("test gate timed out")
+
+  monkeypatch.setattr(broker_module, "_send_frame", pause_after_sign_response)
+  sign_errors: list[BaseException] = []
+
+  def sign() -> None:
+    try:
+      runtime.claim_signer.sign_claim(ttl_seconds=60)
+    except BaseException as exc:
+      sign_errors.append(exc)
+
+  close_started = threading.Event()
+  close_returned = threading.Event()
+
+  def close_broker() -> None:
+    close_started.set()
+    runtime.claim_broker.close()
+    close_returned.set()
+
+  sign_thread = threading.Thread(target=sign)
+  close_thread = threading.Thread(target=close_broker)
+  try:
+    sign_thread.start()
+    assert response_sent.wait(timeout=5)
+    # The response is already readable, but the broker has not incremented.
+    assert runtime.claim_broker.claims_served == 0
+    close_thread.start()
+    assert close_started.wait(timeout=5)
+    # close() cannot return while the response is paused before the increment.
+    assert not close_returned.wait(timeout=0.1)
+    continue_serve.set()
+    sign_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+    assert close_returned.is_set()
+    assert not sign_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert sign_errors == []
+    # close() joins _serve, so a post-close read cannot miss the response.
+    assert runtime.claim_broker.claims_served == 1
+  finally:
+    continue_serve.set()
+    if sign_thread.is_alive():
+      sign_thread.join(timeout=5)
+    if close_thread.is_alive():
+      close_thread.join(timeout=5)
+    runtime.close()
+
+
+def test_failed_sign_response_is_not_counted(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  runtime = _broker_runtime()
+  original_send = broker_module._send_frame
+
+  def fail_sign_response(
+    sock: socket.socket,
+    payload: dict[str, Any],
+    *,
+    deadline: float,
+  ) -> None:
+    if payload.get("op") == "sign" and payload.get("ok") is True:
+      raise OSError("forced sign response failure")
+    original_send(sock, payload, deadline=deadline)
+
+  monkeypatch.setattr(broker_module, "_send_frame", fail_sign_response)
+  try:
+    with pytest.raises(AutonomousClaimBrokerError):
+      runtime.claim_signer.sign_claim(ttl_seconds=60)
+    runtime.close()
+    assert runtime.claim_broker.claims_served == 0
   finally:
     runtime.close()
 
@@ -804,16 +900,9 @@ def test_signer_constructor_closes_owned_fd_on_socket_setup_failure(
     server_socket.close()
 
 
-@pytest.mark.skipif(
-  not Path("/proc/self/environ").exists(),
-  reason="Linux /proc regression",
-)
 def test_exec_child_never_receives_global_key_in_proc_environ(tmp_path: Path) -> None:
-  runtime = _broker_runtime()
-  broker = AutonomousClaimBroker(
-    GatewayClaimSigningAuthority(_SECRET),
-    runtime.envelope_json,
-  )
+  runtime = _broker_runtime(create_signer=False)
+  broker = runtime.claim_broker
   child_fd = broker.take_child_fd()
   child_env = dict(os.environ)
   child_env.pop("AGENT_API_USER_CLAIM_HMAC_KEY", None)
@@ -824,16 +913,21 @@ def test_exec_child_never_receives_global_key_in_proc_environ(tmp_path: Path) ->
   child_env["AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE"] = str(envelope_path)
   package_root = Path(__file__).resolve().parents[1]
   child_env["PYTHONPATH"] = str(package_root)
-  source = r"""
-import json
+  probe = tmp_path / "probe.py"
+  probe.write_text(
+    r"""import json
 import os
 from pathlib import Path
+import subprocess
 from agent_gateway.autonomous_claim_broker import AutonomousClaimSigner
 
 fd = int(os.environ.pop("AGENT_AUTONOMOUS_CLAIM_BROKER_FD"))
 envelope = Path(os.environ.pop("AGENT_AUTONOMOUS_CAPABILITY_ENVELOPE_FILE")).read_text(encoding="utf-8")
 signer = AutonomousClaimSigner(fd, envelope_json=envelope)
-raw = open("/proc/self/environ", "rb").read()
+if Path("/proc/self/environ").exists():
+  raw = open("/proc/self/environ", "rb").read()
+else:
+  raw = subprocess.check_output(["/bin/ps", "eww", "-p", str(os.getpid()), "-o", "command="])
 claim = signer.sign_claim(ttl_seconds=30)
 print(json.dumps({
   "key_name_present": b"AGENT_API_USER_CLAIM_HMAC_KEY=" in raw,
@@ -842,10 +936,12 @@ print(json.dumps({
   "user_id": claim["AGENT_API_CLAIM_USER_ID"],
 }, sort_keys=True))
 signer.close()
-"""
+""",
+    encoding="utf-8",
+  )
   try:
     completed = subprocess.run(
-      [sys.executable, "-c", source],
+      [sys.executable, str(probe)],
       cwd=package_root,
       env=child_env,
       pass_fds=(child_fd,),
@@ -856,7 +952,6 @@ signer.close()
     )
   finally:
     os.close(child_fd)
-    broker.close()
     runtime.close()
   result = json.loads(completed.stdout)
   assert result == {

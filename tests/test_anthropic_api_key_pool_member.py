@@ -659,6 +659,53 @@ def test_programmatic_next_credential_marks_shared_key_pool_out_of_credit_and_ne
   assert exhausted is None
 
 
+def test_credential_key_pool_is_exhausted_only_when_every_key_is_out_of_credit(
+  anthropic_pool,
+) -> None:
+  _pool, credentials, _store = anthropic_pool
+  _write_shared_pool_file([
+    {"key": _HEALTHY_KEY, "workspace_id": _WORKSPACE_ID},
+    {"key": _SECOND_HEALTHY_KEY},
+  ])
+  provider = AnthropicProvider()
+  config = credentials.get_anthropic_config(call_class="programmatic")
+
+  limited = provider.next_credential(
+    config,
+    ProviderCredentialFailure(provider="anthropic", kind="rate_limit", status_code=429, reset_at=_RESET_AT),
+  )
+  assert limited is not None
+  pool = provider.credential_key_pool(merge_refreshed_auth_config(config, limited))
+  assert pool is not None
+  # One key cooling on a rate limit: not credit exhaustion.
+  assert pool.credit_exhaustion().exhausted is False
+
+  billing = ProviderCredentialFailure(provider="anthropic", kind="billing", status_code=400)
+  merged = merge_refreshed_auth_config(config, limited)
+  provider.next_credential(merged, billing)
+  pool = provider.credential_key_pool(merged)
+  assert pool is not None
+  assert pool.credit_exhaustion().exhausted is False
+  load_key_pool("anthropic", env_var="ANTHROPIC_API_KEY", repo="ai-excel-addin").mark_exhausted(
+    fingerprint(_HEALTHY_KEY), reason="credit_balance_too_low",
+  )
+  load_key_pool("anthropic", env_var="ANTHROPIC_API_KEY", repo="ai-excel-addin").mark_exhausted(
+    fingerprint(_SECOND_HEALTHY_KEY), reason="credit_balance_too_low",
+  )
+  pool = provider.credential_key_pool(merged)
+  assert pool is not None
+  assert pool.credit_exhaustion().exhausted is True
+
+
+def test_credential_key_pool_is_absent_for_a_seat_or_a_non_pool_key(anthropic_pool) -> None:
+  provider = AnthropicProvider()
+  seat = {"provider": "anthropic", "auth_mode": "oauth", "auth_token": _SEAT_A}
+  assert provider.credential_key_pool(seat) is None
+  assert provider.credential_key_pool(
+    {"provider": "anthropic", "auth_mode": "api", "api_key": "sk-ant-api03-not-in-pool"},
+  ) is None
+
+
 def _rewrite_shared_pool_file(keys: list[dict[str, str]]) -> None:
   path = pool_config_path("anthropic")
   assert path is not None and path.exists()

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifact_paths import canonicalize_ticker
+from .run_control import run_control_root
 
 
 INDEX_VERSION = 1
@@ -301,7 +302,13 @@ def reconcile_ui_blocks_index(users_root: Path) -> None:
 
 
 def artifact_sidecar_index_path(workspace_dir: Path) -> Path:
-  return _ensure_under_workspace(Path(workspace_dir).resolve().joinpath(*_INDEX_RELATIVE_PATH), workspace_dir)
+  control_root = run_control_root(workspace_dir)
+  db_path = control_root.joinpath(*_INDEX_RELATIVE_PATH).resolve()
+  try:
+    db_path.relative_to(control_root)
+  except ValueError as exc:
+    raise ValueError("resolved artifact index path escapes run control root") from exc
+  return db_path
 
 
 def get_artifact_sidecar_index_row(

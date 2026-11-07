@@ -10,6 +10,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.autonomous as autonomous  # noqa: E402
+from agent_gateway.registry_scope import NoRegistryScope
 from agent_workflow_contracts import AgentOperationRef  # noqa: E402
 from hank_model_transport.capability_execution import BoundCapabilityExecution  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
@@ -73,6 +74,7 @@ def test_run_autonomous_rejects_skills_dir_with_operation_catalog() -> None:
     await autonomous.run_autonomous(
       "You are helpful.",
       "Run the task.",
+      registry_scope=NoRegistryScope(),
       **_bound_execution(),
       skills_dir="skills",
       operation_catalog=_EmptyOperationCatalog(),

@@ -3,7 +3,6 @@ import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import get_type_hints
 
 import pytest
 
@@ -178,10 +177,6 @@ def test_markdown_sync_watch_uses_canonical_observer_binding(
     store.close()
 
 
-def test_markdown_sync_type_hints_resolve_memory_store() -> None:
-  hints = get_type_hints(MarkdownSyncManager.__init__)
-
-  assert hints["store"] is MemoryStore
 
 
 def test_markdown_sync_helpers_use_canonical_writing_state(

@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import NoRegistryScope, RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 # ruff: noqa: E402
 
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
@@ -25,6 +27,7 @@ from agent_gateway.dispatcher_factory import (
 from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.mcp_client_connections import McpClientSession
 from agent_gateway.session import GatewaySession
+from agent_workflow_contracts.models import AdmittedResearchBinding
 from agent_gateway.tool_dispatcher import ToolDispatcher
 from gateway_test_support.capability_execution_test_support import (
   stub_runner_capability_execution,
@@ -70,6 +73,7 @@ def _build_interactive_dispatcher(
     capability_bind=TEST_CAPABILITY_BIND,
     principal=InvocationPrincipal.from_session(session),
     profile="interactive",
+    run_context=run_context_for_test(registry_scope=NoRegistryScope()),
     event_log=None,
     session_id=session.session_id,
     request_approval=None,
@@ -152,6 +156,7 @@ def test_tool_dispatcher_injects_user_id_into_mcp_meta(server_name: str) -> None
     channel="excel",
     role="invite",
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp", "research-corpus-mcp"}),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(_dispatch(dispatcher, "call-1", "portfolio_tool", {"ticker": "AAPL"}))
@@ -221,7 +226,8 @@ def test_real_interactive_entry_paths_forward_canonical_risk_user_id(
   assert mcp.calls[0]["meta"]["user_id"] == "1"
 
 
-def test_non_positive_risk_user_id_is_not_serialized_as_mcp_identity() -> None:
+@pytest.mark.parametrize("user_id", ["henry", "42"])
+def test_unresolved_risk_identity_does_not_use_login_user_id(user_id: str) -> None:
   mcp = _FakeMcpClient(
     server_name="portfolio-reads-mcp",
     tool_name="get_current_model",
@@ -231,11 +237,12 @@ def test_non_positive_risk_user_id_is_not_serialized_as_mcp_identity() -> None:
     mcp_client=mcp,
     local_tool_handlers={},
     session_id="sess-legacy",
-    user_id="henry",
+    user_id=user_id,
     risk_user_id=0,
     channel="mcp",
     role="owner",
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
@@ -253,9 +260,14 @@ def test_non_positive_risk_user_id_is_not_serialized_as_mcp_identity() -> None:
 
 
 
-def test_cli_channel_research_corpus_meta_carries_caller_session_token() -> None:
-  # CLI thesis_list must execute as the calling session: meta carries that
-  # session's token so research-corpus-mcp never mints a second gateway session.
+@pytest.mark.parametrize(
+  ("tool_name", "tool_input"),
+  [("thesis_list", {"ticker": "PCTY", "limit": 10}), ("list_research_files", {"limit": 10})],
+)
+def test_cli_channel_research_corpus_meta_carries_caller_session_token(
+  tool_name: str, tool_input: dict[str, object],
+) -> None:
+  # Both CLI research reads execute as the calling session, never a reminted one.
   session = GatewaySession(
     session_id="sess-cli",
     api_key_hash="hash",
@@ -267,7 +279,7 @@ def test_cli_channel_research_corpus_meta_carries_caller_session_token() -> None
     channel="cli",
     session_token="caller-session-token",
   )
-  mcp = _FakeMcpClient(server_name="research-corpus-mcp", tool_name="thesis_list")
+  mcp = _FakeMcpClient(server_name="research-corpus-mcp", tool_name=tool_name)
   dispatcher = ToolDispatcher(
     capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=mcp,
@@ -279,18 +291,19 @@ def test_cli_channel_research_corpus_meta_carries_caller_session_token() -> None
     channel=session.channel,
     role=session.role,
     mcp_meta_inject_servers=frozenset({"research-corpus-mcp"}),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
-    _dispatch(dispatcher, "call-1", "thesis_list", {"ticker": "PCTY", "limit": 10})
+    _dispatch(dispatcher, "call-1", tool_name, tool_input)
   )
 
   assert error is None
   assert result == {"ok": True}
   assert mcp.calls == [
     {
-      "name": "thesis_list",
-      "tool_input": {"ticker": "PCTY", "limit": 10},
+      "name": tool_name,
+      "tool_input": tool_input,
       "meta": {
         "session_id": "sess-cli",
         "user_id": "1",
@@ -300,6 +313,80 @@ def test_cli_channel_research_corpus_meta_carries_caller_session_token() -> None
       },
     }
   ]
+
+
+def _research_bound_dispatcher(
+  mcp: _FakeMcpClient,
+  *,
+  binding: AdmittedResearchBinding | None,
+) -> ToolDispatcher:
+  session = GatewaySession(
+    session_id="sess-research",
+    api_key_hash="hash",
+    created_at=1,
+    expires_at=2,
+    user_id="henry",
+    risk_user_id=1,
+    role="owner",
+    channel="cli",
+    tool_research_binding=binding,
+  )
+  return ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
+    mcp_client=mcp,
+    local_tool_handlers={},
+    session=session,
+    session_id=session.session_id,
+    user_id=session.user_id,
+    risk_user_id=session.risk_user_id,
+    channel=session.channel,
+    role=session.role,
+    mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
+  )
+
+
+def test_tool_dispatcher_injects_session_research_file_id_into_mcp_meta() -> None:
+  mcp = _FakeMcpClient()
+  dispatcher = _research_bound_dispatcher(
+    mcp,
+    binding=AdmittedResearchBinding(research_file_id=17, ticker="PCTY"),
+  )
+
+  result, error = _run(
+    _dispatch(
+      dispatcher,
+      "call-1",
+      "portfolio_tool",
+      {"ticker": "PCTY"},
+      skill_run_id="skill-run-123",
+    )
+  )
+
+  assert error is None
+  assert result == {"ok": True}
+  assert mcp.calls[0]["meta"] == {
+    "session_id": "sess-research",
+    "user_id": "1",
+    "channel": "cli",
+    "role": "owner",
+    "research_file_id": 17,
+    "skill_run_id": "skill-run-123",
+  }
+
+
+def test_tool_dispatcher_omits_research_file_id_from_mcp_meta_when_unbound() -> None:
+  mcp = _FakeMcpClient()
+  dispatcher = _research_bound_dispatcher(mcp, binding=None)
+
+  result, error = _run(
+    _dispatch(dispatcher, "call-1", "portfolio_tool", {"ticker": "PCTY"})
+  )
+
+  assert error is None
+  assert result == {"ok": True}
+  assert "research_file_id" not in mcp.calls[0]["meta"]
+
 
 
 
@@ -314,6 +401,7 @@ def test_tool_dispatcher_injects_run_context_into_mcp_meta_when_present() -> Non
     channel="excel",
     role="invite",
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
@@ -358,6 +446,7 @@ def test_tool_dispatcher_omits_run_context_from_mcp_meta_when_absent() -> None:
     channel="excel",
     role="invite",
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
@@ -383,6 +472,52 @@ def test_tool_dispatcher_omits_run_context_from_mcp_meta_when_absent() -> None:
   assert "batch_id" not in mcp.calls[0]["meta"]
 
 
+@pytest.mark.parametrize(
+  ("registry_scope", "carried"),
+  [
+    (
+      RegistryScope("session", "sess-chat", "/tmp/workspace"),
+      {"registry_scope_type": "session", "registry_scope_id": "sess-chat"},
+    ),
+    (RegistryScope("run", "skill-run-123", "/tmp/workspace"), {}),
+    (NoRegistryScope(), {}),
+  ],
+)
+def test_tool_dispatcher_carries_the_declared_registry_scope_in_mcp_meta(
+  registry_scope: RegistryScope | NoRegistryScope,
+  carried: dict[str, str],
+) -> None:
+  mcp = _FakeMcpClient()
+  dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
+    mcp_client=mcp,
+    local_tool_handlers={},
+    session_id="sess-1",
+    risk_user_id=42,
+    channel="excel",
+    role="invite",
+    mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
+    run_context=run_context_for_test(registry_scope=registry_scope),
+  )
+
+  result, error = _run(
+    _dispatch(
+      dispatcher,
+      "call-1",
+      "portfolio_tool",
+      {"ticker": "AAPL"},
+      skill_run_id="skill-run-123",
+      workspace_dir="/tmp/workspace",
+    )
+  )
+
+  assert error is None
+  assert result == {"ok": True}
+  meta = mcp.calls[0]["meta"]
+  assert {key: value for key, value in meta.items() if key.startswith("registry_scope")} == carried
+  assert meta["skill_run_id"] == "skill-run-123"
+
+
 def test_tool_dispatcher_defaults_portfolio_scope_for_portfolio_mcp_tool() -> None:
   mcp = _FakeMcpClient()
   dispatcher = ToolDispatcher(
@@ -395,6 +530,7 @@ def test_tool_dispatcher_defaults_portfolio_scope_for_portfolio_mcp_tool() -> No
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
     session=SimpleNamespace(dispatch_scope=_dispatch_scope(), role="owner"),
     get_tool_definitions=lambda: [_portfolio_tool_def()],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(_dispatch(dispatcher, "call-1", "portfolio_tool", {"format": "agent"}))
@@ -421,6 +557,7 @@ def test_tool_dispatcher_defaults_portfolio_scope_for_split_portfolio_mcp_tool()
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
     session=SimpleNamespace(dispatch_scope=_dispatch_scope(), role="owner"),
     get_tool_definitions=lambda: [_portfolio_tool_def()],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(_dispatch(dispatcher, "call-1", "portfolio_tool", {"format": "agent"}))
@@ -444,6 +581,7 @@ def test_tool_dispatcher_preserves_explicit_portfolio_tool_input() -> None:
     session_id="sess-1",
     session=SimpleNamespace(dispatch_scope=_dispatch_scope(), role="owner"),
     get_tool_definitions=lambda: [_portfolio_tool_def()],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
@@ -464,6 +602,7 @@ def test_tool_dispatcher_defaults_when_portfolio_tool_input_is_null_or_blank() -
     session_id="sess-1",
     session=SimpleNamespace(dispatch_scope=_dispatch_scope(), role="owner"),
     get_tool_definitions=lambda: [_portfolio_tool_def()],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
@@ -495,6 +634,7 @@ def test_tool_dispatcher_skips_portfolio_default_when_schema_does_not_accept_it(
     get_tool_definitions=lambda: [
       _portfolio_tool_def(properties={"format": {"type": "string"}}),
     ],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(_dispatch(dispatcher, "call-1", "portfolio_tool", {"format": "agent"}))
@@ -525,6 +665,7 @@ def test_tool_dispatcher_uses_original_tool_name_for_prefixed_portfolio_default(
         },
       ),
     ],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(_dispatch(dispatcher, "call-1", tool_name, {"format": "agent"}))
@@ -553,6 +694,7 @@ def test_runner_tool_start_event_uses_effective_dispatch_scope_input() -> None:
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp"}),
     session=SimpleNamespace(dispatch_scope=_dispatch_scope(), role="owner"),
     get_tool_definitions=lambda: [_portfolio_tool_def()],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   runner = AgentRunner(
     event_log=event_log,
@@ -591,6 +733,7 @@ def test_tool_dispatcher_session_param_injection_still_works() -> None:
     local_tool_handlers={},
     session_id="sess-1",
     mcp_session_inject_servers={"session-param-server"},
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(_dispatch(dispatcher, "call-1", "portfolio_tool", {"ticker": "AAPL"}))
@@ -612,6 +755,7 @@ def test_tool_dispatcher_fails_closed_without_user_id_in_strict_mode() -> None:
     risk_user_id=None,
     mcp_meta_inject_servers=frozenset({"portfolio-reads-mcp", "research-corpus-mcp"}),
     credentials_resolver_active=True,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   with pytest.raises(RuntimeError, match="MCP meta user_id is required in strict mode"):

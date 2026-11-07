@@ -6,6 +6,8 @@ approval, and execution infrastructure around the model loop. Requires Python
 
 ## Ownership
 
+Owner doc: [`docs/architecture.md`](docs/architecture.md) — the package's architecture page; product wiring and approval policy are the embedding app's (`docs/reference/AGENT_INFRASTRUCTURE.md`, `docs/reference/agent-tool-policy-architecture.md`); run-loop and approval mechanism: `docs/architecture.md` and `agent_gateway/README.md`.
+
 This package owns the generic FastAPI chat surface, sessions and JWTs, SSE event
 stream, model/tool run loop, tool dispatch, approvals, code execution, skills,
 sub-agents, autonomous execution, and heartbeat support.
@@ -26,6 +28,14 @@ policy and identity callbacks plus optional batch/operator-schedule backends in
 `GatewayServerConfig`; schema-backed artifact tools and routes belong to the
 embedding application. `server_policy` is process-scoped: configure it before
 building runtimes and use one product policy per gateway process.
+
+Storage-owner syntax belongs to `user_identity_mapping.parse_storage_identity`.
+Raw signed claims, persisted schedule owners, scanned desk-directory names, and
+runtime bootstrap inputs enter through that parser. Session-backed artifact and
+schedule paths reuse `session_owner_user_id()` without parsing again; desk and
+workspace path helpers only locate an already admitted owner. Runtime placement
+additionally requires the parser's numeric form before binding a Risk identity.
+
 
 `sub_agent.continue_approved_child()` is a host-only continuation entry through
 the configured resume handler. It reserves the parked attempt's ordinary resume
@@ -56,6 +66,12 @@ original durable binding once and carries its real result into the successor.
 The warm foreground registry claim retains the same admitted task and bind as
 the journal, so delivery through a warm host and a restored host uses the same
 continuation authority.
+Registered foreground attempts settle their exact admitted identity before
+readable-envelope materialization. Cancellation retains the child's observed
+tools and usage; dispatch/lifecycle failures get canonical failed settlements,
+while genuine approval parks retain `awaiting_approval`. Ambiguous-write retries
+reuse the original completion time. A settlement-write failure is logged and
+recorded as uncertain without replacing the original response or cancellation.
 
 
 Root approval continuations retain the parked turn's sequence space, even after
@@ -70,6 +86,34 @@ supply the restorer's `transcript_dir`. Already-delivered checks run after the
 previous turn settles, under the continuation lock with the session slot held.
 A no-op releases that empty slot without a terminal or transcript entry.
 A second approval park is a turn terminal, not the end of the continued run.
+Authenticated `GET /api/capability-choices/session.driver` uses the same live
+selection projection as init without creating or replacing a chat session.
+Preference controls can refresh it while an approval is parked. Account
+preferences apply to new turns; they do not replace a parked turn's binding.
+
+Session replay pairs every assistant tool call with a result in the immediately
+following user message. A parked call reads as awaiting approval until its real
+result arrives; unanswered siblings, including calls dispatch never started
+before the park, read as explicit `tool_interrupted` errors. These are replay
+projections only: they never settle durable calls, and later recorded results
+replace them.
+
+The native `AgentRunner` accepts an optional async `final_answer_check(text)`
+hook and `final_answer_check_mode` (`hold` by default, `append`, or `off`),
+directly or from the dispatcher's `RunContext`. Every terminal no-tool answer
+emits `citation_check_started` and awaits the hook with the whole answer the
+client holds (a `max_tokens`-continued answer's segments together). A positive
+`runner_state.FinalAnswerVerdict(mode, violation_count, revise_message,
+text_transform)` retains the assistant draft plus the supplied user revision
+instruction in model context and emits `answer_revision_started` before
+continuing the same run; both events name the draft's turn. A run revises at
+most once, so the revised answer is checked again but never revised; `off`
+checks every answer and revises none. The verdict's optional `text_transform`
+is applied once to the reply that answers the revision — through any tool turns
+or retries before it; a reply cut at `max_tokens` is held and spliced whole with
+its continuation; a reply that fails mid-stream settles on `text_transform("")`.
+`None`, a zero-violation verdict, or a logged check exception leaves normal
+completion unchanged. Domain validation and revision wording remain host-owned.
 
 ## Main entrypoints
 
@@ -83,9 +127,9 @@ A second approval park is a turn terminal, not the end of the continued run.
 | [`agent_gateway/containment_settings.py`](agent_gateway/containment_settings.py) | `ContainmentSettings` | Every containment bound (spawn depth, concurrent children, soft ladder per session kind, hung-child silence, context thresholds) as a live view over the operator run-settings file (`agent_gateway/run_settings.py`, `HANK_RUN_SETTINGS_PATH`); `ContainmentSettings(**overrides)` is the pinned form |
 | [`agent_gateway/heartbeat.py`](agent_gateway/heartbeat.py) | `HeartbeatLoop` | Repeated prebound autonomous work with quiet windows and backoff |
 | [`agent_gateway/cli.py`](agent_gateway/cli.py) | `main()` (`agent init` / `agent run`) | Scaffold and run a package project |
-| [`hank_model_transport/send_prompt.py`](../model-transport/hank_model_transport/send_prompt.py) | `send_prompt()` / `send_prompt_sync()` | One already-bound prompt→completion call returning text. Supply `runtime=GATEWAY_SEND_PROMPT_RUNTIME` from `agent_gateway.transport_runtime`. `completion_record_root` is required keyword-only: pass a directory to append one `completion_record` v1 row per provider attempt, or `None` to state the call is not captured |
-| [`hank_model_transport/completion_record.py`](../model-transport/hank_model_transport/completion_record.py) | `build_completion_record()` / `append_completion_record()` | The `completion_record` v1 row for one-shot companion-repo model calls; day-sharded `<root>/<YYYY-MM-DD>.jsonl`, append-only, never fails the call it records |
-| [`agent_gateway/runner_usage.py`](agent_gateway/runner_usage.py) | `apply_provider_diagnostics()` / `apply_thinking_event()` | Fold each provider call's `provider_response_id`, `provider_request_id`, `service_tier`, `rate_limit` (headers read once by `hank_model_transport.providers.response_diagnostics`) and the thinking tallies `thinking_chars` / `redacted_thinking_blocks` into a turn's usage, so `assistant_message.usage`, `turn_complete.usage`, the spend-row attrs and the completion record carry them; thinking blocks, `redacted_thinking` included, stay uncapped in `content_blocks` as the provider replay record |
+| [`packages/model-transport/hank_model_transport/send_prompt.py`](../model-transport/hank_model_transport/send_prompt.py) | `send_prompt()` / `send_prompt_sync()` | One already-bound prompt→completion call returning text. `completion_record_root` is required keyword-only: pass a directory to append one `completion_record` v1 row per provider attempt, or `None` to state the call is not captured |
+| [`packages/model-transport/hank_model_transport/completion_record.py`](../model-transport/hank_model_transport/completion_record.py) | `build_completion_record()` / `append_completion_record()` | The `completion_record` v1 row for one-shot companion-repo model calls (contract: `packages/model-transport/hank_model_transport/contracts/completion-record-v1/completion_record.schema.json`); day-sharded `<root>/<YYYY-MM-DD>.jsonl`, append-only, never fails the call it records |
+| [`agent_gateway/runner_usage.py`](agent_gateway/runner_usage.py) | `apply_provider_diagnostics()` / `apply_thinking_event()` | Fold each provider call's `provider_response_id`, `provider_request_id`, `service_tier`, `rate_limit` (headers read once by `packages/model-transport/hank_model_transport/providers/response_diagnostics.py`) and the thinking tallies `thinking_chars` / `redacted_thinking_blocks` into a turn's usage, so `assistant_message.usage`, `turn_complete.usage`, the spend-row attrs and the completion record carry them; thinking blocks, `redacted_thinking` included, stay uncapped in `content_blocks` as the provider replay record |
 | [`agent_gateway/gateway_address.py`](agent_gateway/gateway_address.py) | `gateway_base_url()` | The origin of the gateway a process talks to: the one reader of `GATEWAY_BASE_URL` and the one place its default is spelled |
 
 `run_gateway_server()` is the serving entry on both local supported launches, not
@@ -97,11 +141,33 @@ The package does not infer a new model or credential inside autonomous
 execution. The application resolves and passes the exact bound capability,
 session, billing mode, and skill limits before calling `run_autonomous()`.
 
+Autonomous model processes inherit `OLLAMA_CLOUD_BASE_URL` and `OLLAMA_BASE_URL`
+through the child-environment owner, including detached profile roots, scheduled
+runs, admitted autonomous/cron children and their continuations. Admission retains
+the endpoint names in the frozen environment projection; launch re-hands endpoints
+even for older persisted projections. `HANK_RUN_ROUTE_FILE` is not allowlisted:
+launch explicitly hands every child the route path or `""` when the parent has no
+route, so the child never reads the operator's current selection. These routing
+names are not granted to `run_bash` or
+`code_execute`. The generic projection never forwards `OLLAMA_CLOUD_API_KEY`:
+the bound model credential still travels through the signed launch's private
+credential handoff.
+
+The owned-process sentinel reports its JSON status on a dedicated pipe the
+parent creates and passes by descriptor number (a non-inheritable read end in
+the parent, the write end inherited only by the sentinel, never by its child).
+The sentinel's stderr is the run log from process start, so interpreter-startup
+and import-time output (`sitecustomize`, `.pth` processing, warnings) lands in
+the log; the parent still parses every status line strictly.
+Reaper-induced abort of a pending event reader, when the reaper is cleaning up
+an already-failed or cancelled run, is cleanup collateral, not a channel
+failure that can replace the process failure.
+
 Model selection and model request facts come from `model_authority`
 (`hank-model-authority`; in the monorepo `packages/model-authority/`), which this
 package depends on and carries no copy of: the registry, the selection policy,
 each entry's per-family `compat` block and the rate tables.
-`CapabilityExecutionResolver.select_bind()` in `capability_execution.py` selects
+`CapabilityExecutionResolver.select_bind()` in `packages/model-transport/hank_model_transport/capability_execution.py` selects
 and authorizes a secret-free bind through that owner, without materializing
 credentials or constructing an adapter. `resolve()` selects and materializes
 once; `materialize_bind()` executes an already selected bind without reselection.
@@ -124,7 +190,7 @@ remembers failed chain positions for fresh child runners, which resume at the
 first remaining entry without re-probing them. Declared resets and credential
 changes revive their entries; a newly prepared root turn starts at its primary.
 [`hank_model_transport.providers`](../model-transport/hank_model_transport/providers/)
-builds each request from the bound entry. Mechanism: [model authority](../../docs/reference/model-authority.md).
+from the bound entry. Mechanism: [model authority](../../docs/reference/model-authority.md).
 
 `admit(SpawnRequest(...), parent, owners=AdmissionOwners(...))` returns the
 selected context and exact `ResolvedAuthority`, without materializing credentials.
@@ -166,6 +232,9 @@ synthetic session or gain those exceptions.
 Operation-private routes may extend the parent's visible surface, but cannot
 bypass its withheld routes. Admission matches withheld canonical route IDs and
 their registered policy names before freezing the executable grant.
+Operation snapshots retain canonical essential-route identities: local tool IDs
+stay unchanged and MCP IDs use `mcp__<server_id>__<tool_id>`. Admission maps these
+identities to the current exposed route names before resolving authority.
 The admitted wire retains `withheld_tools` across descendants and durable
 continuation. Resume keeps its original executable grant while descendants
 retain recorded exclusions plus the current parent's known exclusions.
@@ -179,6 +248,13 @@ that captured scope without minting authority. A child session installs
 and cannot regain root scope.
 Sessionless control/schedule edges use `root_context_from_identity()` with their
 authenticated identity, live roster and approval owner.
+Both root helpers require the keyword `selection_provenance`; fresh roots capture
+it from the same selection-policy object as their snapshot. The existing
+`default_root_provenance(policy)` projection records `policy_default` even when
+there is no named preset. Explicit `None` means the original selection source is
+unknown (historical/frozen jobs or a tool-only bridge with no model selection),
+not permission to reconstruct a layer from the current process. Durable root
+turns retain the original provenance alongside their snapshot for Continue.
 An autonomous skill launch passes its launch edge's user facts as
 `AdmissionOwners.identity` (`AdmittedChildIdentity`). A spawn admits that
 identity only as the parent tenant's owner (`user_id` is the tenant
@@ -197,6 +273,16 @@ a pending/running worker from `task_completed`. Such a corrupted final state
 projects as failed with `task_result_settlement_mismatch`; the result and journal
 remain unchanged. `adopt_reconstructed()` retains one registry entry and lock,
 returning an existing entry rather than replacing it with a fresh replay copy.
+
+`POST /chat/background/{task_id}/interrupt` uses the authenticated session's
+current live runner and the same `TaskRegistry.interrupt()` owner as
+`run_agent(interrupt=task_id)`. It requests `user_interrupted`, never parent-turn
+cancellation. Unknown, foreign, settled or already-interrupting targets return
+`interrupt_requested: false`; a session with no live runner returns HTTP 409.
+An acknowledgement is not durable settlement: wait for the child's interrupted
+notification, then ask the parent to `run_agent(resume=task_id)`. Resume retains
+the original transcript, capability bind and grant and returns a successor ID.
+The endpoint accepts no session override, model selection or replacement grant.
 
 Workflow-node continuation belongs to the workflow owner, not model-facing
 `revive`. A trusted host first calls
@@ -262,6 +348,85 @@ role: child callers supply `role="sub_agent"` and their session ID as
 `sub_agent_id`; independent writer runs supply `role="writer"` and
 `sub_agent_id=None`, with their exact `runner_id`. Both retain the session ID
 as the narrative artifact identity.
+
+## Completion reads (schema version 1)
+
+`agent_gateway.completion_reads` composes raw completion facts from the existing
+runner, task registry, EventLog and durable session-log owners. Control-plane
+chat and autonomous run responses expose this as `completion`; in-process hosts
+can call `read_runner_completion(runner, pending_approval=...)` directly.
+There is deliberately no `settled`, `quiescent`, live-child classification or
+new completion event. A terminal, closed stream or zero observed tasks is not a
+success/quiescence assertion.
+
+The version-1 envelope has `schema_version: 1`, `source`
+(`chat`, `workflow`, or `runner`), `consistency`, `terminal`, `receipt`,
+`journal`, `durable`, `children`, `obligations`, `pending_approval` and `unknown`.
+Facts are copied, not references to mutable registry entries. `consistency` is
+`changed` when the two owner observations differ, `unknown` when an owner or
+epoch is unavailable, otherwise `current`. `current` means only that the
+observations matched, not that execution completed. There is no retry or wait
+for a stable/successful answer. The native background-success fingerprint is
+compared as well, so work changing during composition cannot masquerade as an
+unchanged observation.
+
+| Field | Native meaning |
+| --- | --- |
+| `journal` | EventLog's actual `closed`, absolute current `cursor` (`next_seq - 1`), `next_seq`, revision and last terminal `{seq,event}`. Closing without a terminal keeps terminal null. |
+| `terminal` | The observed journal terminal, independent of durable receipt and detach. Approval-park and interruption dispositions remain unchanged. |
+| `durable` | AgentSessionLog's strict current cursor/revision, runner-scoped root receipt rows, attach, terminal and detach rows, pending appends and read status. No second tailer or cached success store. |
+| `receipt` | Chat/in-process: `{source: "agent_session_log", status, refs}` naming the existing durable receipt-equivalent rows, never a newly minted proof. |
+| `children` | Registry epoch, coverage, `observed_count`, authoritative `count`, raw `state_counts` for every TaskState and copied child refs. The runner's admitted self entry is excluded. |
+| `obligations.background` | The existing success fence's blockers and raw initialization/reconciliation, completion-append, notification queue, acknowledgement and delivery-credit `{count,refs}` observations. |
+| `obligations.session` | Native attach/closure, staged receipts, required top-level skill result/terminal/detach settlement and persistence facts. |
+| `pending_approval` | Existing pending approval count and tool-call/approval refs, not a new approval decision. |
+
+Child rows retain `pending`, `running`, `completed`, `failed`, `killed`,
+`interrupted`, `awaiting_approval`, `idle` and `parked` without mapping them
+to product liveness. Rows also retain registration/completion persistence
+state/error, detached finalizers and pending final state, required skill-result
+settled/projected facts, initialization refs, notification generation/delivery
+state and callback presence/invocation. Queue omission and payload omission
+remain unresolved delivery facts; an unread result handle is not reclassified
+as running work.
+
+### Receipt equivalents and unavailable facts
+
+Chat has no separate `AutonomousTerminalReceipt`. Its receipt equivalents are
+the existing durable `task_completed`, `agent_completion`,
+`skill_result_captured`, `workflow_output_attached`, `stream_complete`, `error`
+and `session_recap` rows. Durable `detach` is separate. The read scopes to the
+exact runner and its attached sub-agent identity (null for root chat), excluding
+other runners/turns and descendant event envelopes. A workflow attached to an
+in-process runner uses those same native workflow-output and skill-result
+rows; their publication is not a child-liveness judgment.
+
+On the control plane, autonomous/subprocess runs use `source: "workflow"`.
+Their existing `AutonomousTerminalReceipt` is projected alongside
+`terminal_manifest_committed`, event-evidence status and the native
+channel acknowledgement's channel/count/digest. A terminal receipt may exist
+before its manifest is committed: `receipt.committed` exposes that distinction.
+The parent does not own the subprocess EventLog, task registry, durable detach
+or settlement queues, so these remain null/unknown rather than inferred from
+exit code, a channel ACK, terminal manifest or event count.
+
+`null` means not observed/available, never zero or successful settlement.
+A durable read has explicit `observed`, `missing`, `no_target` or `unknown`
+status; `missing` means no matching row at the read cursor, not success.
+Unknown readers are listed in `unknown` with their owner/error type.
+Restoring a registry preserves its observed raw task rows but makes coverage
+`unknown` and authoritative `count: null`, even for an empty replay. Its new
+process-local epoch is not continuity proof. A lost chat runner likewise leaves
+children/obligations unknown while retaining an available journal and pending
+approval map. Unavailable task/notification inspections use null counts/refs,
+not an empty collection. No absent receipt, detached writer, restart or empty
+registry is promoted to a completed obligation.
+The session's `detach_status` distinguishes acknowledged (`observed`),
+unacknowledged-write outcome (`unknown`), no acknowledgement (`missing`) and
+no durable target (`no_target`). Detach and receipt persistence errors remain
+visible independently, including after a later detach acknowledgement.
+`durable.pending_appends` is the log owner's current log-wide count, not
+attribution of those appends to this runner.
 
 ## Quick start
 
@@ -368,6 +533,62 @@ it with `auth list anthropic --usage` (cached view only). Mechanism:
 The complete session-token, chat request, and SSE walkthrough is in the
 [quickstart](docs/quickstart.md).
 
+### Durable base-chat history
+
+`GET /api/chat/history` uses the existing `/api/chat/init` bearer. It accepts
+only `limit` (default `50`, range `1`–`200`) and optional `before_seq` (a positive,
+exclusive sequence cursor). There is no caller-selected user, session, log id or
+filesystem path. The authenticated live session supplies its durable
+`agent_session_log`, or its init-bound `resume_log_path` / `fork_source_log_path`
+before the first turn. A fresh session has an empty history. Resume ownership
+continues to belong to the configured init-time resolver, not to this read.
+
+```json
+{
+  "schema_version": 1,
+  "entries": [
+    {"seq": 2, "role": "user", "content": "Hello", "timestamp": 1793318400.0},
+    {"seq": 3, "role": "assistant", "content": "Hello.", "timestamp": 1793318401.0}
+  ],
+  "next_before_seq": null
+}
+```
+
+Pages start at the newest durable writer `user_message` / `assistant_message`
+records and return display entries in ascending sequence order. `seq` is the
+original durable sequence; `timestamp` is numeric Unix epoch seconds. User
+display text comes only from the durable `user_message.analyst_content` string
+or content-block list, captured before per-turn context injection by both native
+and SDK runners. Non-injected writers default it to their supplied content.
+`content` remains the unchanged model-facing message, including appended context,
+and native/SDK replay continues to use it. No provenance keys enter model messages.
+Text blocks join in order with no separator. Operator messages, sub-agent records
+and textless messages are invisible; thinking, tool results/calls, attachments
+and actionable payloads are never returned or replayed. Consecutive assistant
+entries remain separate for clients to group into a response bubble.
+
+If a visible legacy user record lacks `analyst_content`, the read returns HTTP
+`409` with `detail: {"code": "history_analyst_content_unavailable", "seq": ...}`.
+It never displays the unknown model-facing content or guesses which headings to
+strip. Present malformed provenance is an error, not a fallback to `content`.
+This is additive within the existing durable event schema version.
+
+`next_before_seq` is the oldest raw sequence in the page when an older raw page
+exists, otherwise `null`. Visibility filtering can yield an empty `entries`
+array with a non-null cursor. Follow every cursor until `null`, prepending older
+pages and deduplicating by durable sequence so an in-flight newer turn survives
+rehydration. The read uses the existing log and its rotated segments, without
+opening a writer, creating active log files or repairing rotation metadata for
+resume/fork reads. Responses carry `Cache-Control: private, no-store`; there is
+no separate transcript store.
+
+A fork reads its authorized source before its first turn, then reads its own
+live log (also after resuming that fork). The inherited `fork_seed.messages`
+are model context with no analyst/operator display provenance, so they are
+not projected and `source_log_path` is never followed. Inherited display history
+after a fork's first turn requires provenance at the fork-seed owner; it cannot
+be reconstructed safely by this endpoint.
+
 ## Request shape
 
 ```text
@@ -395,7 +616,12 @@ Each bridged nested dispatch inherits the enclosing `code_execute` call's skill
 run, step, workspace and batch context, including for background cells; the
 dispatcher supplies the request's control-run identity as for direct calls.
 
-A docker or kernel cell's `timeout_ms` bounds its compute only. The interpreter
+A docker or kernel cell's `timeout_ms` bounds its compute only: the clock is armed
+by the runner's `started` frame, so a session's first cell never spends its budget
+on interpreter boot. Boot (the cell frame's write to `started`) has its own bound,
+`CodeExecutionConfig.kernel_boot_timeout_ms` (default 60 s); a boot that outlasts
+it discards the kernel and returns `error.code` `kernel_boot_failed` with
+`timed_out` false, never `return_code` 124. The interpreter
 runner brackets each `hank` request made on the cell's own (main interpreter)
 thread, and each `await hank.acall(...)` worker's, with
 `host_wait_begin`/`host_wait_end` frames; `_run_cell` pauses the compute
@@ -437,8 +663,10 @@ flags. In the monorepo checkout, the shortcut is
 From the package root, run:
 
 ```bash
-pytest tests
+pytest --import-mode=importlib tests
 ```
+
+In this monorepo checkout, the repository `pytest.ini` owns import roots and default filters for targeted and whole-suite runs, including the add-in `api/` root; the standalone command above keeps `--import-mode=importlib` explicit.
 
 The suite and its `gateway_test_support/` fixtures are package-local; no embedding
 application checkout or product configuration is required. Product integration

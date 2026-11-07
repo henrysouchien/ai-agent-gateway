@@ -8,24 +8,14 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import _derive_sub_agent_id as package_derive_sub_agent_id  # noqa: E402
-import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.runner_introspection import (  # noqa: E402
   derive_sub_agent_id,
   detect_user_id_param,
   format_exc,
   root_session_id,
 )
-from agent_gateway.sdk_runner import _detect_user_id_param as sdk_detect_user_id_param  # noqa: E402
-from agent_gateway.sub_agent import _derive_sub_agent_id as sub_agent_derive_sub_agent_id  # noqa: E402
 
 
-def test_runner_preserves_introspection_helper_aliases() -> None:
-  assert gateway_runner._derive_sub_agent_id is derive_sub_agent_id
-  assert package_derive_sub_agent_id is derive_sub_agent_id
-  assert sub_agent_derive_sub_agent_id is derive_sub_agent_id
-  assert gateway_runner._detect_user_id_param is detect_user_id_param
-  assert sdk_detect_user_id_param is detect_user_id_param
 
 
 def test_derive_sub_agent_id_accepts_session_objects_and_plain_ids() -> None:

@@ -50,6 +50,8 @@ def _authority(tmp_path: Path, *, unpriced: tuple[str, ...] = ()) -> ModelAuthor
     "extract": _models(["openai.gpt-6-1-sol.chat"], "low"),
     "peer": _models(["openai.gpt-6-luna-sdk"], "none"),
     "ingest": _models(["anthropic.claude-sonnet-5-5-sdk"], "none"),
+    "edgar_extract": _models([HAIKU, "anthropic.claude-haiku-5-5-sdk"], "none"),
+    "embed": _models(["openai.text-embedding-3-small"], "none"),
   }
   document["selection"].pop("presets", None)
   document["selection"]["capabilities"][SESSION_DRIVER_CAPABILITY]["default"] = {"kind": "tier", "tier": "default"}

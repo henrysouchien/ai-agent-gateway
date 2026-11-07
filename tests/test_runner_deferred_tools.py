@@ -9,6 +9,7 @@ import copy
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -21,13 +22,14 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import AgentRunner, AgentSessionLog, EventLog, SessionContextBuilder  # noqa: E402
 from hank_model_transport.multi_user.billing import UsageTotals  # noqa: E402
-from hank_model_transport.providers import AnthropicProvider, CodexProvider, StreamEvent  # noqa: E402
+from hank_model_transport.providers import AnthropicBedrockProvider, AnthropicProvider, CodexProvider, StreamEvent  # noqa: E402
+from agent_gateway.registry_scope import RegistryScope  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
-from agent_gateway.tool_dispatch_classification import settle_catalogless_tool_result  # noqa: E402
-from agent_gateway.tool_policy_registry import PreparedToolCall  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
-  stub_bound_capability_execution,
+  stub_capability_execution_resolver,
 )
+from gateway_test_support.run_context_test_support import run_context_for_test  # noqa: E402
+from gateway_test_support.runner_dispatcher_test_support import CataloglessDispatcherTestSupport  # noqa: E402
 
 MODEL = "claude-opus-5"
 CONFIG = {"model": MODEL, "effort": "none", "auth_mode": "api_key", "api_key": "k"}
@@ -42,38 +44,19 @@ def _tool(name: str, **extra: Any) -> dict[str, Any]:
   }
 
 
-class _Dispatcher:
-  """Returns the scripted result for each tool name."""
+class _Dispatcher(CataloglessDispatcherTestSupport):
+  """Returns the scripted result for each tool name; the rest of the runner's dispatcher surface is the shared double's."""
 
   def __init__(self, results: dict[str, dict[str, Any]]) -> None:
     self.results = results
-
-  def redact_prepared_tool_input(self, tool_name: str, prepared_call: Any) -> dict[str, Any]:
-    return prepared_call.materialize_input()
-
-  def redact_raw_tool_input_for_history(self, tool_name: str, tool_input: Any) -> dict[str, Any]:
-    _ = tool_name
-    return dict(tool_input)
-
-  def settle_tool_result(self, tool_name, dispatch_entry, result, error, semantic_error=None, *, prepared_call):
-    return settle_catalogless_tool_result(
-      entry=dispatch_entry, result=result, error=error, semantic_error=semantic_error,
+    # The runner reads the turn's declared registry scope from the dispatcher's run_context.
+    self.run_context = run_context_for_test(
+      registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
     )
+
 
   async def dispatch(self, tool_id, tool_name, tool_input, **_kwargs):
     return copy.deepcopy(self.results[tool_name]), None
-
-  async def prepare_tool_call_async(self, tool_name, tool_input):
-    _ = tool_name
-    return PreparedToolCall(dict(tool_input))
-
-  async def dispatch_prepared(self, tool_id, tool_name, prepared_call, **kwargs):
-    return await self.dispatch(
-      tool_id,
-      tool_name,
-      prepared_call.materialize_input(),
-      **kwargs,
-    )
 
 
 class _Catalog:
@@ -89,7 +72,7 @@ class _Catalog:
 def _session(session_id: str) -> GatewaySession:
   return GatewaySession(
     session_id=session_id, api_key_hash="h", created_at=0, expires_at=2**31,
-    user_id="alice",
+    user_id="alice", owner_user_id="alice",
   )
 
 
@@ -101,6 +84,9 @@ def _runner(
   session: GatewaySession | None = None,
   excluded: set[str] | None = None,
   agent_session_log: Any = None,
+  model: str = MODEL,
+  effort: str = "none",
+  auth_config: dict[str, Any] | None = None,
 ) -> tuple[AgentRunner, list[dict[str, Any]]]:
   """A runner whose stream records every request's params."""
 
@@ -113,8 +99,22 @@ def _runner(
     yield StreamEvent(type="message_end", stop_reason="end_turn")
 
   provider.stream = stream
-  execution = stub_bound_capability_execution(
-    provider=provider, model=MODEL, effort="none", auth_config={"api_key": "k"},
+  support = provider.adapter_route_support()
+  resolver = stub_capability_execution_resolver(
+    default_provider=provider.name,
+    default_model=model,
+    default_effort=effort,
+    default_adapter=support.adapter,
+    default_protocol_profile="messages.adaptive",
+    default_route=next(iter(support.routes)),
+  )
+  execution = replace(
+    resolver.resolve("session.driver"),
+    adapter=provider,
+    auth_config={
+      "provider": provider.name, "auth_mode": "api", "api_key": "k",
+      **(auth_config or {}),
+    },
   )
   runner = AgentRunner(
     event_log=EventLog(session_id=session.session_id if session else "deferred"),
@@ -132,18 +132,28 @@ def _runner(
   return runner, requests
 
 
-def _request(runner: AgentRunner, messages: list[dict[str, Any]], base_kwargs: dict[str, Any]) -> None:
+def _request(
+  runner: AgentRunner,
+  messages: list[dict[str, Any]],
+  base_kwargs: dict[str, Any],
+  request_reminders: tuple[str, ...] = (),
+) -> None:
   totals: UsageTotals = {
     "input_tokens": 0, "output_tokens": 0,
     "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
   }
   provider = runner._provider
+  execution = runner._capability_execution
   returned = asyncio.run(runner._stream_turn(
-    client=object(), config=dict(CONFIG),
-    model_info=provider.get_model_info(MODEL),
+    client=object(), config={
+      **CONFIG, **execution.auth_config,
+      "model": execution.bind.upstream_model, "effort": execution.bind.effort,
+    },
+    model_info=provider.get_model_info(execution.bind.upstream_model),
     system_prompt=None, current_messages=messages, base_kwargs=base_kwargs,
     max_tokens=4096, turn_count=1, turn_t0=time.time(), turn_t0_mono=time.monotonic(),
     system_chars=0, tools_chars=0, usage_totals=totals,
+    request_reminders=request_reminders,
   ))
   assert isinstance(returned, tuple), returned
 
@@ -183,15 +193,37 @@ def _references(message: dict[str, Any]) -> list[str]:
   ]
 
 
-def test_tools_added_across_a_session_never_touch_the_cached_prefix() -> None:
+@pytest.mark.parametrize(
+  ("provider_type", "model", "auth_config", "effort"),
+  [
+    (AnthropicProvider, MODEL, {"api_key": "k"}, "none"),
+    (
+      AnthropicBedrockProvider,
+      "global.anthropic.claude-opus-5-5",
+      {
+        "api_key": "edge-bedrock-handle",
+        "aws_region": "us-east-1",
+        "base_url": "http://edge.test/egress/bedrock",
+      },
+      "high",
+    ),
+  ],
+  ids=["public", "bedrock"],
+)
+def test_tools_added_across_a_session_never_touch_the_cached_prefix(
+  provider_type: type[AnthropicProvider], model: str, auth_config: dict[str, Any], effort: str,
+) -> None:
   session = _session("deferred-session")
   catalog = _Catalog([_tool("read"), _tool("write", cache_control={"type": "ephemeral"}), _tool("skill_only")])
   results = {
     "load_tools": {"loaded_servers": ["m"], "_load_servers": ["m"]},
     "invoke_skill": {"ok": True, "_active_skill_allow": ["skill_only"]},
   }
-  provider = AnthropicProvider()
-  runner, requests = _runner(provider, catalog, results, session=session, excluded={"skill_only"})
+  provider = provider_type()
+  runner, requests = _runner(
+    provider, catalog, results, session=session, excluded={"skill_only"},
+    model=model, auth_config=auth_config, effort=effort,
+  )
   base_kwargs = {"tools": runner._filter_excluded_tool_definitions(runner._default_tool_definitions())}
   history: list[dict[str, Any]] = [{"role": "user", "content": "go"}]
 
@@ -242,7 +274,10 @@ def test_tools_added_across_a_session_never_touch_the_cached_prefix() -> None:
   # The run ends and the skill allow clears; the next turn is a new runner on
   # the same session, replaying the stored history.
   runner._active_skill_allow.clear()
-  next_runner, next_requests = _runner(AnthropicProvider(), catalog, results, session=session, excluded={"skill_only"})
+  next_runner, next_requests = _runner(
+    provider_type(), catalog, results, session=session, excluded={"skill_only"},
+    model=model, auth_config=auth_config, effort=effort,
+  )
   next_kwargs = {"tools": next_runner._filter_excluded_tool_definitions(next_runner._default_tool_definitions())}
   assert "skill_only" not in {t["name"] for t in next_kwargs["tools"]}
   history.append({"role": "user", "content": "next question"})
@@ -274,6 +309,98 @@ def test_a_reference_is_dropped_when_its_tool_is_absent_from_the_request_tools()
   )
   assert [t["name"] for t in params["tools"]] == ["read", "kept"]
   assert _references(params["messages"][2]) == ["kept"]
+
+
+def _marked_locations(messages: list[dict[str, Any]]) -> list[tuple[int, int]]:
+  return [
+    (message_index, block_index)
+    for message_index, message in enumerate(messages)
+    if isinstance(message["content"], list)
+    for block_index, block in enumerate(message["content"])
+    if "cache_control" in block
+  ]
+
+
+def test_the_anthropic_handoff_marker_is_the_cache_control_it_rendered() -> None:
+  runner, requests = _runner(AnthropicProvider(), _Catalog([_tool("read")]), {})
+  history: list[dict[str, Any]] = [
+    {"role": "user", "content": "go"},
+    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    {"role": "user", "content": [{"type": "text", "text": "more"}]},
+  ]
+  _request(runner, history, {"tools": runner._default_tool_definitions()})
+
+  rendered = _marked_locations(requests[-1]["messages"])
+  assert rendered == [(2, 0)]
+  assert runner._last_request_message_marker_position == rendered[0]
+
+
+@pytest.mark.parametrize(
+  ("history", "marker", "tail_is_own_message"),
+  [
+    (
+      [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        {"role": "user", "content": [{"type": "text", "text": "more"}]},
+      ],
+      (2, 0),
+      False,
+    ),
+    (
+      [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+      ],
+      (1, 0),
+      True,
+    ),
+  ],
+)
+def test_a_request_tail_reminder_stays_outside_the_cache_marker_and_the_fork_pin(
+  history: list[dict[str, Any]], marker: tuple[int, int], tail_is_own_message: bool,
+) -> None:
+  reminder = {"type": "text", "text": "[reminder]"}
+  runner, requests = _runner(AnthropicProvider(), _Catalog([_tool("read")]), {})
+  _request(
+    runner, history, {"tools": runner._default_tool_definitions()},
+    request_reminders=("[reminder]",),
+  )
+
+  sent = requests[-1]["messages"]
+  assert sent[-1]["role"] == "user"
+  if tail_is_own_message:
+    assert sent[-1]["content"] == "[reminder]"
+  else:
+    assert len(sent[-1]["content"]) == len(history[-1]["content"]) + 1
+    assert sent[-1]["content"][-1] == reminder
+  assert len(sent) == len(history) + (1 if tail_is_own_message else 0)
+  # The marker is on the history's last block, never on the changing tail, and
+  # the handoff records that same position.
+  assert _marked_locations(sent) == [marker]
+  assert runner._last_request_message_marker_position == marker
+
+  # A fork child replays the durable history (no tail) with that pin.
+  child, child_requests = _runner(
+    AnthropicProvider(), _Catalog([_tool("read")]), {}, session=_session("tail-child"),
+  )
+  setattr(child, "_fork_mode", True)
+  setattr(child, "_fork_marker_position", runner._last_request_message_marker_position)
+  _request(child, history, {"tools": child._default_tool_definitions()})
+  assert _marked_locations(child_requests[-1]["messages"]) == [marker]
+
+
+def test_an_anthropic_request_that_could_not_place_its_marker_has_no_handoff_marker() -> None:
+  capped = [_tool(f"t{index}", cache_control={"type": "ephemeral"}) for index in range(4)]
+  runner, requests = _runner(AnthropicProvider(), _Catalog(capped), {})
+  _request(
+    runner,
+    [{"role": "user", "content": "go"}],
+    {"tools": runner._default_tool_definitions()},
+  )
+
+  assert _marked_locations(requests[-1]["messages"]) == []
+  assert runner._last_request_message_marker_position is None
 
 
 def test_fork_child_sends_the_parents_exact_wire_tools_and_messages() -> None:

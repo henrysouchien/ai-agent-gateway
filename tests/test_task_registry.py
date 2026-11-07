@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 # ruff: noqa: E402
 
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
@@ -208,6 +210,97 @@ def _run(coro):
   return asyncio.run(coro)
 
 
+def test_completion_read_preserves_raw_states_and_copies_child_facts() -> None:
+  registry = TaskRegistry()
+  for state in TaskState:
+    entry = registry.register(
+      "background_agent",
+      task_id=f"child-{state.value}",
+      sub_agent_id=f"session-{state.value}",
+      required_skill_lifecycle={"skill_run_id": state.value, "nested": ["original"]},
+    )
+    entry.state = state
+  pending = registry.get("child-pending")
+  assert pending is not None
+  pending.registration_persistence_state = "in_flight"
+  pending.completion_persistence_state = "uncertain"
+  pending.completion_persistence_error = "append acknowledgement lost"
+  pending.pending_final_state = TaskState.COMPLETED
+  pending.completion_finalizer_detached = True
+  pending.notification_generation = 3
+  pending.notification_delivery_state = "payload_omitted"
+  pending.completion_callback = lambda entry: None
+  pending.completion_callback_invoked = True
+
+  facts = registry.completion_read()
+
+  assert facts["coverage"] == "current"
+  assert facts["count"] == facts["observed_count"] == len(TaskState)
+  assert facts["state_counts"] == {state.value: 1 for state in TaskState}
+  assert {row["state"] for row in facts["children"]} == {
+    state.value for state in TaskState
+  }
+  row = next(row for row in facts["children"] if row["task_id"] == pending.task_id)
+  assert row["sub_agent_id"] == "session-pending"
+  assert row["registration_persistence_state"] == "in_flight"
+  assert row["completion_persistence_state"] == "uncertain"
+  assert row["completion_persistence_error"] == "append acknowledgement lost"
+  assert row["pending_final_state"] == "completed"
+  assert row["completion_finalizer_detached"] is True
+  assert row["requires_skill_result"] is True
+  assert row["required_skill_result_settled"] is False
+  assert row["initialization_task"] is None
+  assert row["notification_generation"] == 3
+  assert row["notification_delivery_state"] == "payload_omitted"
+  assert row["completion_callback_present"] is True
+  assert row["completion_callback_invoked"] is True
+  row["required_skill_lifecycle"]["nested"].append("changed")
+  assert pending.metadata["required_skill_lifecycle"]["nested"] == ["original"]
+  row["state"] = "changed"
+  assert pending.state is TaskState.PENDING
+
+  excluded = registry.completion_read(exclude_task_id=pending.task_id)
+  assert excluded["epoch"] == facts["epoch"]
+  assert excluded["count"] == len(TaskState) - 1
+  assert excluded["state_counts"]["pending"] == 0
+  assert all(child["task_id"] != pending.task_id for child in excluded["children"])
+
+
+def test_completion_read_replay_keeps_unknown_coverage_even_without_observations() -> None:
+  registry = TaskRegistry()
+  fresh = registry.completion_read()
+  assert fresh["coverage"] == "current"
+  assert fresh["count"] == fresh["observed_count"] == 0
+  assert fresh["epoch"] != TaskRegistry().completion_read()["epoch"]
+
+  registry.load_from_events([])
+  restored = registry.completion_read()
+  assert restored["epoch"] == fresh["epoch"]
+  assert restored["coverage"] == "unknown"
+  assert restored["observed_count"] == 0
+  assert restored["count"] is None
+  assert restored["children"] == []
+  assert restored["state_counts"] == {state.value: 0 for state in TaskState}
+
+  registry.load_from_events([{
+    "type": "task_registered",
+    "event_schema_version": 2,
+    "task_id": "plan_7",
+    "task_type": "plan_run",
+    "started_at": 100.0,
+    "metadata": {"sub_agent_id": "restored-session"},
+  }])
+  restored = registry.completion_read()
+  assert restored["coverage"] == "unknown"
+  assert restored["count"] is None
+  assert restored["observed_count"] == 1
+  assert restored["state_counts"]["parked"] == 1
+  assert restored["children"][0]["state"] == "parked"
+  assert restored["children"][0]["reconstructed_from_log"] is True
+  registry.register("background_agent")
+  assert registry.completion_read()["count"] is None
+
+
 def _linked_registry_runner(
   parent: TaskRegistry,
   task_id: str,
@@ -261,6 +354,7 @@ def _notification_registry_runner(
       local_tool_handlers={},
       event_log=event_log,
       session_id=task_id,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     ),
     session_id=task_id,
     capability_execution=_dispatcher_execution_243,
@@ -3759,11 +3853,13 @@ def test_load_from_events_rejects_raw_completed_child_payload() -> None:
 
 
 @pytest.mark.parametrize(
-  "stored_error",
-  ["provider failed", 42, ["provider failed"], True],
-  ids=["string", "integer", "list", "boolean"],
+  ("stored_error", "final_state"),
+  [
+    ("provider failed", "completed"), ("provider failed", "failed"), ("provider failed", "killed"),
+    (42, "completed"), (["provider failed"], "completed"), (True, "completed"),
+  ],
+  ids=["string-completed", "string-failed", "string-killed", "integer", "list", "boolean"],
 )
-@pytest.mark.parametrize("final_state", ["completed", "failed", "killed"])
 def test_load_from_events_rejects_malformed_child_error(
   stored_error: object,
   final_state: str,

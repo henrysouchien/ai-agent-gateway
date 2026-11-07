@@ -90,10 +90,11 @@ The executor snapshots the bound mapping before its first await and passes
 `allow_stub_response=False`.
 
 No wall clock bounds the run or its `run_agent` children. Liveness is the
-event-gap stall watchdog plus the parent-side child activity guard. The same
+event-gap stall watchdog plus the parent-side child activity guard. Direct provider
+streams of portable compaction (`provider_summarize`) and `send_prompt` use the
 no-progress bound (`runner_streaming.effective_stream_stall_timeout`; heartbeats
-are not progress) covers the direct provider streams of portable compaction
-(`provider_summarize`) and `send_prompt`, which raise `StreamStallError`; time a
+and thinking deltas are liveness, not progress) and raise `StreamStallError`; a
+turn runner separately applies its authority role's thinking-only bound. Time a
 request spends queued for local Anthropic rate-limit capacity
 (`rate_limit.locally_queued`) is not a stall. The deadline is checked before
 consuming ready events, so continuously ready heartbeats cannot bypass it. A

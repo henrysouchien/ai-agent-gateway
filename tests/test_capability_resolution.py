@@ -1144,3 +1144,94 @@ def test_inherited_tagged_ceiling_grants_exactly_its_routes(
 
   assert isinstance(authority, ResolvedAuthority)
   assert granted_tool_ids(authority) == ceiling
+
+
+def _essential_declaration(
+  ceiling: frozenset[str],
+  *,
+  essential: frozenset[str],
+  requirements: tuple[SemanticCapabilityRequirement, ...] = (
+    _requirement("state.mutate/v1"),
+  ),
+) -> OperationDeclaration:
+  return OperationDeclaration(
+    operation_name="study",
+    grant_id="grant:essential",
+    workspace_scope="model_write",
+    required_capabilities=requirements,
+    tool_ceiling=ceiling,
+    essential_routes=essential,
+  )
+
+
+def test_essential_route_missing_is_unavailable_though_capability_is_served(
+  inherited_catalog: PlatformToolCatalog,
+) -> None:
+  """A sibling write serves the capability; it is not the operation's own door."""
+
+  held_only = frozenset({"memory_write"})
+
+  served = resolve_operation_authority(
+    _essential_declaration(held_only, essential=frozenset()),
+    catalog=inherited_catalog,
+  )
+  refused = resolve_operation_authority(
+    _essential_declaration(held_only, essential=frozenset({"external_write"})),
+    catalog=inherited_catalog,
+  )
+
+  assert isinstance(served, ResolvedAuthority)
+  assert isinstance(refused, OperationUnavailable)
+  assert refused.code == "missing_route"
+  assert refused.missing_routes == ("external_write",)
+  assert refused.unsatisfied == ()
+  assert "external_write" in refused.detail
+
+
+def test_essential_route_held_resolves_with_its_full_grant(
+  inherited_catalog: PlatformToolCatalog,
+) -> None:
+  ceiling = frozenset({"memory_write", "external_write"})
+
+  authority = resolve_operation_authority(
+    _essential_declaration(ceiling, essential=frozenset({"external_write"})),
+    catalog=inherited_catalog,
+  )
+
+  assert isinstance(authority, ResolvedAuthority)
+  assert granted_tool_ids(authority) == ceiling
+
+
+def test_essential_route_withheld_by_exclusion_is_missing(
+  inherited_catalog: PlatformToolCatalog,
+) -> None:
+  refused = resolve_operation_authority(
+    _essential_declaration(
+      frozenset({"memory_write", "external_write"}),
+      essential=frozenset({"external_write"}),
+    ),
+    catalog=inherited_catalog,
+    exclusions=("external_write",),
+  )
+
+  assert isinstance(refused, OperationUnavailable)
+  assert refused.missing_routes == ("external_write",)
+
+
+def test_missing_essential_route_is_reported_beside_an_unsatisfied_capability(
+  inherited_catalog: PlatformToolCatalog,
+) -> None:
+  refused = resolve_operation_authority(
+    _essential_declaration(
+      frozenset({"web_fetch"}),
+      essential=frozenset({"external_write"}),
+    ),
+    catalog=inherited_catalog,
+  )
+
+  assert isinstance(refused, OperationUnavailable)
+  assert refused.missing_routes == ("external_write",)
+  assert [item.capability for item in refused.unsatisfied] == ["state.mutate/v1"]
+  # The door the operation cannot run without leads; the capability it also
+  # lacks follows, so the message does not read as the capability alone.
+  assert refused.detail.index("external_write") < refused.detail.index("state.mutate/v1")

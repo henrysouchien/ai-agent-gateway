@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 
 from .health import CONTROL_PLANE_VERSION
 
@@ -27,12 +27,7 @@ def add_control_plane_version_header_middleware(
 
   @app.middleware("http")
   async def control_plane_version_header(request: Request, call_next):
-    try:
-      response = await call_next(request)
-    except RuntimeError as exc:
-      if str(exc) != "No response returned." or not await request.is_disconnected():
-        raise
-      return Response(status_code=499)
+    response = await call_next(request)
     if _matches_prefix(request.url.path, prefixes):
       response.headers[CONTROL_PLANE_VERSION_HEADER] = CONTROL_PLANE_VERSION
     return response

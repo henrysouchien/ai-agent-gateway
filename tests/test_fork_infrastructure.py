@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
@@ -266,7 +268,7 @@ def _runner() -> SimpleNamespace:
     validate=lambda: None,
   )
   return SimpleNamespace(
-    _dispatcher=ToolDispatcher(McpClientManager(), capability_bind=_bind()),
+    _dispatcher=ToolDispatcher(McpClientManager(), capability_bind=_bind(), run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'))),
     _capability_execution=execution,
     _gateway_session=SimpleNamespace(
       session_credential_handle=CredentialHandle(
@@ -477,7 +479,10 @@ def test_fork_tail_shares_placeholder_prefix_and_requests_normal_message() -> No
 
 class _Dispatcher(ToolDispatcher):
   def __init__(self, definitions: list[dict[str, Any]], *, capability_bind = TEST_CAPABILITY_BIND) -> None:
-    super().__init__(McpClientManager(), capability_bind=capability_bind)
+    super().__init__(
+      McpClientManager(), capability_bind=capability_bind,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
+    )
     self.definitions = definitions
     self.calls: list[str] = []
     self.replay_controls: list[bool] = []
@@ -1133,6 +1138,7 @@ def test_run_loop_measures_fork_suffix_and_never_stops_the_fork() -> None:
 
   fork_runner = SimpleNamespace(
     _containment=ContainmentSettings(),
+    _tool_result_aging_stubs={},
     _fork_mode=True,
     _fork_marker_position=(0, 0),
     _fork_suffix_tokens=0,
@@ -1177,7 +1183,7 @@ def test_run_loop_measures_fork_suffix_and_never_stops_the_fork() -> None:
     system_prompt_estimate_text=lambda _prompt: "",
     token_estimate_snapshot=_estimate,
     turn_count=3,
-    turn_reminder=SimpleNamespace(text=""),  # pyright: ignore[reportArgumentType]  # duck-typed reminder
+    turn_reminder=SimpleNamespace(text="", notification_reminder="", record_reminder=""),  # pyright: ignore[reportArgumentType]  # duck-typed reminder
     user_turn_message=lambda text: {"role": "user", "content": text},
   ))
 
@@ -1331,6 +1337,7 @@ def test_approval_park_preserves_fork_admission_usage_and_owner(
       "input_schema": {"type": "object"},
     }]
     dispatcher = ParkingDispatcher(
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
       mcp_client=McpClientManager(config_path=None),
       local_tool_handlers={
         SOURCE_TOOL_ID: handler,
@@ -1347,7 +1354,7 @@ def test_approval_park_preserves_fork_admission_usage_and_owner(
     tenant = AdmittedTenant(tenant_id="tenant-1", storage_id="fork-owner", role="owner")
     session = GatewaySession(
       session_id="parent-session", api_key_hash="hash",
-      created_at=1, expires_at=2, user_id="fork-owner",
+      created_at=1, expires_at=2, user_id="fork-owner", owner_user_id="fork-owner",
       tenant_id=tenant.tenant_id,
       session_credential_handle=CredentialHandle(
         handle_id=parent_bind.credential_ref,
@@ -1360,6 +1367,7 @@ def test_approval_park_preserves_fork_admission_usage_and_owner(
       tenant=tenant, job_id="parent-session",
       tool_ids=frozenset({SOURCE_TOOL_ID}), withheld_tools=frozenset(),
       research_binding=AdmittedResearchBinding(), approval_route=NoApprovalRoute(),
+      selection_provenance=None,
     )
     capture_job_context(session, context)
     capture_root_turn(session, admit_root_turn(
@@ -1582,8 +1590,17 @@ def test_approval_park_preserves_fork_admission_usage_and_owner(
       assert json.loads(parked_results[0]["content"]) == {
         "status": "awaiting_approval", "approval_id": park.approval_id,
       }
-      # Only the asked call is projected; an unscheduled sibling stays an orphan.
-      assert "call-fork-unscheduled" in detect_orphan_tool_uses(replayed)
+      # Only the asked call reads as awaiting approval; an unscheduled sibling
+      # replays as an explicit interrupted result, never an orphan.
+      assert "call-fork-unscheduled" not in detect_orphan_tool_uses(replayed)
+      unscheduled_results = [
+        block for message in replayed if isinstance(message["content"], list)
+        for block in message["content"]
+        if block.get("type") == "tool_result"
+        and block.get("tool_use_id") == "call-fork-unscheduled"
+      ]
+      assert len(unscheduled_results) == 1 and unscheduled_results[0]["is_error"]
+      assert json.loads(unscheduled_results[0]["content"])["error"]["code"] == "tool_interrupted"
       assert result.logical_task == admitted.logical_task
       assert result.attempt == admitted.attempt
       assert result.provenance == provenance_of(admitted)
@@ -1684,11 +1701,12 @@ def test_learning_fork_gains_no_tool_the_parents_effective_policy_excludes(
       get_tool_definitions=lambda: wire_tools,
       capability_bind=parent_execution.bind,
       role="owner",
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     tenant = AdmittedTenant(tenant_id="tenant-1", storage_id="fork-owner", role="owner")
     session = GatewaySession(
       session_id="parent-session", api_key_hash="hash", created_at=1, expires_at=2,
-      user_id="fork-owner", tenant_id=tenant.tenant_id,
+      user_id="fork-owner", owner_user_id="fork-owner", tenant_id=tenant.tenant_id,
       session_credential_handle=CredentialHandle(
         handle_id=parent_bind.credential_ref, provider=parent_bind.provider,
         principal="user", tenant_id="tenant-1", actor_id="fork-owner",
@@ -1699,6 +1717,7 @@ def test_learning_fork_gains_no_tool_the_parents_effective_policy_excludes(
       tenant=tenant, job_id="parent-session",
       tool_ids=None, withheld_tools=frozenset({gated}),
       research_binding=AdmittedResearchBinding(), approval_route=NoApprovalRoute(),
+      selection_provenance=None,
     )
     capture_job_context(session, context)
     capture_root_turn(session, admit_root_turn(

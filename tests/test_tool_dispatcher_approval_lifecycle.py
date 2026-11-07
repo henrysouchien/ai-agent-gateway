@@ -1,6 +1,8 @@
 # ruff: noqa: E402
 
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 import asyncio
 import base64
@@ -27,6 +29,7 @@ from hank_model_transport import policy_imports
 from agent_gateway import tool_dispatcher as dispatcher_module
 from agent_gateway import tool_dispatcher_approval_lifecycle as lifecycle_helpers
 from agent_gateway.admission import (
+  default_root_provenance,
   AdmittedContext, ContinuationOwners, ContinueRequest, admit, admit_root_turn,
   capture_job_context, capture_root_turn, context_for_child, current_parent_context,
   current_root_turn, record_root_turn_admission, root_context,
@@ -220,15 +223,10 @@ def test_resolve_run_context_uses_canonical_session_owner_for_approval_identity(
       session_id="session-1",
       profile="chat",
       channel="cli",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
     session=session,
-    user_id="henry",
-    channel="cli",
-    role="owner",
-    session_id="session-1",
-    approval_policy=SimpleNamespace(policy_bundle_hash="policy-1"),
   )
-
   assert resolved.user_id == "1"
 
 
@@ -583,6 +581,7 @@ def test_delegated_money_wait_is_not_bounded_by_elapsed_time() -> None:
           profile="analyst",
           channel="cli",
           decider_role="owner",
+          registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
         ),
         current_skill_admission_fn=lambda: None,
         redact_for_approval_request_fn=lambda *_args: ({}, "args-hash"),
@@ -630,6 +629,7 @@ def _gateway_session(**overrides: Any) -> GatewaySession:
     "created_at": now,
     "expires_at": now + 600,
     "user_id": "alice",
+    "owner_user_id": "alice",
     "channel": "web",
     "role": "owner",
   }
@@ -794,6 +794,7 @@ def test_delegated_run_settles_everything_but_the_money_boundary(
         profile="analyst",
         channel="cli",
         decider_role="owner",
+        registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
       ),
       current_skill_admission_fn=lambda: None,
       redact_for_approval_request_fn=lambda *_args: ({}, "args-hash"),
@@ -844,6 +845,7 @@ def _native_capture_dispatcher(
       producer,
       withheld_tools=frozenset(),
       research_file_id=None,
+      selection_provenance=None,
     )
     capture_job_context(
       producer,
@@ -863,7 +865,7 @@ def _native_capture_dispatcher(
     session=producer,
     role="owner",
     approval_route=route,
-    run_context=RunContext(user_id="alice", request_id="capture-request"),
+    run_context=RunContext(user_id="alice", request_id="capture-request", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   dispatcher.bind_secret_boundary(SecretBoundary(("raw-original-operand", "private-root-operand")))
   return dispatcher, store, parent
@@ -948,6 +950,11 @@ def test_native_park_captures_exact_call_and_dispatch_operands(
     assert binding.exact_backend == original.exact_backend
     assert binding.credential_generation_ref == credential_generation_ref
     assert binding.dispatch_context == PreparedToolCall({
+      "registry_scope": {
+        "scope_type": "run",
+        "scope_id": "test-run",
+        "store_dir": "/tmp/test-store",
+      },
       "call_index": 7,
       "advertised_tool_names": sorted(advertised) if advertised is not None else None,
       "skill_run_id": "original-skill",
@@ -1064,6 +1071,11 @@ def test_detached_park_sends_private_capture_before_public_approval(
         "prepared_input": original.materialize_input(),
         "exact_backend": exact_backend,
         "dispatch_context": {
+          "registry_scope": {
+            "scope_type": "run",
+            "scope_id": "test-run",
+            "store_dir": "/tmp/test-store",
+          },
           "call_index": 7,
           "advertised_tool_names": ["a_tool", "native_write", "z_tool"],
           "skill_run_id": "private-skill",
@@ -1237,34 +1249,6 @@ def test_real_in_process_child_capture_uses_child_job_not_parent_session(
     parent.approval_route = DurableLocalApprovalRoute(store, policy, parent)
     parent.approval_store = store
     parent.approval_policy = policy
-    parent_context = root_context(
-      parent,
-      withheld_tools=frozenset(),
-      research_file_id=None,
-    )
-
-    async def native_tool(_input: dict[str, Any], **_kwargs: Any) -> ToolResult:
-      raise AssertionError("The denied child's tool must not execute")
-
-    definition = {
-      "name": "web_search",
-      "description": "Native test tool requiring approval.",
-      "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
-    }
-    handlers: dict[str, LocalToolHandler] = {"web_search": native_tool}
-    mcp = _NullMcp()
-    dispatcher = ToolDispatcher(
-      capability_bind=stub_capability_execution_resolver(
-        default_provider="openai", default_model="gpt-5.6-sol",
-      ).resolve("session.driver").bind,
-      mcp_client=mcp,
-      local_tool_handlers=handlers,
-      session=parent,
-      approval_route=parent.approval_route,
-      session_id=parent.session_id,
-      event_log=EventLog(),
-      get_tool_definitions=lambda: [definition],
-    )
     provider = _NativeChildCaptureProvider()
     base = stub_capability_execution_resolver(
       default_provider="openai",
@@ -1279,6 +1263,34 @@ def test_real_in_process_child_capture_uses_child_job_not_parent_session(
       trusted_channel=base.trusted_channel,
       authenticated_run_overrides=base.authenticated_run_overrides,
       executable_capability_ids=base.executable_capability_ids,
+    )
+    parent_context = root_context(
+      parent,
+      withheld_tools=frozenset(),
+      research_file_id=None,
+      selection_provenance=default_root_provenance(resolver.selection_policy),
+    )
+
+    async def native_tool(_input: dict[str, Any], **_kwargs: Any) -> ToolResult:
+      raise AssertionError("The denied child's tool must not execute")
+
+    definition = {
+      "name": "web_search",
+      "description": "Native test tool requiring approval.",
+      "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+    }
+    handlers: dict[str, LocalToolHandler] = {"web_search": native_tool}
+    mcp = _NullMcp()
+    dispatcher = ToolDispatcher(
+      capability_bind=resolver.resolve("session.driver").bind,
+      mcp_client=mcp,
+      local_tool_handlers=handlers,
+      session=parent,
+      approval_route=parent.approval_route,
+      session_id=parent.session_id,
+      event_log=EventLog(),
+      get_tool_definitions=lambda: [definition],
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     observed: dict[str, Any] = {}
 
@@ -1396,6 +1408,7 @@ def test_real_in_process_child_capture_uses_child_job_not_parent_session(
         context=context_for_child(continued, job_id=child_job_id),
         session=parent,
       ),
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     with pytest.raises(lifecycle_helpers.ApprovalPark) as raised:
       await resumed_dispatcher.dispatch_prepared(
@@ -1619,7 +1632,7 @@ def test_fork_parks_against_its_spawning_turn_after_a_later_turn_begins(
 
     async def begin_turn(job_id: str):
       capture_job_context(session, replace(
-        root_context(session, withheld_tools=frozenset(), research_file_id=None),
+        root_context(session, withheld_tools=frozenset(), research_file_id=None, selection_provenance=None),
         job_id=job_id,
       ))
       turn = await record_root_turn_admission(store, admit_root_turn(

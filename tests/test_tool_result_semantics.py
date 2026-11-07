@@ -322,3 +322,31 @@ def test_status_error_elides_more_than_five_data_got_details() -> None:
   assert "ops.4: invalid operation 4" in message
   assert "ops.5: invalid operation 5" not in message
   assert "..." in message
+
+
+def test_owner_type_is_lifted_without_replacing_existing_code_precedence() -> None:
+  owner = {
+    "type": "integrity_refusal",
+    "message": "Portfolio not found",
+    "next_call": ["hank", "tool", "list_portfolios"],
+  }
+  result = {"status": "error", "error": owner}
+  semantic_error = classify_semantic_tool_error(result)
+  assert semantic_error is not None
+  assert semantic_error["sub_code"] == "integrity_refusal"
+  for key in ("code", "sub_code", "error_code", "error_type"):
+    nested_error = classify_semantic_tool_error({
+      "status": "error", "error": {**owner, key: "existing"},
+    })
+    assert nested_error is not None
+    assert nested_error["sub_code"] == "existing"
+    top_level_error = classify_semantic_tool_error({
+      "status": "error", "type": "integrity_refusal", key: "existing",
+    })
+    assert top_level_error is not None
+    assert top_level_error["sub_code"] == "existing"
+  decision_error = classify_semantic_tool_error({
+    "status": "error", "type": "needs_decision",
+  })
+  assert decision_error is not None
+  assert decision_error["sub_code"] == "needs_decision"

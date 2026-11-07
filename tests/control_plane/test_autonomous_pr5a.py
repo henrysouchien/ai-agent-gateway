@@ -609,6 +609,9 @@ def test_live_two_user_run_matrix_is_disjoint_and_cross_user_actions_are_404(
       owner_lifeline_fd=None,
       approval_channel=None,
       event_channel=None,
+      event_channel_acknowledgement=None,
+      terminal_manifest_committed=False,
+      events_evidence_status="missing",
       log_handle=None,
       started_at=time.time(),
       completed_at=None,
@@ -637,9 +640,16 @@ def test_live_two_user_run_matrix_is_disjoint_and_cross_user_actions_are_404(
     record.completed_at = time.time()
     return {"task_id": task_id, "state": "killed"}
 
+  async def fake_shutdown() -> None:
+    # fake_start owns no native subprocess resources; retire its fake records
+    # through the same cancellation implementation used by this matrix.
+    for task_id in registry._tasks:
+      await fake_cancel(task_id)
+
   monkeypatch.setattr(registry, "start", fake_start)
   monkeypatch.setattr(registry, "logs", fake_logs)
   monkeypatch.setattr(registry, "cancel", fake_cancel)
+  monkeypatch.setattr(registry, "shutdown", fake_shutdown)
 
   with TestClient(app) as client:
     alice = _control_session(client, "alice")
@@ -1401,17 +1411,9 @@ def test_soft_budget_abort_projects_interrupted_run_state(monkeypatch, tmp_path)
   assert payload["terminal_receipt"]["disposition"] == "interrupted"
 
 
-@pytest.mark.parametrize(
-  ("internal_state", "projected_state"),
-  [
-    ("blocked", "failed"),
-  ],
-)
-def test_internal_autonomous_terminal_states_do_not_inherit_failed_resume_affordance(
+def test_blocked_run_projects_failed_and_resume_route_accepts_it(
   monkeypatch,
   tmp_path,
-  internal_state: str,
-  projected_state: str,
 ) -> None:
   processes, _envs = _install_fake_spawn(monkeypatch)
   skills_dir = tmp_path / "skills"
@@ -1433,7 +1435,7 @@ def test_internal_autonomous_terminal_states_do_not_inherit_failed_resume_afford
     )
     assert start.status_code == 200, start.text
     record = app.state.subprocess_registry._tasks["bg_0"]
-    record.state = internal_state
+    record.state = "blocked"
     record.exit_code = 1
     record.completed_at = time.time()
     processes[0].returncode = 1
@@ -1442,10 +1444,10 @@ def test_internal_autonomous_terminal_states_do_not_inherit_failed_resume_afford
     resumed = client.post("/api/control/runs/bg_0/resume", headers=_headers(alice), json={})
 
   assert detail.status_code == 200, detail.text
-  assert detail.json()["state"] == projected_state
-  assert detail.json()["resumable"] is False
-  assert resumed.status_code == 409, resumed.text
-  assert resumed.json()["detail"] == "Autonomous run is not resumable"
+  assert detail.json()["state"] == "failed"
+  assert detail.json()["resumable"] is True
+  assert resumed.status_code == 200, resumed.text
+  assert resumed.json()["resumed_from"] == "bg_0"
 
 
 def _turn_estimate_cost_detail(monkeypatch, tmp_path):
@@ -3066,6 +3068,61 @@ def test_control_dispatch_carries_pack_workload_to_the_child_argv(
       "--pack",
       "daily-risk-pack",
     ]
+
+
+def test_control_dispatch_carries_deliver_false_to_the_child(monkeypatch, tmp_path) -> None:
+  """A no-deliver dispatch reaches the child as --no-deliver, never as a delivering run.
+
+  PM E2E campaign children dispatch through this route; dropping the field
+  defaulted the registry to deliver=True and the child sent external output.
+  """
+  processes, envs = _install_fake_spawn(monkeypatch)
+  app = _make_app(monkeypatch, tmp_path)
+  body = {
+    "kind": "autonomous",
+    "profile": "analyst",
+    "mode": "skill",
+    "skill": "earnings-review",
+    "ticker": "AAPL",
+  }
+
+  with TestClient(app) as client:
+    session = _control_session(client, "alice")
+    rejected = client.post(
+      "/api/control/runs",
+      headers=_headers(session),
+      json={**body, "deliver": "false"},
+    )
+    assert rejected.status_code == 422, rejected.text
+    assert processes == []
+
+    suppressed = client.post(
+      "/api/control/runs",
+      headers=_headers(session),
+      json={**body, "deliver": False},
+    )
+    delivering = client.post(
+      "/api/control/runs",
+      headers=_headers(session),
+      json=body,
+    )
+
+    assert suppressed.status_code == 200, suppressed.text
+    assert delivering.status_code == 200, delivering.text
+    suppressed_record = app.state.subprocess_registry._tasks[suppressed.json()["task_id"]]
+    delivering_record = app.state.subprocess_registry._tasks[delivering.json()["task_id"]]
+    assert suppressed_record.deliver is False
+    assert "--no-deliver" in suppressed.json()["cmd"]
+    assert delivering_record.deliver is True
+    assert "--no-deliver" not in delivering.json()["cmd"]
+    workloads = [
+      verify_autonomous_launch_envelope(
+        HMAC_KEY,
+        Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
+      ).workload
+      for env in envs
+    ]
+    assert [workload.deliver for workload in workloads] == [False, True]
 
 
 def test_control_dispatch_keeps_pack_mode_exclusive(monkeypatch, tmp_path) -> None:

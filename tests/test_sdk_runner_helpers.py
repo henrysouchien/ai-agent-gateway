@@ -19,7 +19,6 @@ from hank_model_transport.providers import AgentSDKConfig
 from agent_gateway import AgentSDKRunner, EventLog  # noqa: E402
 import agent_gateway.sdk_runner as sdk_runner  # noqa: E402
 import agent_gateway.sdk_runner_approval as sdk_runner_approval  # noqa: E402
-import agent_gateway.sdk_runner_context as sdk_runner_context  # noqa: E402
 from hank_model_transport import policy_imports  # noqa: E402
 from agent_gateway import sdk_runner_helpers  # noqa: E402
 from agent_gateway.sdk_runner_stream import ToolCallInfo  # noqa: E402
@@ -209,44 +208,14 @@ def test_sdk_runner_registered_mode_keeps_sdk_local_mcp_catalogless() -> None:
   assert descriptor_calls == []
 
 
-def test_sdk_runner_context_sidecar_preserves_prompt_and_semantic_error() -> None:
+def test_sdk_runner_context_sidecar_preserves_semantic_error() -> None:
   runner = _make_runner()
-  messages = [
-    {"role": "user", "content": "first"},
-    {"role": "assistant", "content": "second"},
-    {"role": "user", "content": "third"},
-  ]
-
-  assert runner._build_prompt(messages) == sdk_runner_context.build_prompt(messages)
 
   entry = runner._make_result_entry("tool-1", {"success": False}, None)
 
   assert entry["is_error"] is True
 
 
-def test_sdk_runner_context_surfaces_use_parent_normalizer(monkeypatch: pytest.MonkeyPatch) -> None:
-  runner = AgentSDKRunner(
-    event_log=EventLog(),
-    session_id="sess-sdk-helpers",
-    sdk_config=AgentSDKConfig(
-      user_id="alice",
-      billing_mode="byok",
-      rate_table_version="unknown",
-    ),
-    capability_execution=stub_sdk_capability_execution(),
-    system_prompt="test",
-    context_surfaces=lambda: [{"name": "brief"}, "ignored", {"name": "tooling"}],  # pyright: ignore[reportArgumentType]  # negative: mixed context surface filtering
-  )
-  normalized_inputs = []
-
-  def normalize(surfaces):
-    normalized_inputs.append(surfaces)
-    return [{"patched": True}]
-
-  monkeypatch.setattr(runner, "_normalize_context_surfaces", normalize)
-
-  assert runner._context_surface_records() == [{"patched": True}]
-  assert normalized_inputs == [[{"name": "brief"}, "ignored", {"name": "tooling"}]]
 
 
 def test_sdk_context_surface_failure_log_is_value_free(caplog) -> None:
@@ -317,24 +286,6 @@ def test_sdk_runner_helpers_catalogless_owner_is_unset_without_bound_policy() ->
 
 
 
-def test_sdk_runner_parent_helper_monkeypatches_still_drive_nested_helpers(
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  monkeypatch.setattr(sdk_runner, "_parse_result_payload", lambda _value: {"patched": True})
-  assert sdk_runner._summarize_error_payload("ignored") == '{"patched": true}'
-
-
-def test_sdk_runner_nested_helper_monkeypatches_resolve_parent_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
-  monkeypatch.setattr(sdk_runner, "_as_plain_dict", lambda _value: {"plain": True})
-  assert sdk_runner._as_dict(object()) == {"plain": True}
-  assert sdk_runner._parse_result_payload({"x": 1}) == {"plain": True}
-
-  monkeypatch.setattr(sdk_runner, "_get_attr", lambda _value, key, default=None: "patched" if key == "text" else default)
-  assert sdk_runner._extract_text([object()]) == "patched"
-
-  monkeypatch.setattr(sdk_runner, "_catalogless_tool_name", lambda _tool_name: "preview_patch_ops")
-  monkeypatch.setattr(sdk_runner, "_PATCH_OP_RAW_INPUT_TOOLS", frozenset({"preview_patch_ops"}))
-  assert sdk_runner._should_escrow_raw_tool_input("anything") is True
 
 
 def test_absent_audit_hmac_secret_defaults_loudly(

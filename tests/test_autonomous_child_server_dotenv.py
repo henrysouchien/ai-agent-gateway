@@ -25,6 +25,19 @@ _RISK_SERVERS = frozenset({
 
 
 @pytest.mark.parametrize("template_name", [
+  "mcp.local.template.json",
+  "mcp.local-cron.template.json",
+  "mcp.production-cron.template.json",
+  "mcp.production-gateway-children.template.json",
+])
+def test_child_templates_do_not_project_legacy_gateway_url(template_name: str) -> None:
+  template = json.loads((_ROOT / "deploy" / template_name).read_text(encoding="utf-8"))
+  for config in template["mcpServers"].values():
+    assert "GATEWAY_URL" not in config.get("env", {})
+    assert "GATEWAY_URL" not in config.get("run_scoped_env", [])
+
+
+@pytest.mark.parametrize("template_name", [
   "mcp.production-cron.template.json",
   "mcp.local-cron.template.json",
 ])
@@ -51,6 +64,8 @@ def test_cron_templates_render_declared_tls_setting_without_missing_env(
       for arg in config.get("args", [])
     ):
       assert "cwd" not in config, f"{name}: snapshot launcher owns the child cwd"
+      continue
+    if config.get("type") in {"streamable-http", "http"}:
       continue
     config["cwd"] = str(tmp_path / Path(config["cwd"]).name)
   template_path = tmp_path / "template.json"
@@ -103,13 +118,19 @@ def test_cron_templates_render_declared_tls_setting_without_missing_env(
   assert {
     name: config["env"]["GATEWAY_SSL_VERIFY"]
     for name, config in servers.items()
-    if name in _RISK_SERVERS
-  } == dict.fromkeys(_RISK_SERVERS, expected_verify)
+    if name in _RISK_SERVERS and config.get("type") not in {"streamable-http", "http"}
+  } == {
+    name: expected_verify
+    for name, config in servers.items()
+    if name in _RISK_SERVERS and config.get("type") not in {"streamable-http", "http"}
+  }
   assert all("GATEWAY_SSL_VERIFY" not in names for names in render.unresolved_env.values())
   delivered = server_dotenv.decode_server_dotenv(
     child_env.get(server_dotenv.AUTONOMOUS_CHILD_SERVER_DOTENV_ENV)
   )
   for config in servers.values():
+    if config.get("type") in {"streamable-http", "http"}:
+      continue
     if "GATEWAY_API_KEY" in config["env"]:
       assert config["env"]["GATEWAY_API_KEY"] == "selected-mcp-key"
     assert not authority_values.keys() & config["env"].keys()
@@ -136,11 +157,10 @@ def test_local_topology_keeps_authenticated_child_on_its_selected_gateway(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   template = json.loads((_ROOT / "deploy" / "mcp.local.template.json").read_text(encoding="utf-8"))
-  gateway_consumers = {
-    name for name, config in template["mcpServers"].items()
-    if "GATEWAY_URL" in config.get("env", {})
-  }
-  assert "fmp-mcp" in gateway_consumers
+  assert all(
+    "GATEWAY_URL" not in config.get("env", {})
+    for config in template["mcpServers"].values()
+  )
   risk_root = tmp_path / "risk_module"
   risk_root.mkdir()
   sibling_origin = "https://wrong-gateway.example.test"
@@ -169,6 +189,55 @@ def test_local_topology_keeps_authenticated_child_on_its_selected_gateway(
   monkeypatch.setattr(mcp_config, "_PRIVATE_TMP", tmp_path / "rendered")
   render = mcp_config._materialize_mcp_config("1", "alice@example.com", "analyst")
   servers = json.loads(render.path.read_text(encoding="utf-8"))["mcpServers"]
-  assert {
-    name: servers[name]["env"]["GATEWAY_URL"] for name in gateway_consumers
-  } == dict.fromkeys(gateway_consumers, gateway_origin)
+  assert all("GATEWAY_URL" not in config.get("env", {}) for config in servers.values())
+
+
+@pytest.mark.parametrize("server_name", ["jobs-mcp", "idea-workbench-mcp"])
+def test_detached_local_model_servers_materialize_replay_routing(
+  server_name: str,
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.mcp_client import McpClientManager
+  from agent_gateway.mcp_client_config import build_mcp_env
+
+  risk_root = tmp_path / "risk_module"
+  risk_root.mkdir()
+  (risk_root / ".env").write_text("", encoding="utf-8")
+  routing = {
+    "OLLAMA_CLOUD_BASE_URL": "http://127.0.0.1:18234",
+    "OLLAMA_BASE_URL": "http://127.0.0.1:18234",
+    "HANK_RUN_ROUTE_FILE": str(tmp_path / "control" / "run-route.json"),
+  }
+  parent_env = {
+    "PATH": "/usr/bin:/bin",
+    "MCP_CONFIG_TEMPLATE": str(_ROOT / "deploy" / "mcp.local.template.json"),
+    "MCP_CONFIG_TMP_DIR": str(tmp_path / "mcp"),
+    "JUPYTER_ROOT": str(tmp_path),
+    "EDGAR_UPDATER_ROOT": str(tmp_path / "edgar_updater"),
+    "EDGAR_UPDATER_PYTHON": sys.executable,
+    "RISK_MODULE_DOTENV": str(risk_root / ".env"),
+    "LOCAL_GATEWAY_PYTHON": sys.executable,
+    "LOCAL_GATEWAY_RUNTIME_ROOT": str(tmp_path / "runtime"),
+    "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT": str(tmp_path / "runtime" / "version"),
+    "USER_DATA_DIR": str(tmp_path / "data"),
+    "OLLAMA_CLOUD_API_KEY": "operator-cloud-key-must-not-be-forwarded",
+    **routing,
+  }
+  monkeypatch.setattr(server_dotenv, "_OWN_APPLICATION_ROOT", tmp_path / "ai-excel-addin")
+  child_env = _positive_autonomous_child_env(
+    parent_env, provider="ollama_cloud", profile="analyst", deliver=False,
+  )
+  monkeypatch.setattr(os, "environ", child_env)
+  monkeypatch.setattr(mcp_config, "_PRIVATE_TMP", tmp_path / "rendered")
+  render = mcp_config._materialize_mcp_config("1", "alice@example.com", "analyst")
+  config = json.loads(render.path.read_text(encoding="utf-8"))["mcpServers"][server_name]
+  scoped, absent = McpClientManager(config_path=None)._scoped_server_env(
+    server_name, config, deployment_environ=child_env,
+  )
+  server_env = build_mcp_env(
+    config["env"], environ=scoped, base_environ=child_env, absent=absent,
+  )
+  assert {name: server_env[name] for name in routing} == routing
+  assert "OLLAMA_CLOUD_API_KEY" not in server_env
+  assert parent_env["OLLAMA_CLOUD_API_KEY"] not in server_env.values()

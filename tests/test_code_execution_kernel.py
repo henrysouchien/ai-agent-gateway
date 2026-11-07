@@ -3,16 +3,11 @@ import asyncio
 import contextlib
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 import pytest
 
-PKG_DIR = Path(__file__).resolve().parents[1]
-for path in (PKG_DIR, Path(__file__).resolve().parent):
-  if str(path) not in sys.path:
-    sys.path.insert(0, str(path))
 
 from agent_gateway import SessionStore
 from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution
@@ -297,6 +292,63 @@ def test_timeout_keeps_locals_and_each_cell_gets_a_fresh_budget(tmp_path: Path) 
       assert backend.runtime.pid == pid
 
   asyncio.run(run())
+
+
+def _slow_boot(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+  """The runner's interpreter is still booting for `seconds` after launch."""
+  from agent_gateway.code_execution._backends import _kernel
+
+  runner_source = _kernel._runner_source
+  monkeypatch.setattr(_kernel, "_runner_source", lambda: f"import time\ntime.sleep({seconds})\n" + runner_source())
+
+
+def test_boot_longer_than_timeout_does_not_time_the_first_cell_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+  _slow_boot(monkeypatch, 2.5)
+
+  async def run() -> None:
+    async with _kernel() as backend:
+      result = await backend.execute("print('first')", str(tmp_path), timeout_ms=1000)
+      assert result["return_code"] == 0 and result["stdout"] == "first\n", result
+      assert result["timed_out"] is False and "error" not in result
+      assert result["compute_ms"] < 1000
+
+  asyncio.run(run())
+
+
+def test_cell_exceeding_timeout_after_a_slow_boot_still_times_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+  _slow_boot(monkeypatch, 1.5)
+
+  async def run() -> None:
+    async with _kernel() as backend:
+      result = await backend.execute("import time\ntime.sleep(60)", str(tmp_path), timeout_ms=1000)
+      assert result["timed_out"] is True and result["return_code"] == 124, result
+      assert result.get("error", {}).get("code") != "kernel_boot_failed"
+      assert "[cell interrupted after 1000 ms timeout; kernel state kept]" in result["stderr"]
+      assert 990 <= result["compute_ms"] < 5_000
+
+  asyncio.run(run())
+
+
+def test_boot_that_never_starts_fails_typed_after_the_boot_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+  _slow_boot(monkeypatch, 3600)
+
+  async def run() -> None:
+    config = CodeExecutionConfig(kernel_boot_timeout_ms=500)
+    async with _kernel(config) as backend:
+      begun = asyncio.get_running_loop().time()
+      result = await asyncio.wait_for(backend.execute("print('never')", str(tmp_path), timeout_ms=1000), timeout=30)
+      elapsed = asyncio.get_running_loop().time() - begun
+      assert 0.4 <= elapsed < 10
+      process = backend.runtime.process
+      assert result["error"]["code"] == "kernel_boot_failed", result
+      assert result["timed_out"] is False and result["return_code"] not in (0, 124)
+      assert result["compute_ms"] == 0 and result["stdout"] == ""
+      assert "[kernel lost: interpreter did not start the cell within 0.5 s" in result["stderr"]
+      assert process is None and backend.runtime.runner is None
+
+  asyncio.run(run())
+
+
 
 
 def test_host_wait_longer_than_timeout_does_not_interrupt_the_cell(tmp_path: Path, _policy: Any) -> None:
@@ -743,7 +795,7 @@ def test_acall_gather_runs_concurrent_nested_calls_and_plain_hank_ops_stay_sync(
       assert result["stdout"] == "['A', 'B', 'C']\n['bg_9']\n"
       assert sorted(arrived) == ["A", "B", "C"]
       assert [entry["operation"] for entry in result["nested_calls"]].count(FRED_SERIES) == 3
-      # An operation called without `acall` stays synchronous and returns a plain dict.
+      # An operation called without acall stays synchronous and returns a dict (or dict carrier when source_refs are present).
       del mcp.call_tool
       sync, error = await asyncio.wait_for(dispatcher.dispatch("cell-sync", "code_execute", {
         "code": (
@@ -751,7 +803,7 @@ def test_acall_gather_runs_concurrent_nested_calls_and_plain_hank_ops_stay_sync(
           "waited = hank.wait(['bg_9'], timeout=0)\n"
           f"row = getattr(hank, {FRED_SERIES!r})(series_id='CPIAUCSL')\n"
           "print(type(waited) is dict, inspect.isawaitable(waited), waited['unknown'])\n"
-          "print(type(row) is dict, inspect.isawaitable(row), row['series_id'])"
+          "print(isinstance(row, dict), inspect.isawaitable(row), row['series_id'])"
         ),
       }), timeout=60)
       assert error is None and sync is not None, error
@@ -831,10 +883,10 @@ def test_kernel_reuses_one_hank_bridge_instance_across_cells_without_hello(tmp_p
   async def run() -> None:
     async with _kernel() as backend:
       first = await backend.execute(
-        "hank_id = id(hank)\nprint(not hasattr(hank, 'carry') and not hasattr(hank, 'input'))", str(tmp_path),
+        "hank_id = id(hank)\nprint(callable(hank.carry) and callable(hank.input))", str(tmp_path),
       )
       second = await backend.execute(
-        "print(id(hank) == hank_id)\nprint(not hasattr(hank, 'carry') and not hasattr(hank, 'input'))", str(tmp_path),
+        "print(id(hank) == hank_id)\nprint(callable(hank.carry) and callable(hank.input))", str(tmp_path),
       )
       assert first["return_code"] == 0, first["stderr"]
       assert second["return_code"] == 0, second["stderr"]

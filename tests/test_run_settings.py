@@ -88,6 +88,9 @@ def test_the_cli_text_form_parses_json_and_null(operator_file: Path) -> None:
     ("max_concurrent_children", 0),
     ("context_warning_pct", 101),
     ("compaction_trigger_pct", 0),
+    ("tool_result_aging_after_replies", 0),
+    ("tool_result_aging_min_chars", 0),
+    ("tool_result_aging_step_replies", 0),
     ("model_context_limit", 0),
     ("child_soft_turn_budget", {"nested": 1}),
     ("not_a_setting", 1),
@@ -200,3 +203,85 @@ def test_the_writer_still_rejects_a_bad_value(operator_file: Path) -> None:
   with pytest.raises(RunSettingsError):
     set_operator_setting("context_warning_pct", 500)
   assert not operator_file.exists()
+
+
+def test_approval_policy_defaults_to_approve_all_with_live_orders_asking(operator_file: Path) -> None:
+  assert load_run_settings().approval_policy == "approve_all"
+  assert pinned_run_settings().approval_policy == "approve_all"
+  assert PACKAGED["approval_policy"] == "approve_all"
+  assert load_run_settings().approve_live_orders is False
+  assert pinned_run_settings().approve_live_orders is False
+  assert PACKAGED["approve_live_orders"] is False
+
+
+@pytest.mark.parametrize("mode", ["approve_all", "ask_all"])
+def test_approval_policy_accepts_each_mode(operator_file: Path, mode: str) -> None:
+  operator_file.parent.mkdir(parents=True)
+  operator_file.write_text(json.dumps({"approval_policy": mode}))
+  assert load_run_settings().approval_policy == mode
+  assert pinned_run_settings(approval_policy=mode).approval_policy == mode
+
+
+def test_approval_policy_setter_flips_live_without_restart(operator_file: Path) -> None:
+  assert load_run_settings().approval_policy == "approve_all"
+  assert set_operator_setting("approval_policy", "ask_all").approval_policy == "ask_all"
+  assert load_run_settings().approval_policy == "ask_all"
+  assert operator_overrides()["approval_policy"] == "ask_all"
+  assert set_operator_setting("approval_policy", "approve_all").approval_policy == "approve_all"
+  assert load_run_settings().approval_policy == "approve_all"
+
+
+@pytest.mark.parametrize(
+  "value",
+  ["unknown", True, 1, 1.5, None, [], {}],
+  ids=["unknown", "bool", "int", "float", "null", "list", "object"],
+)
+def test_invalid_approval_policy_is_refused_at_load_pinned_and_setter(
+  operator_file: Path, value: object,
+) -> None:
+  operator_file.parent.mkdir(parents=True)
+  operator_file.write_text(json.dumps({"approval_policy": value, "context_warning_pct": 90}))
+  before = operator_file.read_bytes()
+  with pytest.raises(RunSettingsError, match="approval_policy"):
+    load_run_settings()
+  with pytest.raises(RunSettingsError, match="approval_policy"):
+    pinned_run_settings(approval_policy=value)
+  with pytest.raises(RunSettingsError, match="approval_policy"):
+    set_operator_setting("approval_policy", value)
+  assert operator_file.read_bytes() == before
+
+
+def test_the_live_order_switch_flips_live_and_takes_cli_booleans(operator_file: Path) -> None:
+  assert load_run_settings().approve_live_orders is False
+  assert set_operator_setting("approve_live_orders", "true").approve_live_orders is True
+  assert load_run_settings().approve_live_orders is True
+  assert operator_overrides()["approve_live_orders"] is True
+  assert set_operator_setting("approve_live_orders", False).approve_live_orders is False
+  assert load_run_settings().approve_live_orders is False
+
+
+@pytest.mark.parametrize(
+  "value",
+  ["yes", "True", 1, 0, 1.5, None, [], {}],
+  ids=["text", "capitalised-text", "int-one", "int-zero", "float", "null", "list", "object"],
+)
+def test_a_non_boolean_live_order_switch_is_refused_at_load_pinned_and_setter(
+  operator_file: Path, value: object,
+) -> None:
+  operator_file.parent.mkdir(parents=True)
+  operator_file.write_text(json.dumps({"approve_live_orders": value, "context_warning_pct": 90}))
+  before = operator_file.read_bytes()
+  with pytest.raises(RunSettingsError, match="approve_live_orders"):
+    load_run_settings()
+  with pytest.raises(RunSettingsError, match="approve_live_orders"):
+    pinned_run_settings(approve_live_orders=value)
+  with pytest.raises(RunSettingsError, match="approve_live_orders"):
+    set_operator_setting("approve_live_orders", value)
+  assert operator_file.read_bytes() == before
+
+
+def test_the_retired_mode_name_is_refused_not_aliased(operator_file: Path) -> None:
+  with pytest.raises(RunSettingsError, match="approval_policy"):
+    pinned_run_settings(approval_policy="live_orders_only")
+  with pytest.raises(RunSettingsError, match="approval_policy"):
+    set_operator_setting("approval_policy", "live_orders_only")

@@ -437,12 +437,6 @@ def test_auth_status_prints_identity_and_no_secret(tmp_path: Path) -> None:
 
 
 def test_legacy_flows_dispatch_to_existing_functions() -> None:
-  # OpenAI
-  stdout = StringIO()
-  stderr = StringIO()
-  assert agent_cli.main(["auth", "login", "openai"], stdout=stdout, stderr=stderr) == 2
-  assert "The OpenAI API does not provide ChatGPT subscription OAuth login" in stderr.getvalue()
-
   # Codex
   with patch("agent_gateway.cli._auth_login_codex", return_value=0) as mock_codex:
     stdout = StringIO()
@@ -456,6 +450,37 @@ def test_legacy_flows_dispatch_to_existing_functions() -> None:
     mock_anthropic.assert_called_once()
 
 
+def test_anthropic_logout_without_key_retains_oauth_record_removal(tmp_path: Path) -> None:
+  store = tmp_path / "oauth.json"
+  store.write_text("{}", encoding="utf-8")
+  stdout = StringIO()
+  assert agent_cli.main(
+    ["auth", "logout", "anthropic", "--store", str(store)], stdout=stdout,
+  ) == 0
+  assert not store.exists()
+  assert "Removed Anthropic OAuth token store" in stdout.getvalue()
+
+
+def test_xai_login_still_uses_device_code_flow(tmp_path: Path) -> None:
+  store = tmp_path / "xai.json"
+
+  async def login_device(*, config, on_verification):
+    assert config == {"auth_store_path": str(store)}
+    return {"access_token": "xai-test-token"}, store
+
+  with patch(
+    "hank_model_transport.providers.xai_oauth.login_xai_device_code",
+    side_effect=login_device,
+  ) as device_login, patch("agent_gateway.login_flows.RiskUserKeyClient") as risk:
+    stdout = StringIO()
+    assert agent_cli.main(
+      ["auth", "login", "xai", "--no-browser", "--store", str(store)], stdout=stdout,
+    ) == 0
+  device_login.assert_called_once()
+  risk.assert_not_called()
+  assert "xAI OAuth login complete" in stdout.getvalue()
+
+
 @pytest.mark.parametrize("callback_state", [None, "wrong-state"])
 def test_loopback_oauth_rejects_uncorrelated_callback(callback_state: str | None) -> None:
   exchange = MagicMock()
@@ -466,10 +491,76 @@ def test_loopback_oauth_rejects_uncorrelated_callback(callback_state: str | None
       params["state"] = callback_state
     with httpx.Client(trust_env=False) as client:
       response = client.get(f"{redirect_uri}?{urllib.parse.urlencode(params)}", timeout=5)
-    assert response.status_code == 200
+    assert response.status_code == 400
+    assert "Authorization failed" in response.text
+    assert "Authentication successful" not in response.text
     return "https://accounts.example.com/authorize"
 
   with pytest.raises(RuntimeError, match="OAuth state mismatch in callback; authorization rejected"):
+    run_loopback_oauth_flow(
+      auth_url_builder=build_auth_url, token_exchange=exchange,
+      no_browser=True, console_fallback=False, timeout=5,
+    )
+  exchange.assert_not_called()
+
+
+def test_loopback_oauth_error_callback_reports_failure_in_browser() -> None:
+  exchange = MagicMock()
+
+  def build_auth_url(redirect_uri: str, state: str, challenge: str) -> str:
+    params = {"error": "access_denied", "error_description": "user cancelled", "state": state}
+    with httpx.Client(trust_env=False) as client:
+      response = client.get(f"{redirect_uri}?{urllib.parse.urlencode(params)}", timeout=5)
+    assert response.status_code == 400
+    assert "Authorization failed" in response.text
+    assert "Authentication successful" not in response.text
+    assert "user cancelled" not in response.text
+    return "https://accounts.example.com/authorize"
+
+  with pytest.raises(RuntimeError, match="OAuth authorization failed: access_denied"):
+    run_loopback_oauth_flow(
+      auth_url_builder=build_auth_url, token_exchange=exchange,
+      no_browser=True, console_fallback=False, timeout=5,
+    )
+  exchange.assert_not_called()
+
+
+def test_loopback_oauth_code_callback_acknowledges_receipt_not_completed_auth() -> None:
+  exchange = MagicMock(return_value={"access_token": "token"})
+
+  def build_auth_url(redirect_uri: str, state: str, challenge: str) -> str:
+    params = {"code": "fixture-code", "state": state}
+    with httpx.Client(trust_env=False) as client:
+      response = client.get(f"{redirect_uri}?{urllib.parse.urlencode(params)}", timeout=5)
+    assert response.status_code == 200
+    assert "Authorization response received" in response.text
+    assert "Authentication successful" not in response.text
+    return "https://accounts.example.com/authorize"
+
+  result = run_loopback_oauth_flow(
+    auth_url_builder=build_auth_url, token_exchange=exchange,
+    no_browser=True, console_fallback=False, timeout=5,
+  )
+  assert result == {"access_token": "token"}
+  assert exchange.call_args.args[0] == "fixture-code"
+
+
+def test_loopback_oauth_page_and_console_judge_the_same_first_callback() -> None:
+  exchange = MagicMock()
+
+  def build_auth_url(redirect_uri: str, state: str, challenge: str) -> str:
+    denied = {"error": "access_denied", "state": state}
+    late_code = {"code": "late-code", "state": state}
+    with httpx.Client(trust_env=False) as client:
+      first = client.get(f"{redirect_uri}?{urllib.parse.urlencode(denied)}", timeout=5)
+      second = client.get(f"{redirect_uri}?{urllib.parse.urlencode(late_code)}", timeout=5)
+    assert first.status_code == 400
+    # The stray second request reports the first callback's verdict, not its own.
+    assert second.status_code == 400
+    assert "Authorization failed" in second.text
+    return "https://accounts.example.com/authorize"
+
+  with pytest.raises(RuntimeError, match="OAuth authorization failed: access_denied"):
     run_loopback_oauth_flow(
       auth_url_builder=build_auth_url, token_exchange=exchange,
       no_browser=True, console_fallback=False, timeout=5,

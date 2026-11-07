@@ -80,6 +80,7 @@ def _write_payload(path: Path, *records: dict[str, Any], **extra: Any) -> bytes:
 def _session(user_id: str = "alice") -> Any:
   return types.SimpleNamespace(
     user_id=user_id,
+    owner_user_id=user_id,
     raw_user_id=user_id,
     user_email=None,
     user_slug=user_id,

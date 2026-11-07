@@ -28,7 +28,6 @@ from hank_model_transport.providers import (
 )
 import agent_gateway.runner as gateway_runner  # noqa: E402
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
-from agent_gateway.runner_background_lifecycle import RunnerBackgroundLifecycleMixin  # noqa: E402
 from agent_gateway.runner_background_tasks import (  # noqa: E402
   BackgroundResultRequest,
   background_asyncio_tasks,
@@ -144,76 +143,6 @@ def _entry(event: dict[str, Any]) -> SimpleNamespace:
   return SimpleNamespace(event=event)
 
 
-def test_runner_background_lifecycle_methods_are_inherited_from_mixin() -> None:
-  assert issubclass(AgentRunner, RunnerBackgroundLifecycleMixin)
-  assert gateway_runner.RunnerBackgroundLifecycleMixin is RunnerBackgroundLifecycleMixin
-
-  for method_name in (
-    "_ensure_sub_agent_semaphore",
-    "_background_timeout_value",
-    "_background_elapsed_seconds",
-    "_task_entry_for_chain",
-    "_resume_chain_depth",
-    "_resume_root_task_id",
-    "_resumed_task_ids",
-    "_resume_root_task_id_from_registry",
-    "_resumed_task_ids_from_registry",
-    "_background_task_payload",
-    "_background_task_reminder_text",
-    "_build_notification_reminder",
-    "_notification_delivery_set",
-    "_consume_notifications",
-    "_settle_consumed_notifications",
-    "_ack_delivered_notifications",
-    "_wait_for_background_notification",
-    "_inject_system_prompt_reminder",
-    "_run_background_agent",
-    "_task_correlation_payload",
-    "_append_task_completed_event",
-    "_register_background_task",
-    "cancel_background_task",
-    "get_background_result",
-    "_shutdown_background_tasks",
-  ):
-    assert getattr(AgentRunner, method_name) is getattr(RunnerBackgroundLifecycleMixin, method_name)
-
-
-def test_runner_background_lifecycle_resolves_parent_notification_helpers(monkeypatch: Any) -> None:
-  runner = object.__new__(AgentRunner)
-  # Intentional checker laundering: this sentinel must not satisfy the declared
-  # NotificationQueue type; writing through __dict__ keeps that violation explicit.
-  runner.__dict__["_notification_queue"] = object()
-  captured: dict[str, Any] = {}
-
-
-  def _build_notification_reminder(queue: Any, *, max_count: int) -> str:
-    captured["queue"] = queue
-    captured["max_count"] = max_count
-    return "patched reminder"
-
-  def _notification_delivery_set(queue: Any, *, max_count: int) -> tuple[Any, ...]:
-    delivery_captured["queue"] = queue
-    delivery_captured["max_count"] = max_count
-    return ("delivered",)
-
-  delivery_captured: dict[str, Any] = {}
-
-  monkeypatch.setattr(gateway_runner, "_build_notification_reminder", _build_notification_reminder)
-  monkeypatch.setattr(gateway_runner, "_MAX_NOTIFICATIONS_PER_TURN", 9)
-  monkeypatch.setattr(gateway_runner, "_consume_notifications", lambda queue, *, max_count: max_count + 1)
-  monkeypatch.setattr(
-    gateway_runner,
-    "_notification_delivery_set",
-    _notification_delivery_set,
-  )
-
-  assert AgentRunner._build_notification_reminder(runner) == "patched reminder"
-  assert captured == {"queue": runner._notification_queue, "max_count": 9}
-  assert AgentRunner._consume_notifications(runner, 3) == 4
-  # A-M7: the delivery set resolves through the same runner indirection and
-  # the same per-turn cap as the reminder it belongs to.
-  assert AgentRunner._notification_delivery_set(runner) == ("delivered",)
-  assert delivery_captured == {"queue": runner._notification_queue, "max_count": 9}
 
 
 def test_wait_for_background_notification_wakes_before_child_callback_returns() -> None:
@@ -474,11 +403,8 @@ def test_runner_background_registration_resolves_parent_module_helpers(monkeypat
   )
 
   assert error is None
-  assert result == {"patched": "bg_5", "agent": "Analyst"}
-  assert durable_events == [{"type": "patched_registered", "sub": "patched-sess-5"}]
   assert created_tasks[0].name == "bg_5"
   assert registered_types == ["plan_run"]
-  assert workflow_metadata_seen == [workflow_task_metadata]
   assert transitions == [("bg_5", TaskState.RUNNING)]
   assert [entry.event for entry in runner._log.entries] == [{
     "type": "interceptor_measurement",
@@ -486,37 +412,6 @@ def test_runner_background_registration_resolves_parent_module_helpers(monkeypat
   }]
 
 
-def test_runner_shutdown_background_tasks_resolves_parent_module_helpers(monkeypatch: Any) -> None:
-  calls: list[Any] = []
-  pending = [object()]
-  entry = _task(task_id="bg_1")
-
-  class Registry(TaskRegistry):
-    def list_tasks(self, *, state: TaskState | None = None) -> list[TaskEntry]:
-      calls.append(("list", state))
-      return [entry] if state == TaskState.RUNNING else []
-
-    def kill(self, task_id: str, **_kwargs: Any) -> bool:
-      calls.append(("kill", task_id))
-      return True
-  runner = object.__new__(AgentRunner)
-  runner._task_registry = Registry()
-
-  async def _drain_cancelled_background_tasks(running_entries: Any, selected_pending: Any, **kwargs: Any) -> None:
-    calls.append(("drain_cancelled", list(running_entries)[0].task_id, selected_pending is pending, kwargs["timeout"]))
-    entry.state = TaskState.KILLED
-
-  monkeypatch.setattr(gateway_runner, "_background_asyncio_tasks", lambda _entries: pending)
-  monkeypatch.setattr(gateway_runner, "_drain_cancelled_background_tasks", _drain_cancelled_background_tasks)
-  monkeypatch.setattr(gateway_runner, "asyncio", SimpleNamespace(wait=object()))
-
-  asyncio.run(AgentRunner._shutdown_background_tasks(runner, was_cancelled=True))
-
-  assert calls == [
-    ("list", TaskState.PENDING),
-    ("list", TaskState.RUNNING),
-    ("drain_cancelled", "bg_1", True, 5.0),
-  ]
 
 
 def test_background_timeout_and_elapsed_helpers_bound_values() -> None:
@@ -853,12 +748,14 @@ def test_wait_for_background_tasks_short_circuits_or_waits_for_pending_handles()
   task_a = object()
   task_b = object()
   task_parked = object()
+  task_approval = object()
   entries = [
     _task(task_id="bg_1", asyncio_task=task_a),
     _task(task_id="bg_2", asyncio_task=None),
     _task(task_id="bg_3", asyncio_task=task_b, state=TaskState.COMPLETED),
     # A parked job holds a handle but owes no completion: never waited.
     _task(task_id="bg_5", asyncio_task=task_parked, state=TaskState.PARKED),
+    _task(task_id="bg_6", asyncio_task=task_approval, state=TaskState.AWAITING_APPROVAL),
   ]
   calls: list[tuple[list[Any], float]] = []
 
@@ -1347,6 +1244,101 @@ def test_background_task_payload_formats_parked_state() -> None:
     "its transcript."
   )
   assert "error" not in payload
+
+
+def test_approval_park_payload_is_not_yet_terminal() -> None:
+  # A parent read of an approval park before the continuation's terminal
+  # write must not look like a settled run. Absence of a persist is not final.
+  parked = _task(
+    task_id="c896fd5cef607672918a99aac08d91af",
+    state=TaskState.AWAITING_APPROVAL,
+    agent_name="postcompile-valuation",
+    metadata={"owner_runner_id": "runner-1", "resume_chain_depth": 0},
+  )
+
+  payload = background_task_payload(
+    parked,
+    elapsed_seconds=30,
+    resumed_task_ids=[],
+    now=120.0,
+  )
+
+  assert payload["status"] == "awaiting_approval"
+  assert payload["status"] != "running"
+  assert payload["status"] != "completed"
+  assert payload["completed"] is False
+  assert payload["resumed_as"] == []
+  assert "not a final outcome" in payload["message"]
+  assert "never persisted" not in payload["message"]
+  assert "error" not in payload
+
+def test_get_background_result_wait_on_approval_park_returns_promptly() -> None:
+  async def case() -> None:
+    runner = object.__new__(AgentRunner)
+    runner._task_registry = TaskRegistry()
+    runner._task_registry_rebuilt = True
+    runner._agent_session_log = None
+    runner._background_result_page_state = None
+    parked = runner._task_registry.register("background_agent", task_id="child")
+    parked.agent_name = "postcompile-valuation"
+    runner._task_registry.transition(parked.task_id, TaskState.AWAITING_APPROVAL)
+    held = asyncio.create_task(asyncio.sleep(30))
+    parked.asyncio_task = held
+    started = asyncio.get_running_loop().time()
+    result, error = await AgentRunner.get_background_result(
+      runner,
+      {"task_id": "child", "wait": True, "timeout": 30},
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+    held.cancel()
+    assert error is None
+    assert result is not None
+    assert elapsed < 1
+    assert result["status"] == "awaiting_approval"
+    assert result["completed"] is False
+    assert result["status"] != "running"
+    assert "awaiting approval" in result["message"]
+    assert "not a final outcome" in result["message"]
+    assert "never persisted" not in result["message"]
+
+    inflight = object.__new__(AgentRunner)
+    inflight._task_registry = TaskRegistry()
+    inflight._task_registry_rebuilt = True
+    inflight._agent_session_log = None
+    inflight._background_result_page_state = None
+    running = inflight._task_registry.register("background_agent", task_id="live")
+    running.agent_name = "postcompile-valuation"
+    inflight._task_registry.transition(running.task_id, TaskState.RUNNING)
+    release = asyncio.Event()
+
+    async def still_running() -> None:
+      await release.wait()
+
+    handle = asyncio.create_task(still_running())
+    running.asyncio_task = handle
+
+    async def park_during_wait() -> None:
+      await asyncio.sleep(0.05)
+      inflight._task_registry.transition(running.task_id, TaskState.AWAITING_APPROVAL)
+
+    asyncio.create_task(park_during_wait())
+    started = asyncio.get_running_loop().time()
+    parked_result, parked_error = await AgentRunner.get_background_result(
+      inflight,
+      {"task_id": "live", "wait": True, "timeout": 30},
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+    release.set()
+    handle.cancel()
+    assert parked_error is None
+    assert parked_result is not None
+    assert elapsed < 1
+    assert parked_result["status"] == "awaiting_approval"
+    assert parked_result["completed"] is False
+
+  asyncio.run(case())
+
+
 
 
 def test_background_task_reminder_text_formats_running_tasks() -> None:

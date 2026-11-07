@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, overload
 from model_authority.bind import CapabilityBind
 
+from .approval_policy import RunContext
 from .approval_route import (
   NO_APPROVAL_ROUTE,
   ApprovalRoute,
@@ -115,7 +116,7 @@ def build_tool_dispatcher(
   get_tool_definitions: Any = None,
   commercial_mcp_servers: frozenset[str] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
-  run_context: Any = None,
+  run_context: RunContext,
   excel_wrap: bool = False,
   channel_registry: Any = None,
   execute_addin: Any = None,
@@ -143,7 +144,7 @@ def build_tool_dispatcher(
   get_tool_definitions: Any = None,
   commercial_mcp_servers: frozenset[str] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
-  run_context: Any = None,
+  run_context: RunContext,
   excel_wrap: Literal[True],
   channel_registry: Any = None,
   execute_addin: Any = None,
@@ -171,7 +172,7 @@ def build_tool_dispatcher(
   get_tool_definitions: Any = None,
   commercial_mcp_servers: frozenset[str] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
-  run_context: Any = None,
+  run_context: RunContext,
   excel_wrap: Literal[False] = False,
   channel_registry: Any = None,
   execute_addin: Any = None,
@@ -199,7 +200,7 @@ def build_tool_dispatcher(
   get_tool_definitions: Any = None,
   commercial_mcp_servers: frozenset[str] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
-  run_context: Any = None,
+  run_context: RunContext,
   excel_wrap: bool = False,
   channel_registry: Any = None,
   execute_addin: Any = None,
@@ -226,7 +227,7 @@ def build_tool_dispatcher(
   get_tool_definitions: Any = None,
   commercial_mcp_servers: frozenset[str] | None = None,
   mcp_session_inject_servers: set[str] | None = None,
-  run_context: Any = None,
+  run_context: RunContext,
   excel_wrap: bool = False,
   channel_registry: Any = None,
   execute_addin: Any = None,
@@ -299,6 +300,7 @@ def build_tool_dispatcher(
     "needs_approval": needs_approval,
     "request_approval": request_approval,
     "event_log": event_log,
+    "run_context": run_context,
   }
   if deps.tool_registration_catalog is not None:
     base_kwargs["tool_registration_catalog"] = (
@@ -338,7 +340,6 @@ def build_tool_dispatcher(
       base_kwargs["mcp_session_inject_servers"] = mcp_session_inject_servers
     base_kwargs.update(passthrough)
     base_kwargs["session"] = principal.session
-    base_kwargs["run_context"] = run_context
     base_kwargs["get_tool_definitions"] = get_tool_definitions
     if commercial_mcp_servers is not None:
       base_kwargs["commercial_mcp_servers"] = commercial_mcp_servers

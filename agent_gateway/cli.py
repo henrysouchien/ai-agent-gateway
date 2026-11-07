@@ -22,6 +22,10 @@ import httpx
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
+from hank_model_transport.user_provider_keys import UserProviderKeyError
+
+from .user_provider_keys_client import EnrolmentRefused
+
 from .project import (
   DEFAULT_AGENT_CONFIG,
   PROJECT_CONFIG_ENV,
@@ -100,8 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
   auth_parser = subparsers.add_parser("auth", help="Manage provider authentication.")
   auth_sub = auth_parser.add_subparsers(dest="auth_command", required=True)
   _USER_SCOPE_HELP = (
-    "risk_user_id whose credential pool this account belongs to; omit for the "
-    "deployment's org pool."
+    "For Anthropic/OpenAI API keys: gateway roster name or email (required). "
+    "For OAuth and other providers: credential-pool user scope; omit for the org pool."
   )
   from .login_flows import registered_login_flows
   _flow_choices = sorted(registered_login_flows().keys())
@@ -115,6 +119,8 @@ def build_parser() -> argparse.ArgumentParser:
   auth_login.add_argument("--no-browser", action="store_true", help="Do not open the verification URL.")
   auth_login.add_argument("--store", default=None, help="Override the OAuth token-store path.")
   auth_login.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
+  auth_login.add_argument("--label", default="cli", help="Label for a user-owned Anthropic/OpenAI API key.")
+  auth_login.add_argument("--workspace-id", default=None, help="Anthropic API-key workspace id.")
   auth_login.add_argument("--profile", default=None, help="CAAM profile name for a new Codex enrollment.")
   auth_login.add_argument("--email", default=None, help="Expected ChatGPT email for a new Codex enrollment.")
   auth_enroll = auth_sub.add_parser(
@@ -135,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
   auth_status.add_argument(
     "--api-key",
     action="store_true",
-    help="Inspect the API-key store instead of subscription OAuth/device code.",
+    help="Inspect API keys instead of subscription OAuth/device code (Anthropic shows both).",
   )
   auth_status.add_argument("--store", default=None, help="Override the OAuth token-store path.")
   auth_status.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
@@ -153,6 +159,10 @@ def build_parser() -> argparse.ArgumentParser:
   )
   auth_logout.add_argument("--store", default=None, help="Override the OAuth token-store path.")
   auth_logout.add_argument("--user", default=None, help=_USER_SCOPE_HELP)
+  auth_logout.add_argument("--key", default=None, help="Fingerprint of an Anthropic/OpenAI user API key.")
+  key_status = auth_logout.add_mutually_exclusive_group()
+  key_status.add_argument("--disable", action="store_true", help="Disable --key instead of removing it.")
+  key_status.add_argument("--enable", action="store_true", help="Revalidate and enable --key instead of removing it.")
   auth_list = auth_sub.add_parser("list", help="List enrolled provider accounts.")
   auth_list.add_argument("provider", choices=_flow_choices)
   auth_list.add_argument(
@@ -286,6 +296,9 @@ def main(
 
     if args.command == "list":
       return _list_project(args, stdout=stdout_stream)
+  except (UserProviderKeyError, EnrolmentRefused) as exc:
+    stderr_stream.write(f"agent: {exc.code}: {exc.user_message}\n")
+    return 1
   except AgentProjectError as exc:
     stderr_stream.write(f"agent: {exc}\n")
     return 2
@@ -427,7 +440,7 @@ def _auth_login(args: argparse.Namespace, *, stdout: TextIO) -> int:
   try:
     flow = get_login_flow(args.provider)
     return flow.login(args, stdout=stdout)
-  except AgentProjectError:
+  except (AgentProjectError, UserProviderKeyError, EnrolmentRefused):
     raise
   except Exception as exc:
     raise AgentProjectError(str(exc)) from exc
@@ -540,7 +553,7 @@ def _auth_status(args: argparse.Namespace, *, stdout: TextIO) -> int:
   try:
     flow = get_login_flow(args.provider)
     return flow.status(args, stdout=stdout)
-  except AgentProjectError:
+  except (AgentProjectError, UserProviderKeyError, EnrolmentRefused):
     raise
   except Exception as exc:
     raise AgentProjectError(str(exc)) from exc
@@ -804,7 +817,7 @@ def _auth_logout(args: argparse.Namespace, *, stdout: TextIO) -> int:
   try:
     flow = get_login_flow(args.provider)
     return flow.logout(args, stdout=stdout)
-  except AgentProjectError:
+  except (AgentProjectError, UserProviderKeyError, EnrolmentRefused):
     raise
   except Exception as exc:
     raise AgentProjectError(str(exc)) from exc

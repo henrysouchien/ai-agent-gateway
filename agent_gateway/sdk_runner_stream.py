@@ -22,12 +22,14 @@ from .tool_dispatch_classification import (
 from .tool_result_semantics import classify_semantic_tool_error
 from hank_model_transport.providers.anthropic import _server_tool_unit_deltas
 from .runner_tool_audit import get_tool_risk_value
+from .registry_scope import DeclaredRegistryScope
 from .secret_boundary import SANITIZATION_FAILED, sanitize_boundary_value
 
 
 if TYPE_CHECKING:
   from hank_model_transport.capability_execution import BoundCapabilityExecution
   from .event_log import EventLog
+  from .approval_policy import RunContext
   from .tool_dispatch_classification import DispatchEntry, ToolResultSettlement
   from .tool_dispatcher_approval_lifecycle import ApprovalPark
 
@@ -43,6 +45,9 @@ class ToolCallInfo:
   tool_input: Dict[str, Any]
   started_at: float
   redacted_tool_input: Dict[str, Any]
+  # The scope the call runs under, captured when it starts; a later
+  # invoke_skill rebinding applies only to calls that start after it.
+  registry_scope: DeclaredRegistryScope
 
 
 @dataclass
@@ -101,6 +106,8 @@ class _SDKRunnerStreamMixin:
     _usage: Dict[str, Any]
 
     def _append(self, event: Dict[str, Any]) -> None: ...
+
+    def _resolve_run_context(self) -> RunContext: ...
 
     def _call_on_tool_timing(
       self,
@@ -240,6 +247,7 @@ class _SDKRunnerStreamMixin:
         tool_input=tool_input,
         started_at=started_at,
         redacted_tool_input=copy.deepcopy(redacted_tool_input),
+        registry_scope=copy.copy(self._resolve_run_context().registry_scope),
       )
       display = resolve_display(tool_name, redacted_tool_input)
       tool_start_event = {

@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from agent_gateway.user_identity_mapping import RunOwnerUnresolved, risk_user_id_for
+from agent_gateway.user_identity_mapping import (
+  RunOwnerUnresolved,
+  StorageIdentity,
+  StorageIdentityFinding,
+  parse_storage_identity,
+  risk_user_id_for,
+)
 from hank_model_transport.user_runtime_credentials import (
   USER_RUNTIME_CREDENTIALS_FILE_ENV,
   DeskReplica,
@@ -50,6 +56,36 @@ def _bundle_environ(
   )
   write_user_runtime_credentials(bundle, path)
   return {USER_RUNTIME_CREDENTIALS_FILE_ENV: str(path)}
+
+
+@pytest.mark.parametrize(
+  ("value", "form"),
+  [
+    ("1", "numeric"), ("13", "numeric"), ("henry", "legacy"),
+    ("testuser", "legacy"), ("owner-1", "legacy"), ("user_a", "legacy"),
+    ("1-owner", "legacy"),
+  ],
+)
+def test_storage_identity_parses_numeric_and_legacy_forms(value: str, form: str) -> None:
+  identity = parse_storage_identity(value)
+  assert isinstance(identity, StorageIdentity)
+  assert identity.storage_id == value
+  assert identity.form == form
+
+
+@pytest.mark.parametrize(
+  "value",
+  [
+    "../x", "../bob", "/absolute", "\\", "..", ".", "", " ", "a/b", "a\\b", "a\x00b", "\u2024", "\uff0e",
+    "a\u2024b", "a\uff0eb", "042", "0", "１２", "CalmGlen", "hc@henrychien.com",
+    "a%2fb", "a%2e%2e", " alice ", "a" * 65, 1, 42, True, False, None, 1.5, [], {},
+  ],
+)
+def test_storage_identity_reports_original_malformed_input(value: object) -> None:
+  with pytest.raises(StorageIdentityFinding) as caught:
+    parse_storage_identity(value)
+  assert caught.value.input == value
+  assert caught.value.reason
 
 
 def test_numeric_storage_id_maps_to_itself() -> None:
@@ -109,7 +145,7 @@ def test_roster_entry_without_risk_user_id_raises() -> None:
   del entry["risk_user_id"]
   with pytest.raises(RunOwnerUnresolved) as excinfo:
     risk_user_id_for("henry", environ={"GATEWAY_USER_KEYS": _roster(entry)})
-  assert excinfo.value.reason == "unknown"
+  assert excinfo.value.reason == "malformed_roster"
 
 
 @pytest.mark.parametrize("identifier", ["0", "00", "-1", "-0", "  -2 ", " 0 "])

@@ -1,6 +1,8 @@
 from copy import deepcopy
 from typing import Any, Mapping
 
+from agent_gateway.approval_policy import RunContext
+from agent_gateway.registry_scope import NoRegistryScope
 from agent_gateway.runner_tool_audit import redact_tool_input_for_event
 from agent_gateway.tool_dispatch_classification import (
   ToolResultSettlement,
@@ -8,9 +10,31 @@ from agent_gateway.tool_dispatch_classification import (
 )
 from agent_gateway.tool_dispatcher import _SpawningTurn
 from agent_gateway.tool_policy_registry import PreparedToolCall
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 
 class CataloglessDispatcherTestSupport:
+  """``AgentRunnerDispatcher`` surface for catalogless doubles.
+
+  The runner reads ``run_context.registry_scope`` for every tool call; a
+  catalogless double declares no citation registry.
+  """
+
+  _run_context: RunContext | None = None
+
+  @property
+  def run_context(self) -> RunContext:
+    if self._run_context is None:
+      self._run_context = run_context_for_test(registry_scope=NoRegistryScope())
+    return self._run_context
+
+  @run_context.setter
+  def run_context(self, run_context: RunContext) -> None:
+    self._run_context = run_context
+
+  def rebind_run_context(self, run_context: RunContext) -> None:
+    self._run_context = run_context
+
   def bind_research_file_activity_owner(self, owner: Any) -> None:
     self.research_file_activity_owner = owner
 

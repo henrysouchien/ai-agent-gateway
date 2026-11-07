@@ -19,7 +19,7 @@ from hank_contracts.commercial_work import VerifiedWorkAuthorization
 _TABLE_SQL = """
   CREATE TABLE IF NOT EXISTS commercial_work_authorization_consumptions (
     authorization_id TEXT PRIMARY KEY,
-    schema_version INTEGER NOT NULL CHECK (schema_version IN (1, 2, 3)),
+    schema_version INTEGER NOT NULL CHECK (schema_version IN (1, 2, 3, 4)),
     token_sha256 TEXT NOT NULL UNIQUE CHECK (
       length(token_sha256) = 71
       AND substr(token_sha256, 1, 7) = 'sha256:'
@@ -74,7 +74,7 @@ _TABLE_SQL = """
         AND reserved_spend_microusd IS NULL
       )
       OR (
-        schema_version = 3
+        schema_version IN (3, 4)
         AND model_key IS NULL
         AND credential_principal IN ('user', 'service')
         AND (
@@ -89,7 +89,10 @@ _TABLE_SQL = """
     )
   )
 """
-_V3_METERED_OBSERVABILITY_TABLE_SQL = _TABLE_SQL.replace(
+_V3_TABLE_SQL = _TABLE_SQL.replace(
+  "schema_version IN (1, 2, 3, 4)", "schema_version IN (1, 2, 3)",
+).replace("schema_version IN (3, 4)", "schema_version = 3")
+_V3_METERED_OBSERVABILITY_TABLE_SQL = _V3_TABLE_SQL.replace(
   "primary_inference_observability IN (\n"
   "        'hank_metered', 'hank_byok_observed', 'external_unobserved', 'none'\n"
   "      )",
@@ -353,7 +356,10 @@ class WorkAuthorizationConsumptionStore:
           _rebuild_previous_table(connection, _V1_COLUMNS)
         elif normalized == _normalized_ddl(_V2_TABLE_SQL):
           _rebuild_previous_table(connection, _V2_COLUMNS)
-        elif normalized == _normalized_ddl(_V3_METERED_OBSERVABILITY_TABLE_SQL):
+        elif normalized in {
+          _normalized_ddl(_V3_TABLE_SQL),
+          _normalized_ddl(_V3_METERED_OBSERVABILITY_TABLE_SQL),
+        }:
           _rebuild_previous_table(connection, _COLUMNS)
       connection.execute(_TABLE_SQL)
       for trigger in _TRIGGERS:
@@ -549,6 +555,10 @@ def _rebuild_previous_table(
 def _content_sha256(authorization: VerifiedWorkAuthorization) -> str:
   payload = asdict(authorization)
   payload.pop("token_sha256")
+  if authorization.schema_version < 4:
+    # Pre-V4 content identities did not include the signed funding-route facts.
+    payload.pop("credential_route")
+    payload.pop("credential_owner_kind")
   if authorization.schema_version == 1:
     # V1 content identity predates later fields; keep existing rows' hashes.
     payload.pop("credential_principal", None)

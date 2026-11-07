@@ -9,13 +9,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from agent_gateway.approvals import (
-  TERMINAL_APPROVAL_STATES,
   ApprovalActionError,
+  _approval_replay_result,
   _approval_request_to_dict,
   _record_durable_vote_and_continue,
   _record_vote_and_unblock,
 )
-from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.approval_store import TERMINAL_STATES, SQLiteApprovalStore
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
 from agent_gateway.batch_approval_projection import (
   ApprovalProjection,
@@ -320,7 +320,7 @@ async def _approval_records_for_autonomous_task(store: Any, record: AutonomousTa
     if approval_id_text in seen:
       continue
     seen.add(approval_id_text)
-    request_record = await _store_get(store, approval_id_text, owner_user_id=str(record.user_id or "").strip())
+    request_record = await _store_get(store, approval_id_text, owner_user_id=_record_owner_user_id(record))
     if request_record is not None and request_record.state == "pending_user":
       tool_call_id = str(event.get("tool_call_id") or "")
       if not tool_call_id:
@@ -478,7 +478,7 @@ def _approval_retry_state_error(request_record: Any, approval_id: str) -> JSONRe
   # resolved or not-pending request would ask for a second decision on a call
   # already decided, so only a `pending_user` row is re-notified.
   state = getattr(request_record, "state", None)
-  if state in TERMINAL_APPROVAL_STATES:
+  if state in TERMINAL_STATES:
     return _json_error(409, "Approval request already resolved")
   if state != "pending_user":
     return JSONResponse(
@@ -635,6 +635,26 @@ def build_approvals_router(
       return _json_error(503, "Approval subsystem unavailable")
     return JSONResponse({"approvals": approvals})
 
+  @router.get("/approvals/{approval_id}")
+  async def get_approval(request: Request, approval_id: str) -> JSONResponse:
+    authenticated = _require_bearer_session(request, auth)
+    _require_control_session(authenticated)
+    store: SQLiteApprovalStore | None = getattr(request.app.state, "gateway_approval_store", None)
+    if store is None:
+      return _json_error(503, "Approval subsystem unavailable")
+    owner_user_id = _session_owner_user_id(authenticated)
+    request_record = await _store_get(store, approval_id, session=authenticated)
+    if request_record is None:
+      return _json_error(404, "Run approval not found")
+    if not _channel_matches(request_record.channel, authenticated.channel) and not await _approval_visible_via_delegation(
+      store,
+      request_record,
+      owner_user_id,
+      {},
+    ):
+      return _json_error(404, "Run approval not found")
+    return JSONResponse(_approval_request_to_dict(request_record))
+
   @router.post("/runs/{run_id}/approvals/{approval_id}/notifications/retry")
   async def retry_approval_notification(request: Request, run_id: str, approval_id: str) -> JSONResponse:
     authenticated = _require_bearer_session(request, auth)
@@ -781,7 +801,7 @@ def build_approvals_router(
               approval_id=approval_id,
               tool_call_id=tool_call_id,
               nonce=nonce,
-              approved=payload.approved,
+              approved=existing_delivery["approved"],
               user_id=owner_user_id,
               channel=authenticated.channel,
             )
@@ -794,9 +814,7 @@ def build_approvals_router(
             )
           except (RuntimeError, ValueError) as exc:
             return _json_error(409, str(exc))
-          return JSONResponse({
-            "approval": _approval_request_to_dict(request_record),
-          })
+          return JSONResponse(_approval_replay_result(request_record, approved=payload.approved))
         unavailable = autonomous_decision_unavailable(record)
         if unavailable is not None:
           return _json_error(409, unavailable)
@@ -818,12 +836,12 @@ def build_approvals_router(
           created_at=int(record.started_at),
           expires_at=int(time.time()) + 600,
           user_id=owner_user_id,
+          owner_user_id=owner_user_id,
           user_email=record.user_email,
           role=authenticated.role,
           kind="chat",
           channel=record.channel,
         )
-        shim_session.owner_user_id = owner_user_id
         shim_session.raw_user_id = getattr(record, "raw_user_id", None) or record.user_id
         shim_session.pending_tools[tool_call_id] = pending_entry
         shim_session.approval_queues[tool_call_id] = approval_queue
@@ -867,7 +885,7 @@ def build_approvals_router(
           return JSONResponse(exc.payload, status_code=exc.status_code)
         finally:
           wake_autonomous_approval_delivery(request.app.state)
-        if "approval" in result:
+        if "approval" in result and "outcome" not in result:
           delivery = await store.get_autonomous_approval_delivery(
             approval_id,
             tool_call_id=tool_call_id,
@@ -889,7 +907,7 @@ def build_approvals_router(
               approval_id=approval_id,
               tool_call_id=tool_call_id,
               nonce=nonce,
-              approved=payload.approved,
+              approved=delivery["approved"],
               user_id=owner_user_id,
               channel=authenticated.channel,
             )

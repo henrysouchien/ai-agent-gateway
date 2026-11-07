@@ -32,13 +32,14 @@ from agent_workflow_contracts.models import (
   AdmittedLineage,
   AdmittedResearchBinding,
   AdmittedTenant,
+  SelectionPresetLayer,
   SelectionPresetProvenance,
   SelectionProvenance,
 )
 from model_authority.bind import CapabilityBind
 from model_authority.binding import RunMode
 from pydantic import JsonValue
-from model_authority.selection import SelectionSnapshot
+from model_authority.selection import ProductModelSelectionPolicy, SelectionSnapshot
 
 from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
@@ -166,6 +167,7 @@ class RootTurnAdmission:
   tool_grant: Mapping[str, object]
   research_binding: AdmittedResearchBinding
   selection_snapshot: SelectionSnapshot | None
+  selection_provenance: SelectionProvenance | None
   approval_route_kind: str
   approval_route: ApprovalRoute[Any, Any] = field(repr=False, compare=False)
   policy_generation_ref: str | None = None
@@ -192,6 +194,7 @@ def admit_root_turn(
     tool_grant=MappingProxyType(dict(tool_grant)),
     research_binding=context.research_binding,
     selection_snapshot=context.selection_snapshot,
+    selection_provenance=context.selection_provenance,
     approval_route_kind=_approval_route_name(approval_route),
     approval_route=approval_route,
   )
@@ -236,6 +239,10 @@ async def record_root_turn_admission(
       recorded.selection_snapshot.to_json()
       if recorded.selection_snapshot is not None else {}
     ),
+    selection_provenance=(
+      recorded.selection_provenance.model_dump(mode="json")
+      if recorded.selection_provenance is not None else None
+    ),
     approval_route_kind=recorded.approval_route_kind,
     policy_generation_ref=generation.generation_ref,
   )
@@ -276,6 +283,31 @@ async def link_root_park(
   )
 
 
+def root_preset_layer(
+  selection_policy: ProductModelSelectionPolicy | None,
+  *,
+  chosen_by_session: bool,
+) -> SelectionPresetLayer | None:
+  """Project the winning preset's layer without selecting a model or role map."""
+
+  if chosen_by_session:
+    return "request"
+  if selection_policy is None:
+    return None
+  return selection_policy.default_preset_source or "policy_default"
+
+
+def default_root_provenance(
+  selection_policy: ProductModelSelectionPolicy | None,
+) -> SelectionProvenance:
+  """Record a root with no requested role, effort or session preset."""
+
+  return SelectionProvenance(
+    role=None, role_source=None, effort_source=None, preset=None,
+    preset_layer=root_preset_layer(selection_policy, chosen_by_session=False),
+  )
+
+
 def root_context(
   session: Any | None,
   *,
@@ -284,9 +316,12 @@ def root_context(
   ticker: str | None = None,
   remaining_usd: float | None = None,
   selection_snapshot: SelectionSnapshot | None = None,
-  selection_provenance: SelectionProvenance | None = None,
+  selection_provenance: SelectionProvenance | None,
 ) -> ParentContext:
-  """Capture a root turn after runtime setup; never re-root an admitted child."""
+  """Capture a root turn with its owner's provenance; never re-root a child.
+
+  Explicit ``None`` records an unavailable original selection source.
+  """
 
   admitted: ParentContext | None = getattr(session, "admitted_job_context", None)
   if admitted is not None and admitted.children is not None:
@@ -330,19 +365,16 @@ def root_context_from_identity(
   approval_route: ApprovalRoute[object, object],
   remaining_usd: float | None = None,
   selection_snapshot: SelectionSnapshot | None = None,
-  selection_provenance: SelectionProvenance | None = None,
+  selection_provenance: SelectionProvenance | None,
 ) -> ParentContext:
   """Mint from an authenticated edge's identity, live roster and control owner.
 
   Sessionless schedule/control edges supply these owner facts directly, not a
   synthetic GatewaySession. ``None`` tool IDs retain the session catalog's root
   scope; the grant loop applies withheld tools to a supplied roster.
+  Selection provenance is required; explicit ``None`` retains an unknown source.
   """
 
-  # A root driver never requests a role, so a root always carries a provenance.
-  recorded = selection_provenance or SelectionProvenance(
-    role=None, role_source=None, effort_source=None, preset=None,
-  )
   return ParentContext(
     tenant=tenant,
     research_binding=research_binding,
@@ -355,7 +387,7 @@ def root_context_from_identity(
     depth=0,
     approval_route=approval_route,
     selection_snapshot=selection_snapshot,
-    selection_provenance=recorded,
+    selection_provenance=selection_provenance,
   )
 
 
@@ -713,6 +745,9 @@ def _admit_spawn(
       selection_snapshot=selection_snapshot,
     )
   )
+  # The lane decides the credentials a revival may spend (C1 ee450375); an
+  # inheriting child carries the lane of the parent execution it inherits.
+  selection_lane = owners.capability_execution_resolver.selection_lane(capability_bind)
   placement = _placement_for_run_mode(capability_bind.run_mode)
   env_projection = _environment_projection(placement, owners.env_names)
   if owners.frozen_bind is not None:
@@ -745,6 +780,11 @@ def _admit_spawn(
         )
         if subtree_snapshot is not None and request.model_preset is not None
         else parent_provenance.preset if parent_provenance is not None else None
+      ),
+      preset_layer=(
+        "request"
+        if subtree_snapshot is not None and request.model_preset is not None
+        else parent_provenance.preset_layer if parent_provenance is not None else None
       ),
     )
 
@@ -799,6 +839,7 @@ def _admit_spawn(
       else None
     ),
     selection_provenance=selection_provenance,
+    selection_lane=selection_lane,
     children=children,
     tool_grant=tuple(entry.tool_id for entry in tool_authority.grant.tools),
     withheld_tools=tuple(sorted(parent.withheld)),

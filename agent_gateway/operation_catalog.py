@@ -312,6 +312,19 @@ class ResolvedOperationRuntime:
       raise ValueError("snapshot and runtime policy must agree on resumability")
 
 
+class OperationRefusedError(Exception):
+  """An application catalog refuses a named operation with its own typed code.
+
+  `run_agent` reports `code` and `message` to the caller as the refusal; the
+  catalog owns what the code means, the gateway only carries it.
+  """
+
+  def __init__(self, *, code: str, message: str) -> None:
+    self.code = code
+    self.message = message
+    super().__init__(message)
+
+
 @runtime_checkable
 class AgentOperationCatalog(Protocol):
   """Application-supplied operation catalog used only for new admissions."""
@@ -330,6 +343,7 @@ __all__ = [
   "AgentOperationCatalog",
   "Effort",
   "MutationMode",
+  "OperationRefusedError",
   "OperationRuntimePolicy",
   "ResolvedOperationRuntime",
   "RunMode",

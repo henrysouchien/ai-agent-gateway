@@ -4,7 +4,7 @@ Reference this checklist when adding features, fixing bugs, or changing the publ
 
 ## Always (every change)
 
-- [ ] **Tests pass** — run `pytest tests` from the package root
+- [ ] **Tests pass** — run `pytest --import-mode=importlib tests` from the package root
 - [ ] **Existing consumer tests pass** — run the embedding application's focused gateway consumer tests
 - [ ] **New code has docstrings** — every new public function/class gets a docstring at write time
 

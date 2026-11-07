@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
@@ -96,6 +98,7 @@ def test_irreversible_rechecks_after_approval_and_injects_token_free_lineage() -
     commercial_work_start=commercial,
     commercial_irreversible_recheck=recheck,
     commercial_mcp_servers=frozenset({"portfolio-trades-mcp"}),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = asyncio.run(
@@ -145,6 +148,7 @@ def test_irreversible_live_recheck_failure_never_calls_mcp() -> None:
     commercial_work_start=_commercial(),
     commercial_irreversible_recheck=deny,
     commercial_mcp_servers=frozenset({"portfolio-trades-mcp"}),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = asyncio.run(
@@ -175,6 +179,7 @@ def test_commercial_dispatch_denies_untrusted_mcp_without_metadata_leak() -> Non
     commercial_work_start=_commercial(),
     commercial_irreversible_recheck=lambda _context: None,
     commercial_mcp_servers=frozenset({"different-server"}),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = asyncio.run(
@@ -202,6 +207,7 @@ def test_missing_irreversible_recheck_fails_closed() -> None:
     needs_approval=lambda *_args, **_kwargs: False,
     commercial_work_start=_commercial(),
     commercial_mcp_servers=frozenset({"portfolio-trades-mcp"}),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = asyncio.run(
@@ -227,6 +233,7 @@ def test_noncommercial_dispatch_remains_metadata_free() -> None:
     mcp_client=mcp,
     role="owner",
     needs_approval=lambda *_args, **_kwargs: False,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = asyncio.run(

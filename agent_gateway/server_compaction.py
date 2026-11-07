@@ -514,6 +514,9 @@ _TASK_HEADING_RE = re.compile(
 )
 
 
+# `SessionContextBuilder` replays a `session_recap` event as a user-role
+# message under this heading (e.g. after an approval pause).
+PREVIOUS_TURN_RECAP_HEADER = "## Previous turn recap"
 _RUNNER_USER_TEXT_PREFIXES = (
   "[System:",
   "<background-",
@@ -524,6 +527,7 @@ _RUNNER_USER_TEXT_PREFIXES = (
   "Current checklist (",
   "The analyst edited the checklist:",
   "[tool_result]",
+  PREVIOUS_TURN_RECAP_HEADER,
 )
 _RUNNER_USER_TEXTS = frozenset({CONTINUATION_NUDGE, "Continue from where you left off."})
 
@@ -534,7 +538,7 @@ def is_runner_injected_user_text(text: str) -> bool:
   Owner of the text half of that fact for the compaction header and the todo
   checklist's turn scan: the max-tokens and continue nudges, system notices,
   background/operator/task notifications, the compaction continuation,
-  checklist reminders and analyst-edit notes.
+  checklist reminders, analyst-edit notes and the replayed previous-turn recap.
   """
   stripped = text.strip()
   return stripped in _RUNNER_USER_TEXTS or stripped.startswith(_RUNNER_USER_TEXT_PREFIXES)
@@ -840,7 +844,7 @@ def _extract_deterministic_state_map(
 
 
 def _with_root_deliverable_line(cleaned: str, messages: list[dict[str, Any]]) -> str:
-  if not _message_has_inline_skill_or_stage_narrowing(messages, cleaned):
+  if not cleaned.startswith(_ROOT_DELIVERABLE_LINE_PREFIX) and not _message_has_inline_skill_or_stage_narrowing(messages, cleaned):
     return cleaned
   root_deliverable = _extract_root_deliverable(messages)
   cleaned = _STAGE_ONLY_RECEIPT_RE.sub("", cleaned).strip()
@@ -853,16 +857,82 @@ def _with_root_deliverable_line(cleaned: str, messages: list[dict[str, Any]]) ->
   return f"{_ROOT_DELIVERABLE_LINE_PREFIX}{root_deliverable}\n\n{cleaned}"
 
 
-def _ensure_root_deliverable_header(
-  summary: str,
+# A loaded skill (`invoke_skill`) or methodology section (`docs_fetch`) is text
+# the model was told to follow for the rest of the request, but a summary only
+# paraphrases it (the rendered path sees a truncated preview). The anchor therefore
+# carries the current request's instruction results verbatim after the summary,
+# and a later compaction carries that block forward from the anchor it replaces.
+_INSTRUCTION_TOOLS = frozenset({"invoke_skill", "docs_fetch"})
+_ACTIVE_INSTRUCTIONS_HEADER = (
+  "[ACTIVE INSTRUCTIONS] Skill and methodology text loaded for the current request, "
+  "verbatim from its tool results; it still governs the remaining work."
+)
+_ACTIVE_INSTRUCTION_ENTRY_RE = re.compile(r"(?m)^<<< ((?:invoke_skill|docs_fetch) \{.*\}) >>>$")
+
+
+def _carried_instruction_entries(anchor_text: str) -> dict[str, str]:
+  start = anchor_text.find(_ACTIVE_INSTRUCTIONS_HEADER)
+  if start < 0:
+    return {}
+  block = anchor_text[start + len(_ACTIVE_INSTRUCTIONS_HEADER):]
+  matches = list(_ACTIVE_INSTRUCTION_ENTRY_RE.finditer(block))
+  ends = [match.start() for match in matches[1:]] + [len(block)]
+  return {
+    match.group(1): block[match.end():end].strip()
+    for match, end in zip(matches, ends)
+  }
+
+
+def _extract_active_instructions(
   messages: list[dict[str, Any]],
   *,
-  kernel_locals: Mapping[str, Any] | None = None,
+  tail_messages: list[dict[str, Any]] | None = None,
+) -> str | None:
+  """The `[ACTIVE INSTRUCTIONS]` block for the current request, None when it loaded none.
+
+  One entry per distinct call (tool name plus exact input); a repeated call keeps
+  its latest text.
+  """
+  entries: dict[str, str] = {}
+  calls: dict[str, str] = {}
+  retained_tail = [] if tail_messages is None else tail_messages
+  # The retained tail sets the request scope, but its instructions remain verbatim.
+  current_turn = _current_turn_messages(messages + retained_tail)
+  summarized_count = max(0, len(current_turn) - len(retained_tail))
+  for message in current_turn[:summarized_count]:
+    content = message.get("content")
+    if not isinstance(content, list):
+      continue
+    for block in content:
+      if not isinstance(block, dict):
+        continue
+      block_type = block.get("type")
+      if block_type == "compaction":
+        entries.update(_carried_instruction_entries(str(block.get("content") or "")))
+      elif block_type == "tool_use" and block.get("name") in _INSTRUCTION_TOOLS:
+        call_input = json.dumps(block.get("input") or {}, ensure_ascii=False, sort_keys=True, default=str)
+        calls[str(block.get("id") or "")] = f"{block['name']} {call_input}"
+      elif block_type == "tool_result" and str(block.get("tool_use_id") or "") in calls:
+        key = calls[str(block.get("tool_use_id") or "")]
+        for payload in _tool_payload_dicts(block.get("content")):
+          text = payload.get("content")
+          if isinstance(text, str) and text.strip():
+            entries.pop(key, None)
+            entries[key] = text.strip()
+  if not entries:
+    return None
+  return "\n\n".join([
+    _ACTIVE_INSTRUCTIONS_HEADER,
+    *(f"<<< {key} >>>\n{text}" for key, text in entries.items()),
+  ])
+
+
+def _with_state_map(
+  cleaned: str,
+  messages: list[dict[str, Any]],
+  *,
+  kernel_locals: Mapping[str, Any] | None,
 ) -> str:
-  cleaned = str(summary or "").strip()
-  if not cleaned:
-    return cleaned
-  cleaned = _with_root_deliverable_line(cleaned, messages)
   state_map = _extract_deterministic_state_map(messages, kernel_locals=kernel_locals)
   if state_map is None:
     return cleaned
@@ -872,6 +942,25 @@ def _ensure_root_deliverable_header(
     if line.startswith(_ROOT_DELIVERABLE_LINE_PREFIX):
       return "\n".join([*lines[:position + 1], state_map, *lines[position + 1:]]).strip()
   return f"{state_map}\n\n{cleaned}".strip()
+
+
+def _ensure_root_deliverable_header(
+  summary: str,
+  messages: list[dict[str, Any]],
+  *,
+  kernel_locals: Mapping[str, Any] | None = None,
+  tail_messages: list[dict[str, Any]] | None = None,
+) -> str:
+  cleaned = str(summary or "").strip()
+  if not cleaned:
+    return cleaned
+  # A summarizer that copied the replaced anchor's block does not author it.
+  cleaned = cleaned.split(_ACTIVE_INSTRUCTIONS_HEADER, 1)[0].strip()
+  request_messages = messages + ([] if tail_messages is None else tail_messages)
+  cleaned = _with_root_deliverable_line(cleaned, request_messages)
+  cleaned = _with_state_map(cleaned, messages, kernel_locals=kernel_locals)
+  active = _extract_active_instructions(messages, tail_messages=tail_messages)
+  return cleaned if active is None else f"{cleaned}\n\n{active}"
 
 
 def _summary_tools(provider: ModelProvider, tools: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -929,6 +1018,7 @@ async def summarize_messages(
   on_event: Callable[[dict[str, Any]], object] | None = None,
   session_id: str | None = None,
   kernel_locals: Mapping[str, Any] | None = None,
+  tail_messages: list[dict[str, Any]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
   if not isinstance(capability_execution, BoundCapabilityExecution):
     raise TypeError(
@@ -963,7 +1053,7 @@ async def summarize_messages(
     )
     if result.saw_tool_use:
       raise SummaryResponseRejected("Summary generation returned tool_use", usage=result.usage)
-    return _ensure_root_deliverable_header(_strip_analysis_and_extract_summary(_summary_response_text(result)), messages, kernel_locals=kernel_locals), result.usage
+    return _ensure_root_deliverable_header(_strip_analysis_and_extract_summary(_summary_response_text(result)), messages, kernel_locals=kernel_locals, tail_messages=tail_messages), result.usage
 
   async def _summarize_rendered() -> tuple[str, dict[str, Any]]:
     rendered = render_messages_for_summary(messages)
@@ -979,7 +1069,7 @@ async def summarize_messages(
     )
     if result.saw_tool_use:
       raise SummaryResponseRejected("Summary generation returned tool_use", usage=result.usage)
-    return _ensure_root_deliverable_header(_strip_analysis_and_extract_summary(_summary_response_text(result)), messages, kernel_locals=kernel_locals), result.usage
+    return _ensure_root_deliverable_header(_strip_analysis_and_extract_summary(_summary_response_text(result)), messages, kernel_locals=kernel_locals, tail_messages=tail_messages), result.usage
 
   if _json_chars(messages) <= RENDER_CHAR_BUDGET:
     try:
@@ -1069,6 +1159,7 @@ async def maybe_compact_current_messages(
     on_event=on_event,
     session_id=session_id,
     kernel_locals=kernel_locals,
+    tail_messages=tail,
   )
   summary = summary.strip()
   summary_chars = len(summary)

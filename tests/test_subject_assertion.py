@@ -268,3 +268,23 @@ def test_replay_cache_fails_closed_instead_of_evicting_live_jti() -> None:
       payload_request_id=request_ids[0],
       claimed_channel="web",
     )
+
+
+def test_duplicate_stored_key_id_is_refused_not_a_rotation() -> None:
+  first = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+  second = Ed25519PrivateKey.from_private_bytes(bytes(reversed(range(32))))
+
+  def encoded(key: Ed25519PrivateKey) -> str:
+    raw = key.public_key().public_bytes(
+      encoding=serialization.Encoding.Raw,
+      format=serialization.PublicFormat.Raw,
+    )
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+  stored = (
+    '{"risk-web-v1":' + json.dumps(encoded(first))
+    + ',"risk-web-v1":' + json.dumps(encoded(second)) + "}"
+  )
+  with pytest.raises(SubjectAssertionError, match="invalid_public_keys_config"):
+    load_subject_assertion_public_keys(stored)
+  assert set(load_subject_assertion_public_keys(json.dumps({"risk-web-v1": encoded(first)}))) == {"risk-web-v1"}

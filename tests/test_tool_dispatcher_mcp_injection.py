@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
@@ -57,6 +59,7 @@ def test_dispatch_injects_session_id_only_for_configured_mcp_servers() -> None:
     role="owner",
     session_id="sess_browser_123",
     mcp_session_inject_servers={"browser"},
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   browser_result, browser_error = _run(
@@ -94,6 +97,7 @@ def test_dispatch_runs_mcp_tool_outside_scoped_allowlist() -> None:
     local_tool_handlers={},
     role="owner",
     allowed_mcp_tools_by_server={"browser": {"browser_snapshot"}},
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   allowed_result, allowed_error = _run(

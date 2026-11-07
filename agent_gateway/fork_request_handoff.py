@@ -210,7 +210,7 @@ def _snapshot_request_identity(
     not isinstance(raw_marker, tuple)
     or len(raw_marker) != 2
   ):
-    raise ValueError("fork handoff requires a parent message cache marker")
+    raise ValueError("fork handoff requires the parent request message prefix boundary")
   system_blocks = tuple(
     (
       _required_text(block[0], field_name="system block text"),

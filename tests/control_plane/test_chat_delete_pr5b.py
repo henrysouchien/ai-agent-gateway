@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 import time
 import uuid
 from typing import Any
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 
 from agent_gateway.approval_audit import ApprovalAuditEmitter
 from agent_gateway.approval_policy import ApprovalRequest, ApprovalRequestPayload, RunContext, utc_now
-from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.approval_store import RUN_CANCELLED_REASON, SQLiteApprovalStore
 from agent_gateway.audit_writer import JSONLAuditWriter
 from model_authority.binding import CredentialHandle
 from hank_model_transport.capability_execution import BoundCapabilityExecution
@@ -30,6 +32,7 @@ from hank_model_transport.capability_execution import (
   MaterializedCredential,
 )
 from agent_gateway.session import AuthManager, GatewaySession
+from agent_gateway.tool_policy_registry import PreparedToolCall
 
 
 API_KEY = "chat-delete-pr5b-key"
@@ -314,6 +317,8 @@ def test_chat_delete_denies_pending_approval_unblocks_loop_and_expires_session(t
     assert request_record.state == "denied"
     assert request_record.decider_id == "alice"
     assert request_record.decision == "denied"
+    assert request_record.decision_reason == RUN_CANCELLED_REASON
+    assert _vote_count(store, approval_ids[0]) == 0
     assert policy.resolved == [approval_ids[0]]
     assert policy.authorization_checks == []
     assert app.state.auth.session_store.get_session(run_payload["chat_session_id"]) is None
@@ -326,3 +331,142 @@ def test_chat_delete_denies_pending_approval_unblocks_loop_and_expires_session(t
     assert decided_events
     assert decided_events[-1]["decision_source"] == "user_denied"
     assert decided_events[-1]["approved"] is False
+
+
+def _vote_count(store: SQLiteApprovalStore, approval_id: str) -> int:
+  with sqlite3.connect(store.path) as conn:
+    row = conn.execute(
+      "SELECT COUNT(*) FROM approval_votes WHERE approval_id = ?",
+      (approval_id,),
+    ).fetchone()
+  return int(row[0])
+
+
+def _dispatch_pending_chat_run(
+  app: FastAPI,
+  client: TestClient,
+  approval_ids: list[str],
+) -> tuple[dict[str, Any], dict[str, Any], GatewaySession]:
+  control = _with_role(app, _control_session(app, client, "alice"), "invite")
+  dispatch = client.post(
+    "/api/control/runs",
+    headers=_headers(control),
+    json={"kind": "chat", "message": "place trade", "channel": "tui"},
+  )
+  assert dispatch.status_code == 200, dispatch.text
+  run_payload = dispatch.json()
+  assert run_payload["run"]["state"] == "approval_pending"
+  assert approval_ids
+  session = app.state.auth.session_store.get_session(run_payload["chat_session_id"])
+  assert session is not None
+  return control, run_payload, session
+
+
+def _retained_run_states(session: GatewaySession) -> list[str | None]:
+  return [
+    event.get("state")
+    for event in session.event_history.snapshot()
+    if event.get("type") == "run_state_changed"
+  ]
+
+
+def test_chat_delete_after_approval_resolved_keeps_first_terminal_and_cancels_run(tmp_path) -> None:
+  app, store, policy, _seen_events, approval_ids = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control, run_payload, session = _dispatch_pending_chat_run(app, client, approval_ids)
+    chat_session_id = run_payload["chat_session_id"]
+    _run(
+      store.transition_state(
+        approval_ids[0],
+        "approved",
+        decider_id="alice",
+        decision="approved",
+        decision_reason="reviewed",
+      )
+    )
+
+    deleted = client.delete(f"/api/control/runs/{chat_session_id}", headers=_headers(control))
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["state"] == "cancelled"
+    assert _retained_run_states(session) == ["running", "cancelled"]
+
+    request_record = _run(store.get(approval_ids[0]))
+    assert request_record is not None
+    assert request_record.state == "approved"
+    assert request_record.decision == "approved"
+    assert request_record.decision_reason == "reviewed"
+    assert _vote_count(store, approval_ids[0]) == 0
+    assert policy.resolved == []
+    assert app.state.auth.session_store.get_session(chat_session_id) is None
+
+
+@pytest.mark.parametrize("failure", ["durable_request_missing", "terminalize_error"])
+def test_chat_delete_cancels_run_before_raising_approval_error(tmp_path, monkeypatch, failure) -> None:
+  app, store, _policy, _seen_events, approval_ids = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control, run_payload, session = _dispatch_pending_chat_run(app, client, approval_ids)
+    chat_session_id = run_payload["chat_session_id"]
+    if failure == "durable_request_missing":
+      async def _missing(approval_id: str):
+        _ = approval_id
+        return None
+
+      monkeypatch.setattr(store, "get", _missing)
+      expected_status, expected_error = 404, "Approval request not found"
+    else:
+      async def _boom(*args: Any, **kwargs: Any):
+        _ = args, kwargs
+        raise RuntimeError("injected terminalize failure")
+
+      monkeypatch.setattr(store, "terminalize_pending_for_cancellation", _boom)
+      expected_status = 503
+      expected_error = "Chat run was cancelled but pending approval settlement failed"
+
+    deleted = client.delete(f"/api/control/runs/{chat_session_id}", headers=_headers(control))
+    assert deleted.status_code == expected_status, deleted.text
+    assert deleted.json()["detail"]["error"] == expected_error
+    assert _retained_run_states(session) == ["running", "cancelled"]
+    assert app.state.auth.session_store.get_session(chat_session_id) is None
+
+
+def test_chat_delete_cancels_durable_parked_approval_when_pending_tools_is_empty(tmp_path) -> None:
+  app, store, policy, _seen_events, approval_ids = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control, run_payload, session = _dispatch_pending_chat_run(app, client, approval_ids)
+    chat_session_id = run_payload["chat_session_id"]
+    request_record = _run(store.get(approval_ids[0]))
+    assert request_record is not None
+    # ApprovalPark pops the in-memory entry; only the durable parked row remains.
+    session.pending_tools.clear()
+    _run(
+      store.record_executable_binding(
+        approval_id=request_record.approval_id,
+        job_id="job-parked",
+        tool_call_id=request_record.tool_call_id,
+        nonce="nonce-parked",
+        tenant_storage_id=request_record.user_id,
+        tool_name=request_record.tool_name,
+        prepared_call=PreparedToolCall(prepared_input={"ticker": "AAPL"}, exact_backend="remote"),
+        dispatch_context={"registry_scope": {"scope_type": "none"}},
+        credential_generation_ref=None,
+      )
+    )
+    assert [parked.approval_id for parked in _run(store.list_parked_requests(request_record.user_id))] == [
+      approval_ids[0]
+    ]
+
+    deleted = client.delete(f"/api/control/runs/{chat_session_id}", headers=_headers(control))
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["state"] == "cancelled"
+    assert _retained_run_states(session) == ["running", "cancelled"]
+
+    cancelled = _run(store.get(approval_ids[0]))
+    assert cancelled is not None
+    assert cancelled.state == "denied"
+    assert cancelled.decision == "denied"
+    assert cancelled.decision_reason == RUN_CANCELLED_REASON
+    assert _vote_count(store, approval_ids[0]) == 0
+    assert policy.resolved == [approval_ids[0]]
+    assert policy.authorization_checks == []
+    assert _run(store.list_parked_requests(request_record.user_id)) == []
+    assert app.state.auth.session_store.get_session(chat_session_id) is None

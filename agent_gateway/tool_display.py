@@ -68,7 +68,7 @@ _SEED_MAP: dict[str, _DisplaySpec] = {
   "list_sheets": _spec("Listing workbook sheets", "workbook"),
   "get_selection": _spec("Reading the current selection", "workbook", "sheet"),
   "get_used_range": _spec("Reading used range", "workbook", "sheet"),
-  "apply_render_plan": _spec("Applying workbook updates", "sheet", "range"),
+  "apply_render_plan": _spec("Applying workbook updates", "sheets"),
   "persist_workbook_update": _spec("Updating the workbook model", "ticker", "sheet"),
   "find_cells": _spec("Finding cells", "query", "sheet"),
   # Local / orchestration / memory.

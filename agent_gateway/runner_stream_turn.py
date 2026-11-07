@@ -6,14 +6,20 @@ from contextlib import aclosing
 import logging
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 from hank_model_transport.auth import ProviderCredentialFailure
+from hank_model_transport.message_prefix import message_prefix_boundary
 from hank_model_transport.providers.anthropic import referenced_tool_names
 from hank_model_transport.providers.anthropic_oauth import AnthropicSourceError
 from hank_model_transport.providers.codex import CodexCredentialExpired
 from hank_model_transport.capability_execution import CapabilityExecutionResolver, FallbackSkip, ModelFallbackHop
+from hank_model_transport.user_provider_keys import UserKeysExhausted, user_key_marker
+from model_authority.spend_ledger import spend_context
+from model_authority.bind import FailoverCapabilityBind
 from model_authority.binding import validate_reported_identity
+from model_authority.selection import DEFAULT_THINKING_WITHOUT_PROGRESS_SECONDS
+from model_authority.schema import PROTOCOL_FAMILY_BY_PROFILE
 from hank_model_transport.providers import ModelInfo
 from hank_model_transport.rate_limit import local_queue_left_at, locally_queued
 from hank_model_transport.providers.anthropic_helpers import _format_anthropic_rejection_detail
@@ -30,14 +36,18 @@ from .runner_prompt_rules import (
   messages_require_tool_only_turns as _messages_require_tool_only_turns,
   system_prompt_requires_tool_only_turns as _system_prompt_requires_tool_only_turns,
 )
-from .runner_session_events import error_with_provider_projection
+from .runner_session_events import build_stream_retry_event, error_with_provider_projection
 from .runner_cleanup import attach_cleanup_failure
 from .runner_session_lifecycle import _runner_attr
 from .commercial_work_start import commercial_budget_stop_fields
 from .skill_context import current_skill
 from hank_model_transport.spend_metering import ProviderCallMeter, SpendBudgetBlocked
 from .transport_runtime import GATEWAY_SEND_PROMPT_RUNTIME
-from .runner_state import StreamTurnFailure, StreamTurnResult
+from .runner_state import (
+  StreamTurnFailure,
+  StreamTurnResult,
+  request_messages_with_reminders,
+)
 from hank_model_transport.runtime_helpers import (
   apply_message_start_usage as _apply_message_start_usage,
   apply_usage_update as _apply_usage_update,
@@ -47,6 +57,8 @@ from .tool_dispatch_classification import TRANSPORT_RETRY_POLICY, retry_backoff_
 from .runner_streaming import (
   STREAM_STALL_TIMEOUT,
   STREAM_THINKING_STALL_TIMEOUT,
+  ThinkingOnlyProgress,
+  ThinkingWithoutProgressError,
   classify_guard_outcome,
   effective_stream_stall_timeout,
   observed_thinking_in_messages,
@@ -144,10 +156,14 @@ class RunnerStreamTurnMixin:
 
     def _append(self, event: Dict[str, Any]) -> Any | None: ...
 
+    async def _append_durable_event(self, event: Dict[str, Any]) -> Any | None: ...
+
     def _apply_refreshed_auth_config(
       self,
       config: Dict[str, Any],
-      refreshed: Dict[str, Any],
+      refreshed: Dict[str, Any] | None,
+      *,
+      failure: ProviderCredentialFailure | None = None,
     ) -> bool: ...
 
     def _build_usage_event(
@@ -243,6 +259,14 @@ class RunnerStreamTurnMixin:
   async def _finish_failed_stream_turn(self, client: Any, error: str) -> None:
     cancellation: asyncio.CancelledError | None = None
     try:
+      pending_fallback = getattr(self, "_model_fallback_terminal", None)
+      self._model_fallback_terminal = None
+      if (
+        pending_fallback is not None
+        and pending_fallback["from"]["model_key"] == self._capability_execution.bind.model_key
+      ):
+        pending_fallback["primary_failure"]["detail"] = error
+        self._append(pending_fallback)
       await self._emit_error_event(error)
     except asyncio.CancelledError as exc:
       cancellation = exc
@@ -277,7 +301,10 @@ class RunnerStreamTurnMixin:
     system_chars: int,
     tools_chars: int,
     usage_totals: _UsageTotals,
+    text_transform: Callable[[str], str] | None = None,
+    request_reminders: Sequence[str] = (),
   ) -> Tuple[Any, StreamTurnResult] | StreamTurnFailure | None:
+    self._model_fallback_terminal: Dict[str, Any] | None = None
     asyncio_module = _runner_attr(self, "asyncio", asyncio)
     time_module = _runner_attr(self, "time", time)
     logger = _runner_attr(self, "log", log)
@@ -287,9 +314,13 @@ class RunnerStreamTurnMixin:
     stream_guard_poll_interval = _runner_attr(self, "STREAM_GUARD_POLL_INTERVAL", STREAM_GUARD_POLL_INTERVAL)
     last_progress_at = time_module.monotonic()
     progress_events = 0
+    thinking_progress = ThinkingOnlyProgress()
     guard_reason: tuple[str, str] | None = None
-
-    def _bound_request_facts() -> tuple[ThinkingLevel, EffortResolution, float]:
+    request_messages = request_messages_with_reminders(
+      current_messages,
+      request_reminders,
+    )
+    def _bound_request_facts() -> tuple[ThinkingLevel, EffortResolution, float, float]:
       requested = parse_effort(
         config.get("effort"),
         field_name="capability_execution.effort",
@@ -330,17 +361,35 @@ class RunnerStreamTurnMixin:
         config=config,
         model_info=model_info,
         max_tokens=max_tokens,
-        current_messages=current_messages,
+        current_messages=request_messages,
         effort_resolution=resolution,
       )
-      return requested, resolution, stall_timeout
+      bind = self._capability_execution.bind
+      resolver = self._capability_execution.resolver
+      if isinstance(bind, FailoverCapabilityBind):
+        role = bind.requested_role
+      else:
+        dispatcher = getattr(self, "_dispatcher", None)
+        turn_context = (
+          dispatcher.capture_spawning_turn().context if dispatcher is not None else None
+        )
+        provenance = turn_context.selection_provenance if turn_context is not None else None
+        role = provenance.role if provenance is not None else None
+      thinking_timeout = (
+        DEFAULT_THINKING_WITHOUT_PROGRESS_SECONDS
+        if resolver is None
+        else resolver.selection_policy.thinking_without_progress_seconds(
+          bind.capability_id, role=role,
+        )
+      )
+      return requested, resolution, stall_timeout, float(thinking_timeout)
 
-    requested_effort, effort_resolution, _effective_stall_timeout = _bound_request_facts()
+    requested_effort, effort_resolution, _effective_stall_timeout, _thinking_without_progress_timeout = _bound_request_facts()
 
     def _history_fits(execution: BoundCapabilityExecution) -> bool:
       estimate = token_estimate_snapshot(
         system_text=system_prompt_estimate_text(system_prompt),
-        messages=current_messages,
+        messages=request_messages,
         tools=base_kwargs.get("tools") or [],
       )
       return estimate.est_total_tokens <= model_context_window(
@@ -365,14 +414,16 @@ class RunnerStreamTurnMixin:
     ) -> bool:
       """Move the remaining attempts to the next chain entry (design §6.5).
 
-      The hop happens at this attempt boundary: the failed attempt's partial
-      output is already discarded and completed tool effects stay in the
-      transcript, never replayed. The resolver remembers credential failures
-      for fresh runners in this authenticated selection scope.
+      The hop happens before this attempt has produced text or reasoning;
+      completed tool effects stay in the transcript, never replayed. The
+      resolver remembers credential failures for fresh runners in this
+      authenticated selection scope.
       """
 
-      nonlocal client, model_info, max_tokens, requested_effort, effort_resolution, _effective_stall_timeout
+      nonlocal client, model_info, max_tokens, requested_effort, effort_resolution, _effective_stall_timeout, _thinking_without_progress_timeout
       nonlocal prepare_credential
+      if isinstance(self._capability_execution.bind, FailoverCapabilityBind):
+        return False
       # A reached reservation ends the job before the next provider request.
       # This is not a hop reason. rulings-index WA-ACCOUNT-BUDGET.
       stop = commercial_budget_stop_fields(
@@ -417,6 +468,28 @@ class RunnerStreamTurnMixin:
           primary.bind.model_key,
           reasons_summary,
         )
+        self._model_fallback_terminal = {
+          "type": "model_fallback",
+          "outcome": "exhausted",
+          "from": _model_ref(primary),
+          "to": None,
+          "reason": reason,
+          "reset_at": reset_at,
+          "primary_failure": {
+            "model_key": primary.bind.model_key,
+            "code": "provider_exhausted" if reason == "usage_limit" else reason,
+            "reset_at": reset_at,
+          },
+          "skipped": [
+            {
+              "model_key": skip.model_key,
+              "code": skip.code,
+              "detail": skip.detail,
+              "reset_at": skip.reset_at,
+            }
+            for skip in skipped_reasons
+          ],
+        }
         return False
       # The failed attempt's client belongs to the provider that created it;
       # the retry below builds the next one from the fallback's provider.
@@ -431,7 +504,7 @@ class RunnerStreamTurnMixin:
         config,
         model_info=model_info,
       ).value
-      requested_effort, effort_resolution, _effective_stall_timeout = _bound_request_facts()
+      requested_effort, effort_resolution, _effective_stall_timeout, _thinking_without_progress_timeout = _bound_request_facts()
       tried_credential_refs.add(hop.execution.bind.credential_ref)
       logger.warning(
         "[%s] Model fallback on turn %d: %s -> %s (%s, role %s, chain index %d)",
@@ -453,14 +526,27 @@ class RunnerStreamTurnMixin:
         "role": hop.role,
         "chain_index": hop.chain_index,
         "skipped": [
-          {"model_key": skip.model_key, "code": skip.code}
+          {
+            "model_key": skip.model_key,
+            "code": skip.code,
+            "detail": skip.detail,
+            "reset_at": skip.reset_at,
+          }
           for skip in hop.skipped
         ],
       })
       return True
 
     def _make_params() -> tuple[Dict[str, Any], frozenset[str]]:
-      normalized_messages = self._provider.normalize_messages(current_messages, model_info)
+      # The request's reminders go after the history is normalized: the
+      # provider reads them as the request's tail, and the cache and fork
+      # prefix is the history before them.
+      normalized_history = self._provider.normalize_messages(current_messages, model_info)
+      prefix_boundary = message_prefix_boundary(normalized_history)
+      normalized_messages = request_messages_with_reminders(
+        normalized_history,
+        request_reminders,
+      )
       request_tools = copy.deepcopy(base_kwargs.get("tools") or [])
       advertised_tool_names = frozenset(
         str(definition.get("name") or "").strip()
@@ -468,9 +554,12 @@ class RunnerStreamTurnMixin:
         if isinstance(definition, dict)
         and str(definition.get("name") or "").strip()
       )
-      is_anthropic = getattr(self._provider, "name", None) == "anthropic"
+      is_messages = (
+        PROTOCOL_FAMILY_BY_PROFILE[self._capability_execution.bind.protocol_profile]
+        == "anthropic.messages"
+      )
       fork_kwargs: Dict[str, Any] = {}
-      if is_anthropic:
+      if is_messages:
         prefix = self._tool_prefix
         if not any(
           message.get("role") == "assistant" for message in normalized_messages
@@ -538,6 +627,7 @@ class RunnerStreamTurnMixin:
           ),
           "tool_anchor": copy.deepcopy(prefix.anchor),
           "framing_tool": copy.deepcopy(prefix.framing_tool),
+          "message_prefix_boundary": prefix_boundary,
         }
         if prefix.anchor is not None:
           # A tool the visible history references keeps its definition even
@@ -568,7 +658,7 @@ class RunnerStreamTurnMixin:
         compaction_instructions=self._compaction_instructions,
         **fork_kwargs,
       )
-      if is_anthropic and self._tool_prefix.anchor is None:
+      if is_messages and self._tool_prefix.anchor is None:
         anchor = [
           tool for tool in params.get("tools") or []
           if not tool.get("defer_loading")
@@ -605,17 +695,31 @@ class RunnerStreamTurnMixin:
         params.get("tools") or []
       )
       self._last_request_advertised_tool_names = advertised_tool_names
-      self._last_request_message_marker_position = (
-        marker_locations[0] if len(marker_locations) == 1 else None
-      )
+      if marker_locations:
+        # A provider that renders message cache markers (Anthropic) placed
+        # exactly one at message_prefix_boundary, or none could be pinned.
+        self._last_request_message_marker_position = (
+          marker_locations[0] if len(marker_locations) == 1 else None
+        )
+      elif is_messages:
+        # Anthropic declined to place its marker (four breakpoints already,
+        # or a non-user final message): its fork child could not pin it.
+        self._last_request_message_marker_position = None
+      else:
+        # Markerless protocols: the same boundary, read from the history.
+        self._last_request_message_marker_position = prefix_boundary
       self._last_request_max_tokens = max_tokens
       return params, advertised_tool_names
 
-    suppress_tool_turn_text = (
+    # A turn whose text is held back and emitted once at the end: a tool-only
+    # system prompt or message shape, or a repair turn whose text the caller
+    # transforms before the client sees it (the citation hold repair splices
+    # the returned clauses into the draft).
+    suppress_tool_turn_text = bool(text_transform) or (
       _runner_attr(self, "_system_prompt_requires_tool_only_turns", _system_prompt_requires_tool_only_turns)(
         system_prompt
       )
-      or _runner_attr(self, "_messages_require_tool_only_turns", _messages_require_tool_only_turns)(current_messages)
+      or _runner_attr(self, "_messages_require_tool_only_turns", _messages_require_tool_only_turns)(request_messages)
     )
 
     def _attempt_meter() -> ProviderCallMeter:
@@ -625,20 +729,29 @@ class RunnerStreamTurnMixin:
       rotation and model fallback replace them between attempts.
       """
       bind = self._capability_execution.bind
-      return ProviderCallMeter(
-        runtime=GATEWAY_SEND_PROMPT_RUNTIME,
-        provider=self._provider,
-        provider_name=bind.provider,
-        model=config["model"],
-        model_key=bind.model_key,
-        config=config,
-        call_site="chat_turn",
-        session_id=getattr(self, "_full_session_id", None),
-        request_id=getattr(self, "_request_id", None),
-        run_id=getattr(self, "_skill_run_id", None),
-        skill=current_skill(),
-        attrs={"capability_id": bind.capability_id, "turn": turn_count},
-      )
+      resolver = self._capability_execution.resolver
+      marker = user_key_marker(config)
+      owner = resolver.risk_user_id if resolver is not None else None
+      if owner is None and marker is not None:
+        owner = marker.risk_user_id
+      with spend_context(**({"run_owner": str(owner)} if owner is not None else {})):
+        return ProviderCallMeter(
+          runtime=GATEWAY_SEND_PROMPT_RUNTIME,
+          provider=self._provider,
+          provider_name=bind.provider,
+          model=config["model"],
+          model_key=bind.model_key,
+          config=config,
+          call_site="chat_turn",
+          session_id=getattr(self, "_full_session_id", None),
+          request_id=getattr(self, "_request_id", None),
+          run_id=getattr(self, "_skill_run_id", None),
+          skill=current_skill(),
+          attrs={
+            "capability_id": bind.capability_id, "turn": turn_count,
+            **self._capability_execution.answer_attribution,
+          },
+        )
 
     async def _consume_metered(
       params: Dict[str, Any], result: StreamTurnResult, meter: ProviderCallMeter,
@@ -655,16 +768,19 @@ class RunnerStreamTurnMixin:
       thinking_block_chars = 0
 
       async for event in events:
+        thinking_progress.observe(event, now=time_module.monotonic())
         event_type = event.type
         if event_type != "heartbeat":
-          last_progress_at = time_module.monotonic()
           progress_events += 1
+        if event_type != "heartbeat":
+          last_progress_at = time_module.monotonic()
 
         if event_type == "message_start":
           bind = self._capability_execution.bind
           usage_totals.update({
             "capability_bind": bind.to_json(),
           })
+          usage_totals.update(self._capability_execution.answer_attribution)
           apply_provider_diagnostics(usage_totals, event)
           if event.provider_reported_model is not None:
             usage_totals["provider_reported_model"] = validate_reported_identity(
@@ -707,7 +823,7 @@ class RunnerStreamTurnMixin:
               input_tokens=gross_input_tokens,
               system_chars=system_chars,
               tools_chars=tools_chars,
-              messages=current_messages,
+              messages=request_messages,
             )
             if breakdown is not None:
               logger.info(
@@ -754,15 +870,16 @@ class RunnerStreamTurnMixin:
             result.content_blocks.append(event.raw_block)
           continue
 
-        if event_type == "thinking_delta":
+        if event_type in {"thinking_delta", "thinking_end"}:
           thinking_block_chars = apply_thinking_event(usage_totals, event, thinking_block_chars)
+
+        if event_type == "thinking_delta":
           self._append({"type": "thinking_delta", "text": str(event.thinking_text or "")})
           continue
 
         if event_type == "thinking_end":
           if isinstance(event.raw_block, dict):
             result.content_blocks.append(event.raw_block)
-          thinking_block_chars = apply_thinking_event(usage_totals, event, thinking_block_chars)
           logger.info("[%s] Thinking block complete | %d chars", self._sid, len(str(event.thinking_text or "")))
           continue
 
@@ -833,6 +950,17 @@ class RunnerStreamTurnMixin:
             # A queue wait can start and finish entirely between guard polls.
             last_progress_at = left_queue_at
           stall = now - last_progress_at
+        thinking_elapsed = thinking_progress.elapsed(now=now)
+        if (
+          thinking_elapsed is not None
+          and _thinking_without_progress_timeout > 0
+          and thinking_elapsed >= _thinking_without_progress_timeout
+        ):
+          error = ThinkingWithoutProgressError(thinking_elapsed, session_id=self._sid)
+          guard_reason = (error.code, str(error))
+          logger.error("[%s] Turn %d watchdog (%s): %s", self._sid, turn_count, error.code, error)
+          task.cancel()
+          return
         if stall > _effective_stall_timeout:
           guard_reason = ("stall", f"no stream progress for {stall:.0f}s")
           logger.error("[%s] Turn %d watchdog (%s): %s", self._sid, turn_count, guard_reason[0], guard_reason[1])
@@ -891,12 +1019,108 @@ class RunnerStreamTurnMixin:
       else:
         backoff_s = None
         next_retry_delay = 0.0
-      await self._emit_stream_retry_event(
+      if not result.full_text and not attempt_reasoning_chars:
+        await self._emit_stream_retry_event(
+          attempt=attempt,
+          error=error,
+          attempt_elapsed_s=time_module.monotonic() - attempt_start_mono,
+          backoff_s=backoff_s,
+        )
+        return
+      event = build_stream_retry_event(
         attempt=attempt,
         error=error,
         attempt_elapsed_s=time_module.monotonic() - attempt_start_mono,
         backoff_s=backoff_s,
+        retained_text_chars=0,
+        discarded_text_chars=len(result.full_text),
+        retained_reasoning_chars=0,
+        discarded_reasoning_chars=attempt_reasoning_chars,
       )
+      await self._append_durable_event(event)
+      self._append(event)
+
+    def _finalize_stream_result(result: StreamTurnResult, *, complete: bool = True) -> None:
+      if suppress_tool_turn_text:
+        if result.tool_uses:
+          if result.full_text:
+            logger.info(
+              "[%s] Suppressed %d chars of assistant text from tool-use turn %d",
+              self._sid,
+              len(result.full_text),
+              turn_count,
+            )
+          result.full_text = ""
+          result.content_blocks = [
+            block
+            for block in result.content_blocks
+            if not (isinstance(block, dict) and block.get("type") == "text")
+          ]
+        elif result.full_text:
+          if text_transform is not None:
+            # The transform reads a whole reply. A reply the provider cut off
+            # (a stream failure, a max_tokens stop) stays raw and unemitted;
+            # the run loop settles it or continues it (audit 1b7646d5b287).
+            if not complete or result.stop_reason != "end_turn":
+              return
+            result.full_text = text_transform(result.full_text)
+            result.content_blocks = [
+              block
+              for block in result.content_blocks
+              if not (isinstance(block, dict) and block.get("type") == "text")
+            ] + [{"type": "text", "text": result.full_text}]
+          self._append({"type": "text_delta", "text": result.full_text})
+
+    async def _preserve_partial(error: str) -> Tuple[Any, StreamTurnResult]:
+      # This is settlement, not continuation: replaying the original request
+      # cannot resume either the delivered text or the provider's reasoning.
+      if partial_usage_state.has_tokens:
+        await self._call_on_usage(
+          self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+          usage_state="failed_billable",
+        )
+      completed_text_chars = sum(
+        len(block["text"])
+        for block in result.content_blocks
+        if block.get("type") == "text"
+      )
+      if completed_text_chars < len(result.full_text):
+        result.content_blocks.append({
+          "type": "text",
+          "text": result.full_text[completed_text_chars:],
+        })
+      streamed_text_chars = len(result.full_text)
+      _finalize_stream_result(result, complete=False)
+      retained_text = sum(
+        len(str(block.get("text") or ""))
+        for block in result.content_blocks
+        if isinstance(block, dict) and block.get("type") == "text"
+      )
+      retained_reasoning = sum(
+        len(str(block.get("thinking") or ""))
+        for block in result.content_blocks
+        if isinstance(block, dict) and block.get("type") == "thinking"
+      )
+      result.stop_reason = "partial_stream_failure"
+      result.stop_details = {
+        "error": str(error),
+        "retained_text_chars": retained_text,
+        "retained_reasoning_chars": retained_reasoning,
+      }
+      event = build_stream_retry_event(
+        attempt=attempt,
+        error=error,
+        attempt_elapsed_s=time_module.monotonic() - attempt_start_mono,
+        backoff_s=None,
+        settlement="preserve_partial",
+        retained_text_chars=retained_text,
+        discarded_text_chars=max(0, streamed_text_chars - retained_text),
+        retained_reasoning_chars=retained_reasoning,
+        discarded_reasoning_chars=max(0, attempt_reasoning_chars - retained_reasoning),
+      )
+      await self._append_durable_event(event)
+      self._append(event)
+      return client, result
 
     def _credential_failure_for(exc: Exception) -> ProviderCredentialFailure | None:
       """The credential failure `exc` names, including a typed source error.
@@ -936,10 +1160,39 @@ class RunnerStreamTurnMixin:
       A frozen generation bind never reaches here: it fails typed at
       materialization, before the turn.
       """
-      nonlocal transient_retries
-      rotated_config = self._provider.next_credential(config, credential_failure)
-      if rotated_config is None or not self._apply_refreshed_auth_config(config, rotated_config):
+      nonlocal transient_retries, client, model_info, max_tokens
+      nonlocal requested_effort, effort_resolution, _effective_stall_timeout, prepare_credential, _thinking_without_progress_timeout
+      primary = self._capability_execution
+      try:
+        rotated_config = await asyncio.to_thread(self._provider.next_credential, config, credential_failure)
+        refreshed = await asyncio.to_thread(
+          self._apply_refreshed_auth_config, config, rotated_config, failure=credential_failure,
+        )
+      except UserKeysExhausted as exhausted:
+        if primary.resolver is None:
+          raise
+        execution = await asyncio.to_thread(primary.resolver.rebind_user_key_failover, primary.bind, exhausted)
+        await self._close_client(client, timeout=2.0)
+        client = None
+        self._install_capability_execution(config, execution)
+        refreshed = True
+      if not refreshed:
         return False
+      if self._capability_execution.bind.model_key != primary.bind.model_key:
+        if client is not None:
+          await primary.provider.close_client(client, timeout=2.0)
+          client = None
+        model_info = self._provider.get_model_info(self._capability_execution.bind.upstream_model)
+        max_tokens = select_run_max_tokens(config, model_info=model_info).value
+        requested_effort, effort_resolution, _effective_stall_timeout, _thinking_without_progress_timeout = _bound_request_facts()
+        prepare_credential = True
+      if self._capability_execution.answer_attribution:
+        self._append({
+          "type": "model_failover",
+          "from": _model_ref(primary),
+          "to": _model_ref(self._capability_execution),
+          **self._capability_execution.answer_attribution,
+        })
       credential_ref = self._capability_execution.bind.credential_ref
       new_credential = credential_ref not in tried_credential_refs
       tried_credential_refs.add(credential_ref)
@@ -1001,6 +1254,7 @@ class RunnerStreamTurnMixin:
 
       last_progress_at = attempt_start_mono = time_module.monotonic()
       progress_events = 0
+      thinking_progress = ThinkingOnlyProgress()
       commercial_producer = getattr(self, "_commercial_usage_producer", None)
       commercial_guard = getattr(commercial_producer, "assert_work_allowed", None)
       if callable(commercial_guard):
@@ -1087,6 +1341,9 @@ class RunnerStreamTurnMixin:
         stream_error = exc
         partial_usage_state = _runner_attr(self, "_usage_delta_state", _usage_delta_state)(usage_before_attempt, usage_totals)
         partial_usage = partial_usage_state.usage
+        # apply_thinking_event reconciles streamed deltas and final blocks;
+        # the usage delta isolates this attempt from earlier turns.
+        attempt_reasoning_chars = int(partial_usage.get("thinking_chars", 0))
         usage_totals.clear()
         usage_totals.update(usage_before_attempt)
 
@@ -1096,6 +1353,8 @@ class RunnerStreamTurnMixin:
           stream_retry_max,
         )
         if action != "not_guard":
+          if not self._disconnected and result.full_text:
+            return await _preserve_partial(guard_error)
           guard_message = guard_reason[1] if guard_reason else ""
           if action == "retry":
             stream_error = RuntimeError(guard_error)
@@ -1136,6 +1395,9 @@ class RunnerStreamTurnMixin:
 
         credential_failure = _credential_failure_for(exc)
         if credential_failure is not None:
+          if not self._disconnected and result.full_text:
+            formatted_exc = _runner_attr(self, "_format_exc", _format_exc)(exc)
+            return await _preserve_partial(error_with_provider_projection(formatted_exc, exc))
           # The provider owns interchangeable credentials. A generation's first
           # attempt does not spend the transient-error retry budget; revisiting
           # a generation (including an unchanged bind) does. A typed
@@ -1143,10 +1405,14 @@ class RunnerStreamTurnMixin:
           # via the resolver, exactly like a 401.
           usage_totals.clear()
           usage_totals.update(usage_before_attempt)
+          rotation_usage = (
+            self._build_usage_event(model=config["model"], usage_totals=partial_usage)
+            if partial_usage_state.has_tokens else None
+          )
           if await _rotate_credential(credential_failure, attempt, attempt_start_mono):
-            if partial_usage_state.has_tokens:
+            if rotation_usage is not None:
               await self._call_on_usage(
-                self._build_usage_event(model=config["model"], usage_totals=partial_usage),
+                rotation_usage,
                 usage_state="failed_billable",
               )
             continue
@@ -1154,10 +1420,11 @@ class RunnerStreamTurnMixin:
           # or uncredited pool. The remaining attempts move to the next chain
           # entry. The failed attempt's partial usage bills the model that
           # served it.
-          _exhausted_pool_reason: dict[str, Literal["usage_limit", "credential_denied"]] = {
+          _exhausted_pool_reason: dict[str, Literal["usage_limit", "credential_denied", "provider_outage"]] = {
             "rate_limit": "usage_limit",
             "auth": "credential_denied",
             "billing": "credential_denied",
+            "transport": "provider_outage",
           }
           hop_reason = _exhausted_pool_reason.get(credential_failure.kind)
           if hop_reason is not None:
@@ -1229,6 +1496,9 @@ class RunnerStreamTurnMixin:
             )
           return await self._finish_failed_stream_turn(client, event_error)
 
+        if not self._disconnected and result.full_text:
+          return await _preserve_partial(event_error)
+
         logger.warning(
           "[%s] Transient stream error on turn %d after %.1fs (attempt %d, transient retries %d/%d): %s",
           self._sid,
@@ -1284,8 +1554,15 @@ class RunnerStreamTurnMixin:
           guard_message = guard_reason[1] if guard_reason else ""
           partial_usage_state = _runner_attr(self, "_usage_delta_state", _usage_delta_state)(usage_before_attempt, usage_totals)
           partial_usage = partial_usage_state.usage
+          attempt_reasoning_chars = int(partial_usage.get("thinking_chars", 0))
           usage_totals.clear()
           usage_totals.update(usage_before_attempt)
+          if (
+            guard_kind != ThinkingWithoutProgressError.code
+            and not self._disconnected
+            and (result.full_text or attempt_reasoning_chars)
+          ):
+            return await _preserve_partial(guard_error)
           if action == "retry":
             stream_error = RuntimeError(guard_error)
             if partial_usage_state.has_tokens:
@@ -1332,23 +1609,8 @@ class RunnerStreamTurnMixin:
               usage_state="failed_billable",
             )
           return await self._finish_failed_stream_turn(client, guard_error)
-        if suppress_tool_turn_text:
-          if result.tool_uses:
-            if result.full_text:
-              logger.info(
-                "[%s] Suppressed %d chars of assistant text from tool-use turn %d",
-                self._sid,
-                len(result.full_text),
-                turn_count,
-              )
-            result.full_text = ""
-            result.content_blocks = [
-              block
-              for block in result.content_blocks
-              if not (isinstance(block, dict) and block.get("type") == "text")
-            ]
-          elif result.full_text:
-            self._append({"type": "text_delta", "text": result.full_text})
+        usage_totals["capability_bind"] = self._capability_execution.bind.to_json()
+        _finalize_stream_result(result)
         return client, result
 
     if stream_error is not None:

@@ -15,6 +15,8 @@ from typing import AbstractSet, Any, Callable, cast, Dict, get_args, Mapping, Op
 
 from pydantic import ValidationError
 from model_authority.bind import CapabilityBind
+from hank_model_transport.capability_execution import BoundCapabilityExecution
+from hank_model_transport.user_provider_keys import parse_user_key_handle_id
 
 from agent_workflow_contracts.next_call import next_call as build_next_call
 from agent_workflow_contracts.tool_registration import (
@@ -28,6 +30,7 @@ from agent_workflow_contracts.tool_registration import (
 
 from .admission import ParentContext
 from . import admission
+from .registry_scope import DeclaredRegistryScope, NoRegistryScope, RegistryScope
 from .events import ApprovalDecisionSource
 from hank_model_transport.providers.anthropic_oauth import is_anthropic_generation_ref
 from .approval_policy import (
@@ -59,6 +62,8 @@ from .approval_route import (
   route_store,
 )
 from .event_log import EventLog
+from .single_user_policy import needs_human_approval
+from .tool_registration import RefusedMcpRoute, UnknownRegisteredMcpToolDescriptorError
 from .execution_identity import DispatchIdentity
 from .investment_capability_claim import (
   INVESTMENT_CAPABILITY_CLAIM_SERVER,
@@ -85,7 +90,6 @@ from .secret_boundary import (
 )
 from .tool_policy_registry import (
   ApprovalCacheKeyCall,
-  ApprovalPredicateCall,
   InputPreparationCall,
   OutcomeCall,
   PreparedToolCall,
@@ -332,6 +336,48 @@ def _scope_text(value: Any) -> str | None:
   return value if value.strip() else None
 
 
+def business_model_skill_run_spent_error(*, autonomous: bool) -> dict[str, Any]:
+  """Refuse a BusinessModel retry under a run whose authorized plan failed before commit.
+
+  The prepare-once plan is keyed by the run, so a retry needs a fresh one. In an
+  interactive turn only activating a skill other than the current one mints a
+  run (``invoke_skill``), and both BusinessModel skills grant the door. An
+  autonomous run keeps one identity for the whole run, so nothing inside it can
+  re-plan; the repair is a new run.
+  """
+
+  if autonomous:
+    return {
+      "code": "planned_write_replan_and_reauthorize_required",
+      "message": (
+        "This run's BusinessModel plan failed before commit and is spent: an "
+        "autonomous run keeps one run identity, so no call in it can re-plan. "
+        "Dispatch a new run to persist the BusinessModel."
+      ),
+      "data": {
+        "reason": "skill_run_failed_precommit",
+        "fix": "dispatch a new run for the BusinessModel persist; this run cannot retry it",
+        "next_call": None,
+      },
+    }
+  skill = (
+    "build-model"
+    if current_skill() == "business-model-construction"
+    else "business-model-construction"
+  )
+  return {
+    "code": "planned_write_replan_and_reauthorize_required",
+    "message": (
+      "This BusinessModel skill run's authorized plan failed before commit and "
+      f"is spent; activate {skill} to start a fresh skill run, then retry."
+    ),
+    "data": {
+      "reason": "skill_run_failed_precommit",
+      "next_call": build_next_call("invoke_skill", {"skill_name": skill}),
+    },
+  }
+
+
 @dataclass(frozen=True)
 class _SpawningTurn:
   """The admitted scope a fork keeps from the turn that spawned it."""
@@ -354,6 +400,47 @@ class _BoundaryEventLogProjection:
     if event_log is None:
       raise AttributeError(name)
     return getattr(event_log, name)
+
+
+class ResearchFileActivityOwnerUnavailable(RuntimeError):
+  """A tool requested research-file activity before its run owner was bound."""
+
+  code = "research_file_activity_owner_unavailable"
+  retryable = False
+
+
+@dataclass(frozen=True)
+class AdmittedApprovedBinding:
+  binding: ExecutableApprovalBinding
+  decision: PolicyApprovalRequest
+  context: Any
+  registry_scope: DeclaredRegistryScope
+  dispatch_context: Mapping[str, Any]
+  completed: ToolResult | None
+
+
+@dataclass(frozen=True)
+class _ParentDecidedExecutor:
+  dispatcher: ToolDispatcher
+  continuation: Mapping[str, Any]
+
+  async def admit_approved_binding(
+    self, *, job_id: str, tool_call_id: str, nonce: str,
+  ) -> tuple[AdmittedApprovedBinding | None, dict[str, Any] | None]:
+    return await self.dispatcher._admit_parent_decided_call(
+      continuation=self.continuation, job_id=job_id,
+      tool_call_id=tool_call_id, nonce=nonce,
+    )
+
+  async def execute_admitted_binding(
+    self, admitted: AdmittedApprovedBinding, *,
+    abort_event: asyncio.Event | None,
+    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+  ) -> ToolResult:
+    return await self.dispatcher._execute_parent_admitted_binding(
+      admitted, continuation=self.continuation, abort_event=abort_event,
+      on_executed_prepared_call=on_executed_prepared_call,
+    )
 
 
 class ToolDispatcher:
@@ -389,7 +476,6 @@ class ToolDispatcher:
     credentials_resolver_active: bool = False,
     session: Any | None = None,
     approval_route: ApprovalRoute = NO_APPROVAL_ROUTE,
-    run_context: RunContext | None = None,
     get_tool_definitions: Callable[[], list[dict[str, Any]]] | None = None,
     allowed_mcp_tools_by_server: Mapping[str, AbstractSet[str]] | None = None,
     mcp_scope_context: str = "skill",
@@ -411,6 +497,7 @@ class ToolDispatcher:
     ) = None,
     *,
     capability_bind: CapabilityBind,
+    run_context: RunContext,
   ) -> None:
     self._mcp = mcp_client
     self._capability_bind = capability_bind
@@ -567,7 +654,7 @@ class ToolDispatcher:
     self._source_pack_session = session
     self._session = session
     self._run_context = run_context
-    self._research_file_activity_owner: Callable[[Path, int], bool]
+    self._research_file_activity_owner = self._refuse_unbound_research_file_activity
     self._get_tool_definitions = get_tool_definitions
     self._mcp_scope_context = mcp_scope_context
     self._describe_mcp_scope_block = describe_mcp_scope_block
@@ -616,14 +703,50 @@ class ToolDispatcher:
   def session(self) -> Any | None:
     return self._session
 
-  def replace_capability_bind(self, bind: CapabilityBind) -> None:
-    """Use the runner's current credential bind for subsequent tool captures."""
+  def replace_capability_bind(
+    self, bind: CapabilityBind | BoundCapabilityExecution,
+  ) -> None:
+    """Install a sibling bind, or an authorized seat-to-user execution."""
+    if isinstance(bind, BoundCapabilityExecution):
+      execution = bind
+      bind = execution.bind
+    else:
+      execution = None
     current = self._capability_bind
-    if (
-      bind.capability_id != current.capability_id
-      or bind.run_mode != current.run_mode
-      or bind.credential_principal != current.credential_principal
-    ):
+    same_authority = (
+      bind.capability_id == current.capability_id
+      and bind.run_mode == current.run_mode
+    )
+    if execution is not None:
+      resolver = execution.resolver
+      tenant_id = (
+        self._execution_identity.tenant_id
+        if self._execution_identity is not None
+        else getattr(self._session, "tenant_id", None)
+      )
+      work_start = self._commercial_work_start
+      if not (
+        same_authority
+        and current.credential_principal == "service"
+        and bind.credential_principal == "user"
+        and parse_user_key_handle_id(bind.credential_ref) == (self._risk_user_id, bind.provider)
+        and resolver is not None
+        and resolver.risk_user_id == self._risk_user_id
+        and resolver.auth_context.actor_id == self._user_id
+        and resolver.auth_context.tenant_id == tenant_id
+        and (
+          work_start is None
+          or work_start.authorization.credential_principal == "user"
+        )
+        and (
+          resolver.commercial_work_authorization is None
+          or resolver.commercial_work_authorization.credential_principal == "user"
+        )
+      ):
+        raise ValueError("replacement capability bind changes execution authority")
+      execution.validate()
+      resolver.authorize_bind(bind)
+    elif not same_authority or bind.credential_principal != current.credential_principal:
       raise ValueError("replacement capability bind changes execution authority")
     self._capability_bind = bind
 
@@ -651,11 +774,24 @@ class ToolDispatcher:
   ) -> bool:
     return self._research_file_activity_owner(workspace_dir, research_file_id)
 
+  @staticmethod
+  def _refuse_unbound_research_file_activity(
+    _workspace_dir: Path, _research_file_id: int
+  ) -> bool:
+    raise ResearchFileActivityOwnerUnavailable(
+      "research-file activity requires the constructed run's activity owner"
+    )
+
   @property
-  def run_context(self) -> RunContext | None:
-    """The run context policy is enforced against; ``None`` outside a run."""
+  def run_context(self) -> RunContext:
+    """The current declaration bound to this dispatcher."""
 
     return self._run_context
+
+  def rebind_run_context(self, run_context: RunContext) -> None:
+    """Install the new declaration after an inline skill activates its run."""
+
+    self._run_context = run_context
 
   @property
   def plan_validator(self) -> Callable[..., Mapping[str, Any]] | None:
@@ -746,6 +882,25 @@ class ToolDispatcher:
         "message": SANITIZATION_FAILED,
       }
     return self._event_log.append(projected)
+
+  @property
+  def mcp_client(self) -> "McpClientManager":
+    return self._mcp
+
+  @property
+  def allowed_mcp_tools_by_server(self) -> Mapping[str, AbstractSet[str]] | None:
+    return self._allowed_mcp_tools_by_server
+
+  def bind_tool_definitions(
+    self,
+    definitions: Sequence[Mapping[str, Any]] | Callable[[], Sequence[Mapping[str, Any]]],
+  ) -> None:
+    """Bind a catalog snapshot or a live catalog owner."""
+    if callable(definitions):
+      self._get_tool_definitions = lambda: [dict(item) for item in definitions()]
+    else:
+      items = cast(list[dict[str, Any]], list(definitions))
+      self._get_tool_definitions = lambda: list(items)
 
   def get_tool_definitions(self) -> list[dict[str, Any]]:
     """Return the exact tool catalog enforced by this dispatcher."""
@@ -1062,9 +1217,11 @@ class ToolDispatcher:
     step_id: str | None,
     workspace_dir: str | None,
     batch_id: int | str | None,
+    registry_scope: DeclaredRegistryScope,
   ) -> ToolExecutionContext:
     run_context = self._resolve_run_context()
     return ToolExecutionContext(
+      registry_scope=replace(registry_scope),
       tool_call_id=tool_call_id,
       tool_name=tool_name,
       event_log=(
@@ -1083,6 +1240,7 @@ class ToolDispatcher:
       user_id=run_context.user_id,
       profile=run_context.profile,
       profile_name=run_context.profile_name,
+      capability_bind=self._capability_bind,
       ui_blocks_run=run_context.ui_blocks_run,
       redact_text=self._secret_boundary.redact_text,
       research_file_activity_owner=self._ensure_research_file_activity,
@@ -1248,9 +1406,13 @@ class ToolDispatcher:
       )
     if not callable(get_descriptor):
       raise RuntimeError("registered MCP descriptor lookup is not configured")
-    declaration = validate_tool_registration_declaration(
-      get_descriptor(tool_name).declaration
-    )
+    try:
+      live_declaration = get_descriptor(tool_name).declaration
+    except UnknownRegisteredMcpToolDescriptorError:
+      live_declaration = self._declared_down_tool_declaration(tool_name)
+      if live_declaration is None:
+        raise
+    declaration = validate_tool_registration_declaration(live_declaration)
     if catalog.by_identity(declaration.identity) != declaration:
       raise RuntimeError(
         "live registered MCP declaration does not match dispatcher catalog"
@@ -1311,6 +1473,12 @@ class ToolDispatcher:
         prepared_call.materialize_input(),
       )
     if self._mcp.is_mcp_tool(tool_name):
+      down_declaration = self._declared_down_tool_declaration(tool_name)
+      if down_declaration is not None:
+        return self._redact_registered_declaration_input(
+          down_declaration,
+          prepared_call.materialize_input(),
+        )
       return self._mcp.redact_registered_tool_input(
         tool_name,
         prepared_call,
@@ -1327,6 +1495,12 @@ class ToolDispatcher:
   ) -> dict[str, object]:
     self.ensure_gateway_local_tool_handler(tool_name)
     if tool_name not in self._local:
+      down_declaration = self._declared_down_tool_declaration(tool_name)
+      if down_declaration is not None:
+        return self._redact_registered_declaration_input(
+          down_declaration,
+          tool_input,
+        )
       return self._mcp.redact_registered_raw_tool_input(
         tool_name,
         tool_input,
@@ -1359,6 +1533,24 @@ class ToolDispatcher:
       ),
     )
     return result.materialize_input()
+
+  def _declared_down_tool_declaration(
+    self,
+    tool_name: str,
+  ) -> ToolRegistrationDeclaration | None:
+    """The catalog declaration of a declared MCP tool whose server failed its
+    startup connect: it has no live descriptor, so its history lines are redacted
+    and its approval classified through the declaration, by this dispatcher's
+    declaration-level owners."""
+    if self._tool_registration_catalog is None:
+      return None
+    lookup = getattr(self._mcp, "get_declared_down_tool_declaration", None)
+    if not callable(lookup):
+      return None
+    declaration = lookup(tool_name)
+    if declaration is None:
+      return None
+    return validate_tool_registration_declaration(declaration)
 
   def _required_registered_tool_declaration(
     self,
@@ -1485,7 +1677,7 @@ class ToolDispatcher:
     prepared_call: PreparedToolCall,
     trusted_plan: TrustedToolPlan | None = None,
   ) -> tuple[bool, str | None]:
-    """Return (approval required, approval reuse key) from the registration."""
+    """Return the owner's class decision and the registration's exact reuse key."""
 
     registry = self._tool_policy_implementations
     if registry is None:
@@ -1494,20 +1686,7 @@ class ToolDispatcher:
       raise TypeError("prepared_call must be an exact PreparedToolCall")
 
     policy = declaration.semantics.approval
-    if policy.mode == "never":
-      return False, None
-    if policy.mode == "always":
-      approval_required = True
-    else:
-      assert policy.predicate is not None
-      approval_required = registry.execute_approval_predicate(
-        policy.predicate,
-        ApprovalPredicateCall(
-          declaration.identity,
-          prepared_call.prepared_input,
-          exact_backend=prepared_call.exact_backend,
-        ),
-      )
+    approval_required = needs_human_approval(declaration.semantics.effect)
     if not approval_required or policy.cache_key is None:
       return approval_required, None
     return True, registry.execute_approval_cache_key(
@@ -1603,7 +1782,7 @@ class ToolDispatcher:
     message: str,
     *,
     request: PolicyApprovalRequest | None = None,
-    next_call: str | None = None,
+    next_call: str | Mapping[str, Any] | None = None,
   ) -> dict[str, Any]:
     """Expose approval state and its authenticated reader, never operands."""
 
@@ -1628,16 +1807,71 @@ class ToolDispatcher:
       },
     }
 
-  async def execute_approved_binding(
+  def _admit_binding(
+    self, *, binding: ExecutableApprovalBinding,
+    decision: PolicyApprovalRequest, context: Any,
+    completed: ToolResult | None,
+  ) -> tuple[AdmittedApprovedBinding | None, dict[str, Any] | None]:
+    """Parse the persisted scope once at binding admission."""
+
+    raw = binding.dispatch_context.get("registry_scope")
+    registry_scope: DeclaredRegistryScope
+    if isinstance(raw, Mapping) and dict(raw) == {"scope_type": "none"}:
+      registry_scope = NoRegistryScope()
+    elif (
+      isinstance(raw, Mapping)
+      and set(raw) == {"scope_type", "scope_id", "store_dir"}
+      and raw["scope_type"] in ("session", "run")
+      and isinstance(raw["scope_id"], str) and raw["scope_id"]
+      and isinstance(raw["store_dir"], str) and raw["store_dir"]
+    ):
+      registry_scope = RegistryScope(
+        scope_type="session" if raw["scope_type"] == "session" else "run",
+        scope_id=raw["scope_id"],
+        store_dir=raw["store_dir"],
+      )
+    else:
+      settled = completed is not None or not approval_is_executable(decision)
+      if "registry_scope" not in binding.dispatch_context and settled:
+        # A binding stored before the scope carrier has no registry_scope key.
+        # When its call already settled, or its decision never executes it,
+        # the outcome is replayed or settled as recorded: an approved call
+        # executes at most once and a decided call is never re-solicited. The
+        # binding declared no registry, so its replay persists no citation rows.
+        registry_scope = NoRegistryScope()
+      else:
+        error = self._approved_binding_error(
+          "approval_binding_registry_scope_missing",
+          "The durable call has a missing or malformed registry_scope field.",
+          request=decision,
+          next_call=(
+            "Return this call's recorded outcome to its job; do not retry or "
+            "reauthorize this call."
+            if settled
+            else build_next_call(
+              binding.tool_name,
+              PreparedToolCall(binding.prepared_input, binding.exact_backend).materialize_input(),
+            )
+          ),
+        )
+        error["data"]["field"] = "registry_scope"
+        return None, error
+    dispatch_context = dict(binding.dispatch_context)
+    dispatch_context.pop("registry_scope", None)
+    return AdmittedApprovedBinding(
+      binding=binding, decision=decision, context=context,
+      registry_scope=registry_scope, dispatch_context=dispatch_context,
+      completed=completed,
+    ), None
+
+  async def admit_approved_binding(
     self,
     *,
     job_id: str,
     tool_call_id: str,
     nonce: str,
-    abort_event: asyncio.Event | None,
-    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
-  ) -> ToolResult:
-    """Read the original outcome or execute its admitted private prepared call."""
+  ) -> tuple[AdmittedApprovedBinding | None, dict[str, Any] | None]:
+    """Authenticate and admit the original call before executing or replaying."""
 
     context = self._executing_context()
     if context is None:
@@ -1694,17 +1928,39 @@ class ToolDispatcher:
           else None
         ),
       )
-    if completed is not None:
-      return completed
+    return self._admit_binding(
+      context=context, binding=binding, decision=decision, completed=completed,
+    )
 
+  async def execute_admitted_binding(
+    self, admitted: AdmittedApprovedBinding, *,
+    abort_event: asyncio.Event | None,
+    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+  ) -> ToolResult:
+    if admitted.completed is not None:
+      return admitted.completed
     return await self._settle_decided_binding(
-      context=context,
-      binding=binding,
-      decision=decision,
-      tool_call_id=tool_call_id,
+      admitted=admitted,
+      tool_call_id=admitted.binding.tool_call_id,
       abort_event=abort_event,
       on_executed_prepared_call=on_executed_prepared_call,
       parent_attempt=None,
+    )
+
+  async def execute_approved_binding(
+    self, *, job_id: str, tool_call_id: str, nonce: str,
+    abort_event: asyncio.Event | None,
+    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+  ) -> ToolResult:
+    admitted, error = await self.admit_approved_binding(
+      job_id=job_id, tool_call_id=tool_call_id, nonce=nonce,
+    )
+    if error is not None:
+      return None, error
+    assert admitted is not None
+    return await self.execute_admitted_binding(
+      admitted, abort_event=abort_event,
+      on_executed_prepared_call=on_executed_prepared_call,
     )
 
   def parent_decided_executor(
@@ -1713,37 +1969,16 @@ class ToolDispatcher:
   ) -> "ApprovedBindingExecutor":
     """Bind a signed launch continuation as the resumed call's executor."""
 
-    signed = dict(continuation)
+    return _ParentDecidedExecutor(self, dict(continuation))
 
-    async def execute(
-      *,
-      job_id: str,
-      tool_call_id: str,
-      nonce: str,
-      abort_event: asyncio.Event | None,
-      on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
-    ) -> ToolResult:
-      return await self.execute_parent_decided_call(
-        continuation=signed,
-        job_id=job_id,
-        tool_call_id=tool_call_id,
-        nonce=nonce,
-        abort_event=abort_event,
-        on_executed_prepared_call=on_executed_prepared_call,
-      )
-
-    return execute
-
-  async def execute_parent_decided_call(
+  async def _admit_parent_decided_call(
     self,
     *,
     continuation: Mapping[str, Any],
     job_id: str,
     tool_call_id: str,
     nonce: str,
-    abort_event: asyncio.Event | None,
-    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
-  ) -> ToolResult:
+  ) -> tuple[AdmittedApprovedBinding | None, dict[str, Any] | None]:
     """Run the parent-decided original call from its signed launch continuation.
 
     A contained child never opens the parent's approval ledger. The parent read
@@ -1801,12 +2036,37 @@ class ToolDispatcher:
         "approval_binding_call_identity_mismatch",
         "The signed decision is not the original call's approval.",
       )
+    return self._admit_binding(
+      context=context, binding=binding, decision=decision, completed=None,
+    )
+
+  async def execute_parent_decided_call(
+    self, *, continuation: Mapping[str, Any], job_id: str,
+    tool_call_id: str, nonce: str, abort_event: asyncio.Event | None,
+    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+  ) -> ToolResult:
+    admitted, error = await self._admit_parent_decided_call(
+      continuation=continuation, job_id=job_id,
+      tool_call_id=tool_call_id, nonce=nonce,
+    )
+    if error is not None:
+      return None, error
+    assert admitted is not None
+    return await self._execute_parent_admitted_binding(
+      admitted, continuation=continuation, abort_event=abort_event,
+      on_executed_prepared_call=on_executed_prepared_call,
+    )
+
+  async def _execute_parent_admitted_binding(
+    self, admitted: AdmittedApprovedBinding, *,
+    continuation: Mapping[str, Any], abort_event: asyncio.Event | None,
+    on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
+  ) -> ToolResult:
+    binding = admitted.binding
     parent_attempt = _ParentClaimedAttempt()
     result = await self._settle_decided_binding(
-      context=context,
-      binding=binding,
-      decision=decision,
-      tool_call_id=tool_call_id,
+      admitted=admitted,
+      tool_call_id=binding.tool_call_id,
       abort_event=abort_event,
       on_executed_prepared_call=on_executed_prepared_call,
       parent_attempt=parent_attempt,
@@ -1839,9 +2099,9 @@ class ToolDispatcher:
       await writer({
         "completed_executable_result": {
           "approval_id": binding.approval_id,
-          "job_id": job_id,
-          "tool_call_id": tool_call_id,
-          "nonce": nonce,
+          "job_id": binding.job_id,
+          "tool_call_id": binding.tool_call_id,
+          "nonce": binding.nonce,
           "result_json": result_json,
         },
       })
@@ -1850,15 +2110,16 @@ class ToolDispatcher:
   async def _settle_decided_binding(
     self,
     *,
-    context: Any,
-    binding: ExecutableApprovalBinding,
-    decision: PolicyApprovalRequest,
+    admitted: AdmittedApprovedBinding,
     tool_call_id: str,
     abort_event: asyncio.Event | None,
     on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
     parent_attempt: _ParentClaimedAttempt | None,
   ) -> ToolResult:
     """Settle one read decision: deny it, or execute its exact prepared call."""
+    context = admitted.context
+    binding = admitted.binding
+    decision = admitted.decision
 
     if decision.state in {"denied", "auto_denied"}:
       await self._record_durable_approval_decided(
@@ -1926,9 +2187,10 @@ class ToolDispatcher:
         binding.tool_name,
         prepared_call,
         executable_approval=verified,
+        registry_scope=admitted.registry_scope,
         abort_event=abort_event,
         on_executed_prepared_call=on_executed_prepared_call,
-        **cast(dict[str, Any], binding.dispatch_context),
+        **cast(dict[str, Any], admitted.dispatch_context),
       )
     except TypeError:
       return None, self._approved_binding_error(
@@ -1963,6 +2225,7 @@ class ToolDispatcher:
       tool_call_id,
       tool_name,
       prepared_call,
+      registry_scope=replace(self._run_context.registry_scope),
       call_index=call_index,
       advertised_tool_names=advertised_tool_names,
       abort_event=abort_event,
@@ -1981,6 +2244,7 @@ class ToolDispatcher:
     tool_name: str,
     prepared_call: PreparedToolCall,
     *,
+    registry_scope: DeclaredRegistryScope,
     call_index: int,
     advertised_tool_names: AbstractSet[str] | None,
     abort_event: asyncio.Event | None,
@@ -2047,6 +2311,7 @@ class ToolDispatcher:
         call_index=call_index,
         advertised_tool_names=advertised_tool_names,
         original_prepared_call=prepared_call,
+        registry_scope=registry_scope,
         abort_event=abort_event,
         skill_run_id=skill_run_id,
         step_id=step_id,
@@ -2099,6 +2364,7 @@ class ToolDispatcher:
     *,
     advertised_tool_names: AbstractSet[str] | None,
     original_prepared_call: PreparedToolCall,
+    registry_scope: DeclaredRegistryScope,
     call_index: int = 0,
     abort_event: asyncio.Event | None = None,
     skill_run_id: str | None = None,
@@ -2290,6 +2556,7 @@ class ToolDispatcher:
         )
     if local_handler is not None:
       tool_ctx = self._new_tool_execution_context(
+        registry_scope=registry_scope,
         tool_call_id=tool_call_id,
         tool_name=tool_name,
         qualifier=qualifier,
@@ -2320,13 +2587,9 @@ class ToolDispatcher:
         )
         if durable is not None:
           if durable.lifecycle is PreparedBusinessModelLifecycle.SUPERSEDED_PRECOMMIT:
-            return None, {
-              "code": "planned_write_replan_and_reauthorize_required",
-              "message": (
-                "This BusinessModel skill-run already failed before commit; "
-                "retry with a new skill_run_id."
-              ),
-            }
+            return None, business_model_skill_run_spent_error(
+              autonomous=self._resolve_run_context().autonomous,
+            )
           if durable.lifecycle in {
             PreparedBusinessModelLifecycle.DENIED,
             PreparedBusinessModelLifecycle.EXPIRED,
@@ -2391,6 +2654,7 @@ class ToolDispatcher:
               skill_run_id=skill_run_id,
               workspace_dir=workspace_dir,
             ),
+            "registry_scope": self._resolve_run_context().registry_scope,
           },
         )
         registered_mcp_call = (
@@ -2569,13 +2833,9 @@ class ToolDispatcher:
                 raise TrustedToolPlanError(
                   "FMS skill-run locator conflicts with its terminal intent"
                 )
-              return None, {
-                "code": "planned_write_replan_and_reauthorize_required",
-                "message": (
-                  "This BusinessModel skill-run already failed before commit; "
-                  "retry with a new skill_run_id."
-                ),
-              }
+              return None, business_model_skill_run_spent_error(
+                autonomous=self._resolve_run_context().autonomous,
+              )
             if prepared_business_model_record.lifecycle in {
               PreparedBusinessModelLifecycle.DENIED,
               PreparedBusinessModelLifecycle.EXPIRED,
@@ -2659,7 +2919,6 @@ class ToolDispatcher:
                 "auto_approved",
                 "denied",
                 "auto_denied",
-                "cancelled",
                 "expired",
               }
             ):
@@ -2700,7 +2959,7 @@ class ToolDispatcher:
             registered_prepared_authorization.prepared_payload
           )
           approval_args_redacted = (
-            registered_prepared_authorization.materialize_approval_arguments()
+            registered_prepared_authorization.materialize_approval_display()
           )
           approval_args_hash = (
             registered_prepared_authorization.approval_arguments_hash
@@ -2748,6 +3007,15 @@ class ToolDispatcher:
             executable_capture=_approval_lifecycle_helpers.ExecutableCapture(
               prepared_call=original_prepared_call,
               dispatch_context={
+                "registry_scope": (
+                  {
+                    "scope_type": registry_scope.scope_type,
+                    "scope_id": registry_scope.scope_id,
+                    "store_dir": registry_scope.store_dir,
+                  }
+                  if isinstance(registry_scope, RegistryScope)
+                  else {"scope_type": "none"}
+                ),
                 "call_index": call_index,
                 "advertised_tool_names": (
                   sorted(advertised_tool_names)
@@ -2849,13 +3117,9 @@ class ToolDispatcher:
             prepared_business_model_record.lifecycle
             is PreparedBusinessModelLifecycle.SUPERSEDED_PRECOMMIT
           ):
-            return None, {
-              "code": "planned_write_replan_and_reauthorize_required",
-              "message": (
-                "This BusinessModel skill-run already failed before commit; "
-                "retry with a new skill_run_id."
-              ),
-            }
+            return None, business_model_skill_run_spent_error(
+              autonomous=self._resolve_run_context().autonomous,
+            )
           elif prepared_business_model_record.lifecycle in {
             PreparedBusinessModelLifecycle.DENIED,
             PreparedBusinessModelLifecycle.EXPIRED,
@@ -2940,7 +3204,7 @@ class ToolDispatcher:
           tool_name,
           outcome="approved",
           decision_source="planned_write_reinvocation_required",
-          allow_tool_type_applied=False,
+          allow_tool_type_applied=lifecycle["allow_tool_type"],
           request=approval_request_record,
         )
         return None, {
@@ -2961,7 +3225,7 @@ class ToolDispatcher:
           tool_name,
           outcome="denied",
           decision_source=lifecycle.get("decision_source") or decision_source,
-          allow_tool_type_applied=False,
+          allow_tool_type_applied=lifecycle["allow_tool_type"],
           request=approval_request_record,
         )
         return None, error_dict
@@ -2997,7 +3261,7 @@ class ToolDispatcher:
             else "user_approved"
           )
         ),
-        allow_tool_type_applied=False,
+        allow_tool_type_applied=lifecycle["allow_tool_type"],
         request=approval_request_record,
       )
 
@@ -3047,6 +3311,15 @@ class ToolDispatcher:
           executable_capture=_approval_lifecycle_helpers.ExecutableCapture(
             prepared_call=original_prepared_call,
             dispatch_context={
+              "registry_scope": (
+                {
+                  "scope_type": registry_scope.scope_type,
+                  "scope_id": registry_scope.scope_id,
+                  "store_dir": registry_scope.store_dir,
+                }
+                if isinstance(registry_scope, RegistryScope)
+                else {"scope_type": "none"}
+              ),
               "call_index": call_index,
               "advertised_tool_names": (
                 sorted(advertised_tool_names)
@@ -3097,7 +3370,7 @@ class ToolDispatcher:
             tool_name,
             outcome="denied",
             decision_source=decision_source,
-            allow_tool_type_applied=False,
+            allow_tool_type_applied=lifecycle["allow_tool_type"],
             request=approval_request_record,
           )
           return None, error_dict
@@ -3124,7 +3397,7 @@ class ToolDispatcher:
             if getattr(approval_request_record, "state", None) == "auto_approved"
             else "user_approved"
           ),
-          allow_tool_type_applied=False,
+          allow_tool_type_applied=lifecycle["allow_tool_type"],
           request=approval_request_record,
         )
       elif self._request_approval is None:
@@ -3136,17 +3409,16 @@ class ToolDispatcher:
         allow_persistent = not dynamic_ask
         approval_reason = ir.pending_ask.message if ir.pending_ask is not None else ""
         approval_tool_input = self._approval_transport_input(tool_name, tool_input)
-        decision = await self._request_approval(
-          ApprovalRequest(
-            tool_call_id=tool_call_id,
-            nonce=os.urandom(8).hex(),
-            tool_name=tool_name,
-            tool_input=approval_tool_input,
-            resolved_qualifier=qualifier,
-            reason=approval_reason,
-            allow_persistent_approval=allow_persistent,
-          )
+        approval_request = ApprovalRequest(
+          tool_call_id=tool_call_id,
+          nonce=os.urandom(8).hex(),
+          tool_name=tool_name,
+          tool_input=approval_tool_input,
+          resolved_qualifier=qualifier,
+          reason=approval_reason,
+          allow_persistent_approval=allow_persistent,
         )
+        decision = await self._request_approval(approval_request)
         self._emit_approval_decided(
           tool_call_id,
           tool_name,
@@ -3154,6 +3426,7 @@ class ToolDispatcher:
           decision_source="user_approved" if decision.approved else "user_denied",
           allow_tool_type_applied=False,
           decision_reason=decision.reason,
+          approval_id=approval_request.approval_id,
         )
         if not decision.approved:
           return None, {
@@ -3311,13 +3584,6 @@ class ToolDispatcher:
           )
           else None
         )
-        if (
-          resolved_risk_user_id is None
-          and self._user_id is not None
-          and str(self._user_id).isdigit()
-        ):
-          numeric_user_id = int(str(self._user_id))
-          resolved_risk_user_id = numeric_user_id if numeric_user_id > 0 else None
         if self._credentials_resolver_active and resolved_risk_user_id is None:
           raise RuntimeError("MCP meta user_id is required in strict mode")
         meta = {
@@ -3326,15 +3592,40 @@ class ToolDispatcher:
           "channel": self._channel,
           "role": self._role,
         }
+        # A gateway-minted session carries an issuer for the delegated bearer an
+        # agent tool callback presents (purpose=agent_tool_callback, one per turn);
+        # a session without one (a runtime child restored from launch secrets)
+        # presents its own token, whose stored purpose already names the runtime.
+        callback_issuer = getattr(self._session, "tool_callback_token_issuer", None)
         caller_session_token = getattr(self._session, "session_token", None)
-        if caller_session_token is not None:
+        if callable(callback_issuer):
+          meta["session_token"] = callback_issuer(
+            str(self._run_context.request_id or tool_call_id or self._session_id)
+          )
+        elif caller_session_token is not None:
           meta["session_token"] = caller_session_token
+        research_binding = session_research_binding(
+          self._session, executing_context=self._executing_context(),
+        )
+        if research_binding.research_file_id is not None:
+          meta["research_file_id"] = research_binding.research_file_id
         meta.update(
           self._mcp_meta_run_context(
             skill_run_id=skill_run_id,
             workspace_dir=workspace_dir,
           )
         )
+        # A session-scoped run keeps its ``[S_N]`` rows in the session registry,
+        # which the run id in this meta does not name; a product route a tool
+        # calls back into reads them only from the scope it is handed. A run
+        # scope is the run id above, so it adds nothing.
+        declared_registry_scope = self._resolve_run_context().registry_scope
+        if (
+          isinstance(declared_registry_scope, RegistryScope)
+          and declared_registry_scope.scope_type == "session"
+        ):
+          meta["registry_scope_type"] = declared_registry_scope.scope_type
+          meta["registry_scope_id"] = declared_registry_scope.scope_id
         if batch_id is not None:
           meta["batch_id"] = str(batch_id)
         if (
@@ -3518,7 +3809,13 @@ class ToolDispatcher:
         if not execution_result_known and error is not None:
           note_unknown_execution(error)
     else:
-      result, error = None, {"code": "unknown_tool", "message": f"Unknown tool: {tool_name}"}
+      refused_route = getattr(self._mcp, "get_refused_mcp_route", lambda _name: None)(
+        tool_name
+      )
+      if isinstance(refused_route, RefusedMcpRoute):
+        result, error = None, refused_route.call_error()
+      else:
+        result, error = None, {"code": "unknown_tool", "message": f"Unknown tool: {tool_name}"}
 
     if ir.warnings and error is None and result is not None and isinstance(result, dict):
       result = dict(result)
@@ -3695,8 +3992,8 @@ class ToolDispatcher:
       return False
     registered_declaration = self._registered_approval_declaration(tool_name)
     if registered_declaration is not None:
-      registered_static_needs_approval = (
-        registered_declaration.semantics.approval.mode != "never"
+      registered_static_needs_approval = needs_human_approval(
+        registered_declaration.semantics.effect,
       )
       return self._requires_approval_with_qualifier(
         tool_name,
@@ -3965,7 +4262,7 @@ class ToolDispatcher:
     if self._spawning_turn is not None:
       return self._spawning_turn.context
     if self._session is not None:
-      return self._session.admitted_job_context
+      return getattr(self._session, "admitted_job_context", None)
     return None
 
   def _executing_root_turn(self) -> admission.RootTurnAdmission | None:
@@ -3983,11 +4280,6 @@ class ToolDispatcher:
     return _approval_lifecycle_helpers.resolve_run_context(
       run_context=self._run_context,
       session=self._session,
-      user_id=self._user_id,
-      channel=self._channel,
-      role=self._role,
-      session_id=self._session_id,
-      approval_policy=self._approval_policy,
     )
 
   def _resolve_tool_class(self, tool_name: str) -> str:
@@ -4084,7 +4376,7 @@ class ToolDispatcher:
     overwritten.
     """
 
-    schema = self._tool_input_schema(tool_name)
+    schema = self.tool_input_schema(tool_name)
     properties = _schema_properties(schema)
     if "research_file_id" not in properties:
       return tool_input
@@ -4209,7 +4501,7 @@ class ToolDispatcher:
       context["workspace_dir"] = workspace_dir
     return context
 
-  def _tool_input_schema(
+  def tool_input_schema(
     self, tool_name: str, server: str | None = None,
   ) -> Mapping[str, Any]:
     """The named tool's full input schema, from its live definition."""
@@ -4229,7 +4521,7 @@ class ToolDispatcher:
     if server:
       candidate_names.add(f"mcp__{server}__{original_name}")
     for definition in definitions:
-      if not isinstance(definition, dict):
+      if not isinstance(definition, Mapping):
         continue
       if str(definition.get("name") or "") not in candidate_names:
         continue
@@ -4240,7 +4532,7 @@ class ToolDispatcher:
     return {}
 
   def _portfolio_scope_fields_for_tool(self, tool_name: str, server: str) -> set[str]:
-    return set(_schema_properties(self._tool_input_schema(tool_name, server))) & _PORTFOLIO_SCOPE_FIELDS
+    return set(_schema_properties(self.tool_input_schema(tool_name, server))) & _PORTFOLIO_SCOPE_FIELDS
 
   def _coerce_stringified_json_fields(
     self, tool_name: str, tool_input: Dict[str, Any],
@@ -4253,7 +4545,7 @@ class ToolDispatcher:
     that owns the field's validation answers it.
     """
 
-    properties = _schema_properties(self._tool_input_schema(tool_name))
+    properties = _schema_properties(self.tool_input_schema(tool_name))
     if not properties:
       return tool_input
     coerced: Dict[str, Any] | None = None
@@ -4420,6 +4712,7 @@ class ToolDispatcher:
     allow_tool_type_applied: bool,
     request: PolicyApprovalRequest | None = None,
     decision_reason: str | None = None,
+    approval_id: str | None = None,
   ) -> dict[str, Any] | None:
     return _audit_helpers.emit_approval_decided(
       self._boundary_event_log,
@@ -4428,7 +4721,7 @@ class ToolDispatcher:
       outcome=outcome,
       decision_source=decision_source,
       allow_tool_type_applied=allow_tool_type_applied,
-      approval_id=request.approval_id if request is not None else None,
+      approval_id=request.approval_id if request is not None else approval_id,
       decision_reason=request.decision_reason if request is not None else decision_reason,
       time_fn=time.time,
     )

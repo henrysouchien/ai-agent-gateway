@@ -50,6 +50,10 @@ GateCode: TypeAlias = Literal[
   "UNKNOWN",
 ]
 GATE_CODES: frozenset[str] = frozenset(get_args(GateCode))
+# UNKNOWN means no decisive outcome: no verdict, or a non-completed result the
+# door did not declare. A batch run row stores only a decisive code; UNKNOWN
+# is recorded as an absent gate, not the token.
+DECISIVE_GATE_CODES: frozenset[str] = GATE_CODES - {"UNKNOWN"}
 TopLevelServerTerminalCause = Literal[
   "caller_cancellation",
   "shutdown",

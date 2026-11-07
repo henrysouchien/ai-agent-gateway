@@ -25,6 +25,7 @@ from fastapi import FastAPI
 
 from hank_model_transport._provider_utils import _resolve_provider
 from .agent_session_log import AgentSessionLog, slugify
+from .approval_policy import RunContext
 from .auth import CredentialsResolver
 from model_authority.binding import CredentialHandle
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
@@ -61,6 +62,7 @@ from .server import (
 )
 from .session import AuthManager, GatewaySession, session_owner_user_id
 from .skills import SkillLoader, SkillStateStore
+from .registry_scope import NoRegistryScope
 from .task_registry import CoordinatorConfig, ParentMessage, RegistryOwner
 from .tool_dispatcher import LocalToolHandler
 from model_authority.thinking import resolve_effort_pair
@@ -824,6 +826,17 @@ def create_agent(
         event_log=event_log,
         session_id=session_id,
         mcp_session_inject_servers=mcp_session_inject_servers,
+        # The embedding SDK runner has no research workspace or source store,
+        # so it declares no citation registry (UNC-FMS 2ac8f992). An easy
+        # runner given FMS tools with a real workspace declares RUN instead.
+        run_context=RunContext(
+          user_id=session_owner_user_id(session),
+          request_id=session_id,
+          session_id=session_id,
+          run_id=session_id,
+          profile="chat_embedded",
+          registry_scope=NoRegistryScope(),
+        ),
         get_tool_definitions=_get_tool_defs,
         commercial_work_start=request.commercial_work_start,
         commercial_irreversible_recheck=(
@@ -853,6 +866,7 @@ def create_agent(
         selection_snapshot=capture_selection_snapshot(
           capability_execution_resolver.selection_policy,
         ),
+        selection_provenance=request.selection_provenance,
       )
       root_inbox: asyncio.Queue[ParentMessage] = asyncio.Queue(maxsize=64)
       runner = AgentRunner(

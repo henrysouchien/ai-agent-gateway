@@ -12,6 +12,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import EventLog
+from agent_gateway.registry_scope import NoRegistryScope
 import agent_gateway.tool_dispatcher as dispatcher_module
 import agent_gateway.tool_dispatcher_helpers as dispatcher_helpers
 
@@ -43,6 +44,7 @@ def test_tool_execution_context_emits_and_tracks_abort() -> None:
   ctx = dispatcher_module.ToolExecutionContext(
     tool_call_id="tool-1",
     tool_name="demo",
+    registry_scope=NoRegistryScope(),
     event_log=event_log,
     abort_event=abort_event,
   )
@@ -66,6 +68,7 @@ def test_tool_execution_context_emit_owns_its_delivery_failure() -> None:
   ctx = dispatcher_module.ToolExecutionContext(
     tool_call_id="tool-1",
     tool_name="demo",
+    registry_scope=NoRegistryScope(),
     event_log=event_log,
   )
 

@@ -3,18 +3,22 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field, replace
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException, Request, Response
 from fastapi.routing import APIRoute
 
 import agent_gateway.autonomous as autonomous
+from agent_gateway.registry_scope import NoRegistryScope
 import model_authority.selection as selection
 from agent_gateway import EventLog, create_agent
 from agent_gateway.admission import (
+  default_root_provenance,
   AdmittedContext,
   AdmissionOwners,
   OperationRegistration,
@@ -32,13 +36,14 @@ from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.autonomous_runner import AutonomousRegistry
 from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.model_preferences import ModelPreferenceStore
 from agent_gateway.single_user_policy import SingleUserApprovalPolicy
 from agent_gateway.control_plane import batches, runs, schedules
 from agent_gateway.control_plane.runs_models import AutonomousDispatchRequest
 from agent_gateway.server import ChatRequest, ChatTurnInputs, GatewayServerConfig, create_gateway_app
 from agent_gateway.session import GatewaySession
 from agent_gateway.approval_route import NoApprovalRoute
-from agent_gateway.server_chat_helpers import RootPresetMap, prepare_session_driver_turn
+from agent_gateway.server_chat_helpers import RootPresetMap, _root_preset_map, prepare_session_driver_turn
 from agent_gateway.sub_agent import _spawn_root_context
 from agent_workflow_contracts.models import (
   AdmittedContextWire,
@@ -158,7 +163,7 @@ def _assert_child_keeps_capture(
   assert admitted.wire.selection_snapshot == snapshot.to_json()
   assert len(observation.captures) == 1
   # A later unrelated mint must not inherit this root's capture implicitly.
-  later = root_context(_session("later-root"), withheld_tools=frozenset(), research_file_id=None)
+  later = root_context(_session("later-root"), withheld_tools=frozenset(), research_file_id=None, selection_provenance=None)
   assert later.selection_snapshot is None
 
 
@@ -208,6 +213,11 @@ def test_easy_runtime_root_captures_once_and_forwards_to_child(
     snapshot = _assert_root_capture(parent, resolver, observation)
     child = _admit_child(parent, resolver, session)
     _assert_child_keeps_capture(child, snapshot, observation)
+    assert parent.selection_provenance == prepared.request.selection_provenance
+    assert parent.selection_provenance is not None
+    assert parent.selection_provenance.preset_layer == "policy_default"
+    assert child.wire.selection_provenance is not None
+    assert child.wire.selection_provenance.preset_layer == parent.selection_provenance.preset_layer
 
   asyncio.run(build_and_spawn())
 
@@ -273,7 +283,12 @@ def test_batch_stage_factory_captures_once_and_forwards_to_child(
 
   async def start_and_admit() -> None:
     batch_id = batches._acquire_and_start_batch(
-      {}, app_state=app_state, registry=object(), task_registry=task_registry,
+      {}, app_state=app_state, registry=SimpleNamespace(
+        launch_approval_settings=lambda _batch_id: {
+          "approval_policy": "approve_all",
+          "approve_live_orders": False,
+        },
+      ), task_registry=task_registry,
       dispatch_key="snapshot-test", dispatch_request_spec={},
       user_id=session.user_id, user_email=None, role="owner", channel="cli",
       authenticated_session=session, capability_execution_resolver=resolver,
@@ -287,6 +302,10 @@ def test_batch_stage_factory_captures_once_and_forwards_to_child(
     assert parents[0].research_binding.research_file_id == 42
     snapshot = _assert_root_capture(parents[0], resolver, observation)
     _assert_child_keeps_capture(children[0], snapshot, observation)
+    assert parents[0].selection_provenance is not None
+    assert parents[0].selection_provenance.preset_layer == "policy_default"
+    assert children[0].wire.selection_provenance is not None
+    assert children[0].wire.selection_provenance.preset_layer == "policy_default"
 
   asyncio.run(start_and_admit())
 
@@ -311,15 +330,20 @@ def test_run_autonomous_root_snapshot_matches_optional_resolver(
       snapshot = _assert_root_capture(parent, resolver, observation)
       child = _admit_child(parent, resolver, session)
       _assert_child_keeps_capture(child, snapshot, observation)
+      assert parent.selection_provenance is not None
+      assert parent.selection_provenance.preset_layer == "policy_default"
     else:
       assert isinstance(parent, ParentContext)
       assert parent.selection_snapshot is None
       assert observation.captures == []
+      assert parent.selection_provenance is not None
+      assert parent.selection_provenance.preset_layer is None
     return autonomous.RunOutput("complete", [], {}, None, False)
 
   monkeypatch.setattr(autonomous, "run_session", run_session)
   output = asyncio.run(autonomous.run_autonomous(
     "System", "Read evidence", capability_execution=execution, session=session,
+    registry_scope=NoRegistryScope(),
     capability_execution_resolver=resolver if with_resolver else None,
     user_id=session.user_id, billing_mode="byok", rate_table_version="test",
   ))
@@ -327,10 +351,12 @@ def test_run_autonomous_root_snapshot_matches_optional_resolver(
   assert len(observation.captures) == (1 if with_resolver else 0)
 
 
-def test_product_unadmitted_runtime_root_captures_once_and_forwards_to_child(
+@pytest.mark.parametrize("recorded_layer", ["request", "process_override", "deployment_file", "policy_default", None])
+def test_product_unadmitted_runtime_preserves_signed_provenance_for_children(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
   owner_session_host_policy: Any,
+  recorded_layer: Any,
 ) -> None:
   # Product imports stay inside the test: the gateway wheel collects without api.
   root = Path(__file__).resolve().parents[3]
@@ -387,7 +413,20 @@ def test_product_unadmitted_runtime_root_captures_once_and_forwards_to_child(
     composition.config, local_tool_names={"memory_read"}, always_on_mcp_servers=set(),
     core_mcp_tools={}, deferred_mcp_servers=set(), tool_packs={},
   ))
-  runtime = build_exact_autonomous_test_runtime()
+  recorded_provenance = (
+    SelectionProvenance(
+      role=None, role_source=None, effort_source=None,
+      preset=(
+        SelectionPresetProvenance(
+          name="recorded_user_preset", scope="user", policy_revision="recorded-policy",
+        )
+        if recorded_layer == "request" else None
+      ),
+      preset_layer=recorded_layer,
+    )
+    if recorded_layer is not None else None
+  )
+  runtime = build_exact_autonomous_test_runtime(selection_provenance=recorded_provenance)
   try:
     resolver = runtime.capability_execution_resolver
     observation = _observe_snapshots(monkeypatch)
@@ -413,6 +452,14 @@ def test_product_unadmitted_runtime_root_captures_once_and_forwards_to_child(
     snapshot = _assert_root_capture(parent, resolver, observation)
     child = _admit_child(parent, resolver, context.gateway_session)
     _assert_child_keeps_capture(child, snapshot, observation)
+    assert parent.selection_provenance is runtime.admission.envelope.selection_provenance
+    assert parent.selection_provenance == recorded_provenance
+    assert context.gateway_session.autonomous_selection_provenance == recorded_provenance
+    assert child.wire.selection_provenance is not None
+    assert child.wire.selection_provenance.preset_layer == recorded_layer
+    assert child.wire.selection_provenance.preset == (
+      recorded_provenance.preset if recorded_provenance is not None else None
+    )
   finally:
     runtime.close()
 
@@ -520,11 +567,17 @@ def test_control_root_captures_declared_policy_and_forwards_to_child(
   if with_policy:
     snapshot = _assert_root_capture(parent, resolver, observation)
     _assert_child_keeps_capture(children[0], snapshot, observation)
+    assert parent.selection_provenance is not None
+    assert parent.selection_provenance.preset_layer == "policy_default"
+    assert children[0].wire.selection_provenance is not None
+    assert children[0].wire.selection_provenance.preset_layer == "policy_default"
   else:
     assert parent.selection_snapshot is None
     assert children[0].wire.selection_snapshot is None
     assert observation.captures == []
     assert observation.selections == [("node.explore", None)]
+    assert parent.selection_provenance is not None
+    assert parent.selection_provenance.preset_layer is None
 
 
 _PRESET = "subtree_quick"
@@ -598,6 +651,7 @@ def test_spawn_model_preset_scopes_its_subtree_and_leaves_siblings(
   root_snapshot = selection.capture_selection_snapshot(resolver.selection_policy)
   parent = root_context(
     session, withheld_tools=frozenset(), research_file_id=None, selection_snapshot=root_snapshot,
+    selection_provenance=default_root_provenance(resolver.selection_policy),
   )
 
   scoped = _admit_explore(parent, resolver, session, model_preset=_PRESET)
@@ -619,6 +673,7 @@ def test_spawn_model_preset_never_reselects_a_frozen_bind(owner_session_host_pol
   root_snapshot = selection.capture_selection_snapshot(resolver.selection_policy)
   parent = root_context(
     session, withheld_tools=frozenset(), research_file_id=None, selection_snapshot=root_snapshot,
+    selection_provenance=default_root_provenance(resolver.selection_policy),
   )
   frozen = resolver.select_bind("node.explore", selection_snapshot=root_snapshot)
 
@@ -634,6 +689,7 @@ def test_spawn_model_preset_unpublished_name_refuses(owner_session_host_policy: 
   parent = root_context(
     session, withheld_tools=frozenset(), research_file_id=None,
     selection_snapshot=selection.capture_selection_snapshot(resolver.selection_policy),
+    selection_provenance=default_root_provenance(resolver.selection_policy),
   )
 
   with pytest.raises(CapabilityResolutionError) as raised:
@@ -734,8 +790,6 @@ def test_server_composition_retains_autonomous_policy_object(
     setattr(registry, "selection_policy", resolver.selection_policy)
 
 
-def _empty_provenance() -> SelectionProvenance:
-  return SelectionProvenance(role=None, role_source=None, effort_source=None, preset=None)
 
 
 def test_spawn_records_role_and_effort_sources(owner_session_host_policy: Any) -> None:
@@ -744,26 +798,31 @@ def test_spawn_records_role_and_effort_sources(owner_session_host_policy: Any) -
   parent = root_context(
     session, withheld_tools=frozenset(), research_file_id=None,
     selection_snapshot=selection.capture_selection_snapshot(resolver.selection_policy),
+    selection_provenance=default_root_provenance(resolver.selection_policy),
   )
 
   spawned = _admit_explore(parent, resolver, session, role="fast", effort="none")
   assert spawned.wire.selection_provenance == SelectionProvenance(
     role="fast", role_source="spawn", effort_source="spawn", preset=None,
+    preset_layer="policy_default",
   )
   operated = _admit_explore(
     parent, resolver, session, operation_role="fast", operation_effort="none",
   )
   assert operated.wire.selection_provenance == SelectionProvenance(
     role="fast", role_source="operation", effort_source="operation", preset=None,
+    preset_layer="policy_default",
   )
   default = _admit_explore(parent, resolver, session)
   default_provenance = default.wire.selection_provenance
   assert default_provenance == SelectionProvenance(
     role="explore", role_source=None, effort_source=None, preset=None,
+    preset_layer="policy_default",
   )
   assert default_provenance is not None
   assert default_provenance.model_dump(mode="json") == {
     "role": "explore", "role_source": None, "effort_source": None, "preset": None,
+    "preset_layer": "policy_default",
   }
 
 
@@ -775,6 +834,7 @@ def test_subtree_preset_provenance_is_what_grandchildren_inherit(
   parent = root_context(
     session, withheld_tools=frozenset(), research_file_id=None,
     selection_snapshot=selection.capture_selection_snapshot(resolver.selection_policy),
+    selection_provenance=default_root_provenance(resolver.selection_policy),
   )
 
   scoped = _admit_explore(parent, resolver, session, model_preset=_PRESET)
@@ -784,14 +844,43 @@ def test_subtree_preset_provenance_is_what_grandchildren_inherit(
   assert provenance.preset.scope == "subtree"
   assert scoped.wire.selection_snapshot is not None
   assert provenance.preset.policy_revision == scoped.wire.selection_snapshot["policy_revision"]
+  assert provenance.preset_layer == "request"
   child = context_for_child(scoped, job_id="scoped-child")
   assert child.selection_provenance == provenance
   grandchild = _admit_explore(child, resolver, session)
   assert grandchild.wire.selection_provenance is not None
   assert grandchild.wire.selection_provenance.preset == provenance.preset
+  assert grandchild.wire.selection_provenance.preset_layer == "request"
   sibling = _admit_explore(parent, resolver, session)
   assert sibling.wire.selection_provenance is not None
   assert sibling.wire.selection_provenance.preset is None
+  assert sibling.wire.selection_provenance.preset_layer == "policy_default"
+
+
+@pytest.mark.parametrize("layer", ["process_override", "deployment_file", "policy_default", None])
+def test_child_preset_layer_inherits_or_starts_a_request_subtree(
+  owner_session_host_policy: Any,
+  layer: Any,
+) -> None:
+  resolver = _preset_resolver()
+  session = _session("provenance-layer")
+  parent = root_context(
+    session, withheld_tools=frozenset(), research_file_id=None,
+    selection_snapshot=selection.capture_selection_snapshot(resolver.selection_policy),
+    selection_provenance=SelectionProvenance(role=None, role_source=None, effort_source=None, preset=None, preset_layer=layer),
+  )
+  inherited = _admit_explore(parent, resolver, session)
+  assert inherited.wire.selection_provenance is not None
+  assert inherited.wire.selection_provenance.preset_layer == layer
+  scoped = _admit_explore(parent, resolver, session, model_preset=_PRESET)
+  assert scoped.wire.selection_provenance is not None
+  assert scoped.wire.selection_provenance.preset_layer == "request"
+  grandchild = _admit_explore(context_for_child(scoped, job_id="layer-child"), resolver, session)
+  assert grandchild.wire.selection_provenance is not None
+  assert grandchild.wire.selection_provenance.preset_layer == "request"
+  sibling = _admit_explore(parent, resolver, session)
+  assert sibling.wire.selection_provenance is not None
+  assert sibling.wire.selection_provenance.preset_layer == layer
 
 
 def test_frozen_bind_writes_no_selection_provenance(owner_session_host_policy: Any) -> None:
@@ -800,6 +889,7 @@ def test_frozen_bind_writes_no_selection_provenance(owner_session_host_policy: A
   snapshot = selection.capture_selection_snapshot(resolver.selection_policy)
   parent = root_context(
     session, withheld_tools=frozenset(), research_file_id=None, selection_snapshot=snapshot,
+    selection_provenance=default_root_provenance(resolver.selection_policy),
   )
   frozen = resolver.select_bind("node.explore", selection_snapshot=snapshot)
 
@@ -819,6 +909,7 @@ def test_historical_wire_without_provenance_re_serializes_byte_identical(
   snapshot = selection.capture_selection_snapshot(resolver.selection_policy)
   parent = root_context(
     session, withheld_tools=frozenset(), research_file_id=None, selection_snapshot=snapshot,
+    selection_provenance=default_root_provenance(resolver.selection_policy),
   )
   frozen = resolver.select_bind("node.explore", selection_snapshot=snapshot)
   omitted = _admit_explore(parent, resolver, session, frozen_bind=frozen).wire.model_dump_json()
@@ -845,8 +936,8 @@ def test_root_provenance_carries_preset_name_and_scope(owner_session_host_policy
     ),
   )
   parent = root_context(
-    session, withheld_tools=frozenset(), research_file_id=None,
-    selection_snapshot=snapshot, selection_provenance=provenance,
+    session, withheld_tools=frozenset(), research_file_id=None, selection_snapshot=snapshot,
+    selection_provenance=provenance,
   )
   assert parent.selection_provenance == provenance
   child = _admit_explore(parent, resolver, session)
@@ -856,8 +947,9 @@ def test_root_provenance_carries_preset_name_and_scope(owner_session_host_policy
   minted = root_context_from_identity(
     tenant=None, job_id=None, tool_ids=None, withheld_tools=frozenset(),
     research_binding=AdmittedResearchBinding(), approval_route=NoApprovalRoute(),
+    selection_provenance=default_root_provenance(resolver.selection_policy),
   )
-  assert minted.selection_provenance == _empty_provenance()
+  assert minted.selection_provenance == default_root_provenance(resolver.selection_policy)
 
 
 def test_spawn_root_remint_keeps_the_turns_root_provenance(
@@ -873,8 +965,8 @@ def test_spawn_root_remint_keeps_the_turns_root_provenance(
     ),
   )
   root_context(
-    session, withheld_tools=frozenset(), research_file_id=None,
-    selection_snapshot=snapshot, selection_provenance=provenance,
+    session, withheld_tools=frozenset(), research_file_id=None, selection_snapshot=snapshot,
+    selection_provenance=provenance,
   )
 
   spawning = _spawn_root_context(
@@ -888,13 +980,18 @@ def test_spawn_root_remint_keeps_the_turns_root_provenance(
 
 
 
-def test_prepare_session_driver_turn_stamps_root_preset_provenance(
+def _prepare_root_turn(
   monkeypatch: pytest.MonkeyPatch,
   tmp_path: Path,
-  owner_session_host_policy: Any,
-) -> None:
+  *,
+  preset_map: RootPresetMap,
+  policy_source: Literal["process_override"] | None = None,
+  model_key: str | None = None,
+  effort: str | None = None,
+  claims_turn: bool = True,
+) -> Any:
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
-  (tmp_path / "gateway").mkdir(mode=0o700)
+  (tmp_path / "gateway").mkdir(mode=0o700, parents=True)
   app = create_agent("System", api_key="test-key", session_log_base_dir=tmp_path / "sessions")
   config = app.state.gateway_config
   session = app.state.auth.session_store.create_session(
@@ -909,34 +1006,202 @@ def test_prepare_session_driver_turn_stamps_root_preset_provenance(
     ),
   )
 
-  def named_map(*_args: Any, **_kwargs: Any) -> RootPresetMap:
-    return RootPresetMap(name="quiet", scope="user", source="saved_preference")
+  build_chat_runtime = app.state.gateway_build_chat_runtime
+  policy = config.model_selection_policy
+  monkeypatch.setattr(
+    build_chat_runtime,
+    "_gateway_model_selection_policy",
+    replace(
+      policy, default_preset=next(iter(policy.presets)) if policy_source is not None else None,
+      default_preset_source=policy_source,
+    ),
+  )
 
   monkeypatch.setattr(
-    "agent_gateway.server_chat_helpers._root_preset_for_session", named_map,
+    "agent_gateway.server_chat_helpers._root_preset_for_session",
+    lambda *_args, **_kwargs: preset_map,
   )
   request = ChatRequest.model_validate({"messages": [{"role": "user", "content": "Read evidence"}]})
   inputs = ChatTurnInputs(
     messages=list(request.messages), request_id=request.request_id,
     context=dict(request.context), metadata=dict(request.metadata),
-    model_key=request.model_key, effort=request.effort,
+    model_key=model_key, effort=effort,
     catalog_revision=request.catalog_revision, ui_blocks_contract=request.ui_blocks_contract,
     commercial_work_start=request.commercial_work_start,
+    claims_turn=claims_turn,
   )
   prepared = prepare_session_driver_turn(
     session, inputs, build_chat_runtime=app.state.gateway_build_chat_runtime,
+  )
+  return prepared
+
+
+@pytest.mark.parametrize("claims_turn", [True, False])
+def test_prepared_request_carries_whether_its_build_claims_the_turn(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+  claims_turn: bool,
+) -> None:
+  prepared = _prepare_root_turn(
+    monkeypatch, tmp_path,
+    preset_map=RootPresetMap(name="quiet", scope="user", source="saved_preference"),
+    claims_turn=claims_turn,
+  )
+  assert prepared.request.claims_turn is claims_turn
+
+
+def test_prepare_session_driver_turn_stamps_root_preset_provenance(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+) -> None:
+  prepared = _prepare_root_turn(
+    monkeypatch, tmp_path,
+    preset_map=RootPresetMap(name="quiet", scope="user", source="saved_preference"),
   )
   stamped = getattr(prepared.request, "_selection_provenance")
   assert isinstance(stamped, SelectionProvenance)
   assert stamped.role is None and stamped.role_source is None and stamped.effort_source is None
   assert stamped.preset is not None
   assert (stamped.preset.name, stamped.preset.scope) == ("quiet", "user")
+  assert stamped.preset_layer == "request"
   assert prepared.selection_snapshot is not None
   assert stamped.preset.policy_revision == prepared.selection_snapshot.policy_revision
   bind = prepared.request.capability_bind
   assert bind is not None
-  explicit = prepare_session_driver_turn(
-    session, replace(inputs, model_key=bind.model_key, effort=bind.effort),
-    build_chat_runtime=app.state.gateway_build_chat_runtime,
+  explicit = _prepare_root_turn(
+    monkeypatch, tmp_path / "explicit",
+    preset_map=RootPresetMap(name="quiet", scope="user", source="saved_preference"),
+    model_key=bind.model_key, effort=bind.effort,
   )
   assert getattr(explicit.request, "_selection_provenance").effort_source == "explicit"
+
+
+@pytest.mark.parametrize(
+  ("policy_source", "layer"),
+  [("process_override", "process_override"), (None, "policy_default")],
+)
+def test_root_preset_layer_records_authority_without_a_session_preset(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+  policy_source: Literal["process_override"] | None,
+  layer: str,
+) -> None:
+  prepared = _prepare_root_turn(
+    monkeypatch, tmp_path, preset_map=RootPresetMap(), policy_source=policy_source,
+  )
+  provenance = prepared.request._selection_provenance
+  assert provenance.preset is None
+  assert provenance.preset_layer == layer
+
+
+@pytest.mark.parametrize("scope", ["run", "user", "firm"])
+@pytest.mark.parametrize("source", ["process_override", None])
+def test_session_preset_layer_outranks_authority_and_preserves_scope(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+  scope: Literal["run", "user", "firm"],
+  source: Literal["process_override"] | None,
+) -> None:
+  prepared = _prepare_root_turn(
+    monkeypatch, tmp_path,
+    preset_map=RootPresetMap(name="quiet", scope=scope, source="internal_policy"),
+    policy_source=source,
+  )
+  provenance = prepared.request._selection_provenance
+  assert provenance.preset is not None
+  assert provenance.preset.scope == scope
+  assert provenance.preset_layer == "request"
+
+
+@pytest.mark.parametrize("winner", ["run", "user", "firm", None])
+@pytest.mark.parametrize("source", ["process_override", None])
+def test_preset_layer_follows_existing_whole_map_precedence(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  owner_session_host_policy: Any,
+  winner: str | None,
+  source: Literal["process_override"] | None,
+) -> None:
+  policy = _preset_resolver().selection_policy
+  role_map = policy.presets[_PRESET]
+  policy = replace(
+    policy, presets={name: role_map for name in ("run", "user", "firm", "authority")},
+    default_preset="authority" if source is not None else None,
+    default_preset_source=source,
+  )
+  account_id = UUID(int=1)
+  store = ModelPreferenceStore(
+    tmp_path / "preferences.sqlite3", known_preset_names=frozenset(policy.presets),
+  )
+  if winner in {"run", "user"}:
+    store.put_user_preset(
+      tenant_id="tenant", actor_id="actor", name="user", policy_revision=policy.revision,
+    )
+  if winner is not None:
+    store.put_firm_preset(
+      commercial_account_id=account_id, name="firm", policy_revision=policy.revision,
+    )
+  preset = _root_preset_map(
+    policy, preference_store=store, tenant_id="tenant", actor_id="actor",
+    commercial_account_id=account_id,
+    run_preset="run" if winner == "run" else None,
+  )
+  assert preset.name == winner
+  assert preset.scope == winner
+  snapshot = selection.capture_selection_snapshot(
+    policy, role_map=preset.role_map, role_map_source=preset.source,
+  )
+  expected = selection.capture_selection_snapshot(
+    policy, role_map=role_map if winner is not None else None,
+    role_map_source=preset.source,
+  )
+  assert snapshot == expected
+  prepared = _prepare_root_turn(
+    monkeypatch, tmp_path, preset_map=preset, policy_source=source,
+  )
+  assert prepared.request._selection_provenance.preset_layer == (
+    "request" if winner is not None else source or "policy_default"
+  )
+
+
+def test_root_context_keeps_explicit_unknown_provenance() -> None:
+  session = _session("unknown-provenance")
+  captured = root_context(
+    session, withheld_tools=frozenset(), research_file_id=None,
+    selection_provenance=None,
+  )
+  assert captured.selection_provenance is None
+  minted = root_context_from_identity(
+    tenant=None, job_id=None, tool_ids=None, withheld_tools=frozenset(),
+    research_binding=AdmittedResearchBinding(), approval_route=NoApprovalRoute(),
+    selection_provenance=None,
+  )
+  assert minted.selection_provenance is None
+
+
+@pytest.mark.parametrize(
+  ("helper", "args", "kwargs"),
+  [
+    (
+      root_context, (None,),
+      {"withheld_tools": frozenset(), "research_file_id": None},
+    ),
+    (
+      root_context_from_identity, (),
+      {
+        "tenant": None, "job_id": None, "tool_ids": None,
+        "withheld_tools": frozenset(), "research_binding": AdmittedResearchBinding(),
+        "approval_route": NoApprovalRoute(),
+      },
+    ),
+  ],
+)
+def test_root_helpers_require_an_explicit_provenance_argument(
+  helper: Callable[..., ParentContext], args: tuple[object, ...], kwargs: dict[str, object],
+) -> None:
+  with pytest.raises(TypeError, match="selection_provenance"):
+    helper(*args, **kwargs)

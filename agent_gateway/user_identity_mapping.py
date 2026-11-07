@@ -7,8 +7,10 @@ and never a legacy risk_user_id of 0.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from hank_model_transport.user_runtime_credentials import (
   MalformedGatewayUserKeys,
@@ -18,6 +20,40 @@ from hank_model_transport.user_runtime_credentials import (
   normalized_str,
   positive_int,
 )
+
+
+@dataclass(frozen=True)
+class StorageIdentity:
+  """A parsed desk owner, separate from its login aliases."""
+
+  storage_id: str
+  form: Literal["numeric", "legacy"]
+
+
+class StorageIdentityFinding(ValueError):
+  """An external desk-owner input that the storage grammar cannot admit."""
+
+  def __init__(self, input: object, reason: str) -> None:
+    self.input = input
+    self.reason = reason
+    super().__init__(f"storage identity Finding: {reason}: {input!r}")
+
+
+_NUMERIC_STORAGE_ID_RE = re.compile(r"[1-9][0-9]*")
+_LEGACY_STORAGE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+
+
+def parse_storage_identity(value: object) -> StorageIdentity:
+  """Parse one canonical numeric owner or a lowercase, single-segment legacy id."""
+  if type(value) is not str:
+    raise StorageIdentityFinding(value, "storage id must be a string")
+  if _NUMERIC_STORAGE_ID_RE.fullmatch(value) is not None:
+    return StorageIdentity(value, "numeric")
+  if value.isdecimal():
+    raise StorageIdentityFinding(value, "numeric storage id must be canonical and positive")
+  if _LEGACY_STORAGE_ID_RE.fullmatch(value) is not None:
+    return StorageIdentity(value, "legacy")
+  raise StorageIdentityFinding(value, "storage id must be a lowercase safe single segment")
 
 
 class RunOwnerUnresolved(ValueError):
@@ -91,14 +127,12 @@ def validated_identity_entries(
   *,
   environ: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-  """Roster/bundle rows that name a slug and a positive risk_user_id."""
+  """Roster/bundle rows, each already parsed to a slug and a positive risk_user_id by the roster owner."""
   validated: list[dict[str, Any]] = []
   for entry in gateway_user_key_entries(environ=environ):
-    risk_user_id = positive_int(entry.get("risk_user_id"))
-    slug = normalized_str(entry.get("slug"))
+    risk_user_id = positive_int(entry["risk_user_id"])
+    slug = normalized_str(entry["slug"])
     email = _normalized_email(entry.get("email"))
-    if risk_user_id is None or slug is None:
-      continue
     validated.append({
       "slug": slug,
       "email": email,
@@ -180,6 +214,9 @@ def _normalized_email(value: object) -> str | None:
 
 __all__ = [
   "RunOwnerUnresolved",
+  "StorageIdentity",
+  "StorageIdentityFinding",
+  "parse_storage_identity",
   "entry_risk_user_id",
   "gateway_user_key_entries",
   "mapped_risk_user_id",

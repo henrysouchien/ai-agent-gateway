@@ -10,6 +10,7 @@ the live server catalog selects compatible routes, and the resulting exact
 from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Mapping
+from types import MappingProxyType
 
 from agent_workflow_contracts import (
   AdmittedToolRoute,
@@ -109,6 +110,7 @@ def admit_operation_tools(
   effect_resolver: ToolEffectResolver | None = None,
   identity: ExecutionIdentity | None = None,
   exclusions: Iterable[str] = (),
+  exposed_route_ids: Mapping[str, str] = MappingProxyType({}),
 ) -> ResolvedAuthority | OperationUnavailable:
   """Resolve one ordinary-delegation operation's authority (B-6).
 
@@ -132,11 +134,16 @@ def admit_operation_tools(
     if (tool_id := str(definition.get("name") or "").strip())
     and tool_id in exact_ceiling
   }))
+  essential_routes = frozenset(
+    exposed_route_ids.get(route_id, route_id)
+    for route_id in operation.essential_routes
+  )
   declaration = OperationDeclaration(
     operation_name=operation.operation.name,
     grant_id=grant_id,
     workspace_scope=operation.workspace_scope,
     required_capabilities=operation.required_capabilities,
+    essential_routes=essential_routes,
     tool_ceiling=exact_ceiling,
   )
   return resolve_operation_authority(

@@ -919,7 +919,7 @@ def test_concurrent_requests_reserve_one_dispatch_before_consumption(
   assert len(store.attached) == 1
 
 
-def _commercial_jwt(issuer: str) -> str:
+def _commercial_jwt(issuer: object) -> str:
   def segment(payload: dict[str, object]) -> str:
     return base64.urlsafe_b64encode(
       json.dumps(payload, separators=(",", ":")).encode()
@@ -970,6 +970,19 @@ def test_server_rejects_commercial_bearer_material_anywhere_in_body(
   persisted = b"".join(path.read_bytes() for path in tmp_path.glob("*.jsonl"))
   assert CLAIM_TOKEN.encode() not in persisted
   assert WORK_TOKEN.encode() not in persisted
+
+
+@pytest.mark.parametrize("issuer", ([], {"iss": 1}, None, 7, True))
+def test_body_compact_string_with_non_string_issuer_is_ordinary_text(issuer: object) -> None:
+  from agent_gateway.server_models import ChatRequest
+
+  note = _commercial_jwt(issuer)
+
+  request = ChatRequest.model_validate(
+    {"messages": [{"role": "user", "content": "hello"}], "context": {"note": note}}
+  )
+
+  assert request.context == {"note": note}
 
 
 @pytest.mark.parametrize(

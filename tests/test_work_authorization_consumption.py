@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import sqlite3
+import json
 from uuid import UUID, uuid4
 
 import pytest
@@ -278,6 +279,42 @@ def test_previous_v2_store_is_rebuilt_and_old_row_reads_back(tmp_path) -> None:
   assert migrated.reserved_spend_microusd is None
   assert migrated.provider == v2.provider
   assert migrated.request_id == v2.request_id
+
+
+def test_v3_store_migrates_without_changing_old_content_identity(tmp_path):
+  path = tmp_path / "usage.sqlite3"
+  old_auth = _verified(
+    schema_version=3, credential_principal="service", reserved_spend_microusd=100,
+  )
+  # Independently reproduce the pre-V4 signed content, without the new fields.
+  old_payload = asdict(old_auth)
+  for name in ("token_sha256", "credential_route", "credential_owner_kind"):
+    del old_payload[name]
+  encoded = json.dumps(old_payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+  old_digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+  values = consumption_module._values(old_auth, old_digest, "2026-07-11T12:00:01Z")
+  with sqlite3.connect(path) as connection:
+    connection.execute(consumption_module._V3_TABLE_SQL)
+    columns = ", ".join(consumption_module._COLUMNS)
+    placeholders = ", ".join("?" for _ in consumption_module._COLUMNS)
+    connection.execute(
+      f"INSERT INTO commercial_work_authorization_consumptions ({columns}) VALUES ({placeholders})",
+      values,
+    )
+  store = _store(path)
+  migrated = store.get(old_auth.authorization_id)
+  assert migrated is not None and migrated.content_sha256 == old_digest
+  with pytest.raises(WorkAuthorizationAlreadyAttached):
+    store.attach_once(old_auth)
+  current = _verified(
+    schema_version=4, credential_principal="service", reserved_spend_microusd=100,
+    credential_route="server_managed", credential_owner_kind="hank",
+  )
+  record = store.attach_once(current)
+  assert record.schema_version == 4
+  assert _store(path).get(current.authorization_id) == record
+  with pytest.raises(WorkAuthorizationConsumptionConflict):
+    store.attach_once(replace(current, credential_owner_kind="flat_subscription"))
 
 
 def test_same_columns_with_case_changed_digest_constraint_fail_closed(

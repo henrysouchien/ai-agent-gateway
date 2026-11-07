@@ -283,7 +283,7 @@ def test_build_request_params_skips_marker_without_cacheable_final_block(
   skip_records = [
     record
     for record in caplog.records
-    if "final message has no cacheable block" in record.getMessage()
+    if "request prefix has no cacheable block" in record.getMessage()
   ]
   assert len(skip_records) == 1
 
@@ -2608,6 +2608,131 @@ def test_stream_final_iteration_prompt_is_independent_of_repeated_billing_and_wa
   ]
   assert (client.beta.messages.kwargs is not None) is native_compaction
   assert (client.messages.kwargs is not None) is not native_compaction
+
+
+@pytest.mark.parametrize("usage_snapshots", [1, 2], ids=["final", "repeated-cumulative"])
+def test_documented_web_search_stream_accumulates_server_tool_usage(
+  usage_snapshots: int,
+) -> None:
+  import sqlite3
+  from contextlib import closing
+  from copy import deepcopy
+
+  from anthropic._models import construct_type_unchecked
+  from anthropic.types import RawMessageDeltaEvent, RawMessageStartEvent, RawMessageStopEvent
+  from agent_gateway.transport_runtime import GATEWAY_SEND_PROMPT_RUNTIME
+  from hank_model_transport.spend_metering import ProviderCallMeter
+  from model_authority.spend_ledger import ledger_path
+
+  # Documentation-derived fixture, NOT a live capture: these usage-bearing
+  # events are copied from Anthropic's web-search streaming response example:
+  # https://platform.claude.com/docs/en/build-with-claude/streaming
+  # Content-block events are omitted; the documented id is already abbreviated.
+  # https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool#usage-and-pricing
+  # identifies usage.server_tool_use.web_search_requests as separately billed.
+  raw_start = {
+    "type": "message_start",
+    "message": {
+      "id": "msg_01G...",
+      "type": "message",
+      "role": "assistant",
+      "model": "claude-opus-5-5",
+      "content": [],
+      "stop_reason": None,
+      "stop_sequence": None,
+      "usage": {
+        "input_tokens": 2679,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 3,
+      },
+    },
+  }
+  raw_delta = {
+    "type": "message_delta",
+    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+    "usage": {
+      "input_tokens": 10682,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 510,
+      "server_tool_use": {"web_search_requests": 1},
+    },
+  }
+  raw_stop = {"type": "message_stop"}
+  raw_before = deepcopy([raw_start, raw_delta, raw_stop])
+  # Streaming usage is cumulative within a message, not additive snapshots.
+  # Repetition below is a synthetic regression variant, not another captured
+  # search. Use the SDK's normal response construction, not model_validate:
+  # AsyncStream -> BaseClient._process_response_data -> construct_type, whose
+  # typed wrapper is construct_type_unchecked. Strict validation requires a
+  # web_fetch_requests field absent from this published response; inventing a
+  # zero would no longer exercise the documented wire shape.
+  sdk_events = [
+    construct_type_unchecked(type_=RawMessageStartEvent, value=raw_start),
+    *[
+      construct_type_unchecked(type_=RawMessageDeltaEvent, value=raw_delta)
+      for _ in range(usage_snapshots)
+    ],
+    construct_type_unchecked(type_=RawMessageStopEvent, value=raw_stop),
+  ]
+  sdk_before = [event.model_dump() for event in sdk_events]
+  client = _FakeStreamingClient(sdk_events)
+
+  async def collect_metered_events() -> list[StreamEvent]:
+    meter = ProviderCallMeter(
+      provider=AnthropicProvider(),
+      runtime=GATEWAY_SEND_PROMPT_RUNTIME,
+      provider_name="anthropic",
+      model="claude-opus-5-5",
+      model_key="claude-opus-5-5",
+      config={"auth_mode": "api", "api_key": "test-documented-web-search"},
+      call_site="test_documented_web_search",
+    )
+    return [
+      event async for event in meter.stream(
+        client, {"model": "claude-opus-5-5", "messages": []},
+      )
+    ]
+
+  # Replay as two independent provider calls: each owes one search, while a
+  # repeated cumulative snapshot within either call owes no additional units.
+  for _ in range(2):
+    events = asyncio.run(collect_metered_events())
+    assert events[0].type == "message_start"
+    assert events[-1].type == "message_end"
+    updates = [event for event in events if event.type == "usage_update"]
+    assert [event.provider_unit_deltas for event in updates] == [
+      {"web_search": 1}, *[{} for _ in range(usage_snapshots - 1)],
+    ]
+    assert [(event.input_tokens, event.output_tokens) for event in updates] == [
+      (8003, 510), *[(0, 0) for _ in range(usage_snapshots - 1)],
+    ]
+
+  # Read the real wrapper's ledger output, not another copy of its event dispatch:
+  # losing provider_unit_deltas between the adapter and accumulator must fail here.
+  with closing(sqlite3.connect(ledger_path())) as connection:
+    connection.row_factory = sqlite3.Row
+    rows = [
+      dict(row) for row in connection.execute(
+        "SELECT * FROM api_spend_events ORDER BY ts, rowid"
+      )
+    ]
+  assert len(rows) == 2
+  for row in rows:
+    assert row["status"] == "ok"
+    assert (
+      row["input_tokens"], row["output_tokens"],
+      row["cache_read_tokens"], row["cache_write_tokens"], row["reasoning_tokens"],
+    ) == (10682, 510, 0, 0, 0)
+    assert json.loads(row["attrs_json"])["provider_unit_deltas"] == {"web_search": 1}
+  assert sum(row["input_tokens"] for row in rows) == 21364
+  assert sum(row["output_tokens"] for row in rows) == 1020
+  assert sum(
+    json.loads(row["attrs_json"])["provider_unit_deltas"]["web_search"] for row in rows
+  ) == 2
+  assert [raw_start, raw_delta, raw_stop] == raw_before
+  assert [event.model_dump() for event in sdk_events] == sdk_before
 
 
 @pytest.mark.parametrize("iterations", [None, []])

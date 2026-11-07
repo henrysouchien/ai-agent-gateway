@@ -58,7 +58,9 @@ _TERMINAL_REASON_PRECEDENCE = (
 #: Assistant stop reasons that close a logical response whose text is the
 #: child's delivered narrative. ``refusal`` is the provider declining to
 #: continue: what the model delivered before the stop is still its output.
-_TERMINAL_NARRATIVE_STOP_REASONS = frozenset({"end_turn", "refusal"})
+_TERMINAL_NARRATIVE_STOP_REASONS = frozenset(
+  {"end_turn", "refusal", "partial_stream_failure"}
+)
 
 
 @runtime_checkable

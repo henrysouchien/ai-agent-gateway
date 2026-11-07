@@ -32,11 +32,14 @@ from fastmcp.client.auth.oauth import OAuth as FastMCPOAuth
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
+from mcp import MCPError
+from mcp.types import CONNECTION_CLOSED
 from typing_extensions import TypeIs
 
 from agent_workflow_contracts.tool_registration import (
   McpInputPreparationRoute,
   ToolRegistrationCatalog,
+  ToolRegistrationDeclaration,
   index_mcp_input_preparation_routes,
   validate_tool_registration_catalog,
 )
@@ -48,7 +51,8 @@ from . import mcp_client_errors as _error_helpers
 from . import mcp_client_oauth_storage as _oauth_storage
 from . import mcp_client_runtime as _runtime_helpers
 from . import mcp_client_startup as _startup_helpers
-from .approval_policy import sha256_args
+from .approval_policy import bounded_approval_display, sha256_args
+from .single_user_policy import needs_human_approval
 from .autonomous_claim_broker import AutonomousClaimSigner
 from .autonomous_runner_claims import get_agent_api_claim_ttl_seconds
 from .claim_signing_authority import (
@@ -71,13 +75,13 @@ from .tool_dispatch_classification import (
   ToolResultSettlement,
 )
 from .tool_registration import (
+  RefusedMcpRoute,
   RegisteredMcpToolDescriptor,
   UnknownRegisteredMcpToolDescriptorError,
   compile_registered_mcp_tool_descriptors,
 )
 from .tool_policy_registry import (
   ApprovalCacheKeyCall,
-  ApprovalPredicateCall,
   InputPreparationCall,
   OutcomeCall,
   PlanDecision,
@@ -85,6 +89,7 @@ from .tool_policy_registry import (
   PreparedToolCall,
   RedactionCall,
   SourceIdentityCall,
+  ToolInputPreparationError,
   ToolPolicyImplementationRegistry,
   ToolPolicyResultError,
 )
@@ -119,6 +124,9 @@ _GSHEETS_BROKER_WRITE_TOOLS = frozenset({
 _GSHEETS_BROKER_TOOLS = _GSHEETS_BROKER_READ_TOOLS | _GSHEETS_BROKER_WRITE_TOOLS
 _READ_ONLY_POLICY_CLASSES = frozenset({"read", "pure_transform"})
 _AUTOMATIC_REPLAY_EFFECTS = frozenset({"read", "pure_transform", "support"})
+# The state a stdio server's diagnostic carries from the moment its child is lost
+# (or its startup connect failed) until a replacement publishes.
+_STDIO_RECONNECTING = "reconnecting"
 PER_USER_SESSION_TTL_SECONDS = 60 * 60
 PER_USER_EXPIRY_MARGIN_SECONDS = 5 * 60
 PER_USER_IDLE_REAP_SECONDS = 30 * 60
@@ -205,6 +213,27 @@ def _build_http_headers(
     headers if isinstance(headers, dict) else None,
     environ=environ,
   )
+
+
+def _is_dropped_response_stream(exc: BaseException) -> bool:
+  """A streamable-HTTP response stream that closed with no response (the SDK's synthesized error)."""
+  return any(
+    isinstance(candidate, MCPError)
+    and candidate.code == CONNECTION_CLOSED
+    and "stream ended without a response" in str(candidate).lower()
+    for candidate in _config_helpers.iter_exception_tree(exc)
+  )
+
+
+def _stdio_recovery_delay(attempt: int) -> float:
+  """Pause between recovery rounds for a down stdio server: bounded, never a verdict."""
+  base = _config_helpers.env_nonnegative_float(
+    "MCP_STDIO_RECOVERY_BACKOFF_S", 5.0, environ=os.environ, logger=log,
+  )
+  cap = _config_helpers.env_nonnegative_float(
+    "MCP_STDIO_RECOVERY_BACKOFF_MAX_S", 60.0, environ=os.environ, logger=log,
+  )
+  return min(cap, base * (2 ** min(attempt, 16)))
 
 
 def _stdio_connect_retries() -> int:
@@ -571,6 +600,18 @@ class RegisteredMcpRawPatchAuthorization:
   def materialize_approval_arguments(self) -> dict[str, object]:
     return PreparedToolCall(self.approval_arguments).materialize_input()
 
+  def materialize_approval_display(self) -> dict[str, object]:
+    """The bounded copy a person reads and the audit log persists.
+
+    ``approval_arguments_hash`` binds the exact arguments; this projection only
+    abbreviates long strings (each keeps its length and SHA-256) so a plan that
+    carries a whole filing cannot exceed the approval audit record limit.
+    """
+
+    display = bounded_approval_display(self.materialize_approval_arguments())
+    assert isinstance(display, dict)
+    return display
+
   @classmethod
   def from_plan_decision(
     cls,
@@ -664,6 +705,15 @@ RegisteredMcpToolCall = (
 RegisteredSdkMcpToolCall = RegisteredMcpToolCall
 
 
+@dataclass(frozen=True)
+class _DeclaredDownTool:
+  """A registration-declared tool of a stdio server whose startup connect failed."""
+
+  server_name: str
+  logical_server_id: str
+  declaration: ToolRegistrationDeclaration
+
+
 class McpClientManager:
   """Manage MCP server lifecycles and tool routing.
 
@@ -733,6 +783,16 @@ class McpClientManager:
     self._prefixed_to_original: Dict[str, str] = {}
     self._mcp_tool_names: Set[str] = set()
     self._startup_diagnostics: Dict[str, Dict[str, Any]] = {}
+    # Stdio servers whose startup connect failed, with the config that failed.
+    # Its recovery task reconnects them off every call's path, through the same
+    # owner that restores a child lost after startup.
+    self._stdio_startup_failures: Dict[str, Dict[str, Any]] = {}
+    # One task per startup-failed stdio server retries its connect off every
+    # caller's path, in the same bounded rounds the EOF watch uses.
+    self._stdio_startup_recovery_tasks: Dict[str, asyncio.Task[None]] = {}
+    # Counts changes to which stdio servers are down after startup; readiness
+    # rebuilds its MCP block from the live manager once this moves.
+    self._recovery_generation = 0
     self._server_aliases = dict(server_aliases or {})
     self._logical_server_routes = dict(logical_server_routes or {})
     self._logical_tool_aliases = {
@@ -852,6 +912,9 @@ class McpClientManager:
       str,
       RegisteredMcpToolDescriptor,
     ] = MappingProxyType({})
+    # Live routes with no exact static registration: out of the model-visible
+    # surface, reported by readiness, answered with a typed call error.
+    self._refused_mcp_routes: tuple[RefusedMcpRoute, ...] = ()
     self._dispatch_to_original: Dict[str, str] = {}
     self._allowed_servers = self._canonical_server_names(allowed_servers) if allowed_servers is not None else None
     self._builtin_tool_names = set(builtin_tool_names or set())
@@ -909,6 +972,7 @@ class McpClientManager:
     message: str,
     retryable: bool,
     error_type: str | None = None,
+    state: str | None = None,
   ) -> None:
     canonical_name = self._canonical_server_name(server_name)
     payload: Dict[str, Any] = {
@@ -919,6 +983,8 @@ class McpClientManager:
     }
     if error_type:
       payload["error_type"] = error_type
+    if state:
+      payload["state"] = state
     self._startup_diagnostics[canonical_name] = payload
 
   def _expected_seconds_for_tool(self, server_name: str, exposed_name: str, original_name: str) -> float:
@@ -960,10 +1026,7 @@ class McpClientManager:
 
   def _configured_server_configs(self) -> Dict[str, Dict[str, Any]]:
     config = self._read_claude_config()
-    mcp_servers = config.get("mcpServers", {})
-    if not isinstance(mcp_servers, dict):
-      mcp_servers = {}
-    configured = dict(mcp_servers)
+    configured = dict(config.get("mcpServers", {}))
     configured.update(self._inline_servers)
     return self._canonicalize_server_configs(configured)
 
@@ -987,6 +1050,8 @@ class McpClientManager:
         supported_server_types=set(_SUPPORTED_SERVER_TYPES),
         logger=log,
       )
+      for failed_server in list(self._stdio_startup_failures):
+        self._arm_startup_stdio_recovery(failed_server)
 
   def _connection_runtime(self) -> _connection_helpers.McpConnectionRuntime:
     return _connection_helpers.McpConnectionRuntime(
@@ -1071,6 +1136,7 @@ class McpClientManager:
     self._registered_mcp_descriptors_by_exposed_name = (
       candidate._registered_mcp_descriptors_by_exposed_name
     )
+    self._refused_mcp_routes = candidate._refused_mcp_routes
     for state in states:
       if state.stdio_eof is not None and state.stdio_watch_task is None:
         state.stdio_watch_task = asyncio.create_task(self._reconnect_stdio_on_eof(state))
@@ -1166,6 +1232,7 @@ class McpClientManager:
     exit_contexts: List[Any],
     tool_prefix: str,
     allowed_tools: tuple[str, ...] | None = None,
+    stdio_child: _connection_helpers.StdioChildProgress | None = None,
   ) -> _ConnectedServerState:
     return await _connection_helpers.initialize_session_state(
       self,
@@ -1175,27 +1242,49 @@ class McpClientManager:
       tool_prefix=tool_prefix,
       allowed_tools=allowed_tools,
       runtime=self._connection_runtime(),
+      stdio_child=stdio_child,
     )
 
   async def _verify_stdio_session_stable(
     self,
     session: _connection_helpers.McpConnectionSession,
+    *,
+    stdio_child: _connection_helpers.StdioChildProgress | None = None,
   ) -> None:
     await _connection_helpers.verify_stdio_session_stable(
       self,
       session,
       self._connection_runtime(),
+      stdio_child=stdio_child,
     )
 
   def get_tool_definitions(self) -> List[Dict[str, Any]]:
     if self._tool_registration_catalog is not None:
+      refused_names = self._refused_mcp_exposed_names()
       return [
         self.get_registered_mcp_tool_descriptor(
           str(definition.get("name"))
         ).materialize_provider_definition()
         for definition in self._tool_definitions
+        if definition.get("name") not in refused_names
       ]
     return copy.deepcopy(self._tool_definitions)
+
+  def get_refused_mcp_routes(self) -> tuple[RefusedMcpRoute, ...]:
+    """Return the live routes refused for lack of an exact static registration."""
+
+    return self._refused_mcp_routes
+
+  def get_refused_mcp_route(self, exposed_name: str) -> RefusedMcpRoute | None:
+    """Return the refusal record for one exposed name, if it was refused."""
+
+    for route in self._refused_mcp_routes:
+      if route.exposed_name == exposed_name:
+        return route
+    return None
+
+  def _refused_mcp_exposed_names(self) -> frozenset[str]:
+    return frozenset(route.exposed_name for route in self._refused_mcp_routes)
 
   def get_registered_mcp_tool_descriptor(
     self,
@@ -1306,19 +1395,9 @@ class McpClientManager:
     else:
       prepared_authorization = None
     policy = descriptor.declaration.semantics.approval
-    if policy.mode == "never":
-      approval_required = False
-    elif policy.mode == "always":
-      approval_required = True
-    else:
-      assert policy.predicate is not None
-      approval_required = registry.execute_approval_predicate(
-        policy.predicate,
-        ApprovalPredicateCall(
-          descriptor.identity,
-          prepared_call.prepared_input,
-        ),
-      )
+    approval_required = needs_human_approval(
+      descriptor.declaration.semantics.effect,
+    )
     approval_reuse_key = None
     if approval_required and policy.cache_key is not None:
       approval_reuse_key = registry.execute_approval_cache_key(
@@ -1457,6 +1536,14 @@ class McpClientManager:
   ) -> PreparedToolCall:
     """Prepare one exact registered MCP call before policy and retry handling."""
 
+    down_tool = self._declared_down_tool(exposed_name)
+    if down_tool is not None:
+      # A declared tool of a startup-failed server has no live route to prepare
+      # against. Preparation is the one boundary every route (door, chat turn,
+      # dispatch) passes before it reads a descriptor, so the call settles here
+      # with the manager's typed refusal; nothing unprepared proceeds. The failed
+      # server's own name keys its startup diagnostic, so the reason is carried.
+      raise ToolInputPreparationError(self._server_unavailable_error([down_tool.server_name]))
     descriptor = self.get_registered_mcp_tool_descriptor(exposed_name)
     registry = self._tool_policy_implementations
     context_factory = self._input_preparation_context_factory
@@ -1481,21 +1568,33 @@ class McpClientManager:
     """Rebuild the exact live join after the exposed topology is finalized."""
 
     self._registered_mcp_descriptors_by_exposed_name = MappingProxyType({})
+    self._refused_mcp_routes = ()
     catalog = self._tool_registration_catalog
     if catalog is None:
       return
-    descriptors = compile_registered_mcp_tool_descriptors(
+    compilation = compile_registered_mcp_tool_descriptors(
       catalog,
       self.get_server_tool_route_bindings(self.get_server_names()),
     )
     by_exposed_name = {
       descriptor.exposed_name: descriptor
-      for descriptor in descriptors
+      for descriptor in compilation.descriptors
     }
-    if set(by_exposed_name) != self._mcp_tool_names:
+    refused_names = {route.exposed_name for route in compilation.refused}
+    if set(by_exposed_name) | refused_names != self._mcp_tool_names:
       raise ValueError(
         "registered MCP descriptors do not match the live tool surface"
       )
+    for route in compilation.refused:
+      log.warning(
+        "MCP route refused, no exact static registration: "
+        "server=%s tool=%s exposed_name=%s transport_server_id=%s",
+        route.logical_server_id,
+        route.logical_name,
+        route.exposed_name,
+        route.transport_server_id,
+      )
+    self._refused_mcp_routes = compilation.refused
     self._registered_mcp_descriptors_by_exposed_name = MappingProxyType(
       by_exposed_name
     )
@@ -1510,17 +1609,45 @@ class McpClientManager:
     self,
     server_names: Set[str],
   ) -> tuple[OriginatedToolDefinition, ...]:
+    return self._server_tool_definition_records(server_names, include_collisions=False)
+
+  def get_collision_preserving_server_tool_definition_records(
+    self,
+    server_names: Set[str],
+  ) -> tuple[OriginatedToolDefinition, ...]:
+    return self._server_tool_definition_records(server_names, include_collisions=True)
+
+  def _server_tool_definition_records(
+    self,
+    server_names: Set[str],
+    *,
+    include_collisions: bool,
+  ) -> tuple[OriginatedToolDefinition, ...]:
     canonical_server_names = self._canonical_server_names(set(server_names))
     records: list[OriginatedToolDefinition] = []
     for server_name, state in self._servers.items():
       if server_name in canonical_server_names and not self._is_transport_only_server(server_name):
-        for definition in state.published_tool_definitions:
+        # Collision copies are projected exactly as publication projects them
+        # (prefix, guidance, stripped input fields); the raw advertised
+        # definition is never what the registered surface describes.
+        definitions = (
+          [
+            _catalog_helpers.materialize_published_tool_definition(
+              definition,
+              prefix=state.tool_prefix,
+              strip_input_fields=self._strip_input_fields,
+            )
+            for definition in state.tool_definitions
+          ]
+          if include_collisions else state.published_tool_definitions
+        )
+        for definition in definitions:
           record = OriginatedToolDefinition(
             definition=definition,
             origin="mcp",
             server_id=server_name,
           )
-          if self._tool_to_server.get(record.name) != server_name:
+          if not include_collisions and self._tool_to_server.get(record.name) != server_name:
             raise ValueError("MCP tool definition owner mapping is incoherent")
           records.append(record)
     for server_name in canonical_server_names:
@@ -1534,8 +1661,15 @@ class McpClientManager:
           raise ValueError("MCP tool definition owner mapping is incoherent")
         records.append(record)
     if self._tool_registration_catalog is not None:
+      refused_names = self._refused_mcp_exposed_names()
       registered_records: list[OriginatedToolDefinition] = []
       for record in records:
+        if record.name in refused_names:
+          continue
+        if self._tool_to_server.get(record.name) != record.server_id:
+          # A collision copy that lost its exposed name has no registration.
+          registered_records.append(record)
+          continue
         descriptor = self.get_registered_mcp_tool_descriptor(record.name)
         registered_record = descriptor.live_binding.originated_definition
         if registered_record != record:
@@ -1852,11 +1986,18 @@ class McpClientManager:
     return exported
 
   def get_server_catalog(self) -> Dict[str, Dict[str, Any]]:
+    # A refused route is not an available tool: the catalog the required-tool
+    # check reads must not count it.
+    refused_names = self._refused_mcp_exposed_names()
     catalog: Dict[str, Dict[str, Any]] = {}
     for server_name, state in self._servers.items():
       if self._is_transport_only_server(server_name):
         continue
-      tool_names = sorted(tool["name"] for tool in state.published_tool_definitions if isinstance(tool.get("name"), str))
+      tool_names = sorted(
+        tool["name"]
+        for tool in state.published_tool_definitions
+        if isinstance(tool.get("name"), str) and tool["name"] not in refused_names
+      )
       catalog[server_name] = {
         "tool_count": len(tool_names),
         "tools": tool_names,
@@ -1867,11 +2008,27 @@ class McpClientManager:
       tool_names = sorted(
         tool["name"]
         for tool in definitions
-        if isinstance(tool.get("name"), str)
+        if isinstance(tool.get("name"), str) and tool["name"] not in refused_names
       )
       catalog[server_name] = {
         "tool_count": len(tool_names),
         "tools": tool_names,
+      }
+    # A stdio server that failed its startup connect is still a server of this
+    # gateway (its config is kept and its recovery task reconnects it): the
+    # catalog the surface authorizes against lists the tools the registration
+    # catalog declares for it, so a session can reach them and the call fails
+    # typed while the server is down.
+    declared_down: Dict[str, List[str]] = {}
+    for tool_name, server_name in self.get_declared_tools_of_startup_failed_servers().items():
+      declared_down.setdefault(server_name, []).append(tool_name)
+    for server_name, tool_names in declared_down.items():
+      if server_name in catalog:
+        continue
+      catalog[server_name] = {
+        "tool_count": len(tool_names),
+        "tools": sorted(tool_names),
+        "startup_failed": True,
       }
     return catalog
 
@@ -1880,7 +2037,13 @@ class McpClientManager:
 
   def is_mcp_tool(self, name: str) -> bool:
     if self._tool_registration_catalog is not None:
-      return name in self._registered_mcp_descriptors_by_exposed_name
+      # A startup-failed server published no descriptors; the tools its
+      # registration declares are still this manager's, so a dispatch reaches
+      # `call_tool`, which answers typed while the server is down.
+      return (
+        name in self._registered_mcp_descriptors_by_exposed_name
+        or name in self.get_declared_tools_of_startup_failed_servers()
+      )
     return name in self._mcp_tool_names
 
   def uses_registered_tool_catalog(self) -> bool:
@@ -1891,11 +2054,9 @@ class McpClientManager:
   def get_server_for_tool(self, name: str) -> str | None:
     if self._tool_registration_catalog is not None:
       descriptor = self._registered_mcp_descriptors_by_exposed_name.get(name)
-      return (
-        descriptor.live_binding.logical_server_id
-        if descriptor is not None
-        else None
-      )
+      if descriptor is not None:
+        return descriptor.live_binding.logical_server_id
+      return self.get_declared_tools_of_startup_failed_servers().get(name)
     return self._tool_to_server.get(name)
 
   def get_policy_tool_name(self, name: str) -> str | None:
@@ -1948,22 +2109,6 @@ class McpClientManager:
     config = getattr(state, "config", None)
     return bool(config and config.get("per_user") is True)
 
-  @staticmethod
-  def _declared_run_scoped_env(config: Mapping[str, Any]) -> tuple[str, ...]:
-    raw = config.get("run_scoped_env")
-    if raw is None:
-      return ()
-    if (
-      not isinstance(raw, list)
-      or not raw
-      or any(not isinstance(name, str) or not name.strip() for name in raw)
-    ):
-      raise ValueError("run_scoped_env must be a non-empty list of environment names")
-    names = tuple(name.strip() for name in raw)
-    if len(set(names)) != len(names):
-      raise ValueError("run_scoped_env must not contain duplicate environment names")
-    return names
-
   def _declared_server_env_names(
     self,
     server_name: str,
@@ -1973,7 +2118,7 @@ class McpClientManager:
     canonical_name = self._canonical_server_name(base_name)
     return (
       frozenset(self._server_env_passthrough.get(canonical_name, ()))
-      | frozenset(self._declared_run_scoped_env(config))
+      | frozenset(_config_helpers.declared_run_scoped_env(config))
     )
 
   def _scoped_server_env(
@@ -2101,7 +2246,7 @@ class McpClientManager:
       if not isinstance(config, Mapping):
         continue
       try:
-        declared = self._declared_run_scoped_env(config)
+        declared = _config_helpers.declared_run_scoped_env(config)
       except ValueError:
         continue
       names.update(name for name in declared if name not in _oauth_credential_env_names())
@@ -2132,10 +2277,10 @@ class McpClientManager:
         "a per_user streamable-http server authenticates with its user's claim; "
         "oauth is not supported"
       )
-    self._declared_run_scoped_env(prepared)
+    _config_helpers.declared_run_scoped_env(prepared)
     projection = self._jobs_oauth_projection(os.environ)
     if projection:
-      refs = set(self._declared_run_scoped_env(prepared))
+      refs = set(_config_helpers.declared_run_scoped_env(prepared))
       env_block = prepared.get("env")
       if isinstance(env_block, dict):
         for value in env_block.values():
@@ -2239,10 +2384,13 @@ class McpClientManager:
       # Every request of this connection carries its own fresh claim for the
       # session's user; no credential is projected into the config. The
       # fingerprint rotates the connection when that identity changes.
-      claim_auth = self._user_claim_http_auth(
-        subject.claim_user_id,
-        subject.claim_user_email,
-      )
+      scoped_env, _ = self._scoped_server_env(server_name, config)
+      claim_auth = _connection_helpers._remote_user_claim_http_auth(scoped_env)
+      if claim_auth is None:
+        claim_auth = self._user_claim_http_auth(
+          subject.claim_user_id,
+          subject.claim_user_email,
+        )
       binding_fingerprint = self._per_user_binding_fingerprint(subject)
       expires_at = float("inf")
     else:
@@ -2659,6 +2807,11 @@ class McpClientManager:
     invocation_report.certainty = "settled"
     if type(allow_uncertain_replay) is not bool:
       raise TypeError("allow_uncertain_replay must be an exact bool")
+    still_down = [
+      server
+      for server in self._stdio_startup_failures
+      if self._failed_stdio_server_may_serve(server, name)
+    ] if name not in self._tool_to_server else []
     registered_descriptor = (
       self._registered_mcp_descriptors_by_exposed_name.get(name)
       if self._tool_registration_catalog is not None
@@ -2675,8 +2828,22 @@ class McpClientManager:
         )
       )
     )
+    refused_route = self.get_refused_mcp_route(name)
+    if refused_route is not None:
+      return None, refused_route.call_error()
+    # The registration catalog's side-effect classification is the read-only
+    # criterion for replaying a call whose response stream was dropped: only a
+    # declared idempotent read or pure transform. No MCP tool annotation is kept.
+    dropped_stream_replay_allowed = (
+      allow_uncertain_replay
+      and registered_descriptor is not None
+      and registered_descriptor.declaration.semantics.idempotent
+      and registered_descriptor.declaration.semantics.effect in _READ_ONLY_POLICY_CLASSES
+    )
     server_name = self._tool_to_server.get(name)
     if not server_name:
+      if still_down and self._tool_registration_catalog is not None:
+        return None, self._server_unavailable_error(still_down)
       return None, {"code": "unknown_tool", "message": f"Unknown tool: {name}"}
 
     if _is_exact_prepared_tool_call(tool_input):
@@ -2751,12 +2918,20 @@ class McpClientManager:
         "code": "mcp_tool_error",
         "message": f"MCP server unavailable: {server_name}",
       }
+    down_error = (
+      None
+      if is_sheets or self.is_per_user_server(transport_server_name)
+      else self._down_stdio_server_error(transport_server_name)
+    )
+    if down_error is not None:
+      return None, down_error
     per_user_state: _PerUserServerState | None = None
     per_user_subject: _PerUserGatewaySubject | None = None
     if self.is_per_user_server(transport_server_name):
       try:
+        server_config = cast(Mapping[str, Any], server.config)
         if self._user_claim_signer is not None and _is_streamable_http_config(
-          cast(Mapping[str, Any], server.config)
+          server_config
         ):
           signer = self._user_claim_signer
           per_user_subject = _PerUserGatewaySubject(
@@ -2764,6 +2939,23 @@ class McpClientManager:
             user_email=signer.user_email,
             claim_user_id=signer.user_id,
             claim_user_email=signer.user_email,
+          )
+        elif gateway_session is None and _is_streamable_http_config(server_config):
+          scoped_env, _ = self._scoped_server_env(
+            transport_server_name, dict(server_config)
+          )
+          if _connection_helpers._remote_user_claim_http_auth(scoped_env) is None:
+            raise ValueError("per-user MCP requires a gateway session")
+          stated_user_id = meta.get("user_id") if isinstance(meta, Mapping) else None
+          if (
+            isinstance(stated_user_id, bool)
+            or not isinstance(stated_user_id, int)
+            or stated_user_id <= 0
+          ):
+            raise ValueError("remote claim mint requires a positive integer meta.user_id")
+          per_user_subject = _PerUserGatewaySubject(
+            user_id=str(stated_user_id),
+            claim_user_id=str(stated_user_id),
           )
         else:
           per_user_subject = _PerUserGatewaySubject.from_gateway_session(
@@ -2859,8 +3051,12 @@ class McpClientManager:
       if per_user_state is not None:
         per_user_state.active_calls += 1
         per_user_state.last_used_at = time.time()
-      result = await self._call_tool_once_with_loopback_retry(
+      result = await self._call_tool_once_on_fresh_session_after_dropped_stream(
         server=server,
+        per_user_state=per_user_state,
+        per_user_subject=per_user_subject,
+        server_name=transport_server_name,
+        replay_allowed=dropped_stream_replay_allowed,
         original_name=original_name,
         tool_input=effective_input,
         meta=meta,
@@ -3204,6 +3400,108 @@ class McpClientManager:
       if abort_task is not None:
         abort_task.cancel()
 
+  async def _call_tool_once_on_fresh_session_after_dropped_stream(
+    self,
+    *,
+    server: _connection_helpers._McpCallableServerState,
+    per_user_state: _PerUserServerState | None,
+    per_user_subject: _PerUserGatewaySubject | None,
+    server_name: str,
+    replay_allowed: bool,
+    original_name: str,
+    tool_input: Dict[str, Any],
+    meta: Dict[str, Any] | None,
+    abort_event: asyncio.Event | None,
+    expected_seconds: float,
+    invocation_report: McpInvocationReport | None,
+    retry_refusals: bool,
+  ) -> _connection_helpers.McpToolCallResult:
+    """One MCP call; a read whose streamable-HTTP response stream closed with no response gets one fresh session.
+
+    The SDK resolves a stream that ends without a result as a synthesized
+    ``CONNECTION_CLOSED`` error. ``replay_allowed`` is the caller's
+    declared-read authority, so a write never replays here; any other failure,
+    and a failed second attempt, surfaces as the caller's typed transport error.
+    """
+
+    def call_on(target: _connection_helpers._McpCallableServerState):
+      return self._call_tool_once_with_loopback_retry(
+        server=target,
+        original_name=original_name,
+        tool_input=tool_input,
+        meta=meta,
+        abort_event=abort_event,
+        expected_seconds=expected_seconds,
+        invocation_report=invocation_report,
+        retry_refusals=retry_refusals,
+      )
+
+    try:
+      return await call_on(server)
+    except Exception as dropped:
+      if (
+        not replay_allowed
+        or not _is_dropped_response_stream(dropped)
+        or not _is_streamable_http_config(cast(Mapping[str, Any], getattr(server, "config", None) or {}))
+      ):
+        raise
+      log.warning(
+        "MCP server %s response stream for %s ended without a response; "
+        "retrying the read once on a fresh session",
+        server_name,
+        original_name,
+      )
+      if per_user_state is None:
+        try:
+          fresh = await self._replace_shared_http_server(server_name, cast(_ServerState, server))
+        except Exception:
+          raise dropped
+        if fresh is None:
+          raise dropped
+        return await call_on(fresh)
+      assert per_user_subject is not None
+      key = (server_name, per_user_subject.user_id)
+      if self._per_user_servers.get(key) is per_user_state:
+        self._per_user_servers.pop(key, None)
+        self._retire_per_user_spawn_lock(key)
+      self._schedule_drain(per_user_state, "response_stream_dropped")
+      try:
+        fresh_state = await self._get_per_user_server(server_name, per_user_subject)
+      except Exception:
+        raise dropped
+      fresh_state.active_calls += 1
+      try:
+        return await call_on(fresh_state.server)
+      except Exception:
+        if self._per_user_servers.get(key) is fresh_state:
+          self._per_user_servers.pop(key, None)
+          self._retire_per_user_spawn_lock(key)
+        self._schedule_drain(fresh_state, "dispatch_transport_failure")
+        raise
+      finally:
+        fresh_state.active_calls = max(0, fresh_state.active_calls - 1)
+        fresh_state.last_used_at = time.time()
+
+  async def _replace_shared_http_server(
+    self, server_name: str, server: _ServerState,
+  ) -> _ServerState | None:
+    """Swap a shared streamable-HTTP server for a fresh session; None when it is no longer published."""
+    async with server.reconnect_lock:
+      async with self._lock:
+        current = self._servers.get(server_name)
+        if current is not server:
+          return current
+        config = server.config
+        assert config is not None
+      replacement = await self._connect(server_name, config)
+      try:
+        async with self._lock:
+          await self._publish_server_states([replacement], replacing=server)
+          return self._servers.get(server_name)
+      except BaseException:
+        await self._close_contexts(replacement.exit_contexts)
+        raise
+
   async def _call_tool_once_with_loopback_retry(
     self,
     *,
@@ -3306,7 +3604,7 @@ class McpClientManager:
       message,
     )
     try:
-      retry_server = await self._replace_stdio_server(server_name, server)
+      retry_server = await self._replace_stdio_server(server_name, server, from_call=True)
     except Exception as reconnect_exc:
       reconnect_message = str(reconnect_exc).strip() or type(reconnect_exc).__name__
       log.warning(
@@ -3351,17 +3649,256 @@ class McpClientManager:
       type(cause).__name__,
     )
     try:
-      return await self._replace_stdio_server(server_name, server) is not None
+      return await self._replace_stdio_server(server_name, server, from_call=True) is not None
     except Exception as reconnect_exc:
       log.warning(
-        "MCP stdio server %s could not reconnect for future calls (%s)",
+        "MCP stdio server %s could not reconnect for future calls (%s): %s",
         server_name,
         type(reconnect_exc).__name__,
+        str(reconnect_exc).strip() or type(reconnect_exc).__name__,
       )
       return False
 
+  def _record_stdio_unavailable(
+    self,
+    server_name: str,
+    exc: BaseException,
+    *,
+    category: str,
+  ) -> None:
+    """Name the failure that keeps a stdio server down; readiness reports it."""
+    message = ": ".join(
+      str(cause).strip() or type(cause).__name__
+      for cause in _config_helpers.iter_exception_tree(exc)
+    )
+    failure = _startup_failure_from_exception(exc)
+    self._set_startup_diagnostic(
+      server_name,
+      category=category,
+      message=f"MCP server {server_name} could not be reconnected: {message}",
+      retryable=bool(failure["retryable"]),
+      error_type=str(failure["error_type"]) if failure.get("error_type") else None,
+      state=_STDIO_RECONNECTING,
+    )
+    self._recovery_generation += 1
+
+  def _record_stdio_reconnecting(self, server: _ServerState) -> None:
+    """From the moment EOF fires the server is down: readiness and calls say so before any round ends."""
+    if not self._started or self._servers.get(server.name) is not server:
+      return
+    self._set_startup_diagnostic(
+      server.name,
+      category="reconnecting",
+      message=f"MCP server {server.name} lost its connection; reconnecting",
+      retryable=True,
+      state=_STDIO_RECONNECTING,
+    )
+    self._recovery_generation += 1
+
+  def _clear_stdio_unavailable(self, server_name: str) -> None:
+    if self._startup_diagnostics.pop(self._canonical_server_name(server_name), None) is not None:
+      self._recovery_generation += 1
+
+  def get_recovery_generation(self) -> int:
+    return self._recovery_generation
+
+  def _declared_down_tools(self) -> Dict[str, "_DeclaredDownTool"]:
+    """Exposed tool name -> (failed server name, logical server id, declaration), for every
+    tool the registration catalog declares on a stdio server whose startup connect
+    failed and whose config is kept. The one derivation every declared-down reader uses.
+    Without a registration catalog nothing says which tools a server declares: empty."""
+    catalog = self._tool_registration_catalog
+    if catalog is None or not self._stdio_startup_failures:
+      return {}
+    declared: Dict[str, _DeclaredDownTool] = {}
+    for server_name, config in self._stdio_startup_failures.items():
+      canonical = self._canonical_server_name(server_name)
+      prefix = str(config.get("tool_prefix", "") or "").strip()
+      for server in catalog.servers:
+        if canonical not in {
+          self._canonical_server_name(server.transport_server_id),
+          self._canonical_server_name(server.logical_server_id),
+          self._transport_server_name(server.logical_server_id),
+        }:
+          continue
+        for declaration in catalog.declarations:
+          identity = declaration.identity
+          if identity.route_kind != "mcp" or identity.logical_server_id != server.logical_server_id:
+            continue
+          declared[f"{prefix}{identity.logical_name}"] = _DeclaredDownTool(
+            server_name, server.logical_server_id, declaration,
+          )
+    return declared
+
+  def get_declared_tools_of_startup_failed_servers(self) -> Dict[str, str]:
+    """Exposed tool name -> logical server id, for every tool the registration catalog
+    declares on a stdio server whose startup connect failed and whose config is kept.
+
+    Such a server published no definitions, so nothing else names its tools. A caller
+    that admits one of these names reaches preparation, which refuses typed
+    (`mcp_server_unavailable`) while the server is down.
+    """
+    return {name: tool.logical_server_id for name, tool in self._declared_down_tools().items()}
+
+  def _declared_down_tool(self, exposed_name: str) -> "_DeclaredDownTool | None":
+    """A declared tool with no live descriptor whose server failed its startup connect;
+    None for every other name."""
+    if exposed_name in self._registered_mcp_descriptors_by_exposed_name:
+      return None
+    return self._declared_down_tools().get(exposed_name)
+
+  def get_declared_down_tool_declaration(
+    self, exposed_name: str,
+  ) -> ToolRegistrationDeclaration | None:
+    """The catalog declaration of a declared tool whose server failed its startup
+    connect: what a reader may know about the tool while no live route exists."""
+    tool = self._declared_down_tool(exposed_name)
+    return tool.declaration if tool is not None else None
+
+  def _failed_stdio_server_may_serve(self, server_name: str, tool_name: str) -> bool:
+    """Whether a tool name can belong to a server that has no live catalog.
+
+    Without a registration catalog nothing says which server owns a tool, so
+    every failed server is a candidate; with one, the server's declared tools do.
+    """
+    catalog = self._tool_registration_catalog
+    if catalog is None:
+      return True
+    canonical = self._canonical_server_name(server_name)
+    logical_ids = {
+      server.logical_server_id
+      for server in catalog.servers
+      if canonical in {
+        self._canonical_server_name(server.transport_server_id),
+        self._canonical_server_name(server.logical_server_id),
+        self._transport_server_name(server.logical_server_id),
+      }
+    }
+    return any(
+      declaration.identity.route_kind == "mcp"
+      and declaration.identity.logical_server_id in logical_ids
+      and (
+        tool_name == declaration.identity.logical_name
+        or tool_name.endswith(f"__{declaration.identity.logical_name}")
+      )
+      for declaration in catalog.declarations
+    )
+
+  def _server_unavailable_error(self, server_names: Sequence[str]) -> Dict[str, Any]:
+    diagnostics = self._startup_diagnostics
+    reasons = "; ".join(
+      str(diagnostics.get(self._canonical_server_name(name), {}).get("message", ""))
+      for name in server_names
+    )
+    return {
+      "code": "mcp_tool_error",
+      "sub_code": "mcp_server_unavailable",
+      "message": f"MCP server unavailable: {', '.join(server_names)}; {reasons}",
+    }
+
+  def _down_stdio_server_error(self, server_name: str) -> Dict[str, Any] | None:
+    """The typed error for a stdio server recorded down; its recovery runs off the call path."""
+    diagnostic = self._startup_diagnostics.get(self._canonical_server_name(server_name))
+    if diagnostic is None or diagnostic.get("state") != _STDIO_RECONNECTING:
+      return None
+    return self._server_unavailable_error([server_name])
+
+  async def _recover_stdio_server(
+    self,
+    attempt: Callable[[], Coroutine[Any, Any, bool]],
+    *,
+    pause_first: bool = False,
+  ) -> None:
+    """Retry one down stdio server until it is back, pausing a bounded time between rounds.
+
+    Runs as the EOF watch task (a child lost after startup) or the
+    startup-recovery task (a failed startup connect), never on a caller's path.
+    ``attempt`` records its own diagnostic and returns whether the server is
+    back; shutdown ends the loop by cancelling its task.
+    """
+    failures = 0
+    if pause_first:
+      await asyncio.sleep(_stdio_recovery_delay(failures))
+      failures += 1
+    while not await attempt():
+      await asyncio.sleep(_stdio_recovery_delay(failures))
+      failures += 1
+
+  def _arm_startup_stdio_recovery(self, server_name: str) -> None:
+    task = self._stdio_startup_recovery_tasks.get(server_name)
+    if task is not None and not task.done():
+      return
+    diagnostic = self._startup_diagnostics.get(self._canonical_server_name(server_name))
+    if diagnostic is not None:
+      diagnostic["state"] = _STDIO_RECONNECTING
+    self._stdio_startup_recovery_tasks[server_name] = asyncio.create_task(
+      self._recover_stdio_server(
+        lambda: self._connect_startup_failed_stdio_server(server_name),
+        pause_first=True,
+      )
+    )
+
+  async def _connect_startup_failed_stdio_server(self, server_name: str) -> bool:
+    """One recovery round for a server whose startup connect failed; True when it is published."""
+    config = self._stdio_startup_failures.get(server_name)
+    if config is None:
+      return True
+    try:
+      replacement = await self._connect_stdio_with_retries(server_name, config)
+    except Exception as exc:
+      log.warning(
+        "MCP stdio server %s still down after its startup failure (%s): %s",
+        server_name,
+        type(exc).__name__,
+        str(exc).strip() or type(exc).__name__,
+      )
+      self._record_stdio_unavailable(
+        server_name, exc,
+        category=str(_startup_failure_from_exception(exc)["category"]),
+      )
+      return False
+    try:
+      async with self._lock:
+        if not self._started:
+          await self._close_contexts(replacement.exit_contexts)
+          return True
+        await self._publish_server_states([replacement])
+    except BaseException as exc:
+      await self._close_contexts(replacement.exit_contexts)
+      if not isinstance(exc, Exception):
+        raise
+      log.warning(
+        "MCP stdio server %s reconnected but was not published (%s): %s",
+        server_name,
+        type(exc).__name__,
+        str(exc).strip() or type(exc).__name__,
+      )
+      self._record_stdio_unavailable(server_name, exc, category="reconnect_failed")
+      return False
+    del self._stdio_startup_failures[server_name]
+    self._clear_stdio_unavailable(server_name)
+    log.warning("MCP stdio server %s connected after its startup failure", server_name)
+    return True
+
+  def _ensure_stdio_recovery(self, server: _ServerState) -> None:
+    """After a failed round, keep one recovery task for a generation that is still the published one.
+
+    A round run by a call may have cancelled the EOF watch task (closing the
+    generation cancels it); without a task nothing would ever reconnect the server.
+    """
+    watch = server.stdio_watch_task
+    if (
+      (watch is not None and not watch.done())
+      or not self._started
+      or self._servers.get(server.name) is not server
+    ):
+      return
+    server.stdio_watch_task = asyncio.create_task(
+      self._recover_stdio_server(lambda: self._replace_after_eof(server), pause_first=True)
+    )
+
   async def _replace_stdio_server(
-    self, server_name: str, server: _ServerState,
+    self, server_name: str, server: _ServerState, *, from_call: bool = False,
   ) -> _ServerState | None:
     # EOF and an in-flight call can observe the same disconnect. One owner
     # closes/spawns/publishes; the other uses the already published generation.
@@ -3390,27 +3927,49 @@ class McpClientManager:
         current = self._servers.get(server_name)
         if current is not server:
           return current
+        if from_call and self._down_stdio_server_error(server_name) is not None:
+          # The recovery owner's rounds are the reconnect; a call never runs one beside
+          # it (a call that closed the generation would cancel the owner's task).
+          return None
         await self._close_server(server)
-      replacement = await self._connect_stdio_with_retries(server_name, config)
+      try:
+        replacement = await self._connect_stdio_with_retries(server_name, config)
+      except Exception as exc:
+        self._record_stdio_unavailable(server_name, exc, category="reconnect_failed")
+        self._ensure_stdio_recovery(server)
+        raise
       try:
         async with self._lock:
           await self._publish_server_states([replacement], replacing=server)
-          return self._servers.get(server_name)
-      except BaseException:
+          published = self._servers.get(server_name)
+          if published is replacement:
+            self._clear_stdio_unavailable(server_name)
+          return published
+      except BaseException as exc:
         await self._close_contexts(replacement.exit_contexts)
+        if isinstance(exc, Exception):
+          self._record_stdio_unavailable(server_name, exc, category="reconnect_failed")
+          self._ensure_stdio_recovery(server)
         raise
 
   async def _reconnect_stdio_on_eof(self, server: _ServerState) -> None:
     assert server.stdio_eof is not None
     await server.stdio_eof.wait()
     log.warning("MCP stdio server %s closed stdout; reconnecting", server.name)
+    self._record_stdio_reconnecting(server)
+    await self._recover_stdio_server(lambda: self._replace_after_eof(server))
+
+  async def _replace_after_eof(self, server: _ServerState) -> bool:
+    """One recovery round for a child lost after startup; True when a generation is published."""
     try:
       await self._replace_stdio_server(server.name, server)
     except Exception as exc:
       log.warning(
-        "MCP stdio server %s could not reconnect after EOF (%s)",
-        server.name, type(exc).__name__,
+        "MCP stdio server %s could not reconnect after EOF (%s): %s",
+        server.name, type(exc).__name__, str(exc).strip() or type(exc).__name__,
       )
+      return False
+    return True
 
   async def _close_server(self, server: _ServerState) -> None:
     watch = server.stdio_watch_task
@@ -3432,15 +3991,22 @@ class McpClientManager:
         and not server.stdio_watch_task.done()
       )
     ]
+    watches.extend(
+      task
+      for task in self._stdio_startup_recovery_tasks.values()
+      if task is not asyncio.current_task() and not task.done()
+    )
     for watch in watches:
       watch.cancel()
     if watches:
       await asyncio.gather(*watches, return_exceptions=True)
+    self._stdio_startup_recovery_tasks = {}
 
   async def shutdown(self) -> None:
     await self._retire_stdio_watch_tasks()
     async with self._lock:
       self._registered_mcp_descriptors_by_exposed_name = MappingProxyType({})
+      self._refused_mcp_routes = ()
       if not self._started and not self._servers:
         return
 
@@ -3478,6 +4044,7 @@ class McpClientManager:
       self._logical_tool_definitions = {}
       self._logical_alias_generation = ()
       self._startup_diagnostics = {}
+      self._stdio_startup_failures = {}
       self._configured_transport_server_names = None
       self._started = False
 
@@ -3489,6 +4056,7 @@ class McpClientManager:
     for state in self._servers.values():
       state.published_tool_definitions = state.tool_definitions
     self._registered_mcp_descriptors_by_exposed_name = MappingProxyType({})
+    self._refused_mcp_routes = ()
     self._logical_alias_generation = ()
     if policy_server_for_tool is None:
       _get_forbidden_tools_for_session, get_server_for_policy_tool, _get_tool_class = load_server_policy_helpers()
@@ -3592,4 +4160,4 @@ class McpClientManager:
     )
 
   def _read_claude_config(self) -> Dict[str, Any]:
-    return _runtime_helpers.read_claude_config(self._config_path, json_load=json.load, logger=log)
+    return _runtime_helpers.read_claude_config(self._config_path, json_load=json.load)

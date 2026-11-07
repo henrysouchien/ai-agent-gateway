@@ -35,7 +35,9 @@ from .auth import (
   ChannelMismatchError,
   CrossUserReuseError,
   MissingUserIdError,
+  SessionDriverUserKeyMissing,
 )
+from .user_identity_mapping import StorageIdentityFinding
 from .autonomous_runner import AutonomousRegistry
 from .skills import SkillLoader
 from .directory_control_skill_catalog import DirectoryControlSkillCatalog
@@ -47,7 +49,7 @@ from .skill_limits import (
 from .control_plane import create_control_plane_router
 from .control_plane.middleware import add_control_plane_version_header_middleware
 from .control_plane.session import _resolve_control_identity
-from hank_contracts.commercial_work import CommercialWorkStartError
+from hank_contracts.commercial_work import COMMERCIAL_CLAIM_HEADER, CommercialWorkStartError
 from model_authority.binding import CapabilityResolutionError, eligible_model_choices
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from .event_log import EventLog, UserEventBus
@@ -75,6 +77,7 @@ from .session import (
   SessionStream,
   bind_session_credentials,
   session_owner_user_id,
+  caller_kind_for_channel,
 )
 from .undo_token_lifetime import (
   UndoTokenLifetimeRegistry,
@@ -115,6 +118,7 @@ from .server_models import (  # noqa: F401
   ChatTurnInputs,
   ChatTurnResult,
   PreparedChatTurn,
+  CapabilityChoiceResponse,
   ToolResultRequest,
   ToolApprovalRequest,
   ChatRuntime,
@@ -122,18 +126,18 @@ from .server_models import (  # noqa: F401
   ModelPreferenceUpdate,
   ModelPresetResponse,
   ModelPresetUpdate,
-  _call_build_chat_runtime,
+  call_build_chat_runtime,
   RequestContext,
   GatewayServerConfig,
   MaterializedCredential,
   SessionResumeRefusalReason,
 )
+from .artifact_paths import autonomous_log_dir
 from .server_artifact_helpers import (  # noqa: F401
   _normalize_prefix,
   _route_path,
   _default_control_skills_dir,
   _default_autonomous_api_dir,
-  _default_autonomous_log_dir,
   _resolve_compaction_trigger,
   _json_dumps,
   _artifact_auth_dependency,
@@ -151,7 +155,7 @@ from .server_chat_helpers import (  # noqa: F401
   _cleanup_sessions_loop,
   _maybe_await,
   _clear_active_turn,
-  _active_turn_is_running,
+  active_turn_is_running,
   _cancel_active_turn_runner,
   _cleanup_active_turn_on_expiry,
   _event_for_wire,
@@ -159,6 +163,7 @@ from .server_chat_helpers import (  # noqa: F401
   _make_request_approval,
   bind_init_capability_selections,
   build_capability_choices,
+  user_key_service_unavailable_notice,
   _capability_execution_resolver_for_session,
   prepare_session_driver_turn,
   _dispatch_chat_turn,
@@ -571,7 +576,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       # `_finalize_run` and writes its `on_session_summary` row.
       for session in list(auth.session_store.sessions.values()):
         active_turn = session.active_turn
-        if active_turn is None or not _active_turn_is_running(active_turn):
+        if active_turn is None or not active_turn_is_running(active_turn):
           continue
         try:
           await _cancel_active_turn_runner(active_turn)
@@ -776,7 +781,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       ]
     except Exception:
       log.warning("Gateway-local skill tool injection failed", exc_info=True)
-    runtime = await _call_build_chat_runtime(
+    runtime = await call_build_chat_runtime(
       build_chat_runtime,
       session=session,
       request=request,
@@ -853,7 +858,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     config.claim_signing_authority
   )
   app.state.gateway_skill_application = config.skill_application
-  autonomous_storage_root = _default_autonomous_log_dir()
+  autonomous_storage_root = autonomous_log_dir()
   if (
     config.control_skill_catalog is not None
     and config.control_skills_dir is not None
@@ -938,6 +943,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     agent_run_schedule_users_root,
     schedule_store_for,
   )
+  from .model_preferences import StoredPreferenceError
 
   app.state.agent_run_schedule_store_for = functools.cache(schedule_store_for)
   app.state.agent_run_schedule_runner = AgentRunScheduleRunner(
@@ -960,6 +966,61 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       },
     )
 
+  def _stored_preference_refusal(
+    exc: StoredPreferenceError,
+    *,
+    session_token: str | None = None,
+  ) -> JSONResponse:
+    # A mistyped stored row is data corruption in the caller's own saved
+    # selection (or the firm's): name the column and the call that removes it.
+    # `chat/init` has already created the session the repair call needs, so it
+    # hands back that session's token with the refusal; every other caller
+    # already holds one.
+    retry = f"retry POST {_route_path(route_prefix, '/chat/init')}"
+    bearer = (
+      " with the session_token in this response as the Bearer token"
+      if session_token is not None
+      else ""
+    )
+    if exc.scope == "preference":
+      next_call = (
+        f"DELETE {_route_path(route_prefix, f'/model-preferences/{exc.capability_id}')}"
+        f"{bearer} (or PUT a new selection there), then {retry}"
+      )
+    elif exc.scope == "user_preset":
+      next_call = (
+        f"DELETE {_route_path(route_prefix, '/model-presets/self')}"
+        f"{bearer} (or PUT a published preset there), then {retry}"
+      )
+    else:
+      next_call = (
+        "no caller route edits a firm preset: the deployment operator must "
+        f"correct or delete that firm_model_presets row, then {retry}"
+      )
+    content: dict[str, Any] = {
+      "error_code": "stored_model_preference_invalid",
+      "scope": exc.scope,
+      "column": exc.column,
+      "message": str(exc),
+      "next_call": next_call,
+    }
+    headers: dict[str, str] = {}
+    if session_token is not None:
+      content["session_token"] = session_token
+      headers["Cache-Control"] = "private, no-store"
+    return JSONResponse(
+      status_code=status.HTTP_409_CONFLICT,
+      content=content,
+      headers=headers,
+    )
+
+  @app.exception_handler(StoredPreferenceError)
+  async def _stored_preference_handler(
+    _request: Request,
+    exc: StoredPreferenceError,
+  ) -> JSONResponse:
+    return _stored_preference_refusal(exc)
+
   app.state.batch_task_registry = BatchTaskRegistry()
   app.state.batch_backend = config.batch_backend
   control_prefix = _route_path(route_prefix, "/control")
@@ -981,6 +1042,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   async def chat_init(
     payload: ChatInitRequest,
     response: Response,
+    request: Request,
   ) -> ChatInitResponse | JSONResponse:
     auth.validate_api_key(payload.api_key)
     try:
@@ -989,7 +1051,11 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       return JSONResponse({"error": "unsupported_schema_version", "message": str(exc.detail)}, status_code=exc.status_code)
     resolver = config.credentials_resolver
     try:
-      resolved_user_id = _normalize_request_user_id(payload.user_id)
+      resolved_user_id = (
+        payload.user_id
+        if resolver is None and config.identity_resolver is None
+        else _normalize_request_user_id(payload.user_id)
+      )
     except MissingUserIdError as exc:
       status, error_payload = _error_payload(exc)
       return JSONResponse(error_payload, status_code=status)
@@ -1007,13 +1073,30 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     resolved_model_entitled_capabilities: frozenset[str] = frozenset()
     resolved_unknown_model_entitled_capabilities: frozenset[str] = frozenset()
     resolved_model_entitled_keys: frozenset[str] = frozenset()
+    resolved_enrolled_user_key_providers: frozenset[str] = frozenset()
+    resolved_unavailable_user_key_providers: frozenset[str] = frozenset()
     resolved_credential_principal = None
     resolved_allow_service_for_interactive = (
       config.allow_service_credentials_for_interactive
     )
+    metered_pending: SessionDriverUserKeyMissing | None = None
+    commercial_gate = config.commercial_work_start_gate
     if resolver is not None:
       try:
         result = await resolver(payload.api_key, payload)
+      except SessionDriverUserKeyMissing as exc:
+        # Keyless session driver: only a commercial claim the turn gate's own
+        # verifier accepts below opens the session, and it opens with no
+        # credential. Without a claim this is the ordinary start refusal.
+        if (
+          commercial_gate is None
+          or not commercial_gate.enabled
+          or COMMERCIAL_CLAIM_HEADER not in request.headers
+        ):
+          status, error_payload = _error_payload(exc, user_id=resolved_user_id)
+          return JSONResponse(error_payload, status_code=status)
+        metered_pending = exc
+        result = exc.pending
       except Exception as exc:
         status, error_payload = _error_payload(exc, user_id=resolved_user_id)
         return JSONResponse(error_payload, status_code=status)
@@ -1052,6 +1135,8 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         result.unknown_model_entitled_capabilities
       )
       resolved_model_entitled_keys = result.model_entitled_keys
+      resolved_enrolled_user_key_providers = result.enrolled_user_key_providers
+      resolved_unavailable_user_key_providers = result.unavailable_user_key_providers
       resolved_auth_config = result.auth_config.to_dict()
       resolved_credential_principal = result.credential_principal
       resolved_allow_service_for_interactive = (
@@ -1093,6 +1178,17 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     except (ValueError, SystemExit) as exc:
       status, error_payload = _resolver_contract_payload(str(exc), user_id=resolved_user_id)
       return JSONResponse(error_payload, status_code=status)
+    if metered_pending is not None and commercial_gate is not None:
+      try:
+        metered_claim = commercial_gate.verify_session_claim(
+          request.headers, owner_user_id=str(identity.owner_user_id or ""),
+        )
+      except CommercialWorkStartError as exc:
+        log.warning("Metered-pending session start refused | code=%s", exc.code)
+        return JSONResponse({"error": exc.code, "message": str(exc)}, status_code=exc.status_code)
+      if metered_claim is None:
+        status, error_payload = _error_payload(metered_pending, user_id=resolved_user_id)
+        return JSONResponse(error_payload, status_code=status)
 
     api_key_hash = AuthManager.hash_api_key(payload.api_key)
     resume_log_path: Path | None = None
@@ -1127,9 +1223,24 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           # so two live sessions never hold one log.
           prior_turn = prior_session.active_turn
           if prior_turn is not None and prior_turn.in_progress:
-            resume_outcome = "in_use"
-          else:
-            auth.session_store.expire_session(prior_session.session_id)
+            # The caller cannot resume onto an answering turn; the turn ends
+            # through the cancel route on the session that holds it, never
+            # through a resume (R5 2026-11-04: a stuck pipeline was "cancelled"
+            # by resume and refused here with no way named).
+            return JSONResponse(
+              {
+                "error": "session_resume_refused",
+                "reason": "in_use",
+                "in_use_session_id": prior_session.session_id,
+                "next_call": {
+                  "method": "POST",
+                  "path": "/chat/cancel",
+                  "body": {"session_id": prior_session.session_id},
+                },
+              },
+              status_code=409,
+            )
+          auth.session_store.expire_session(prior_session.session_id)
       if not isinstance(resume_outcome, Path):
         return JSONResponse(
           {"error": "session_resume_refused", "reason": resume_outcome},
@@ -1142,28 +1253,44 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         # session holding that log keeps it, idle or answering.
         fork_source_log_path = resume_outcome
 
-    session = auth.session_store.create_session(
-      api_key_hash=api_key_hash,
-      user_id=resolved_user_id,
-      user_email=identity.user_email,
-      risk_user_id=identity.risk_user_id,
-      role=resolved_role,
-      capabilities=resolved_capabilities,
-      model_entitled_capabilities=resolved_model_entitled_capabilities,
-      model_entitled_keys=resolved_model_entitled_keys,
-      kind="chat",
-      auth_config=resolved_auth_config,
-      schema_version=schema_version,
-      owner_user_id=str(identity.owner_user_id),
-      raw_user_id=str(identity.raw_user_id),
-      user_slug=identity.user_slug,
-      user_aliases=tuple(str(alias) for alias in identity.aliases),
-      identity_status=str(identity.identity_status),
-      tenant_id=config.tenant_id,
-      allow_service_for_interactive=resolved_allow_service_for_interactive,
-    )
+    try:
+      session = auth.session_store.create_session(
+        api_key_hash=api_key_hash,
+        user_id=resolved_user_id,
+        user_email=identity.user_email,
+        risk_user_id=identity.risk_user_id,
+        role=resolved_role,
+        capabilities=resolved_capabilities,
+        model_entitled_capabilities=resolved_model_entitled_capabilities,
+        model_entitled_keys=resolved_model_entitled_keys,
+        enrolled_user_key_providers=resolved_enrolled_user_key_providers,
+        unavailable_user_key_providers=resolved_unavailable_user_key_providers,
+        kind="chat",
+        auth_config=resolved_auth_config,
+        schema_version=schema_version,
+        owner_user_id=identity.owner_user_id,
+        raw_user_id=identity.raw_user_id,
+        user_slug=identity.user_slug,
+        user_aliases=tuple(str(alias) for alias in identity.aliases),
+        identity_status=str(identity.identity_status),
+        tenant_id=config.tenant_id,
+        allow_service_for_interactive=resolved_allow_service_for_interactive,
+      )
+    except StorageIdentityFinding as exc:
+      status, error_payload = _resolver_contract_payload(str(exc), user_id=resolved_user_id)
+      return JSONResponse(error_payload, status_code=status)
     session.channel = resolved_channel
+    # Who this session is for is minted here, positively: a human client channel
+    # or an agent program; a product door that needs the caller's kind reads it
+    # and refuses a session no door classified. (`purpose` is the turn's context
+    # purpose, rewritten per /api/chat turn; this is a different fact.)
+    session.caller_kind = caller_kind_for_channel(resolved_channel)
+    if metered_pending is not None:
+      session.metered_pending_provider = metered_pending.provider
     session.resume_log_path = resume_log_path
+    session.resumed_from_session_id = (
+      payload.resume_session_id if resume_log_path is not None else None
+    )
     session.fork_source_log_path = fork_source_log_path
     if app.state.undo_token_lifetimes.is_closed(
       owner=undo_owner_id(session), conversation=undo_conversation_id(session),
@@ -1181,7 +1308,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     )
     try:
       if config.on_session_created is not None:
-        config.on_session_created(session, payload.api_key, payload)
+        await asyncio.to_thread(config.on_session_created, session, payload.api_key, payload)
       if (
         session.session_credential_handle is None
         and resolved_credential_principal is not None
@@ -1195,7 +1322,8 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
             resolved_allow_service_for_interactive
           ),
         )
-      bind_init_capability_selections(
+      await asyncio.to_thread(
+        bind_init_capability_selections,
         session=session,
         selections=payload.capability_selections,
         model_preset=payload.model_preset,
@@ -1214,6 +1342,13 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       auth.session_store.expire_session(session.session_id)
       raise
     token = auth.issue_token(session)
+    try:
+      capability_choices = build_capability_choices(
+        session=session,
+        build_chat_runtime=app.state.gateway_build_chat_runtime,
+      )
+    except StoredPreferenceError as exc:
+      return _stored_preference_refusal(exc, session_token=token)
     log.info(
       "Session created: %s%s",
       session.session_id,
@@ -1235,13 +1370,8 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       session_id=session.session_id,
       expires_at=session.expires_at,
       schema_version=session.schema_version,
-      capability_choices=build_capability_choices(
-        session=session,
-        build_chat_runtime=app.state.gateway_build_chat_runtime,
-      ),
-      resumed_from_session_id=(
-        payload.resume_session_id if resume_log_path is not None else None
-      ),
+      capability_choices=capability_choices,
+      resumed_from_session_id=session.resumed_from_session_id,
       forked_from_session_id=(
         payload.fork_from_session_id if fork_source_log_path is not None else None
       ),
@@ -1251,6 +1381,19 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     token = AuthManager.get_bearer_token(request.headers.get("Authorization"))
     session, _claims = auth.verify_token_with_payload(token)
     return session
+
+  @router.get("/capability-choices/session.driver", response_model=None)
+  async def get_session_driver_choices(request: Request, response: Response) -> CapabilityChoiceResponse | JSONResponse:
+    """Read current choices without replacing the session that owns a parked turn."""
+    session = _model_preference_session(request)
+    try:
+      choices = build_capability_choices(
+        session=session, build_chat_runtime=app.state.gateway_build_chat_runtime,
+      )
+    except StoredPreferenceError as exc:
+      return _stored_preference_refusal(exc)
+    response.headers["Cache-Control"] = "private, no-store"
+    return choices["session.driver"]
 
   def _require_model_selection_capability(capability_id: str) -> str:
     normalized_capability = str(capability_id or "").strip()
@@ -1279,6 +1422,20 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       session=session,
       build_chat_runtime=app.state.gateway_build_chat_runtime,
     )
+    unavailable = user_key_service_unavailable_notice(
+      session, resolver, normalized_capability, body.model_key,
+    )
+    if unavailable is not None:
+      return JSONResponse(
+        {
+          "error_code": "credential_unavailable",
+          "reason": unavailable.reason,
+          "capability_id": normalized_capability,
+          "model_key": body.model_key,
+          "message": unavailable.message,
+        },
+        status_code=422,
+      )
     choices = {
       choice.key: choice
       for choice in eligible_model_choices(
@@ -1568,7 +1725,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       commercial_gate is not None
       and commercial_gate.enabled
       and (
-        _active_turn_is_running(session.active_turn)
+        active_turn_is_running(session.active_turn)
         or session.stream_active
         or session._commercial_dispatch_owner is not None
       )
@@ -1596,7 +1753,22 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
         if commercial_gate.enabled:
           commercial_dispatch_owner = object()
           session._commercial_dispatch_owner = commercial_dispatch_owner
-      prepared_turn = prepare_session_driver_turn(
+      # A verified metered V4 decides this turn's credential before it binds:
+      # its seat is the only service handle it mints, and the authorization
+      # attaches below only to a bind on that seat.
+      metered_seat = (
+        commercial_gate.metered_seat(
+          verified_commercial_claim,
+          session=session,
+          request_id=(
+            inputs.request_id.strip() if isinstance(inputs.request_id, str) else ""
+          ),
+        )
+        if commercial_gate is not None
+        else None
+      )
+      prepared_turn = await asyncio.to_thread(
+        prepare_session_driver_turn,
         session,
         inputs,
         build_chat_runtime=app.state.gateway_build_chat_runtime,
@@ -1605,6 +1777,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           if verified_commercial_claim is not None
           else None
         ),
+        metered_seat=metered_seat,
       )
       if commercial_gate is not None:
         pending_work_start = commercial_gate.authorize_request(
@@ -1612,6 +1785,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
           session=session,
           request=prepared_turn.request,
           channel=prepared_turn.channel,
+          metered_seat=metered_seat,
         )
         # Keep the bounded local attach synchronous while this opaque owner is
         # held. A detached worker cannot be cancelled safely after SQLite has
@@ -1773,6 +1947,14 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
     if active is not None and getattr(active, "event_log", None) is not None:
       active.event_log.append(event)
 
+  @router.get("/chat/history")
+  async def chat_history(request: Request) -> JSONResponse:
+    return await _server_chat_control_routes.chat_history_response(
+      request,
+      auth=auth,
+      get_bearer_token=AuthManager.get_bearer_token,
+    )
+
   @router.get("/chat/subscribe")
   async def chat_subscribe(request: Request) -> StreamingResponse:
     return await _server_chat_control_routes.chat_subscribe_response(
@@ -1784,6 +1966,7 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       stream_subscriber_sse=_stream_subscriber_sse,
       transcript_dir=transcript_dir,
       log=log,
+      get_session=auth.session_store.get_session,
     )
 
   @router.post("/chat/cancel")
@@ -1795,6 +1978,16 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
       get_bearer_token=AuthManager.get_bearer_token,
       cancel_active_turn_runner=_cancel_active_turn_runner,
       clear_active_turn=_clear_active_turn,
+      get_session=auth.session_store.get_session,
+    )
+
+  @router.post("/chat/background/{task_id}/interrupt")
+  async def chat_interrupt_background_child(request: Request, task_id: str) -> JSONResponse:
+    return await _server_chat_control_routes.chat_interrupt_background_child_response(
+      request,
+      task_id,
+      auth=auth,
+      get_bearer_token=AuthManager.get_bearer_token,
     )
 
   @router.post("/chat/recap")
@@ -1929,6 +2122,9 @@ def create_gateway_app(config: GatewayServerConfig) -> FastAPI:
   ))
 
   app.include_router(router)
+  from .autonomous_user_keys import build_autonomous_user_keys_router
+
+  app.include_router(build_autonomous_user_keys_router(auth=auth))
   app.include_router(
     create_control_plane_router(
       auth=auth,

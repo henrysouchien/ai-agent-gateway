@@ -22,9 +22,31 @@ ContinueStatus = Literal[
   "outcome_unknown",
   "not_root",
   "credential_unavailable",
+  "session_no_longer_active",
   "policy_generation_changed",
   "tenant_mismatch",
   "not_restorable",
+  "credentials_resolver_unavailable",
+  "attach_discovery_unavailable",
+  "session_attach_not_found",
+  "api_key_match_not_unique",
+  "credential_identity_mismatch",
+  "session_log_missing",
+  "session_log_binding_mismatch",
+  "live_session_log_unavailable",
+  "session_restoration_unavailable",
+]
+
+RootSessionRestoreStatus = Literal[
+  "credentials_resolver_unavailable",
+  "attach_discovery_unavailable",
+  "session_attach_not_found",
+  "api_key_match_not_unique",
+  "credential_identity_mismatch",
+  "session_log_missing",
+  "session_log_binding_mismatch",
+  "live_session_log_unavailable",
+  "session_restoration_unavailable",
 ]
 
 
@@ -93,6 +115,9 @@ class ChildContinueOutcome:
   status: ContinueStatus
   job_id: str | None = None
   tool_call_id: str | None = None
+  # Human-readable reason for a status that is not a delivery; the status stays
+  # the machine-read field and no consumer branches on this text.
+  detail: str | None = None
 
 
 ChildContinueHook = Callable[[ChildContinueRequest], Awaitable[ChildContinueOutcome]]

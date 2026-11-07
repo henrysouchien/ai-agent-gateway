@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import errno
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -28,9 +29,27 @@ if str(PKG_DIR) not in sys.path:
 import agent_gateway.mcp_client as mcp_client_module  # noqa: E402
 import agent_gateway.mcp_client_connections as mcp_client_connections  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager  # noqa: E402
+from agent_gateway.mcp_client_errors import McpStdioStartupBoundError  # noqa: E402
+from agent_gateway.tool_policy_registry import (  # noqa: E402
+  PlanDecision,
+  PreparedToolCall,
+  RedactionResult,
+  SourceIdentityResult,
+  ToolPolicyImplementation,
+  ToolPolicyImplementationRegistry,
+  reject_policy_parameters,
+)
 from agent_gateway.tool_registration import RegisteredMcpToolCompilationError  # noqa: E402
+from gateway_test_support.host_policy import owner_session_host_policy  # noqa: E402,F401
 from agent_workflow_contracts.tool_registration import (  # noqa: E402
+  PolicyKind,
+  RegisteredToolIdentity,
+  RegisteredToolServerDescriptor,
+  ToolApprovalPolicy,
+  ToolIntrinsicSemantics,
   ToolRegistrationCatalog,
+  ToolRegistrationDeclaration,
+  VersionedPolicyRef,
 )
 
 
@@ -412,7 +431,47 @@ def test_reconnect_restores_tools_hidden_by_temporary_collision(reconnect_transp
   asyncio.run(scenario())
 
 
-def test_rejected_startup_closes_all_connected_transports(reconnect_transport):
+def test_startup_contains_unregistered_routes_and_refuses_calls_to_them(reconnect_transport):
+  async def scenario():
+    queue, opened_contexts = reconnect_transport
+    queue(["alpha"])
+    queue(["beta"])
+    manager = McpClientManager(
+      config_path=None,
+      inline_servers={
+        name: {"command": sys.executable} for name in ("first", "second")
+      },
+      tool_registration_catalog=ToolRegistrationCatalog(declarations=(), servers=()),
+    )
+    try:
+      await manager.startup()
+      assert {
+        (route.logical_server_id, route.logical_name)
+        for route in manager.get_refused_mcp_routes()
+      } == {("first", "alpha"), ("second", "beta")}
+      assert manager.get_tool_definitions() == []
+      result, error = await manager.call_tool("alpha", {})
+      assert result is None
+      assert error is not None
+      assert error["code"] == "mcp_tool_not_registered"
+      assert "alpha" in error["message"]
+      assert "first" in error["message"]
+      assert not any(context.closed for context in opened_contexts)
+    finally:
+      await manager.shutdown()
+    assert manager.get_refused_mcp_routes() == ()
+
+  asyncio.run(scenario())
+
+
+def test_rejected_startup_closes_all_connected_transports(reconnect_transport, monkeypatch):
+  def incoherent_compile(*_args, **_kwargs):
+    raise RegisteredMcpToolCompilationError("duplicate live MCP exposed name")
+
+  monkeypatch.setattr(
+    mcp_client_module, "compile_registered_mcp_tool_descriptors", incoherent_compile,
+  )
+
   async def scenario():
     queue, opened_contexts = reconnect_transport
     queue(["alpha"])
@@ -585,7 +644,9 @@ async def read_generation() -> dict:
         await asyncio.Event().wait()
     return {"generation": generation}
 
-mcp.run()
+# The banner's PyPI version check is a network call: where the resolver does not answer
+# (a no-egress gate box) it stalls every spawn of this server for about 10 s.
+mcp.run(show_banner=False)
 """)
   generation_file = tmp_path / "generation"
   generation_file.write_text("first")
@@ -663,7 +724,7 @@ def read_generation() -> dict:
         stream.write(generation + "\\n")
     return identity
 
-mcp.run()
+mcp.run(show_banner=False)
 """)
   generation_file.write_text("first")
 
@@ -1213,6 +1274,192 @@ def test_failed_stdio_child_with_surviving_descendant_shuts_down_bounded(monkeyp
   assert diagnostic.endswith("child fatal: dependency missing")
 
 
+def test_gateway_spawned_fastmcp_child_attempts_no_update_check(tmp_path, monkeypatch) -> None:
+  # A product server's plain `mcp.run()`: FastMCP's banner makes a blocking PyPI
+  # version check unless the gateway's child env turns it off.
+  monkeypatch.setattr(mcp_client_module, "_stdio_connect_retries", lambda: 0)
+  egress = tmp_path / "egress.log"
+  server_script = tmp_path / "plain_run_server.py"
+  server_script.write_text("""
+import os
+import socket
+import sys
+from pathlib import Path
+
+egress = Path(os.environ["EGRESS_LOG"])
+
+def refuse_egress(event, args):
+    # Record every name lookup and non-local connect, and fail it at once, as a
+    # box whose resolver does not answer would, minus the wait.
+    if event == "socket.getaddrinfo":
+        target = args[0]
+    elif event == "socket.connect" and args[0].family != socket.AF_UNIX:
+        target = args[1]
+    else:
+        return
+    with egress.open("a") as stream:
+        stream.write(f"{event} {target!r}\\n")
+    raise socket.gaierror(socket.EAI_NONAME, "egress refused by the test")
+
+sys.addaudithook(refuse_egress)
+
+from fastmcp import FastMCP
+
+mcp = FastMCP("plain-run")
+
+@mcp.tool()
+def ping() -> dict:
+    return {"pong": True}
+
+mcp.run()
+""")
+
+  async def scenario():
+    manager = McpClientManager(config_path=None, inline_servers={
+      "plain-run": {
+        "command": sys.executable,
+        "args": [str(server_script)],
+        "cwd": str(tmp_path),
+        # No version cache from an earlier run stands in for the check.
+        "env": {"EGRESS_LOG": str(egress), "FASTMCP_HOME": str(tmp_path / "fastmcp-home")},
+      },
+    })
+    try:
+      await manager.startup()
+      assert manager.get_server_names() == {"plain-run"}
+      assert await manager.call_tool("ping", {}) == ({"pong": True}, None)
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+  assert not egress.exists(), egress.read_text()
+
+
+_SLOW_START_SERVER = """
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+name, mode, seconds = sys.argv[1], sys.argv[2], float(sys.argv[3])
+Path(f"{name}.pid").write_text(str(os.getpid()))
+if mode == "busy":
+    # Spend CPU before reading stdin, as a cold import on a loaded machine does.
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        pass
+elif mode == "died":
+    # A descendant keeps stdout open, so the gateway sees no EOF from the exit.
+    descendant = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL,
+    )
+    Path(f"{name}.descendant").write_text(str(descendant.pid))
+    raise SystemExit(0)
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request or mode == "stalled":
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": request["params"]["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": name, "version": "1.0"},
+        }
+    elif method == "tools/list":
+        result = {"tools": [{
+            "name": "slow_echo",
+            "description": "Report the responding server",
+            "inputSchema": {"type": "object", "properties": {}},
+        }]}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"""
+
+
+def _connect_slow_start_child(tmp_path, name, mode, seconds, *, startup_timeout):
+  server_script = tmp_path / "slow_start_server.py"
+  server_script.write_text(_SLOW_START_SERVER)
+
+  async def scenario():
+    manager = McpClientManager(config_path=None, startup_timeout=startup_timeout)
+    try:
+      state = await manager._connect_or_warn(name, {
+        "command": sys.executable,
+        "args": [str(server_script), name, mode, str(seconds)],
+        "cwd": str(tmp_path),
+      })
+      return state, manager.get_startup_diagnostics().get(name)
+    finally:
+      await manager.shutdown()
+      descendant = tmp_path / f"{name}.descendant"
+      if descendant.exists():
+        with contextlib.suppress(ProcessLookupError):
+          os.kill(int(descendant.read_text()), signal.SIGKILL)
+
+  return asyncio.run(scenario())
+
+
+def test_busy_stdio_child_keeps_its_startup_window_past_the_bound(tmp_path, monkeypatch, caplog) -> None:
+  monkeypatch.setattr(mcp_client_module, "_stdio_connect_retries", lambda: 0)
+  monkeypatch.setattr(mcp_client_module, "_stdio_connect_stabilize_delay", lambda: 0)
+  caplog.set_level(logging.INFO, logger="agent_gateway.mcp_client")
+
+  # Busy for one and a half bounds before it reads `initialize`.
+  state, diagnostic = _connect_slow_start_child(tmp_path, "busy-child", "busy", 3.0, startup_timeout=2)
+
+  assert diagnostic is None
+  assert state is not None
+  assert state.tool_names == {"slow_echo"}
+  pid = (tmp_path / "busy-child.pid").read_text()
+  assert any(
+    record.getMessage().startswith(f"MCP stdio server busy-child (pid {pid}) is still starting")
+    for record in caplog.records
+  )
+
+
+@pytest.mark.parametrize(
+  ("mode", "outcome", "detail"),
+  [("stalled", "stalled", "alive but stalled"), ("died", "died", "died")],
+)
+def test_idle_or_dead_stdio_child_fails_at_the_startup_bound(
+  tmp_path, monkeypatch, mode, outcome, detail,
+) -> None:
+  monkeypatch.setattr(mcp_client_module, "_stdio_connect_retries", lambda: 0)
+  name = f"{mode}-child"
+  observed: list[BaseException] = []
+  connect_stdio = McpClientManager._connect_stdio
+
+  async def observe(self, server_name, config):
+    try:
+      return await connect_stdio(self, server_name, config)
+    except BaseException as exc:
+      observed.append(exc)
+      raise
+
+  monkeypatch.setattr(McpClientManager, "_connect_stdio", observe)
+
+  state, diagnostic = _connect_slow_start_child(tmp_path, name, mode, 0, startup_timeout=2)
+
+  assert state is None
+  pid = int((tmp_path / f"{name}.pid").read_text())
+  [error] = observed
+  assert isinstance(error, McpStdioStartupBoundError)
+  assert (error.server, error.step, error.outcome, error.pid) == (name, "initialize", outcome, pid)
+  assert diagnostic is not None
+  assert diagnostic["category"] == "transient_timeout"
+  assert diagnostic["error_type"] == "McpStdioStartupBoundError"
+  message = diagnostic["message"]
+  assert f"stdio child pid {pid} {detail}" in message
+  measured = re.search(r"startup initialize failed after ([0-9.]+)s: no response", message)
+  assert measured is not None
+  # At the bound, never extended toward the 6 s ceiling.
+  assert 2.0 <= float(measured.group(1)) < 4.0
+
+
 def test_stdio_stability_probe_rejects_closed_transport(reconnect_transport):
   async def scenario():
     queue, opened_contexts = reconnect_transport
@@ -1364,3 +1611,819 @@ def test_loopback_refusal_ignores_enodata_under_linux_numbering(monkeypatch):
 
   assert mcp_client_connections.is_loopback_connection_refused(no_data) is False
   assert mcp_client_connections.is_loopback_connection_refused(refused) is True
+
+
+_FLAKY_STDIO_SERVER = """
+import os
+import sys
+import time
+from pathlib import Path
+
+while Path("hold").exists():
+    time.sleep(0.02)
+if Path("refuse").exists():
+    sys.stderr.write("refusing to start\\n")
+    sys.exit(3)
+from fastmcp import FastMCP
+
+with Path("starts").open("a") as stream:
+    stream.write(str(os.getpid()) + "\\n")
+mcp = FastMCP("flaky")
+
+@mcp.tool()
+def read_probe() -> dict:
+    return {"pid": os.getpid()}
+
+mcp.run(show_banner=False)
+"""
+
+
+def _flaky_stdio_manager(
+  tmp_path, monkeypatch, *, server_source: str | None = None, **manager_kwargs,
+) -> McpClientManager:
+  monkeypatch.setenv("MCP_STDIO_CONNECT_RETRIES", "0")
+  monkeypatch.setenv("MCP_STDIO_CONNECT_STABILIZE_S", "0")
+  monkeypatch.setattr(
+    mcp_client_module, "_stdio_recovery_delay", lambda _attempt: 0.05, raising=False,
+  )
+  script = tmp_path / "mcp_server.py"
+  script.write_text(_FLAKY_STDIO_SERVER if server_source is None else server_source)
+  return McpClientManager(
+    config_path=None,
+    inline_servers={
+      "probe": {"command": sys.executable, "args": [str(script)], "cwd": str(tmp_path)},
+    },
+    **manager_kwargs,
+  )
+
+
+def _flaky_starts(tmp_path) -> list[int]:
+  starts = tmp_path / "starts"
+  return [int(line) for line in starts.read_text().split()] if starts.exists() else []
+
+
+async def _until(condition, *, seconds: float = 30):
+  async with asyncio.timeout(seconds):
+    while not condition():
+      await asyncio.sleep(0.02)
+
+
+def test_stdio_server_that_failed_startup_comes_back_without_a_call(tmp_path, monkeypatch):
+  (tmp_path / "refuse").write_text("x")
+  manager = _flaky_stdio_manager(tmp_path, monkeypatch)
+
+  async def scenario():
+    await manager.startup()
+    try:
+      assert "probe" not in manager._servers
+      assert manager.get_startup_diagnostics()["probe"]["category"] == "transient_transport"
+      result, error = await manager.call_tool("read_probe", {})
+      assert result is None and error is not None
+      assert _flaky_starts(tmp_path) == []
+
+      # The cause is gone; no call is made. The startup-recovery round publishes it.
+      (tmp_path / "refuse").unlink()
+      await _until(lambda: manager.get_server_for_tool("read_probe") == "probe")
+      assert manager.get_startup_diagnostics() == {}
+      watch = manager._servers["probe"].stdio_watch_task
+      assert watch is not None and not watch.done()
+      result, error = await manager.call_tool("read_probe", {})
+      assert error is None
+      assert result == {"pid": _flaky_starts(tmp_path)[0]}
+
+      # The revived child is under the same EOF supervision as any other.
+      os.kill(_flaky_starts(tmp_path)[0], signal.SIGTERM)
+      await _until(lambda: len(_flaky_starts(tmp_path)) == 2)
+      await _until(lambda: manager._servers["probe"].stdio_watch_task is not watch)
+      result, error = await manager.call_tool("read_probe", {})
+      assert error is None
+      assert result == {"pid": _flaky_starts(tmp_path)[1]}
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
+def _registered_probe_catalog() -> ToolRegistrationCatalog:
+  return _registered_catalog("probe", {"read_probe": ("read", True)})
+
+
+def _registered_catalog(
+  server_id: str, tools: dict[str, tuple[str, bool]],
+) -> ToolRegistrationCatalog:
+  def policy(kind: str) -> VersionedPolicyRef:
+    return VersionedPolicyRef(kind=kind, policy_id=f"{kind}.identity", version="1")  # type: ignore[arg-type]
+
+  return ToolRegistrationCatalog(
+    declarations=tuple(
+      ToolRegistrationDeclaration(
+        identity=RegisteredToolIdentity(
+          route_kind="mcp", logical_server_id=server_id, logical_name=name,
+        ),
+        semantics=ToolIntrinsicSemantics(
+          effect=effect,  # type: ignore[arg-type]
+          idempotent=idempotent,
+          semantic_capability="market-data.read/v1",
+          approval=ToolApprovalPolicy(mode="never"),
+          audience="ordinary",
+          redaction_policy=policy("redaction"),
+          planning_policy=policy("planning"),
+          input_preparation_policy=policy("input_preparation"),
+          outcome_policy=policy("outcome"),
+          source_identity_policy=policy("source_identity"),
+        ),
+      )
+      for name, (effect, idempotent) in tools.items()
+    ),
+    servers=(
+      RegisteredToolServerDescriptor(
+        logical_server_id=server_id,
+        transport_server_id=server_id,
+        default_timeout_seconds=30,
+        per_tool_timeout_seconds={},
+        session_injection_policy=policy("session_injection"),
+      ),
+    ),
+  )
+
+
+async def _call_at_once(manager):
+  """A call to a down server answers typed while every recovery round is parked (the
+  child's start waits on ``hold``): it ran no round of its own and waited on none. A call
+  that did would not return."""
+  async with asyncio.timeout(10):
+    return await manager.call_tool("read_probe", {})
+
+
+def test_call_to_a_registered_tool_of_a_down_stdio_server_fails_typed(tmp_path, monkeypatch):
+  (tmp_path / "refuse").write_text("x")
+  manager = _flaky_stdio_manager(
+    tmp_path, monkeypatch, tool_registration_catalog=_registered_probe_catalog(),
+  )
+
+  async def scenario():
+    await manager.startup()
+    try:
+      # Recovery rounds park in the child's start; "at once" is a typed answer while they do.
+      (tmp_path / "hold").write_text("x")
+      (tmp_path / "refuse").unlink()
+      result, error = await _call_at_once(manager)
+      assert result is None
+      assert error is not None
+      assert error["code"] == "mcp_tool_error"
+      assert error["sub_code"] == "mcp_server_unavailable"
+      assert "probe" in error["message"]
+      assert "probe" in manager.get_startup_diagnostics()
+      (tmp_path / "hold").unlink()
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
+def test_server_catalog_lists_a_startup_failed_servers_declared_tools(tmp_path, monkeypatch):
+  """b05-72 end to end: a server that failed its startup connect published no definitions,
+  so nothing named its tools and the tool door answered 404 before the manager could
+  answer. The catalog the surface authorizes against lists its declared tools."""
+  (tmp_path / "refuse").write_text("x")
+  manager = _flaky_stdio_manager(
+    tmp_path, monkeypatch, tool_registration_catalog=_registered_probe_catalog(),
+  )
+
+  async def scenario():
+    await manager.startup()
+    try:
+      assert manager.get_declared_tools_of_startup_failed_servers() == {"read_probe": "probe"}
+      catalog = manager.get_server_catalog()
+      assert catalog["probe"] == {"tool_count": 1, "tools": ["read_probe"], "startup_failed": True}
+      assert manager.get_tool_definitions() == []
+      # The dispatcher routes on these two facts: a declared tool of a down server is
+      # this manager's and belongs to its declared server, so dispatch reaches
+      # `call_tool` instead of answering unknown_tool (the door's 404).
+      assert manager.is_mcp_tool("read_probe")
+      assert manager.get_server_for_tool("read_probe") == "probe"
+      assert not manager.is_mcp_tool("never_declared")
+      assert manager.get_server_for_tool("never_declared") is None
+      # A call to such a tool fails typed at once; the startup-recovery task, not the
+      # call, reconnects the server (the tool door dispatches into this same call).
+      _result, error = await manager.call_tool("read_probe", {})
+      assert error is not None and error["sub_code"] == "mcp_server_unavailable"
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
+def test_dispatch_of_a_declared_tool_of_a_startup_failed_server_settles_typed_in_production_shape(
+  tmp_path, monkeypatch, owner_session_host_policy,
+):
+  """b05-72 in the production shape: the registration catalog and policy implementations
+  on both the manager and the dispatcher (api/mcp_client.py, api/main.py). A declared tool
+  of a startup-failed server has no live descriptor. Every route the door, a chat turn and
+  dispatch take must answer the manager's typed mcp_server_unavailable, never raise on a
+  missing descriptor (500) and never unknown_tool (404)."""
+  from agent_gateway.approval_policy import RunContext
+  from agent_gateway.event_log import EventLog
+  from agent_gateway.registry_scope import RegistryScope
+  from agent_gateway.session import SessionStore
+  from agent_gateway.tool_dispatcher import ToolDispatcher
+  from agent_gateway.tool_policy_registry import ToolInputPreparationError
+  from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
+
+  (tmp_path / "refuse").write_text("x")
+  registry = _redacting_policy_registry()
+  manager = _flaky_stdio_manager(
+    tmp_path, monkeypatch,
+    tool_registration_catalog=_registered_probe_catalog(),
+    tool_policy_implementations=registry,
+    input_preparation_context_factory=lambda _descriptor, _scope: None,
+    redaction_context_factory=lambda _registration: None,
+  )
+
+  async def scenario():
+    await manager.startup()
+    try:
+      session = SessionStore(ttl=3600).create_session(
+        api_key_hash="hash", user_id="alice", role="owner",
+      )
+      execution = stub_capability_execution_resolver().resolve("session.driver")
+      dispatcher = ToolDispatcher(
+        capability_bind=execution.bind,
+        mcp_client=manager,
+        needs_approval=lambda *_args: False,
+        event_log=EventLog(),
+        session=session,
+        role="owner",
+        run_context=RunContext(
+          user_id="alice", request_id="request-1", session_id=session.session_id,
+          registry_scope=RegistryScope("run", "test-run", str(tmp_path / "store")),
+        ),
+        tool_registration_catalog=_registered_probe_catalog(),
+        tool_policy_implementations=registry,
+        redaction_context_factory=lambda _declaration: None,
+      )
+      assert dispatcher.registered_tool_declaration("read_probe") is not None
+
+      # dispatch(): settled typed at preparation, with the failed server's diagnostic.
+      result, error = await dispatcher.dispatch("call-1", "read_probe", {"q": 1})
+      assert result is None
+      assert error is not None and error.get("sub_code") == "mcp_server_unavailable", error
+      assert "Connection closed" in error["message"]
+
+      # The door's sequence: prepare, then requires_approval_prepared on a prepared call.
+      with pytest.raises(ToolInputPreparationError) as refused:
+        dispatcher.prepare_tool_call("read_probe", {"q": 1})
+      assert refused.value.materialize_error()["sub_code"] == "mcp_server_unavailable"
+      # Classification reads the catalog declaration (its planning policy is not
+      # "none", so the planning branch answers True) instead of raising on the
+      # missing descriptor.
+      assert dispatcher.requires_approval_prepared(
+        "read_probe", PreparedToolCall({"q": 1}),
+      ) is True
+
+      # A chat turn's history line after preparation failed, and a prepared line:
+      # both run the declaration's redaction policy (the registry's redactor marks
+      # every value), never the raw input.
+      assert dispatcher.redact_raw_tool_input_for_history("read_probe", {"q": 1}) == {"q": "<redacted>"}
+      assert dispatcher.redact_prepared_tool_input("read_probe", PreparedToolCall({"q": 1})) == {"q": "<redacted>"}
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
+def test_down_stdio_server_fails_fast_and_returns_without_a_call(tmp_path, monkeypatch):
+  manager = _flaky_stdio_manager(tmp_path, monkeypatch)
+
+  async def scenario():
+    await manager.startup()
+    try:
+      first_pid = _flaky_starts(tmp_path)[0]
+      (tmp_path / "refuse").write_text("x")
+      os.kill(first_pid, signal.SIGTERM)
+      await _until(
+        lambda: manager.get_startup_diagnostics().get("probe", {}).get("category")
+        == "reconnect_failed",
+      )
+
+      # The next recovery round parks in the child's start: a call that ran, or waited on, a
+      # round would not return.
+      (tmp_path / "hold").write_text("x")
+      (tmp_path / "refuse").unlink()
+      for _ in range(2):
+        result, error = await _call_at_once(manager)
+        assert result is None
+        assert error is not None
+        assert error["sub_code"] == "mcp_server_unavailable"
+        assert "Connection closed" in error["message"]
+
+      # The recovery rounds keep running off the call path; the cause clears.
+      (tmp_path / "hold").unlink()
+      await _until(lambda: manager.get_startup_diagnostics() == {})
+      pids = _flaky_starts(tmp_path)
+      assert len(pids) == 2 and pids[1] != first_pid
+      watch = manager._servers["probe"].stdio_watch_task
+      assert watch is not None and not watch.done()
+      result, error = await manager.call_tool("read_probe", {})
+      assert error is None
+      assert result == {"pid": pids[1]}
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
+def test_child_loss_is_reported_reconnecting_at_once_and_calls_fail_fast(tmp_path, monkeypatch):
+  manager = _flaky_stdio_manager(tmp_path, monkeypatch)
+
+  async def scenario():
+    await manager.startup()
+    try:
+      first_pid = _flaky_starts(tmp_path)[0]
+      # The replacement child parks before its handshake: only a record made when EOF fires
+      # can show the server down before any round has ended.
+      (tmp_path / "hold").write_text("x")
+      os.kill(first_pid, signal.SIGTERM)
+      await _until(lambda: "probe" in manager.get_startup_diagnostics())
+      diagnostic = manager.get_startup_diagnostics()["probe"]
+      assert diagnostic["category"] == "reconnecting"
+      assert diagnostic["state"] == "reconnecting"
+
+      result, error = await _call_at_once(manager)
+      assert result is None
+      assert error is not None
+      assert error["sub_code"] == "mcp_server_unavailable"
+
+      # The cause clears: the replacement publishes, readiness data and calls recover.
+      (tmp_path / "hold").unlink()
+      await _until(lambda: manager.get_startup_diagnostics() == {})
+      pids = _flaky_starts(tmp_path)
+      assert len(pids) == 2 and pids[1] != first_pid
+      result, error = await manager.call_tool("read_probe", {})
+      assert error is None
+      assert result == {"pid": pids[1]}
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
+def test_a_replacement_whose_publish_raises_is_retried_until_it_compiles(tmp_path, monkeypatch):
+  """Production 2026-11-05 22:49Z (EC2 gateway, before the recovery work): EOF from
+  edgar-parser-mcp, the replacement connected, its publish raised
+  RegisteredMcpToolCompilationError, the failure was logged once and never retried, so
+  the child count stayed 0 until a gateway.service restart. Every round must re-run the
+  publish; once it compiles the server comes back with no call."""
+  manager = _flaky_stdio_manager(
+    tmp_path, monkeypatch, tool_registration_catalog=_registered_probe_catalog(),
+  )
+  compile_registered = McpClientManager._refresh_registered_mcp_tool_descriptors
+  rejected: list[int] = []
+
+  def compile_unless_skewed(self):
+    if (tmp_path / "skew").exists():
+      rejected.append(1)
+      raise RegisteredMcpToolCompilationError("live MCP route has no exact static registration")
+    compile_registered(self)
+
+  monkeypatch.setattr(McpClientManager, "_refresh_registered_mcp_tool_descriptors", compile_unless_skewed)
+
+  async def scenario():
+    await manager.startup()
+    try:
+      first_pid = _flaky_starts(tmp_path)[0]
+      (tmp_path / "skew").write_text("x")
+      os.kill(first_pid, signal.SIGTERM)
+
+      # The replacements start and connect, and every publish is refused: the server is
+      # reported down, with the reason, and the rounds keep coming.
+      await _until(lambda: len(rejected) >= 3)
+      diagnostic = manager.get_startup_diagnostics()["probe"]
+      assert diagnostic["state"] == "reconnecting"
+      assert diagnostic["category"] in {"reconnecting", "reconnect_failed"}
+      assert len(_flaky_starts(tmp_path)) >= 3
+      if diagnostic["category"] == "reconnect_failed":
+        assert "no exact static registration" in diagnostic["message"]
+      assert manager._servers["probe"].stdio_eof is not None and manager._servers["probe"].stdio_eof.is_set()
+
+      # The route compiles again (EDGAR rolled back): no call is made, the server returns.
+      (tmp_path / "skew").unlink()
+      await _until(lambda: manager.get_startup_diagnostics() == {})
+      published = manager._servers["probe"]
+      assert published.stdio_eof is not None and not published.stdio_eof.is_set()
+      watch = published.stdio_watch_task
+      assert watch is not None and not watch.done()
+      pids = _flaky_starts(tmp_path)
+      assert pids[-1] != first_pid
+      served = await published.session.call_tool("read_probe", {}, read_timeout_seconds=None)
+      assert served.structured_content == {"pid": pids[-1]}
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
+_SHAPED_STDIO_SERVER = """
+import os
+from pathlib import Path
+
+from fastmcp import FastMCP
+
+shape = set(Path("shape").read_text().split(",")) if Path("shape").exists() else set()
+with Path("starts").open("a") as stream:
+    stream.write(str(os.getpid()) + "\\n")
+mcp = FastMCP("shaped")
+
+if "missing" not in shape and "schema" in shape:
+    @mcp.tool()
+    def read_probe(ticker: str) -> dict:
+        return {"pid": os.getpid(), "ticker": ticker}
+elif "missing" not in shape:
+    @mcp.tool()
+    def read_probe() -> dict:
+        return {"pid": os.getpid()}
+
+if "extra" in shape:
+    @mcp.tool()
+    def get_restatements() -> dict:
+        return {"pid": os.getpid()}
+
+mcp.run(show_banner=False)
+"""
+
+
+def test_one_undeclared_tool_is_refused_alone_at_startup_and_after_an_eof_republish(
+  tmp_path, monkeypatch,
+):
+  """The production shape (edgar-parser-mcp gaining get_restatements): one declared tool and
+  one undeclared tool on the same server. The declared tool stays published and callable;
+  only the undeclared one is refused. A declared tool that goes missing, or whose schema
+  changes, is not contained: the published surface follows the live server."""
+  monkeypatch.setenv("MCP_STDIO_CONNECT_RETRIES", "0")
+  monkeypatch.setenv("MCP_STDIO_CONNECT_STABILIZE_S", "0")
+  monkeypatch.setattr(
+    mcp_client_module, "_stdio_recovery_delay", lambda _attempt: 0.05, raising=False,
+  )
+  script = tmp_path / "mcp_server.py"
+  script.write_text(_SHAPED_STDIO_SERVER)
+  (tmp_path / "shape").write_text("extra")
+  manager = McpClientManager(
+    config_path=None,
+    inline_servers={
+      "probe": {"command": sys.executable, "args": [str(script)], "cwd": str(tmp_path)},
+    },
+    tool_registration_catalog=_registered_probe_catalog(),
+    tool_policy_implementations=_identity_policy_registry(),
+    input_preparation_context_factory=lambda _descriptor, _scope: None,
+    redaction_context_factory=lambda _descriptor: None,
+  )
+
+  def surface() -> tuple[list[str], set[tuple[str, str]]]:
+    return (
+      sorted(str(definition["name"]) for definition in manager.get_tool_definitions()),
+      {(route.logical_server_id, route.logical_name) for route in manager.get_refused_mcp_routes()},
+    )
+
+  async def republish(shape: str):
+    previous = manager._servers["probe"]
+    (tmp_path / "shape").write_text(shape)
+    os.kill(_flaky_starts(tmp_path)[-1], signal.SIGTERM)
+    await _until(
+      lambda: manager._servers["probe"] is not previous and manager.get_startup_diagnostics() == {},
+    )
+
+  async def scenario():
+    await manager.startup()
+    try:
+      for label in ("startup", "after-eof-republish"):
+        if label != "startup":
+          await republish("extra")
+        assert surface() == (["read_probe"], {("probe", "get_restatements")}), label
+        result, error = await manager.call_tool("read_probe", {})
+        assert error is None, label
+        assert result == {"pid": _flaky_starts(tmp_path)[-1]}, label
+        result, error = await manager.call_tool("get_restatements", {})
+        assert result is None, label
+        assert error is not None and error["code"] == "mcp_tool_not_registered", label
+        assert "get_restatements" in error["message"]
+
+      # A declared tool that went missing is simply gone: no definition, no route to call.
+      await republish("extra,missing")
+      assert surface() == ([], {("probe", "get_restatements")})
+      result, error = await manager.call_tool("read_probe", {})
+      assert result is None
+      assert error is not None and error["code"] == "unknown_tool"
+
+      # A declared tool whose schema changed is published with the live schema, and a
+      # call that does not satisfy it is refused by the server, never answered.
+      await republish("extra,schema")
+      definitions = {str(item["name"]): item for item in manager.get_tool_definitions()}
+      assert definitions["read_probe"]["input_schema"]["required"] == ["ticker"]
+      result, error = await manager.call_tool("read_probe", {})
+      assert result is None
+      assert error is not None
+      result, error = await manager.call_tool("read_probe", {"ticker": "AAPL"})
+      assert error is None
+      assert result == {"pid": _flaky_starts(tmp_path)[-1], "ticker": "AAPL"}
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
+_HOLDING_STDIO_SERVER = _FLAKY_STDIO_SERVER.replace("import os\n", "import asyncio\nimport os\n", 1).replace(
+  "mcp.run(show_banner=False)",
+  """@mcp.tool()
+async def hold() -> dict:
+    Path("holding").write_text(str(os.getpid()))
+    await asyncio.Event().wait()
+    return {}
+
+mcp.run(show_banner=False)""",
+)
+
+
+def test_a_call_in_flight_at_the_kill_leaves_the_recovery_owner_running(tmp_path, monkeypatch):
+  """A read in flight when the child dies fails with a transport error and queues behind the
+  watch's first connect round. When that round fails the call must not run its own round: closing
+  the generation from the call path cancelled the watch task, and with no task left every later
+  call answered mcp_server_unavailable while nothing reconnected the server (audit P1 d0c3f8c7d34a)."""
+  manager = _flaky_stdio_manager(tmp_path, monkeypatch, server_source=_HOLDING_STDIO_SERVER)
+  monkeypatch.setenv("MCP_STDIO_CONNECT_RETRIES", "2")
+  monkeypatch.setenv("MCP_STDIO_CONNECT_BACKOFF_S", "0.3")
+
+  async def scenario():
+    await manager.startup()
+    try:
+      first_pid = _flaky_starts(tmp_path)[0]
+      call = asyncio.create_task(manager.call_tool("hold", {}))
+      await _until(lambda: (tmp_path / "holding").exists())
+      (tmp_path / "refuse").write_text("x")
+      os.kill(first_pid, signal.SIGTERM)
+
+      result, error = await asyncio.wait_for(call, timeout=60)
+      assert result is None
+      assert error is not None
+      watch = manager._servers["probe"].stdio_watch_task
+      assert watch is not None and not watch.done()
+      assert manager.get_startup_diagnostics()["probe"]["state"] == "reconnecting"
+
+      # The cause clears: the owner's next round publishes, no call needed.
+      (tmp_path / "refuse").unlink()
+      await _until(lambda: manager.get_startup_diagnostics() == {})
+      pids = _flaky_starts(tmp_path)
+      assert len(pids) == 2 and pids[1] != first_pid
+      result, error = await manager.call_tool("read_probe", {})
+      assert error is None
+      assert result == {"pid": pids[1]}
+    finally:
+      await manager.shutdown()
+
+  asyncio.run(scenario())
+
+
+_DROPPING_HTTP_SERVER = """
+import sys
+from pathlib import Path
+
+import uvicorn
+from fastmcp import FastMCP
+
+mcp = FastMCP("dropping")
+
+
+def record(name: str) -> int:
+    with Path(name).open("a") as stream:
+        stream.write("x\\n")
+    return len(Path(name).read_text().split())
+
+
+@mcp.tool()
+def read_probe() -> dict:
+    return {"runs": record("reads")}
+
+
+@mcp.tool()
+def write_probe() -> dict:
+    return {"runs": record("writes")}
+
+
+inner = mcp.http_app(path="/mcp")
+
+
+async def app(scope, receive, send):
+    if scope["type"] != "http" or scope["method"] != "POST":
+        await inner(scope, receive, send)
+        return
+    messages = []
+    more = True
+    while more:
+        message = await receive()
+        messages.append(message)
+        more = message.get("more_body", False)
+    pending = iter(messages)
+
+    async def replayed():
+        return next(pending, None) or await receive()
+
+    body = b"".join(message.get("body", b"") for message in messages)
+    drops = Path("drops")
+    remaining = int(drops.read_text()) if drops.exists() else 0
+    if b'"tools/call"' not in body or remaining <= 0:
+        await inner(scope, replayed, send)
+        return
+    # The server runs the tool and its response never reaches the client: the
+    # response stream closes empty, with no event and no result.
+    drops.write_text(str(remaining - 1))
+
+    async def discard(_message):
+        return None
+
+    await inner(scope, replayed, discard)
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"text/event-stream")]})
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
+"""
+
+
+def _redacting_policy_registry() -> ToolPolicyImplementationRegistry:
+  """The identity registry with a redactor that marks every value, so a redaction
+  path that skipped execute_redaction and returned raw input would fail."""
+  def entry(kind: PolicyKind, implementation: Any) -> ToolPolicyImplementation:
+    return ToolPolicyImplementation(
+      kind, f"{kind}.identity", "1", reject_policy_parameters, implementation,
+    )
+
+  return ToolPolicyImplementationRegistry((
+    entry("redaction", lambda _ref, call: RedactionResult(
+      {key: "<redacted>" for key in call.prepared_input},
+    )),
+    entry("planning", lambda _ref, _call: PlanDecision("none")),
+    entry("input_preparation", lambda _ref, call: PreparedToolCall(call.raw_input)),
+    entry("outcome", lambda _ref, _call: "ok"),
+    entry("source_identity", lambda _ref, _call: SourceIdentityResult(())),
+    entry("session_injection", lambda _ref, _call: (_ for _ in ()).throw(AssertionError("unused"))),
+  ))
+
+
+def _identity_policy_registry() -> ToolPolicyImplementationRegistry:
+  def entry(kind: PolicyKind, implementation: Any) -> ToolPolicyImplementation:
+    return ToolPolicyImplementation(
+      kind, f"{kind}.identity", "1", reject_policy_parameters, implementation,
+    )
+
+  return ToolPolicyImplementationRegistry((
+    entry("redaction", lambda _ref, call: RedactionResult(call.prepared_input)),
+    entry("planning", lambda _ref, _call: PlanDecision("none")),
+    entry("input_preparation", lambda _ref, call: PreparedToolCall(call.raw_input)),
+    entry("outcome", lambda _ref, _call: "ok"),
+    entry("source_identity", lambda _ref, _call: SourceIdentityResult(())),
+    entry("session_injection", lambda _ref, _call: (_ for _ in ()).throw(AssertionError("unused"))),
+  ))
+
+
+def _registered_http_manager(tmp_path, port: int, **kwargs) -> McpClientManager:
+  registry = _identity_policy_registry()
+  return McpClientManager(
+    config_path=None,
+    inline_servers={"dropping": {"type": "streamable-http", "url": f"http://127.0.0.1:{port}/mcp"}},
+    tool_registration_catalog=_registered_catalog(
+      "dropping",
+      {"read_probe": ("read", True), "write_probe": ("external_write", False)},
+    ),
+    tool_policy_implementations=registry,
+    input_preparation_context_factory=lambda _descriptor, _scope: None,
+    redaction_context_factory=lambda _descriptor: None,
+    **kwargs,
+  )
+
+
+async def _dropping_http_server(tmp_path, drops: int):
+  import socket
+
+  with socket.socket() as probe:
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+  script = tmp_path / "http_server.py"
+  script.write_text(_DROPPING_HTTP_SERVER)
+  (tmp_path / "drops").write_text(str(drops))
+  process = await asyncio.create_subprocess_exec(
+    sys.executable, str(script), str(port), cwd=str(tmp_path),
+    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+  )
+  async with asyncio.timeout(30):
+    while True:
+      try:
+        _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+      except OSError:
+        await asyncio.sleep(0.05)
+        continue
+      writer.close()
+      return process, port
+
+
+def _runs(tmp_path, name: str) -> int:
+  path = tmp_path / name
+  return len(path.read_text().split()) if path.exists() else 0
+
+
+@pytest.mark.parametrize(
+  ("tool", "drops", "ran", "succeeds"),
+  [
+    ("read_probe", 1, 2, True),
+    ("read_probe", 2, 2, False),
+    ("write_probe", 1, 1, False),
+  ],
+  ids=["read-retried-once", "read-fails-after-one-retry", "write-never-replayed"],
+)
+def test_dropped_response_stream_retries_only_a_declared_read_once(
+  tmp_path, tool, drops, ran, succeeds,
+):
+  async def scenario():
+    process, port = await _dropping_http_server(tmp_path, drops)
+    manager = _registered_http_manager(tmp_path, port)
+    try:
+      await manager.startup()
+      assert manager.get_server_for_tool(tool) == "dropping"
+      first = manager._servers["dropping"]
+      result, error = await manager.call_tool(tool, {})
+      if succeeds:
+        assert error is None
+        assert result == {"runs": 2}
+        assert manager._servers["dropping"] is not first
+      else:
+        assert result is None
+        assert error is not None
+        assert error["code"] == "tool_error"
+        assert error["sub_code"] == "connection_error"
+        assert "SSE stream ended without a response" in error["message"]
+      assert _runs(tmp_path, "reads" if tool == "read_probe" else "writes") == ran
+    finally:
+      await manager.shutdown()
+      process.terminate()
+      await process.wait()
+
+  asyncio.run(scenario())
+
+
+def test_dropped_per_user_stream_retries_a_read_on_a_fresh_per_user_session():
+  drop = MCPError(CONNECTION_CLOSED, "SSE stream ended without a response")
+  calls: list[str] = []
+
+  class Session:
+    def __init__(self, label, outcome):
+      self.label, self.outcome = label, outcome
+
+    async def call_tool(self, name, arguments, **_kwargs):
+      calls.append(self.label)
+      if isinstance(self.outcome, BaseException):
+        raise self.outcome
+      return self.outcome
+
+  def state(label, outcome):
+    server = SimpleNamespace(
+      session=Session(label, outcome), config={"type": "streamable-http", "per_user": True},
+    )
+    return SimpleNamespace(server=server, active_calls=0, last_used_at=0.0, draining=False)
+
+  ok = CallToolResult(content=[], structured_content={"from": "fresh"})
+
+  async def scenario(replay_allowed):
+    calls.clear()
+    manager = McpClientManager(config_path=None)
+    subject = SimpleNamespace(user_id="7")
+    old = state("old", drop)
+    fresh = state("fresh", ok)
+    manager._per_user_servers[("remote", "7")] = cast(Any, old)
+    drained: list[tuple[Any, str]] = []
+    manager._schedule_drain = lambda target, reason: drained.append((target, reason))  # type: ignore[method-assign]
+
+    async def get_fresh(*_args, **_kwargs):
+      return fresh
+
+    manager._get_per_user_server = get_fresh  # type: ignore[method-assign]
+    try:
+      result = await manager._call_tool_once_on_fresh_session_after_dropped_stream(
+        server=cast(Any, old.server), per_user_state=cast(Any, old),
+        per_user_subject=cast(Any, subject), server_name="remote",
+        replay_allowed=replay_allowed, original_name="read_probe", tool_input={},
+        meta=None, abort_event=None, expected_seconds=5, invocation_report=None,
+        retry_refusals=True,
+      )
+    except MCPError as exc:
+      return exc, drained, manager
+    return result, drained, manager
+
+  result, drained, manager = asyncio.run(scenario(True))
+  assert result is ok
+  assert calls == ["old", "fresh"]
+  assert [reason for _state, reason in drained] == ["response_stream_dropped"]
+  assert ("remote", "7") not in manager._per_user_servers
+
+  result, drained, _manager = asyncio.run(scenario(False))
+  assert result is drop
+  assert calls == ["old"]
+  assert drained == []

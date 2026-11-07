@@ -1,4 +1,5 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import NoRegistryScope, RegistryScope
 
 import asyncio
 import json
@@ -7,7 +8,7 @@ import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, cast
 
 import pytest
 
@@ -19,7 +20,7 @@ if str(PKG_DIR) not in sys.path:
 
 
 from hank_model_transport.providers import AgentSDKConfig
-from agent_gateway import AgentSDKRunner, EventLog, SessionStore  # noqa: E402
+from agent_gateway import AgentSDKRunner, AgentSessionLog, EventLog, SessionStore  # noqa: E402
 from agent_gateway import sdk_runner_approval  # noqa: E402
 from agent_gateway.admission import (
   admit_root_turn,
@@ -38,7 +39,7 @@ from agent_gateway.autonomous_approval_channel import (
   AutonomousApprovalChannelChild,
 )
 from agent_gateway.approval_store import SQLiteApprovalStore  # noqa: E402
-from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock  # noqa: E402
+from agent_gateway.approvals import _record_vote_and_unblock  # noqa: E402
 from agent_gateway.batch_approval_projection import (  # noqa: E402
   BatchApprovalProjectionRegistry,
   BatchApprovalScope,
@@ -83,7 +84,9 @@ def test_sdk_approval_context_uses_canonical_session_owner_identity() -> None:
       session_id="session-1",
       profile="chat",
       channel="cli",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
+    registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     usage_user_id="henry",
     session=session,
     approval_policy=SimpleNamespace(policy_bundle_hash="policy-1"),
@@ -228,6 +231,7 @@ def _make_runner(
   skill_run_id: str | None = None,
   api_key: str = "test-secret",
   approval_store_path: Path | None = None,
+  agent_session_log: AgentSessionLog | None = None,
 ) -> AgentSDKRunner:
   if (
     registered_mcp_descriptor_for_sdk_tool is not None
@@ -281,8 +285,82 @@ def _make_runner(
     on_tool_result=on_tool_result,
     run_context=run_context,
     skill_run_id=skill_run_id,
+    agent_session_log=agent_session_log,
     **route_kwargs,
   )
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+def test_sdk_bound_chat_commits_analyst_content_without_selected_content(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  as_blocks: bool,
+) -> None:
+  from agent_gateway.chat_history import ChatHistoryQuery, read_chat_history
+
+  state = _install_fake_agent_sdk(monkeypatch)
+  session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
+  session_log = AgentSessionLog(path=tmp_path / "sdk-chat.jsonl", gateway_session=session)
+  session.agent_session_log = session_log
+  runner = _make_runner(agent_session_log=session_log)
+  text = "What drove revenue?"
+  context = '## Current Workbook Context\n```json\n{"channel": "excel"}\n```'
+  analyst_content = [{"type": "text", "text": text}] if as_blocks else text
+  model_content = (
+    [*analyst_content, {"type": "text", "text": context}]
+    if isinstance(analyst_content, list)
+    else f"{text}\n\n{context}"
+  )
+  runner.bind_analyst_content(analyst_content)
+  messages = [{"role": "user", "content": model_content}]
+  _run(runner.run(messages))
+  rows, _ = _run(session_log.query(event_types={"user_message"}, order="asc"))
+  assert len(rows) == 1
+  assert rows[0].event["content"] == model_content
+  assert rows[0].event["analyst_content"] == analyst_content
+  assert rows[0].event["selected_content"] == []
+  assert len(state.prompts) == 1
+
+  async def read_prompt() -> list[dict[str, Any]]:
+    return [message async for message in state.prompts[0]]
+
+  assert _run(read_prompt()) == [{
+    "type": "user",
+    "message": {
+      "role": "user",
+      "content": [{
+        "type": "text",
+        "text": model_content if isinstance(model_content, str) else str(model_content),
+      }],
+    },
+  }]
+  assert messages == [{"role": "user", "content": model_content}]
+  page = _run(read_chat_history(session, ChatHistoryQuery()))
+  assert [entry["content"] for entry in page["entries"]] == [text]
+
+
+def test_sdk_bound_chat_without_optional_durable_log_still_reaches_model(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  state = _install_fake_agent_sdk(monkeypatch)
+  runner = _make_runner()
+  runner.bind_analyst_content("Question")
+  model_content = "Question\n\nPRIVATE_CONTEXT"
+  messages = [{"role": "user", "content": model_content}]
+  _run(runner.run(messages))
+  assert len(state.prompts) == 1
+
+  async def read_prompt() -> list[dict[str, Any]]:
+    return [message async for message in state.prompts[0]]
+
+  assert _run(read_prompt()) == [{
+    "type": "user",
+    "message": {
+      "role": "user",
+      "content": [{"type": "text", "text": model_content}],
+    },
+  }]
+  assert messages == [{"role": "user", "content": model_content}]
 
 
 def _registered_settlement(*_args: Any) -> ToolResultSettlement:
@@ -305,18 +383,41 @@ def _seed_tool_call(
     tool_input,
     0.0,
     dict(tool_input),
+    runner._resolve_run_context().registry_scope,
   )
 
 
-def test_sdk_runner_without_a_decider_refuses_only_a_live_order(
+@pytest.mark.parametrize(
+  ("mode", "tool_name", "tool_class", "expected_behavior"),
+  [
+    pytest.param("approve_all", "file_read", "read", "allow", id="approve_all-read"),
+    pytest.param("ask_all", "file_read", "read", "allow", id="ask_all-read"),
+    pytest.param("approve_all", "code_execute", "pure_transform", "allow", id="approve_all-pure_transform"),
+    pytest.param("ask_all", "code_execute", "pure_transform", "allow", id="ask_all-pure_transform"),
+    pytest.param("approve_all", "execute_trade", "irreversible", "deny", id="approve_all-irreversible"),
+    pytest.param("ask_all", "execute_trade", "irreversible", "deny", id="ask_all-irreversible"),
+    pytest.param("approve_all", "file_write", "state_write", "allow", id="approve_all-state_write"),
+    pytest.param("ask_all", "file_write", "state_write", "deny", id="ask_all-state_write"),
+  ],
+)
+def test_sdk_runner_without_a_decider_obeys_approval_mode(
   monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  mode: str,
+  tool_name: str,
+  tool_class: str,
+  expected_behavior: str,
 ) -> None:
-  """GA23: with no route, a non-money call is settled; a live order is refused.
+  """The real SDK permission callback refuses exactly calls needing a decider."""
 
-  `_make_runner()` supplies no route, so the runner holds `NoApprovalRoute`,
-  no store, no policy and no session.
-  """
+  settings_path = tmp_path / "run-settings.json"
+  settings_path.write_text(json.dumps({"approval_policy": mode}))
+  monkeypatch.setenv("HANK_RUN_SETTINGS_PATH", str(settings_path))
 
+  from agent.shared import server_policies
+  from hank_model_transport import policy_imports
+
+  monkeypatch.setattr(policy_imports, "_server_policy", server_policies)
   _install_fake_agent_sdk(monkeypatch)
   runner = _make_runner()
 
@@ -324,20 +425,17 @@ def test_sdk_runner_without_a_decider_refuses_only_a_live_order(
   assert runner._approval_store is None
   assert runner._approval_policy is None
 
-  allowed = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
-  assert allowed.behavior == "allow"
+  tool_input = {"value": "unchanged"}
 
-  monkeypatch.setattr(
-    runner,
-    "_resolve_sdk_approval_identity",
-    lambda _tool_name: ("execute_trade", "irreversible"),
-  )
-  denied = _run(runner._can_use_tool_callback("execute_trade", {"ticker": "MSFT"}, None))
+  result = _run(runner._can_use_tool_callback(tool_name, tool_input, None))
 
-  assert denied.behavior == "deny"
-  error = json.loads(denied.message)["error"]
-  assert error["code"] == "approval_route_absent"
-  assert error["data"]["next_call"]
+  assert result.behavior == expected_behavior
+  if expected_behavior == "allow":
+    assert result.updated_input == tool_input
+  else:
+    error = json.loads(result.message)["error"]
+    assert error["code"] == "approval_route_absent"
+    assert error["data"]["next_call"]
 
 
 def test_sdk_runner_parent_delegated_non_money_call_reaches_the_class_check(
@@ -491,8 +589,9 @@ def test_sdk_registered_read_returns_manager_prepared_input_without_approval(
 
   assert allowed.behavior == "allow"
   assert allowed.updated_input == {"ticker": "BRK.B"}
-  assert scopes == [{
+  assert [dict(cast(Mapping[str, object], scope)) for scope in scopes] == [{
     "portfolio_id": "portfolio-1",
+    "registry_scope": NoRegistryScope(),
     "user_id": "alice",
   }]
 
@@ -743,6 +842,7 @@ def test_sdk_runner_executes_report_admission_with_same_carried_run_identity(
     request_id="request-sdk-report",
     session_id="sess-sdk-report",
     run_id="skill-run-sdk-report",
+    registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
   )
   runner = _make_runner(
     run_context=run_context,
@@ -817,6 +917,7 @@ def test_sdk_runner_user_denial_carries_code_and_next_call(
         request_id="request-1",
         session_id=session.session_id,
         channel="web",
+        registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
       ),
     )
 
@@ -930,6 +1031,7 @@ def test_sdk_runner_transport_end_drains_detached_permission_before_release(
     async def record_turn():
       context = root_context(
         session, withheld_tools=frozenset(), research_file_id=None,
+        selection_provenance=None,
       )
       turn = await record_root_turn_admission(store, admit_root_turn(
         context,
@@ -1688,9 +1790,9 @@ def test_sdk_runner_connected_vote_settles_original_callback_once(
       ),
     }
     await _record_vote_and_unblock(**vote)
-    with pytest.raises(ApprovalActionError) as duplicate:
-      await _record_vote_and_unblock(**vote)
-    assert duplicate.value.status_code == 409
+    duplicate = await _record_vote_and_unblock(**vote)
+    assert duplicate["outcome"] == "already_decided"
+    assert duplicate["state_unchanged"] is True
 
     result = await callback_task
     assert result.behavior == expected_behavior
@@ -1776,6 +1878,7 @@ def test_sdk_batch_admission_disconnect_before_pending_publish_aborts_durable_ro
         run_id="batch_77",
         session_id=session.session_id,
         channel="tui",
+        registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
       ),
     )
     pending_committed = asyncio.Event()
@@ -2091,6 +2194,7 @@ def test_sdk_runner_trade_approval_record_includes_preview_summary(
         request_id="request-1",
         session_id=session.session_id,
         channel="web",
+        registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
       ),
     )
 
@@ -2197,6 +2301,64 @@ def test_sdk_runner_opted_in_skill_result_activates_exact_allow(
   # A skill no longer subtracts tools: an unlisted tool keeps the run's surface.
   file_write = _run(runner._can_use_tool_callback("file_write", {"path": "x"}, None))
   assert file_write.behavior == "allow"
+
+
+def test_sdk_runner_invoke_skill_result_context_keeps_the_scope_it_ran_under(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  # Audit 8afa7f7b851f DEFECT P3: the call ran under RUN(parent); its rotated
+  # run applies to later calls only, as AgentRunner captures scope pre-call.
+  _install_fake_agent_sdk(monkeypatch)
+  contexts = []
+
+  async def _on_tool_result(ctx: Any):
+    contexts.append(ctx)
+    return []
+
+  parent_scope = RegistryScope("run", "run-parent", str(tmp_path))
+  runner = _make_runner(
+    on_tool_result=_on_tool_result,
+    run_context=RunContext(
+      user_id="alice", request_id="req-1", registry_scope=parent_scope,
+    ),
+  )
+  runner._workspace_dir = str(tmp_path)
+  _seed_tool_call(runner, "tool-invoke", "invoke_skill", {"skill_name": "phase0-agent"})
+  # Started under RUN(parent) before the invoke_skill result rebinds the run.
+  _seed_tool_call(runner, "tool-early", "mcp__foreign__lookup", {})
+
+  _run(runner._post_tool_use_hook(
+    {
+      "tool_name": "invoke_skill",
+      "tool_input": {"skill_name": "phase0-agent"},
+      "result": json.dumps({
+        "skill": "phase0-agent",
+        "content": "Do the work.",
+        "_skill_run_id": "run-activated",
+      }),
+    },
+    "tool-invoke",
+    None,
+  ))
+  activated_scope = RegistryScope("run", "run-activated", str(tmp_path))
+  assert runner._resolve_run_context().registry_scope == activated_scope
+  _seed_tool_call(runner, "tool-late", "mcp__foreign__lookup", {})
+
+  for tool_call_id in ("tool-early", "tool-late"):
+    _run(runner._post_tool_use_hook(
+      {
+        "tool_name": "mcp__foreign__lookup",
+        "tool_input": {},
+        "result": json.dumps({"status": "ok"}),
+      },
+      tool_call_id,
+      None,
+    ))
+
+  assert [ctx.registry_scope for ctx in contexts] == [
+    parent_scope, parent_scope, activated_scope,
+  ]
 
 
 def test_sdk_runner_legacy_skill_result_does_not_activate_active_skill_gate(

@@ -6,14 +6,19 @@ executing runner's task registry. Neither is a tool: the cell learns them from
 the `hello` reply, not from a copy of the catalog.
 """
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 import asyncio
 import json
-import sys
 import textwrap
 import types
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Mapping
+
+import pytest
+
+from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 
 from agent_gateway import AgentRunner, SessionStore, ToolDispatcher
 from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution
@@ -32,8 +37,7 @@ from hank_model_transport.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.task_registry import TaskRegistry, TaskState
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 from gateway_test_support.transport_runtime import TEST_SEND_PROMPT_RUNTIME
-sys.path.insert(0, str(Path(__file__).parent))
-from test_code_execution_bridge import _CODE_CALLABLE, OUTER_ID, _CaptureMcp, _tool_definitions  # noqa: E402
+from test_code_execution_bridge import _CODE_CALLABLE, OUTER_ID, _CaptureMcp, _tool_definitions
 
 RUN_AGENT_DEFINITION = {
   "name": "run_agent",
@@ -60,6 +64,7 @@ def _setup(run_agent: Any, *, grant_run_agent: bool) -> tuple[Any, ToolDispatche
     event_log=EventLog(),
     approval_key_qualifier=bundle.approval_qualifier,
     get_tool_definitions=lambda: definitions,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   bundle.bind_dispatcher(
     dispatcher,
@@ -254,8 +259,12 @@ def _test_capability_execution(provider: Any) -> Any:
     default_provider="anthropic",
     default_model="claude-sonnet-4-6",
   )
-  resolver = replace(resolver, adapter_resolver=lambda _adapter: provider)
-  return resolver.resolve("edgar.general_completion")
+  resolver = replace(
+    resolver,
+    adapter_resolver=lambda _adapter: provider,
+    executable_capability_ids=GATEWAY_EXECUTED_CAPABILITY_IDS,
+  )
+  return resolver.resolve("session.driver")
 
 
 def _real_runner(execution: Any, *, commercial_usage_producer: Any = None) -> AgentRunner:
@@ -263,11 +272,12 @@ def _real_runner(execution: Any, *, commercial_usage_producer: Any = None) -> Ag
   return AgentRunner(
     event_log=event_log,
     dispatcher=ToolDispatcher(
-      capability_bind=TEST_CAPABILITY_BIND,
+      capability_bind=execution.bind,
       mcp_client=_CaptureMcp(),
       local_tool_handlers={},
       event_log=event_log,
       session_id="sess-bridge-ops",
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     ),
     session_id="sess-bridge-ops",
     capability_execution=execution,
@@ -278,7 +288,7 @@ def _real_runner(execution: Any, *, commercial_usage_producer: Any = None) -> Ag
     channel="cli",
   )
 
-def test_completion_and_judge_bridge_ops_execute_registered_operations() -> None:
+def test_judge_bridge_ops_execute_registered_operations() -> None:
   provider = _TestModelProvider(answer='{"verdict": "supported", "findings": ["claim verified"]}')
   execution = _test_capability_execution(provider)
   runner = _real_runner(execution)
@@ -291,40 +301,40 @@ def test_completion_and_judge_bridge_ops_execute_registered_operations() -> None
     bundle.frame_reader.bind_job_runner(lambda: runner)
     return await _run_cell(dispatcher, """
       import json
-      c = hank.completion("general_completion", material="summarize this text")
+      v = hank.judge("verification", state={"revenue_growth": 0.1}, questions={"valid": True})
       j = hank.judge("citation_review", state={"claim": "rev up 10%"}, questions={"supported": True})
-      wait_res = hank.wait([c["task_id"], j["task_id"]], timeout=5)
-      print(json.dumps({"c": c, "j": j, "wait": wait_res}))
+      wait_res = hank.wait([v["task_id"], j["task_id"]], timeout=5)
+      print(json.dumps({"v": v, "j": j, "wait": wait_res}))
     """)
 
   result = asyncio.run(run())
   output = json.loads(result["stdout"].strip())
-  c = output["c"]
+  v = output["v"]
   j = output["j"]
   waited = output["wait"]
 
-  assert c["status"] == "running"
-  assert c["operation"] == "general_completion"
-  assert c["task_id"].startswith("mc_")
+  assert v["status"] == "running"
+  assert v["operation"] == "verification"
+  assert v["task_id"].startswith("mc_")
 
   assert j["status"] == "running"
   assert j["operation"] == "citation_review"
   assert j["task_id"].startswith("mc_")
 
-  assert waited["jobs"][c["task_id"]]["completed"] is True
-  assert waited["jobs"][c["task_id"]]["state"] == "completed"
+  assert waited["jobs"][v["task_id"]]["completed"] is True
+  assert waited["jobs"][v["task_id"]]["state"] == "completed"
 
   assert waited["jobs"][j["task_id"]]["completed"] is True
   assert waited["jobs"][j["task_id"]]["state"] == "completed"
 
-  entry_c = runner._task_registry.get(c["task_id"])
+  entry_v = runner._task_registry.get(v["task_id"])
   entry_j = runner._task_registry.get(j["task_id"])
-  assert entry_c is not None and entry_c.result is not None
+  assert entry_v is not None and entry_v.result is not None
   assert entry_j is not None and entry_j.result is not None
   assert "verdict" in entry_j.result["content"]
 
 
-def test_completion_and_judge_refuse_unknown_operations_and_raw_slot_ids() -> None:
+def test_completion_is_unsupported_and_judge_refuses_unknown_operations_and_raw_slot_ids() -> None:
   provider = _TestModelProvider()
   execution = _test_capability_execution(provider)
   runner = _real_runner(execution)
@@ -343,6 +353,8 @@ def test_completion_and_judge_refuse_unknown_operations_and_raw_slot_ids() -> No
         lambda: hank.completion("non_existent_op", material="test"),
         lambda: hank.judge("general_completion", state="test", questions={}),
         lambda: hank.judge("edgar.general_completion", state="test", questions={}),
+        lambda: hank.judge("citation.review", state="test", questions={}),
+        lambda: hank.judge("non_existent_op", state="test", questions={}),
       ]:
         try:
           fn()
@@ -353,21 +365,96 @@ def test_completion_and_judge_refuse_unknown_operations_and_raw_slot_ids() -> No
 
   result = asyncio.run(run())
   refusals = json.loads(result["stdout"].strip())
-  # All four calls are refused with unknown_operation: neither raw slot IDs nor wrong kinds are admitted.
-  assert refusals == ["unknown_operation", "unknown_operation", "unknown_operation", "unknown_operation"]
+  # Completion is always unsupported; judgments admit only registered operation names.
+  assert refusals == [
+    "unsupported_operation", "unsupported_operation",
+    "unknown_operation", "unknown_operation", "unknown_operation", "unknown_operation",
+  ]
+
+
+@pytest.mark.parametrize("runner_bound", [True, False])
+def test_completion_refuses_before_binding_launch_or_usage(
+  monkeypatch: pytest.MonkeyPatch, runner_bound: bool,
+) -> None:
+  billed: list[dict[str, Any]] = []
+
+  def sink(events: list[dict[str, Any]]) -> str:
+    billed.extend(events)
+    return "outbox"
+
+  provider = _TestModelProvider()
+  execution = _test_capability_execution(provider)
+  runner = _real_runner(execution, commercial_usage_producer=_commercial_producer(sink))
+  bind_attempts: list[str] = []
+
+  def refuse_bind(_self: Any, capability_id: str, **_kwargs: Any) -> Any:
+    bind_attempts.append(capability_id)
+    raise AssertionError("unsupported completion must not resolve a capability")
+
+  monkeypatch.setattr(type(execution.resolver), "resolve", refuse_bind)
+
+  async def run_agent(tool_input: dict[str, Any], **_kwargs: Any) -> tuple[dict[str, Any], None]:
+    raise AssertionError("unsupported completion must not launch an agent")
+
+  async def run() -> dict[str, Any]:
+    bundle, dispatcher = _setup(run_agent, grant_run_agent=True)
+    if runner_bound:
+      bundle.frame_reader.bind_job_runner(lambda: runner)
+    return await _run_cell(dispatcher, """
+      import json
+      try:
+        hank.completion("general_completion", material="must not reach a provider")
+      except Exception as exc:
+        print(json.dumps({
+          "type": type(exc).__name__, "code": exc.code,
+          "reason": exc.message, "next_call": exc.next_call,
+        }))
+      else:
+        raise AssertionError("completion unexpectedly launched")
+    """)
+
+  result = asyncio.run(run())
+  assert json.loads(result["stdout"].strip()) == {
+    "type": "HankBridgeError",
+    "code": "unsupported_operation",
+    "reason": "hank.completion is unsupported: no gateway-executed completion capability is defined",
+    "next_call": None,
+  }
+  assert "nested_calls" not in result
+  assert runner._task_registry.list_tasks() == []
+  assert bind_attempts == []
+  assert provider.prompts_seen == []
+  assert billed == []
+
+
+class _PooledModelProvider(_TestModelProvider):
+  """An account pool double: preparation selects one credential generation."""
+
+  GENERATION = "anthropic-generation-" + "a1" * 32
+
+  async def prepare_credential(
+    self, config: Mapping[str, Any], *, model: str, session_id: str | None,
+  ) -> dict[str, Any] | None:
+    return {
+      "api_key": "pooled-secret",
+      "credential_source": {"generation_ref": self.GENERATION, "automatic": True},
+    }
 
 
 def test_direct_host_door_and_kernel_door_produce_identical_bind_provenance_and_usage() -> None:
-  provider = _TestModelProvider(answer="Equivalence test answer.")
-  execution = _test_capability_execution(provider)
-  runner = _real_runner(execution)
+  provider = _PooledModelProvider(answer='{"verdict": "supported"}')
+  runner = _real_runner(_test_capability_execution(provider))
+  # The kernel door's runner has run a turn: its credential is prepared, so its
+  # resolver is pinned to the generation the provider selected.
+  assert asyncio.run(runner._prepare_credential(dict(runner._auth_config)))
 
-  # Direct host door: no runner, the resolver alone.
+  # Direct host door: a host holding only a fresh resolver, no runner.
   direct_res = asyncio.run(execute_leaf_model_call(
-    "general_completion",
+    "citation_review",
     runtime=TEST_SEND_PROMPT_RUNTIME,
-    material="equivalence test material",
-    resolver=runner.capability_execution.resolver,
+    state="equivalence test material",
+    questions={"supported": True},
+    resolver=_test_capability_execution(provider).resolver,
   ))
 
   # Kernel door execution via cell
@@ -379,7 +466,7 @@ def test_direct_host_door_and_kernel_door_produce_identical_bind_provenance_and_
     bundle.frame_reader.bind_job_runner(lambda: runner)
     return await _run_cell(dispatcher, """
       import json
-      c = hank.completion("general_completion", material="equivalence test material")
+      c = hank.judge("citation_review", state="equivalence test material", questions={"supported": True})
       w = hank.wait([c["task_id"]], timeout=5)
       print(json.dumps({"c": c, "w": w}))
     """)
@@ -391,10 +478,11 @@ def test_direct_host_door_and_kernel_door_produce_identical_bind_provenance_and_
   assert cell_entry is not None
   assert cell_entry.result is not None
 
-  # Identity check: same capability_id, provider, model and bind structure
-  assert direct_res["bind"]["capability_id"] == cell_entry.result["capability_id"] == "edgar.general_completion"
-  assert direct_res["bind"]["provider"] == cell_entry.result["provider"] == "anthropic"
-  assert direct_res["bind"]["model_key"] == cell_entry.result["model"]
+  # The bind of record, its selection provenance (credential_ref included) and
+  # the usage row are the same through both doors.
+  assert direct_res["bind"]["capability_id"] == cell_entry.result["capability_id"] == "citation.review"
+  assert direct_res["bind"]["credential_ref"] == _PooledModelProvider.GENERATION
+  assert direct_res["bind"] == cell_entry.capability_bind_receipt == cell_out["c"]["bind"]
   assert direct_res["selection_provenance"] == cell_entry.result["selection_provenance"]
   assert direct_res["usage"] == cell_entry.result["usage"]
   assert cell_entry.result["usage"]["input_tokens"] == 11
@@ -424,7 +512,7 @@ def test_model_call_cancellation_settles_as_killed(tmp_path: Path) -> None:
     cell_task = asyncio.create_task(_run_cell(dispatcher, f"""
       import json, time
       from pathlib import Path
-      c = hank.completion("general_completion", material="slow cancel test")
+      c = hank.judge("citation_review", state="slow cancel test", questions={{"supported": True}})
       Path({str(task_id_path)!r}).write_text(c["task_id"])
       while not Path({str(settled_path)!r}).exists():
         time.sleep(0.01)
@@ -433,7 +521,7 @@ def test_model_call_cancellation_settles_as_killed(tmp_path: Path) -> None:
     """, timeout_ms=300000))
 
     # Synchronize on product state, never on a poll budget: the cell writes
-    # the task id the moment hank.completion registers it; kill by that id —
+    # the task id the moment hank.judge registers it; kill by that id —
     # valid for pending and running entries alike, since a pre-start kill is
     # recorded as intent and settled as killed at pickup — and release the
     # cell only after the killed entry reaches a terminal state.  (The silent
@@ -541,16 +629,17 @@ def test_leaf_call_usage_reaches_the_commercial_producer_with_its_real_state() -
     bundle.frame_reader.bind_job_runner(lambda: runner)
     done = await _run_cell(dispatcher, """
       import json
-      c = hank.completion("general_completion", material="billed completion")
+      c = hank.judge("citation_review", state="billed judgment", questions={"supported": True})
       print(json.dumps(hank.wait([c["task_id"]], timeout=5)["jobs"][c["task_id"]]))
     """)
 
     provider.sleep_s = 10.0
+    cancel_prompt = 'State:\nbilled cancel\n\nQuestions/Rubric:\n{\n  "supported": true\n}'
 
     async def _cancel_after_tokens() -> None:
       for _ in range(500):
         running = runner._task_registry.list_tasks(state=TaskState.RUNNING)
-        if running and provider.prompts_seen[-1:] == ["billed cancel"]:
+        if running and provider.prompts_seen[-1:] == [cancel_prompt]:
           await asyncio.sleep(0.05)  # message_start has streamed; the sleep holds the call open
           runner._task_registry.kill(running[0].task_id, termination_intent="cancelled")
           return
@@ -559,7 +648,7 @@ def test_leaf_call_usage_reaches_the_commercial_producer_with_its_real_state() -
     cancel = asyncio.create_task(_cancel_after_tokens())
     killed = await _run_cell(dispatcher, """
       import json, time
-      c = hank.completion("general_completion", material="billed cancel")
+      c = hank.judge("citation_review", state="billed cancel", questions={"supported": True})
       time.sleep(0.3)
       print(json.dumps(hank.wait([c["task_id"]], timeout=5)["jobs"][c["task_id"]]))
     """)
@@ -572,19 +661,31 @@ def test_leaf_call_usage_reaches_the_commercial_producer_with_its_real_state() -
 
   states = [(p["usage_state"], p["uncached_input_tokens"], p["billable_output_tokens"]) for p in billed]
   assert states == [("succeeded", 11, 7), ("canceled", 11, 0)]
-  assert {p["capability_bind"]["capability_id"] for p in billed} == {"edgar.general_completion"}
+  assert {p["capability_bind"]["capability_id"] for p in billed} == {"citation.review"}
 
 
 def test_prompt_names_registered_model_call_operations() -> None:
   tool_def = make_code_execute_tool_def(CodeExecutionConfig())
   desc = tool_def["description"]
-  assert "general_completion" in desc
+  assert "general_completion" not in desc
+  assert "hank.completion is unsupported" in desc
+  assert "no gateway-executed completion capability is defined" in desc
   assert "citation_review" in desc
   assert "verification" in desc
   assert "hank.completion(operation, material, role, effort, evidence_handles)" in desc
   assert "hank.judge(operation, state, questions, role, effort, evidence_handles)" in desc
   assert "hank.workpool(items, operation, mode, role, effort, context_handles, timeout)" in desc
   assert "hank.judge_batch(operation, states, questions, role, effort, evidence_handles, wait, timeout)" in desc
+
+
+def test_default_model_call_registry_advertises_only_gateway_judgments() -> None:
+  reset_model_call_operations_for_tests()
+  operations = list_model_call_operations()
+  assert {op.name for op in operations} == {"citation_review", "verification"}
+  assert all(op.kind == "judgment" for op in operations)
+  assert all(op.execution_class in GATEWAY_EXECUTED_CAPABILITY_IDS for op in operations)
+  assert lookup_model_call_operation("general_completion") is None
+  assert list_model_call_operations(kind="completion") == ()
 
 
 def test_describe_model_call_and_bridge_operations() -> None:
@@ -602,7 +703,12 @@ def test_describe_model_call_and_bridge_operations() -> None:
       import json
       d_comp = hank.describe("completion")
       d_judge = hank.describe("judge")
-      d_gen = hank.describe("general_completion")
+      try:
+        hank.describe("general_completion")
+      except Exception as exc:
+        d_gen = {"code": exc.code, "next_call": exc.next_call}
+      else:
+        raise AssertionError("general_completion unexpectedly advertised")
       d_cit = hank.describe("citation_review")
       print(json.dumps({
         "comp": d_comp,
@@ -616,13 +722,15 @@ def test_describe_model_call_and_bridge_operations() -> None:
   output = json.loads(result["stdout"].strip())
   assert output["comp"]["route_kind"] == "bridge"
   assert output["comp"]["name"] == "completion"
+  assert "Unsupported" in output["comp"]["description"]
+  assert "no gateway-executed completion capability is defined" in output["comp"]["description"]
+  assert "unsupported_operation" in output["comp"]["description"]
+  assert "no next_call" in output["comp"]["description"]
 
   assert output["judge"]["route_kind"] == "bridge"
   assert output["judge"]["name"] == "judge"
 
-  assert output["gen"]["route_kind"] == "model_call"
-  assert output["gen"]["name"] == "general_completion"
-  assert output["gen"]["execution_class"] == "edgar.general_completion"
+  assert output["gen"] == {"code": "unknown_operation", "next_call": None}
 
   assert output["cit"]["route_kind"] == "model_call"
   assert output["cit"]["name"] == "citation_review"

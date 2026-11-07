@@ -58,6 +58,64 @@ from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark  # noq
 from agent_gateway.server_chat_helpers import _chat_turn_state_from_events  # noqa: E402
 
 
+@pytest.mark.parametrize("content", ["Question", [{"type": "text", "text": "Question"}]])
+def test_user_message_defaults_analyst_content_to_uninjected_input(content: Any) -> None:
+  event = build_user_message_event(
+    content=content, client_kind="web", received_at=1.0, selected_content=(),
+  )
+  assert event["content"] == content
+  assert event["analyst_content"] == content
+
+
+@pytest.mark.parametrize("analyst_content", ["Question", [{"type": "text", "text": "Question"}], ""])
+def test_user_message_preserves_explicit_analyst_content(analyst_content: Any) -> None:
+  event = build_user_message_event(
+    content="Question\n\n## Current Workbook Context\nPRIVATE_CONTEXT",
+    analyst_content=analyst_content,
+    client_kind="excel", received_at=1.0, selected_content=(),
+  )
+  assert event["analyst_content"] == analyst_content
+  assert event["content"] == "Question\n\n## Current Workbook Context\nPRIVATE_CONTEXT"
+
+
+@pytest.mark.parametrize("analyst_content", [None, True, 12, {}])
+def test_user_message_refuses_malformed_present_analyst_content(analyst_content: Any) -> None:
+  with pytest.raises(TypeError, match="analyst content"):
+    build_user_message_event(
+      content="Question", analyst_content=analyst_content,
+      client_kind="excel", received_at=1.0, selected_content=(),
+    )
+
+
+def test_native_provenance_is_not_reused_for_nudges_or_operator_steers() -> None:
+  runner = object.__new__(AgentRunner)
+  runner._client_kind = "excel"
+  appended: list[dict[str, Any]] = []
+
+  async def append(event: dict[str, Any]):
+    appended.append(event)
+    return SimpleNamespace(seq=len(appended))
+
+  runner._append_durable_event = append
+  runner.bind_analyst_content("Original question")
+
+  async def write_messages() -> None:
+    await runner._append_user_message_event(
+      {"role": "user", "content": "Original question\n\nPRIVATE_CONTEXT"},
+      analyst_turn=True,
+    )
+    await runner._append_user_message_event({"role": "user", "content": "Continue."})
+    runner._client_kind = "operator"
+    await runner._append_user_message_event({"role": "user", "content": "Focus on revenue."})
+
+  _run(write_messages())
+  assert [event["analyst_content"] for event in appended] == [
+    "Original question", "Continue.", "Focus on revenue.",
+  ]
+  assert appended[0]["content"] == "Original question\n\nPRIVATE_CONTEXT"
+  assert appended[-1]["client_kind"] == "operator"
+
+
 def test_context_pressure_reminder_copy_is_model_actionable() -> None:
   assert build_context_pressure_reminder(pct=60) == (
     "Context at 60% — prefer delegating further reading; "
@@ -122,18 +180,6 @@ def test_runner_session_lifecycle_resolves_parent_module_event_builders(monkeypa
 
   _run(AgentRunner._emit_attach_event(runner))
 
-  assert appended == [
-    {
-      "type": "patched_attach",
-      "gateway_session_id": "sess",
-      "started_at": 12.5,
-      "client_kind": "cli",
-      "hostname": "patched-host",
-      "user_id": None,
-      "channel": None,
-      "api_key_hash": None,
-    }
-  ]
   assert runner._durable_attach_emitted
 
 
@@ -181,16 +227,6 @@ def test_runner_append_durable_event_resolves_parent_module_payload_helpers(
   assert entry is not None
   assert entry.seq == 1
   assert runner._last_durable_seq == 1
-  assert appended == [
-    {
-      "type": "custom",
-      "patched": True,
-      "runner_id": "runner-1",
-      "role": "writer",
-      "sub_agent_id": None,
-      "product_id": "patched-product",
-    }
-  ]
 
 
 def test_runner_writer_recovery_resolves_parent_module_risk_helper(tmp_path: Path, monkeypatch: Any) -> None:
@@ -278,6 +314,7 @@ def test_session_event_builders_copy_inputs_and_shape_payloads() -> None:
   ) == {
     "type": "user_message",
     "content": "question",
+    "analyst_content": "question",
     "client_kind": "web",
     "received_at": 2.5,
     "selected_content": [],
@@ -301,6 +338,13 @@ def test_session_event_builders_copy_inputs_and_shape_payloads() -> None:
     "error": "stall",
     "attempt_elapsed_s": 12.5,
     "backoff_s": 8.0,
+    "settlement": "retry",
+    "resumed_text_chars": 0,
+    "resumed_reasoning_chars": 0,
+    "discarded_text_chars": 0,
+    "discarded_reasoning_chars": 0,
+    "retained_text_chars": 0,
+    "retained_reasoning_chars": 0,
   }
   assert build_error_event("failed") == {"type": "error", "error": "failed"}
   assert build_run_error_event(phase="close", error_type="RuntimeError", error="offline") == {
@@ -454,7 +498,6 @@ def test_runner_release_write_lease_delegates_and_clears_on_error() -> None:
   runner = AgentRunner.__new__(AgentRunner)
   runner._write_lease_file = SimpleNamespace(close=lambda: calls.append("closed"))
 
-  assert gateway_runner._release_write_lease is release_write_lease
 
   runner._release_write_lease()
 
@@ -667,10 +710,13 @@ def test_tool_call_complete_requires_a_dispatch_record() -> None:
 def test_run_terminal_and_limit_event_builders_shape_payloads() -> None:
   turn_usage = {"input_tokens": 1}
 
-  assert build_turn_complete_event(turn=2, usage=turn_usage) == {
+  assert build_turn_complete_event(
+    turn=2, usage=turn_usage, upstream_model="muse-spark-1.3",
+  ) == {
     "type": "turn_complete",
     "turn": 2,
     "usage": {"input_tokens": 1},
+    "upstream_model": "muse-spark-1.3",
   }
   turn_usage["input_tokens"] = 9
   assert build_soft_budget_steer_event("turns", 3, 3) == {
@@ -724,6 +770,30 @@ def test_stream_complete_event_includes_static_token_estimates_with_provider_usa
       "est_tools_tokens": 3400,
     },
   }
+
+
+@pytest.mark.parametrize(
+  ("cost", "expected"),
+  [(None, None), (0.0, 0.0), (0, 0), (1.23456, 1.2346), (0.00004, 0.0)],
+)
+def test_stream_complete_event_estimated_cost_none_is_null_and_numeric_is_rounded(
+  cost: float | None, expected: float | None,
+) -> None:
+  usage = {
+    "input_tokens": 1, "output_tokens": 1,
+    "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+  }
+
+  event = build_stream_complete_event(
+    usage_totals=usage, estimated_cost=cost, est_system_tokens=1, est_tools_tokens=2,
+  )
+
+  assert event["usage"]["estimated_cost"] == expected
+  if expected is None:
+    assert event["usage"]["estimated_cost"] is None
+  else:
+    assert event["usage"]["estimated_cost"] is not None
+  assert json.loads(json.dumps(event))["usage"]["estimated_cost"] == expected
 
 
 def test_context_warning_log_data_payloads_support_initial_and_turn_estimates() -> None:

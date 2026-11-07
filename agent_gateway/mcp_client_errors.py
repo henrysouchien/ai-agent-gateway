@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from mcp import MCPError
 from mcp.types import (
@@ -25,6 +25,35 @@ class McpExecutableMissingError(RuntimeError):
   burning stdio connect retries on a generic "Connection closed" transport
   failure.
   """
+
+
+StdioStartupOutcome = Literal["stalled", "died", "busy_past_ceiling", "unobserved"]
+
+
+class McpStdioStartupBoundError(TimeoutError):
+  """A stdio child's startup step ended at the startup bound, naming why.
+
+  ``outcome`` is what the gateway measured on the child when the step's window
+  ended: ``stalled`` (alive, spent no CPU in the window), ``died`` (the process
+  is gone though its pipes gave no EOF), ``busy_past_ceiling`` (still spending
+  CPU at the hard ceiling) or ``unobserved`` (the process could not be found).
+  A timeout like any other, so startup classification and retry are unchanged.
+  """
+
+  def __init__(
+    self,
+    message: str,
+    *,
+    server: str | None,
+    step: str,
+    outcome: StdioStartupOutcome,
+    pid: int | None,
+  ) -> None:
+    super().__init__(message)
+    self.server = server
+    self.step = step
+    self.outcome: StdioStartupOutcome = outcome
+    self.pid = pid
 
 
 def classify_exception(exc: Exception, msg: str) -> str:
@@ -113,6 +142,8 @@ def startup_failure_from_exception(
 
 __all__ = [
   "McpExecutableMissingError",
+  "McpStdioStartupBoundError",
+  "StdioStartupOutcome",
   "classify_exception",
   "classify_mcp_error",
   "startup_failure_from_exception",

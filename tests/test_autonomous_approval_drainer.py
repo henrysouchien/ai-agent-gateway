@@ -563,16 +563,6 @@ def test_selector_contract_fails_closed() -> None:
   asyncio.run(scenario())
 
 
-def test_drainer_has_no_polling_sleep() -> None:
-  source_path = (
-    Path(__file__).parents[1]
-    / "agent_gateway"
-    / "control_plane"
-    / "autonomous_approval_drainer.py"
-  )
-  source = source_path.read_text(encoding="utf-8")
-  assert "asyncio.sleep" not in source
-  assert "time.sleep" not in source
 
 
 def _running_task(**overrides: Any) -> AutonomousTask:

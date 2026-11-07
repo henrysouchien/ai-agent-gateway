@@ -21,6 +21,10 @@ from agent_gateway.server_chat_helpers import (
 from agent_gateway.server_models import ChatMessage, ChatRequest
 from agent_gateway.session import SessionStore, SessionStream
 from gateway_test_support.model_defaults import SESSION_DRIVER
+from hank_model_transport.user_provider_keys import (
+  ResolvedKey, ResolvedUserKeys, UserKeyPools, install_user_key_pools,
+)
+from model_authority.spend_ledger import fingerprint_credential
 
 
 class _ExactProvider(ModelProvider):
@@ -55,12 +59,18 @@ def _service_handle(provider: str) -> CredentialHandle:
   )
 
 
-def _session(*, auth_config: dict[str, Any] | None = None, risk_user_id: int = 0):
+def _session(
+  *,
+  auth_config: dict[str, Any] | None = None,
+  risk_user_id: int = 0,
+  enrolled_user_key_providers: frozenset[str] = frozenset(),
+):
   return SessionStore().create_session(
-    api_key_hash="hash",
+    api_key_hash="0123456789abcdef",
     user_id="alice",
     owner_user_id="101",
     risk_user_id=risk_user_id,
+    enrolled_user_key_providers=enrolled_user_key_providers,
     auth_config=(
       {
         "provider": "anthropic",
@@ -175,18 +185,34 @@ def test_prepare_keeps_auth_config_credential_only_and_binds_registry_identity()
   assert "user-secret" not in repr(prepared.request)
 
 
-def test_prepare_accepts_explicit_stable_key_with_service_authority() -> None:
+def test_prepare_explicit_provider_uses_user_key_not_service_authority() -> None:
   async def builder(*_args: Any, storage_root: Path | None = None, **_kwargs: Any) -> Any:
     raise AssertionError
 
   materialized_scopes: list[Any] = []
   _configure_builder(builder, materialized_scopes=materialized_scopes)
-  prepared = prepare_session_driver_turn(
-    _session(risk_user_id=7),
-    _inputs(model_key="openai.gpt-6-1-sol", effort="xhigh"),
-    build_chat_runtime=builder,
-  )
-  assert materialized_scopes == [7]
+  class Source:
+    def resolve(self, *, risk_user_id, provider, context):
+      return ResolvedUserKeys(
+        provider=provider, risk_user_id=risk_user_id,
+        keys=(ResolvedKey(fingerprint_credential("user-openai-key"), "OpenAI", "user-openai-key"),),
+      )
+
+    def report(self, **kwargs):
+      raise AssertionError("no provider failure to report")
+
+  install_user_key_pools(UserKeyPools(Source()))
+  try:
+    prepared = prepare_session_driver_turn(
+      _session(risk_user_id=7, enrolled_user_key_providers=frozenset({"openai"})),
+      _inputs(model_key="openai.gpt-6-1-sol", effort="xhigh"),
+      build_chat_runtime=builder,
+    )
+  finally:
+    install_user_key_pools(None)
+  assert materialized_scopes == []
+  assert prepared.request.bound_auth_config is not None
+  assert prepared.request.bound_auth_config["api_key"] == "user-openai-key"
   bind = prepared.request.capability_bind
   assert bind is not None
   assert (
@@ -200,7 +226,7 @@ def test_prepare_accepts_explicit_stable_key_with_service_authority() -> None:
     "openai",
     "gpt-6.1-sol",
     "xhigh",
-    "service",
+    "user",
   )
 
 
@@ -535,13 +561,13 @@ def test_session_creation_preserves_selected_anthropic_generation(tmp_path, monk
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
   def enroll(material):
     return register_anthropic_static_credential(
-      material, source="request:anthropic:api_key", user_scope=101,
+      material, credential_kind="auth_token", source="request:anthropic:auth_token", user_scope=101,
     )
 
   selected = enroll("first-key")
   assert selected is not None
   first_config = {
-    "provider": "anthropic", "auth_mode": "api", "api_key": selected.token,
+    "provider": "anthropic", "auth_mode": "oauth", "auth_token": selected.token,
     "credential_source": selected.source_metadata(),
   }
   first = _session(auth_config=first_config)
@@ -549,7 +575,7 @@ def test_session_creation_preserves_selected_anthropic_generation(tmp_path, monk
   replacement = enroll("replacement-key")
   assert replacement is not None
   changed = _session(auth_config={
-    **first_config, "api_key": replacement.token,
+    **first_config, "auth_token": replacement.token,
     "credential_source": replacement.source_metadata(),
   })
   assert first.session_credential_handle is not None
@@ -571,3 +597,54 @@ def test_non_anthropic_sessions_keep_independent_handles():
   assert first.session_credential_handle is not None
   assert second.session_credential_handle is not None
   assert first.session_credential_handle.handle_id != second.session_credential_handle.handle_id
+
+
+@pytest.mark.asyncio
+async def test_dispatch_leases_user_keys_off_the_event_loop() -> None:
+  import asyncio
+
+  calls = []
+
+  class Source:
+    def resolve(self, *, risk_user_id, provider, context):
+      with pytest.raises(RuntimeError, match="no running event loop"):
+        asyncio.get_running_loop()
+      calls.append((risk_user_id, provider))
+      return ResolvedUserKeys(
+        provider, risk_user_id,
+        (ResolvedKey(fingerprint_credential("thread-user-key"), "user", "thread-user-key"),),
+      )
+
+    def report(self, **kwargs):
+      raise AssertionError("no provider failure")
+
+  async def builder(session, request, channel, auth_manager, *, storage_root=None):
+    assert request.bound_auth_config["api_key"] == "thread-user-key"
+    return ChatRuntime(
+      system_prompt="system",
+      build_runner=lambda event_log, *_args: _CompleteRunner(event_log, request.capability_execution),
+      capability_execution=request.capability_execution,
+    )
+
+  async def capture(event):
+    pass
+
+  _configure_builder(builder)
+  session = _session(
+    risk_user_id=101, enrolled_user_key_providers=frozenset({"anthropic"}),
+    auth_config={
+      "provider": "anthropic", "auth_mode": "api", "billing_mode": "byok",
+      "auth_mechanism": "api_key", "entitlement_kind": "commercial_byok",
+    },
+  )
+  install_user_key_pools(UserKeyPools(Source()))
+  try:
+    result = await _dispatch_chat_turn(
+      session, _inputs(),
+      turn=SessionStream(event_log=EventLog(session_id=session.session_id), runner_task=None),
+      on_event=capture, build_chat_runtime=builder, transcript_dir=None,
+    )
+    assert result.state == "completed"
+    assert calls == [(101, "anthropic")]
+  finally:
+    install_user_key_pools(None)

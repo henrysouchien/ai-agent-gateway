@@ -9,10 +9,14 @@ from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
 from model_authority.selection import capture_selection_snapshot
 
 from agent_workflow_contracts.models import SelectionProvenance
-from agent_gateway.admission import root_context
+from agent_gateway.admission import root_context, root_preset_layer
 from agent_gateway.autonomous_capability_handoff import AutonomousLaunchAdmissionRefused
 from agent_gateway.approval_route import bind_session_approval_route
-from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock
+from agent_gateway.approvals import (
+  ApprovalActionError,
+  _cancel_pending_approval_and_unblock,
+)
+from agent_gateway.approval_store import RUN_CANCELLED_REASON
 from agent_gateway.autonomous_runner import AutonomousRegistry, AutonomousTask
 from agent_gateway.control_run_lifecycle import is_control_run_active_state
 from agent_gateway.session import AuthManager
@@ -74,6 +78,85 @@ from .runs_chat_helpers import (
   cleanup_control_chat_tasks,
   _dispatch_control_chat_turn,
 )
+
+
+async def _cancel_chat_pending_approval(
+  *,
+  session: Any,
+  tool_call_id: str,
+  pending_entry: dict[str, Any],
+  authenticated: Any,
+  owner_user_id: str,
+  app_state: Any,
+) -> None:
+  """Cancel one pending chat approval through the lifecycle cancel, never a vote."""
+  store = getattr(app_state, "gateway_approval_store", None)
+  policy = getattr(app_state, "gateway_approval_policy", None)
+  if store is None or policy is None:
+    raise ApprovalActionError(503, {"error": "Approval subsystem unavailable"})
+  approval_id = str(pending_entry.get("approval_id") or "")
+  durable = await store.get(approval_id)
+  if durable is None:
+    raise ApprovalActionError(
+      404,
+      {"error": "Approval request not found", "approval_id": approval_id},
+    )
+  await _cancel_pending_approval_and_unblock(
+    target_session=session,
+    pending_entry=pending_entry,
+    tool_call_id=tool_call_id,
+    nonce=str(pending_entry.get("nonce") or ""),
+    decider_id=owner_user_id,
+    decider_role=getattr(authenticated, "role", None),
+    reason=RUN_CANCELLED_REASON,
+    app_state=app_state,
+    authoritative_store=store,
+    authoritative_policy=policy,
+    expected_owner_user_id=durable.user_id,
+    expected_request_id=durable.request_id,
+    expected_run_id=durable.run_id,
+    expected_session_id=durable.session_id,
+    expected_channel=durable.channel,
+  )
+
+
+async def _durable_parked_chat_approvals(
+  *,
+  session: Any,
+  owner_user_id: str,
+  app_state: Any,
+  listed_approval_ids: set[str],
+) -> list[tuple[str, dict[str, Any]]]:
+  """Durable parked approvals of this chat run; `ApprovalPark` pops `pending_tools`."""
+  store = getattr(app_state, "gateway_approval_store", None)
+  if store is None:
+    return []
+  return [
+    (parked.tool_call_id, {"approval_id": parked.approval_id, "nonce": ""})
+    for parked in await store.list_parked_requests(owner_user_id)
+    if parked.session_id == session.session_id and parked.approval_id not in listed_approval_ids
+  ]
+
+
+def _raise_collected_cancel_approval_error(
+  approval_error: Exception | None,
+  *,
+  subject: str,
+) -> None:
+  """Re-raise an approval error collected while the run cancel still ran."""
+  if isinstance(approval_error, ApprovalActionError):
+    raise HTTPException(
+      status_code=approval_error.status_code,
+      detail=approval_error.payload,
+    ) from approval_error
+  if approval_error is not None:
+    raise HTTPException(
+      status_code=503,
+      detail={
+        "error": f"{subject} was cancelled but pending approval settlement failed",
+      },
+    ) from approval_error
+
 
 def build_runs_router(
   *,
@@ -157,12 +240,17 @@ def build_runs_router(
         auth_config=authenticated.auth_config,
         model_entitled_capabilities=authenticated.model_entitled_capabilities,
         model_entitled_keys=authenticated.model_entitled_keys,
+        enrolled_user_key_providers=authenticated.enrolled_user_key_providers,
+        unavailable_user_key_providers=authenticated.unavailable_user_key_providers,
         tenant_id=authenticated.tenant_id,
         session_credential_handle=authenticated.session_credential_handle,
         allow_service_for_interactive=(
           authenticated.allow_service_for_interactive
         ),
       )
+      # A dispatched run is an agent's session, never a human at a product door.
+      chat_session.caller_kind = "agent"
+      chat_session.metered_pending_provider = authenticated.metered_pending_provider
       chat_session.owner_user_id = owner_user_id
       chat_session.raw_user_id = authenticated.user_id
       chat_session.user_slug = getattr(authenticated, "user_slug", None)
@@ -250,9 +338,13 @@ def build_runs_router(
             role_source="spawn",
             effort_source="spawn",
             preset=None,
+            preset_layer=root_preset_layer(
+              registry.selection_policy, chosen_by_session=False,
+            ),
           ),
         ),
         role=authenticated.role,
+        capabilities=authenticated.capabilities,
         profile=payload.profile,
         mode=payload.mode,
         model_preset=payload.model_preset,
@@ -262,6 +354,7 @@ def build_runs_router(
         context=payload.context,
         ticker=payload.ticker,
         research_file_id=payload.research_file_id,
+        deliver=payload.deliver,
         dispatch_start_decision_id=payload.dispatch_start_decision_id,
         channel=channel,
         user_id=authenticated.user_id,
@@ -314,6 +407,7 @@ def build_runs_router(
         start_payload = await registry.start(
           # Resume follows current authority in both promotion and revocation directions.
           role=authenticated.role,
+          capabilities=authenticated.capabilities,
           profile=record.profile,
           mode=record.mode,
           task=record.task,
@@ -611,22 +705,31 @@ def build_runs_router(
           for tool_call_id, entry in session.pending_tools.items()
           if entry.get("approval_id")
         ]
+        approval_error: Exception | None = None
+        try:
+          pending_snapshot.extend(
+            await _durable_parked_chat_approvals(
+              session=session,
+              owner_user_id=owner_user_id,
+              app_state=request.app.state,
+              listed_approval_ids={entry["approval_id"] for _, entry in pending_snapshot},
+            )
+          )
+        except Exception as exc:
+          approval_error = exc
         for tool_call_id, pending_entry in pending_snapshot:
           try:
-            await _record_vote_and_unblock(
-              target_session=session,
-              pending_entry=pending_entry,
+            await _cancel_chat_pending_approval(
+              session=session,
               tool_call_id=tool_call_id,
-              nonce=str(pending_entry.get("nonce") or ""),
-              decider_id=owner_user_id,
-              decider_role=getattr(authenticated, "role", None),
-              approved=False,
-              allow_tool_type=False,
-              reason="run_cancelled",
+              pending_entry=pending_entry,
+              authenticated=authenticated,
+              owner_user_id=owner_user_id,
               app_state=request.app.state,
             )
-          except ApprovalActionError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=exc.payload) from exc
+          except Exception as exc:
+            if approval_error is None:
+              approval_error = exc
 
         cancelled_event = _run_state_event(control_run_id, "cancelled")
         session.event_history.append(cancelled_event)
@@ -647,6 +750,7 @@ def build_runs_router(
           session,
           control_run_id,
         )
+        _raise_collected_cancel_approval_error(approval_error, subject="Chat run")
         return run
     registry = _require_autonomous_registry(autonomous_registry)
     record = _autonomous_task_for_user(registry, control_run_id, owner_user_id)
@@ -661,22 +765,13 @@ def build_runs_router(
       )
     except Exception as exc:
       approval_error = exc
-    await asyncio.shield(registry.cancel(record.task_id))
-    if isinstance(approval_error, ApprovalActionError):
-      raise HTTPException(
-        status_code=approval_error.status_code,
-        detail=approval_error.payload,
-      ) from approval_error
-    if approval_error is not None:
-      raise HTTPException(
-        status_code=503,
-        detail={
-          "error": (
-            "Autonomous run was cancelled but pending approval "
-            "settlement failed"
-          ),
-        },
-      ) from approval_error
+    try:
+      await asyncio.shield(registry.cancel(record.task_id))
+    except NamedRefusal as exc:
+      to_detail = getattr(exc, "to_detail", None)
+      detail = to_detail() if callable(to_detail) else str(exc)
+      raise HTTPException(status_code=exc.http_status, detail=detail) from exc
+    _raise_collected_cancel_approval_error(approval_error, subject="Autonomous run")
     return _autonomous_run_from_task(record)
 
   return router

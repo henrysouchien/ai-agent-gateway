@@ -13,7 +13,17 @@ if str(PKG_DIR) not in sys.path:
 
 import agent_gateway.mcp_client as mcp_client_module  # noqa: E402
 from agent_gateway.mcp_client import McpClientManager, _build_mcp_env  # noqa: E402
-from agent_gateway.mcp_client_config import McpEnvExpansionError  # noqa: E402
+from agent_gateway.mcp_client_config import MCP_CHILD_FIXED_ENV, McpEnvExpansionError  # noqa: E402
+from agent_gateway.mcp_client_connections import STDIO_SPAWN_MARKER_ENV  # noqa: E402
+
+
+def _spawned_env(captured: dict[str, object]) -> dict[str, str]:
+  """The env a stdio child was given, less its per-spawn marker (checked here)."""
+  env = captured["env"]
+  assert isinstance(env, dict)
+  spawned = {str(name): str(value) for name, value in env.items()}
+  assert len(spawned.pop(STDIO_SPAWN_MARKER_ENV)) == 32
+  return spawned
 
 
 def _run(coro):
@@ -60,6 +70,8 @@ def test_build_mcp_env_keeps_allowlist_only_for_empty_server_env(monkeypatch) ->
     "LANG": "en_US.UTF-8",
     "PYTHONNOUSERSITE": "1",
     "HANK_MODEL_AUTHORITY_DIR": "/etc/hank/model-authority",
+    "HANK_RUN_ROUTE_FILE": "",
+    **MCP_CHILD_FIXED_ENV,
   }
   assert "ANTHROPIC_API_KEY" not in env
   assert "OPENAI_API_KEY" not in env
@@ -114,6 +126,8 @@ def test_build_mcp_env_expands_explicit_investment_claim_public_key_only(
   )
 
   assert env == {
+    "HANK_RUN_ROUTE_FILE": "",
+    **MCP_CHILD_FIXED_ENV,
     "INVESTMENT_CAPABILITY_CLAIM_ED25519_PUBLIC_KEY": "server-public-key",
   }
 
@@ -471,10 +485,12 @@ def test_connect_passes_filtered_env_to_stdio_server_parameters(monkeypatch) -> 
   assert captured["command"] == "fake-mcp-server"
   assert captured["args"] == ["--serve"]
   assert captured["cwd"] is None
-  assert captured["env"] == {
+  assert _spawned_env(captured) == {
     "PATH": "/custom/bin",
     "HOME": "/tmp/home",
     "USER": "tester",
+    "HANK_RUN_ROUTE_FILE": "",
+    **MCP_CHILD_FIXED_ENV,
     "ANTHROPIC_API_KEY": "explicit-anthropic",
   }
 
@@ -521,6 +537,34 @@ def test_placed_runtime_investment_children_inherit_the_desk_and_shared_children
   shared = _local_template_child_env(server_name, launch)
   assert USER_STORAGE_ID_ENV not in shared
   assert "INVESTMENT_TOOLS_STATE_DIR" not in shared
+
+
+@pytest.mark.parametrize("server_name", ["jobs-mcp", "idea-workbench-mcp"])
+def test_local_model_servers_keep_replay_routing_without_ambient_credentials(
+  server_name: str,
+) -> None:
+  routing = {
+    "OLLAMA_CLOUD_BASE_URL": "http://127.0.0.1:18234",
+    "OLLAMA_BASE_URL": "http://127.0.0.1:18234",
+    "HANK_RUN_ROUTE_FILE": "/runtime/control/run-route.json",
+  }
+  launch = {
+    "PATH": "/usr/bin:/bin",
+    "LOCAL_GATEWAY_PYTHON": "/runtime/python",
+    "LOCAL_GATEWAY_RUNTIME_ROOT": "/runtime",
+    "LOCAL_GATEWAY_RUNTIME_VERSION_ROOT": "/runtime/v1",
+    "OLLAMA_CLOUD_API_KEY": "operator-cloud-key-must-not-be-forwarded",
+  }
+  child = _local_template_child_env(server_name, {**launch, **routing})
+  assert {name: child[name] for name in routing} == routing
+  assert "OLLAMA_CLOUD_API_KEY" not in child
+  assert launch["OLLAMA_CLOUD_API_KEY"] not in child.values()
+
+  ordinary = _local_template_child_env(server_name, launch)
+  assert "OLLAMA_CLOUD_BASE_URL" not in ordinary
+  assert "OLLAMA_BASE_URL" not in ordinary
+  assert ordinary["HANK_RUN_ROUTE_FILE"] == ""
+  assert "OLLAMA_CLOUD_API_KEY" not in ordinary
 
 
 _UNSET_DECLARED_CONFIG = {
@@ -690,7 +734,9 @@ def test_build_mcp_env_omits_entries_referencing_an_absent_declared_name() -> No
     absent=frozenset({"UNSET_NAME"}),
   )
 
-  assert env == {"SET_NAME": "value", "LITERAL": "plain"}
+  assert env == {
+    "HANK_RUN_ROUTE_FILE": "", **MCP_CHILD_FIXED_ENV, "SET_NAME": "value", "LITERAL": "plain",
+  }
 
 
 def test_build_mcp_env_still_refuses_undeclared_reference_with_absent_names() -> None:
@@ -763,8 +809,10 @@ def test_stdio_child_env_lacks_declared_unset_names_and_keeps_empty_values(monke
     )
   )
 
-  assert captured["env"] == {
+  assert _spawned_env(captured) == {
     "PATH": "/usr/bin",
+    "HANK_RUN_ROUTE_FILE": "",
+    **MCP_CHILD_FIXED_ENV,
     "SET_NAME": "value",
     "EMPTY_NAME": "",
   }

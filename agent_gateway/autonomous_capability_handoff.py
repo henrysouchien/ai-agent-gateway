@@ -54,6 +54,21 @@ class AutonomousCapabilityBindingRequest:
   # A published preset name a fresh skill launch admits under (design §6.4);
   # a resume's ``required_bind`` never reselects, so it never carries one.
   model_preset: str | None = None
+  # The dispatching session's own capability grants (enrolled-account writes,
+  # team workspace, shared subject): the facts operation admission reads to
+  # tell an enrolled invite from an unenrolled one (R24 operation-admission (1):
+  # the launch edge handed admission no subject, so every invite was refused).
+  capabilities: frozenset[str] = frozenset()
+
+  def admission_subject(self) -> dict[str, object]:
+    """The launch's trusted subject facts in the shape the server policies read
+    (`role`, `risk_user_id`, `capabilities`, `user_id`); never a fabricated session."""
+    return {
+      "role": self.role,
+      "risk_user_id": self.risk_user_id,
+      "capabilities": sorted(self.capabilities),
+      "user_id": self.owner_user_id,
+    }
 
   def __post_init__(self) -> None:
     object.__setattr__(self, "task_id", _required_text(self.task_id, field_name="task_id"))

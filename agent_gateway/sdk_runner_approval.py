@@ -4,17 +4,19 @@ import logging
 from dataclasses import replace
 from typing import Any, Callable, cast
 
-from .approval_policy import MONEY_BOUNDARY_TOOL_CLASSES, RunContext
+from .approval_policy import RunContext
 from .approval_enrichment import enrich_trade_approval_args
 from .approval_route import NoApprovalRoute, route_ledger
 from .mcp_client import registered_mcp_dispatch_scope
-from hank_model_transport.policy_imports import resolve_effective_role, resolve_server_policy_tool_class
+from .registry_scope import DeclaredRegistryScope
+from hank_model_transport.policy_imports import resolve_effective_role
 from .sdk_runner_helpers import (
   catalogless_policy_owner_mismatch,
   catalogless_tool_name,
   server_for_tool,
 )
 from .skill_limits import ActiveSkillAdmission
+from .single_user_policy import needs_human_approval, resolve_approval_class
 from . import tool_dispatcher_approval_lifecycle as _approval_lifecycle_helpers
 from hank_model_transport.tool_errors import make_error_result
 from . import tool_redaction as _redaction
@@ -25,6 +27,7 @@ log = logging.getLogger("agent_gateway.sdk_runner_approval")
 def resolve_run_context(
   *,
   run_context: RunContext | None,
+  registry_scope: DeclaredRegistryScope,
   run_id: str | None = None,
   usage_user_id: str,
   session: Any | None,
@@ -39,6 +42,7 @@ def resolve_run_context(
       return replace(run_context, user_id=owner_user_id)
     return run_context
   return RunContext(
+    registry_scope=registry_scope,
     user_id=str(
       getattr(session, "owner_user_id", None)
       or usage_user_id
@@ -58,7 +62,7 @@ def resolve_run_context(
 def resolve_catalogless_approval_identity(
   tool_name: str,
   *,
-  resolve_server_policy_tool_class_fn: Callable[..., str] = resolve_server_policy_tool_class,
+  resolve_server_policy_tool_class_fn: Callable[..., str] = resolve_approval_class,
 ) -> tuple[str, str]:
   """Return the legacy lifecycle identity for an explicit catalog-free route."""
 
@@ -150,7 +154,10 @@ async def can_use_tool_callback(
     )
     trusted_scope = registered_mcp_dispatch_scope(
       user_id=runner._resolve_run_context().user_id,
-      dispatch_scope=getattr(runner._session, "dispatch_scope", None),
+      dispatch_scope={
+        **dict(getattr(runner._session, "dispatch_scope", None) or {}),
+        "registry_scope": runner._resolve_run_context().registry_scope,
+      },
     )
     registered_call = preparer(
       tool_name,
@@ -171,16 +178,16 @@ async def can_use_tool_callback(
   approval_constraint = "standard"
   route = runner._approval_route
   if isinstance(route, NoApprovalRoute):
-    # A run with no decider settles every class outside the money boundary
-    # itself; a live order nobody can decide must not spend the owner's money
-    # (`NoApprovalRoute`), so it alone is refused here.
-    if tool_class in MONEY_BOUNDARY_TOOL_CLASSES:
+    # The policy owner decides which calls need a human. Without an admitted
+    # route, those calls cannot obtain that decision.
+    if needs_human_approval(tool_class, approval_constraint):
       return deny_cls(
         message=_deny_message(
           "approval_route_absent",
           f"This run has no admitted approval route for '{tool_name}'.",
-          "A live order needs a human decider; this run has none. Report that "
-          "the order was not placed and let the owner place it from a session "
+          f"The approval policy requires a human decision for this "
+          f"'{tool_class}' call, and this run has none. Report that the "
+          "call was not executed and let the owner run it from a session "
           "that can approve it.",
         )
       )
@@ -199,7 +206,7 @@ async def can_use_tool_callback(
       )
     )
   approval_input = (
-    prepared_authorization.materialize_approval_arguments()
+    prepared_authorization.materialize_approval_display()
     if prepared_authorization is not None
     else prepared_input
   )

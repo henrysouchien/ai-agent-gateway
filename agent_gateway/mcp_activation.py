@@ -324,6 +324,25 @@ def _catalog_tool_names(payload: Any) -> set[str]:
   }
 
 
+def core_scoped_servers(registration: Any | None) -> frozenset[str]:
+  """Servers whose visible set a core registration scopes.
+
+  ``registration`` is what ``derive_live_surface`` reads (a profile, or the
+  autonomous policy): a server it registers in ``core_mcp_tools`` and does
+  not mark unscoped shows only its core plus the fold's grants once active;
+  any other server shows its whole catalog. No registration scopes nothing.
+  """
+  unscoped = {
+    str(server_name)
+    for server_name in getattr(registration, "unscoped_active_mcp_servers", frozenset()) or frozenset()
+  }
+  return frozenset(
+    str(server_name)
+    for server_name in (getattr(registration, "core_mcp_tools", {}) or {})
+    if str(server_name) not in unscoped
+  )
+
+
 def derive_live_surface(
   *,
   profile: Any | None,
@@ -362,14 +381,11 @@ def derive_live_surface(
     for server_name, payload in server_catalog.items()
     if str(server_name) not in denied_servers
   }
-  unscoped_servers = {
-    str(server_name)
-    for server_name in getattr(profile, "unscoped_active_mcp_servers", frozenset()) or frozenset()
-  }
+  scoped_servers = core_scoped_servers(profile)
   registered_defaults: dict[str, set[str]] = {
     str(server_name): {str(tool_name) for tool_name in tool_names}
     for server_name, tool_names in (getattr(profile, "core_mcp_tools", {}) or {}).items()
-    if str(server_name) not in unscoped_servers
+    if str(server_name) in scoped_servers
   }
   registered_ceilings: dict[str, set[str]] = {
     str(server_name): {str(tool_name) for tool_name in tool_names}
@@ -634,6 +650,12 @@ class SessionToolSurface:
     return DerivedToolScope(lambda: self.surface().allowed_mcp_tools_by_server)
 
   @property
+  def core_scoped_servers(self) -> frozenset[str]:
+    """Servers this surface's profile scopes by core (``core_scoped_servers``)."""
+
+    return core_scoped_servers(self._profile)
+
+  @property
   def known_mcp_tools_by_server(self) -> DerivedToolScope:
     """Connected catalog routes, independent of session activation."""
 
@@ -704,6 +726,7 @@ def coerce_tool_surface(value: Any) -> Any:
       "defers_mcp_tools",
       "record_activation",
       "allowed_mcp_tools_by_server",
+      "core_scoped_servers",
     )
   ):
     return value
@@ -714,6 +737,7 @@ def coerce_tool_surface(value: Any) -> Any:
 
 __all__ = [
   "ACTIVATION_SOURCE_LOAD_TOOLS",
+  "core_scoped_servers",
   "ACTIVATION_SOURCE_RUN_AGENT",
   "DerivedToolNames",
   "DerivedToolScope",

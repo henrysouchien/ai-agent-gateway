@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
 import hashlib
 import html
 import math
@@ -710,16 +711,22 @@ def background_asyncio_tasks(running_entries: Iterable[Any]) -> list[Any]:
 
 
 def background_wait_tasks(entries: Iterable[Any]) -> list[Any]:
-  # A parked job holds no slot and owes no completion, so nothing waits on it.
+  # A parked job, including an approval park, holds no completion a waiter
+  # can force. Waiting would stall the parent while a human decides.
   return [
     bg_task.asyncio_task
     for bg_task in entries
     if (
       bg_task.asyncio_task is not None
       and not bg_task.completed
-      and bg_task.state != TaskState.PARKED
+      and bg_task.state not in {TaskState.PARKED, TaskState.AWAITING_APPROVAL}
     )
   ]
+
+
+# How often an in-flight wait re-reads entry state. An approval park does not
+# complete the handle, and the caller's timeout must not be spent waiting on it.
+_APPROVAL_PARK_OBSERVE_S = 0.05
 
 
 async def wait_for_background_tasks(
@@ -731,9 +738,34 @@ async def wait_for_background_tasks(
 ) -> None:
   if not wait:
     return
-  pending = background_wait_tasks(entries)
-  if pending:
-    await wait_fn(pending, timeout=timeout)
+  selected = list(entries)
+  pending = background_wait_tasks(selected)
+  if not pending:
+    return
+  pending_ids = {id(task) for task in pending}
+  watched = [
+    entry for entry in selected
+    if entry.asyncio_task is not None and id(entry.asyncio_task) in pending_ids
+  ]
+  waiter = asyncio.ensure_future(wait_fn(pending, timeout=timeout))
+  try:
+    while not waiter.done():
+      if watched and all(
+        getattr(entry, "state", None) == TaskState.AWAITING_APPROVAL
+        for entry in watched
+      ):
+        return
+      await asyncio.wait({waiter}, timeout=_APPROVAL_PARK_OBSERVE_S)
+  finally:
+    if not waiter.done():
+      waiter.cancel()
+      try:
+        await waiter
+      except asyncio.CancelledError:
+        pass
+    else:
+      await waiter
+
 
 
 def _job_wait_row(entry: Any) -> Dict[str, Any]:
@@ -1025,7 +1057,11 @@ def background_task_payload(
     payload["agent"] = bg_task.agent_name
 
   state = getattr(bg_task, "state", None)
-  if state in {TaskState.INTERRUPTED, TaskState.PARKED}:
+  if state in {
+    TaskState.INTERRUPTED,
+    TaskState.PARKED,
+    TaskState.AWAITING_APPROVAL,
+  }:
     metadata = getattr(bg_task, "metadata", {}) if isinstance(getattr(bg_task, "metadata", None), dict) else {}
     capability_bind_receipt = getattr(
       bg_task,
@@ -1039,19 +1075,27 @@ def background_task_payload(
       else None
     )
     parked_result = getattr(bg_task, "task_result", None)
-    default_message = (
-      "Background task was interrupted by a gateway restart before completion."
-      if state == TaskState.INTERRUPTED
-      else (
+    reason = (
+      f" ({parked_result.execution.terminal_reason})"
+      if parked_result is not None
+      else ""
+    )
+    if state == TaskState.INTERRUPTED:
+      default_message = (
+        "Background task was interrupted by a gateway restart before completion."
+      )
+    elif state == TaskState.AWAITING_APPROVAL:
+      default_message = (
+        "Background task is awaiting approval"
+        + reason
+        + "; this read is not a final outcome."
+      )
+    else:
+      default_message = (
         "Background task is parked"
-        + (
-          f" ({parked_result.execution.terminal_reason})"
-          if parked_result is not None
-          else ""
-        )
+        + reason
         + "; resume_background_agent continues it from its transcript."
       )
-    )
     interrupted_message = (
       str(interrupted_error.get("message") or "")
       if interrupted_error is not None

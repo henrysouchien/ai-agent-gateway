@@ -11,13 +11,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 import signal
 import time
+from collections.abc import Iterable
 from typing import Any, ContextManager, Mapping, TYPE_CHECKING
 
 from .admission import ParentContext
+from .session_capabilities import normalize_session_capabilities
 from .autonomous_child_server_dotenv import (
   AUTONOMOUS_CHILD_SERVER_DOTENV_ENV,
   server_dotenv_payload,
 )
+from .admission import default_root_provenance
 from .autonomous_capability_handoff import (
   AutonomousCapabilityBindingRequest,
   resolve_autonomous_capability_binding,
@@ -78,15 +81,23 @@ from .claim_signing_authority import (
 from .autonomous_runner_commands import normalize_autonomous_profile
 from .artifact_paths import canonicalize_ticker
 from model_authority.binding import CredentialHandle
+from model_authority.run_route import handed_run_route_env
 from .events import DEFAULT_SCHEMA_VERSION
 from .child_environment import (
   AUTONOMOUS_CHILD_ENVIRONMENT,
+  AUTONOMOUS_CHILD_MODEL_ENDPOINT_ENV_NAMES,
   AUTONOMOUS_CHILD_PROFILES,
   AUTONOMOUS_CHILD_RUNTIME_ENV_NAMES,
   filter_child_environment,
 )
 from .role_validation import require_exact_role
 from .named_refusal import NamedRefusal
+from .run_settings import RunSettingsError
+from .single_user_policy import (
+  ApprovalSettings,
+  ApprovalSettingsPinError,
+  current_approval_settings,
+)
 from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES
 from .ttl_policy import (
   AUTONOMOUS_SESSION_AUTHORITY_TTL,
@@ -106,6 +117,7 @@ from .autonomous_runner_state import (
 )
 if TYPE_CHECKING:
   from collections.abc import Callable
+  from model_authority.selection import ProductModelSelectionPolicy
 
   from .autonomous_approval_ack import _AutonomousApprovalAckStore
   from .autonomous_capability_handoff import (
@@ -217,6 +229,7 @@ def _pinned_autonomous_child_pythonpath(
     ai_root / "packages" / "agent-gateway",
     ai_root / "packages" / "agent-workflow-contracts",
     ai_root / "packages" / "model-authority",
+    ai_root / "packages" / "model-transport",
     ai_root / "packages" / "excel-mcp" / "python",
     ai_root / "packages" / "ibkr-relay-client" / "python",
     ai_root / "packages" / "sheets-finance-mcp",
@@ -261,9 +274,12 @@ def _positive_autonomous_child_env(
       if type((value := environ.get(name))) is str
     }
   )
+  projected.update(handed_run_route_env(environ))
+  # Runtime endpoints, like the handed route, survive a persisted admission
+  # projection created before these names were registered.
   projected.update({
     name: value
-    for name in provider_env_names
+    for name in provider_env_names | AUTONOMOUS_CHILD_MODEL_ENDPOINT_ENV_NAMES
     if type((value := environ.get(name))) is str
   })
   pinned_pythonpath = _pinned_autonomous_child_pythonpath(environ)
@@ -315,9 +331,9 @@ def _positive_autonomous_child_env(
 
 
 _OWNED_PROCESS_SENTINEL_SOURCE = r"""
+import os
 import json
 import fcntl
-import os
 import select
 import signal
 import subprocess
@@ -387,21 +403,25 @@ output_line_max_bytes = int(sys.argv[1])
 owner_lifeline_fd = canonical_fd(sys.argv[2], "owner lifeline descriptor")
 owner_lease_fd = canonical_fd(sys.argv[3], "owner lease descriptor")
 owner_cleanup_grace_seconds = float(sys.argv[4])
-target_cmd = sys.argv[5:]
+status_fd = canonical_fd(sys.argv[5], "status descriptor")
+target_cmd = sys.argv[6:]
 all_inherited_descriptors = (
     *child_descriptors,
     owner_lifeline_fd,
     owner_lease_fd,
+    status_fd,
 )
 if len(all_inherited_descriptors) != len(set(all_inherited_descriptors)):
     raise SystemExit("autonomous inherited descriptors collide")
 
 
 def emit_status(payload):
-    sys.stderr.write(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    os.write(
+        status_fd,
+        (
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8"),
     )
-    sys.stderr.flush()
 
 
 def park():
@@ -665,6 +685,32 @@ def _asyncio_module() -> Any:
   return _runtime_attr("asyncio", asyncio)
 
 
+async def _attach_sentinel_status_reader(proc: Any, read_fd: int) -> None:
+  """Own the sentinel status pipe's read end and expose it as ``proc.stderr``.
+
+  The sentinel's stderr is the run log from process start; its JSON status
+  travels on this dedicated pipe, so interpreter-startup output can never
+  reach the parent's strict status parser. The read end is closed here on
+  every path, including a failed attach. Test doubles model the target
+  process directly and carry their own ``stderr`` status seam.
+  """
+  asyncio_module = _asyncio_module()
+  status_pipe = os.fdopen(read_fd, "rb", buffering=0)
+  if not isinstance(proc, asyncio_module.subprocess.Process):
+    status_pipe.close()
+    return
+  reader = asyncio_module.StreamReader()
+  try:
+    await asyncio_module.get_running_loop().connect_read_pipe(
+      lambda: asyncio_module.StreamReaderProtocol(reader),
+      status_pipe,
+    )
+  except BaseException:
+    status_pipe.close()
+    raise
+  proc.stderr = reader
+
+
 def _get_process_group_id(pid: int) -> int:
   return os.getpgid(pid)
 
@@ -845,6 +891,9 @@ class AutonomousRegistryStartMixin:
     _owner_run_limit_resolver: Callable[[str, int], int | None]
     _ttl_resolver: Callable[[str, str], int | None] | None
 
+    @property
+    def selection_policy(self) -> ProductModelSelectionPolicy | None: ...
+
     def live_process_count_for_owner(self, owner_user_id: str) -> int: ...
     _approval_store: _AutonomousApprovalAckStore | None
     _mcp_user_key_lookup: Callable[[str, str | None], dict[str, Any] | None] | None
@@ -880,6 +929,7 @@ class AutonomousRegistryStartMixin:
       skill: str | None,
       pack: str | None = None,
       deliver: bool = True,
+      context: str | None = None,
       ticker: str | None = None,
       research_file_id: int | None = None,
     ) -> list[str]: ...
@@ -942,6 +992,7 @@ class AutonomousRegistryStartMixin:
     *,
     owner_lifeline_fd: int,
     owner_lease_fd: int,
+    status_fd: int,
   ) -> list[str]:
     return [
       self._python,
@@ -951,6 +1002,7 @@ class AutonomousRegistryStartMixin:
       str(owner_lifeline_fd),
       str(owner_lease_fd),
       str(_SPAWN_CLEANUP_GRACE_SEC),
+      str(status_fd),
       *target_cmd,
     ]
 
@@ -1318,6 +1370,7 @@ class AutonomousRegistryStartMixin:
       ),
       session_log_authority=session_log_authority,
       approval_continuation=record.launch_approval_continuation,
+      approval_settings=record.launch_approval_settings,
     )
     control_authority = record.control_authority
     if type(control_authority) is not AutonomousControlAuthority:
@@ -1335,6 +1388,7 @@ class AutonomousRegistryStartMixin:
       session_authority=session_authority,
       admitted_context=record.admitted_context,
       tool_authority=record.tool_authority,
+      selection_provenance=record.selection_provenance,
     )
 
   @_with_run_mutation_lock
@@ -1351,6 +1405,7 @@ class AutonomousRegistryStartMixin:
     risk_user_id: int | None = None,
     user_aliases: list[str] | tuple[str, ...] | None = None,
     identity_status: str | None = None,
+    capabilities: Iterable[str] | None = None,
     control_run_id: str | None = None,
     task: str | None = None,
     skill: str | None = None,
@@ -1506,6 +1561,36 @@ class AutonomousRegistryStartMixin:
         normalized_pack = resumed_record.pack
         normalized_deliver = resumed_record.deliver
 
+      # The parent owns the approval settings snapshot: a first launch takes the
+      # live operator values, a successor copies its source's persisted record,
+      # and nothing the child reported is read. A successor of a run that
+      # predates the pin cannot continue an approved call under an unrecorded
+      # policy, so an approval resume is refused by name rather than pinned afresh.
+      # A plain resume of such a run is a new launch at the operator's request:
+      # the source never had a pin and read the settings live, so a fresh
+      # snapshot keeps its behaviour, and refusing would break resume for every
+      # historical run. The widening risk is the approval resume's alone.
+      if resumed_record is None:
+        launch_approval_settings = current_approval_settings().record()
+      elif resumed_record.launch_approval_settings is not None:
+        try:
+          launch_approval_settings = ApprovalSettings.from_record(
+            resumed_record.launch_approval_settings
+          ).record()
+        except RunSettingsError as exc:
+          raise ApprovalSettingsPinError(
+            f"Run {normalized_resumed_from} carries invalid approval settings "
+            f"({exc}); re-run it from the start."
+          ) from exc
+      elif approval_continuation is None:
+        launch_approval_settings = current_approval_settings().record()
+      else:
+        raise ApprovalSettingsPinError(
+          f"Run {normalized_resumed_from} cannot continue its approved call: "
+          "its park predates the approval-settings pin, so no launch policy "
+          "was recorded. Re-run it from the start."
+        )
+
       normalized_context = context.strip() if isinstance(context, str) and context.strip() else None
       cmd = self._build_cmd(
         profile=normalized_profile,
@@ -1514,6 +1599,19 @@ class AutonomousRegistryStartMixin:
         skill=normalized_skill,
         pack=normalized_pack,
         deliver=normalized_deliver,
+        # Only the short direct-skill convenience path repeats signed context
+        # on argv. External, scheduled and resumed launches use the file alone.
+        context=(
+          normalized_context
+          if (
+            normalized_mode == "skill"
+            and parent is None
+            and channel is None
+            and normalized_schedule_id is None
+            and resumed_record is None
+          )
+          else None
+        ),
         ticker=ticker,
         research_file_id=normalized_research_file_id,
       )
@@ -1594,17 +1692,27 @@ class AutonomousRegistryStartMixin:
           risk_user_id=int(launch_identity["risk_user_id"]),
           user_aliases=tuple(launch_identity["user_aliases"]),
           identity_status=str(launch_identity["identity_status"]),
+          capabilities=normalize_session_capabilities(capabilities),
         ),
       )
       child_identity = None
       if resumed_record is not None:
         admitted_context = resumed_record.admitted_context
         tool_authority = resumed_record.tool_authority
+        selection_provenance = resumed_record.selection_provenance
       else:
         admitted = capability_binding.admitted
         admitted_context = admitted.wire if admitted is not None else None
         tool_authority = admitted.tool_authority if admitted is not None else None
         child_identity = admitted.identity if admitted is not None else None
+        # Root launches have no admitted wire, but still persist their own
+        # captured provenance. A parentless root reads the registry's policy.
+        selection_provenance = (
+          admitted.wire.selection_provenance
+          if admitted is not None
+          else parent.selection_provenance if parent is not None
+          else default_root_provenance(self.selection_policy)
+        )
       if child_identity is not None:
         # ``admit`` bound the child's identity to its tenant; the record and the
         # session authority it seals carry that identity.
@@ -1747,8 +1855,10 @@ class AutonomousRegistryStartMixin:
         tool_result_spill_dir=tool_result_spill_dir,
         capability_bind=capability_binding.bind,
         admitted_context=admitted_context,
+        selection_provenance=selection_provenance,
         tool_authority=tool_authority,
         launch_approval_continuation=approval_continuation,
+        launch_approval_settings=launch_approval_settings,
         resumed_approval_id=(
           approval_continuation["approval_id"]
           if approval_continuation is not None else None
@@ -1943,6 +2053,8 @@ class AutonomousRegistryStartMixin:
       env[AUTONOMOUS_CREDENTIAL_HANDOFF_ENV] = (
         AUTONOMOUS_CREDENTIAL_HANDOFF_STDIN
       )
+      status_read_fd, status_write_fd = os_module.pipe()
+      status_read_handed_off = False
       try:
         await self._spawn_owned_process(
           record,
@@ -1951,11 +2063,12 @@ class AutonomousRegistryStartMixin:
               cmd,
               owner_lifeline_fd=owner_lifeline_read_fd,
               owner_lease_fd=owner_lease_fd,
+              status_fd=status_write_fd,
             ),
             cwd=str(self._api_dir),
             stdin=asyncio_module.subprocess.PIPE,
             stdout=log_handle,
-            stderr=asyncio_module.subprocess.PIPE,
+            stderr=log_handle,
             env=env,
             pass_fds=(
               child_event_channel_fd,
@@ -1968,16 +2081,22 @@ class AutonomousRegistryStartMixin:
               *prepared_session_log.pass_fds,
               owner_lifeline_read_fd,
               owner_lease_fd,
+              status_write_fd,
             ),
             start_new_session=True,
           ),
         )
+        status_read_handed_off = True
+        await _attach_sentinel_status_reader(record.proc, status_read_fd)
       finally:
         event_channel_child.close()
         event_channel_child = None
         if claim_broker_child_fd >= 0:
           os_module.close(claim_broker_child_fd)
           claim_broker_child_fd = -1
+        os_module.close(status_write_fd)
+        if not status_read_handed_off:
+          os_module.close(status_read_fd)
       record.event_channel_task = asyncio_module.create_task(
         self._drain_event_channel(task_id)
       )

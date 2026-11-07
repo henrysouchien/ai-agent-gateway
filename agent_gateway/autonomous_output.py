@@ -81,8 +81,9 @@ def collect_run_output(
     if terminal_seen:
       continue
     if event_type == "stream_retry":
-      text_parts.clear()
-      tool_calls.clear()
+      if event.get("settlement") != "preserve_partial":
+        text_parts.clear()
+        tool_calls.clear()
     elif event_type == "text_delta":
       text_parts.append(str(event.get("text", "")))
     elif event_type == "tool_call_start":

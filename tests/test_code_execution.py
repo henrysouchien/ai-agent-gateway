@@ -14,6 +14,8 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway import AgentRunner, SessionStore, ToolDispatcher
+from agent_gateway.registry_scope import NoRegistryScope, RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from agent_gateway.code_execution import (
   CodeExecutionConfig,
   build_code_execution,
@@ -92,6 +94,7 @@ async def _dispatch_bundle_tool(
     needs_approval=needs_approval or (lambda _name, _tool_input, _qualifier: False),
     event_log=event_log or EventLog(),
     approval_key_qualifier=bundle.approval_qualifier,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   return await dispatcher.dispatch(f"{tool_name}_call", tool_name, tool_input)
 
@@ -207,6 +210,7 @@ def test_code_execute_output_is_redacted_by_the_run_boundary() -> None:
       needs_approval=lambda _name, _tool_input, _qualifier: False,
       event_log=event_log,
       approval_key_qualifier=bundle.approval_qualifier,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     dispatcher.bind_secret_boundary(SecretBoundary((canary,)))
 
@@ -254,6 +258,7 @@ def test_code_execute_redacts_structured_errors_and_display_keys(tmp_path: Path)
       role="owner",
       needs_approval=lambda _name, _tool_input, _qualifier: False,
       approval_key_qualifier=bundle.approval_qualifier,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     dispatcher.bind_secret_boundary(SecretBoundary((canary,)))
     try:
@@ -284,7 +289,7 @@ def test_code_execute_runs_any_timeout_and_reports_it() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(default_timeout_ms=1000, max_timeout_ms=2000),
+      config=CodeExecutionConfig(default_timeout_ms=1000),
     )
 
     result, error = await _dispatch_bundle_tool(
@@ -319,7 +324,7 @@ def test_code_execute_rejects_invalid_timeout_ms() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(default_timeout_ms=1000, max_timeout_ms=2000),
+      config=CodeExecutionConfig(default_timeout_ms=1000),
     )
 
     cases = [
@@ -370,7 +375,7 @@ def test_code_execute_invalid_input_returns_validation_error() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(default_timeout_ms=1000, max_timeout_ms=2000),
+      config=CodeExecutionConfig(default_timeout_ms=1000),
     )
 
     cases = [
@@ -436,7 +441,7 @@ def test_code_execute_background_rejects_invalid_timeout_ms() -> None:
     session = SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice")
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(default_timeout_ms=1000, max_timeout_ms=2000),
+      config=CodeExecutionConfig(default_timeout_ms=1000),
     )
 
     for timeout_ms, expected_message in (
@@ -463,7 +468,7 @@ def test_code_execute_background_accepts_integral_float_timeout_ms() -> None:
     runner = _job_runner()
     bundle = build_code_execution(
       session,
-      config=CodeExecutionConfig(default_timeout_ms=1000, max_timeout_ms=2000),
+      config=CodeExecutionConfig(default_timeout_ms=1000),
       job_runner=lambda: runner,
     )
 
@@ -667,6 +672,7 @@ def _job_runner(spill_dir: Path | None = None, auth_config: dict[str, Any] | Non
       local_tool_handlers={},
       event_log=event_log,
       session_id="sess-code-jobs",
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     ),
     session_id="sess-code-jobs",
     capability_execution=stub_runner_capability_execution(
@@ -996,6 +1002,7 @@ def test_strip_code_execute_base64_hook_rewrites_model_history() -> None:
     )
   }
   ctx = ToolResultContext(
+    registry_scope=NoRegistryScope(),
     tool_name="code_execute",
     tool_input={"code": "print(1)"},
     redacted_tool_input={"code": "print(1)"},

@@ -1019,6 +1019,19 @@ Emitted when the turn's model cannot continue — its account pool is rate-limit
 
 A child run's hop appears on its parent's stream, once, carrying the child's `sub_agent_id`; a hop without `sub_agent_id` is the turn's own.
 
+If no chain entry can serve, the runner retains the evaluated skips while the
+primary's existing transient retry policy runs. Only when the turn actually
+fails, it emits one `model_fallback` notice with `outcome: "exhausted"` before
+the terminal `error`. Its `to` is `null`; there is no hop or implied retry.
+`primary_failure` carries `model_key`, `code`, the final error `detail`, and the
+provider's `reset_at` (or `null` if none was supplied). `skipped` retains chain
+evaluation order, with `model_key`, `code`, `detail`, and `reset_at` on each entry.
+Renderers must branch on `outcome` rather than claim the turn is continuing.
+`provider_exhausted` identifies recorded provider usage-limit evidence; generic
+parking remains `credential_pool_parked`, and a Kimi hop that has only a metered
+credential remains `metered_credential_not_selected`. Exhaustion never authorizes
+that metered credential or changes chain order.
+
 Schema:
 
 ```json
@@ -1030,7 +1043,7 @@ Schema:
   "reset_at": 1760050800.0,
   "role": "deep",
   "chain_index": 1,
-  "skipped": [{"model_key": "codex.gpt-6-1-sol", "code": "default_not_eligible"}],
+  "skipped": [{"model_key": "codex.gpt-6-1-sol", "code": "default_not_eligible", "detail": "Fallback entry was omitted by selection: default_not_eligible", "reset_at": null}],
   "sub_agent_id": "sub0:..."  // present only when a child run hopped
 }
 ```

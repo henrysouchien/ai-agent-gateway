@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import NoRegistryScope, RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
@@ -64,49 +66,10 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
     local_tool_handlers={},
     event_log=event_log or EventLog(),
     session_id="sess-callback",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
-def test_runner_callback_wrappers_resolve_parent_module_helpers(monkeypatch: Any) -> None:
-  def metric_callback(_name: str, _value: int) -> None:
-    raise AssertionError("metric callback should be forwarded, not invoked")
-
-  runner = AgentRunner(
-    event_log=EventLog(),
-    dispatcher=_make_dispatcher(),
-    session_id="sess",
-    capability_execution=_capability_execution(),
-    on_metric=metric_callback,
-    user_id="callback-test",
-    billing_mode="byok",
-    rate_table_version="unknown",
-  )
-  metric_calls: list[dict[str, Any]] = []
-
-  def _call_metric_hook(callback: Any, *, name: str, value: int, log_session_id: str, logger: Any) -> None:
-    metric_calls.append(
-      {
-        "callback": callback,
-        "name": name,
-        "value": value,
-        "log_session_id": log_session_id,
-        "logger": logger,
-      }
-    )
-
-  monkeypatch.setattr(gateway_runner, "_call_metric_hook", _call_metric_hook)
-
-  AgentRunner._call_metric(runner, "gateway.test", 3)
-
-  assert metric_calls == [
-    {
-      "callback": metric_callback,
-      "name": "gateway.test",
-      "value": 3,
-      "log_session_id": "sess",
-      "logger": gateway_runner.log,
-    }
-  ]
 
 
 def test_tool_timing_helper_passes_optional_user_id_when_supported() -> None:
@@ -304,6 +267,7 @@ def test_tool_result_hook_exception_logs_are_value_free_for_native_and_sdk() -> 
 
   sdk_logger = _Logger()
   sdk_ctx = ToolResultContext(
+    registry_scope=NoRegistryScope(),
     tool_name="lookup",
     tool_input={},
     redacted_tool_input={},
@@ -473,6 +437,7 @@ def test_runner_hook_delegates_preserve_log_and_filter_results() -> None:
     rate_table_version="unknown",
   )
   ctx = ToolResultContext(
+    registry_scope=NoRegistryScope(),
     tool_name="lookup",
     tool_input={"query": "AAPL"},
     redacted_tool_input={"query": "AAPL"},

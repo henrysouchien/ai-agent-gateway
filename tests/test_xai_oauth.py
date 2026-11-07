@@ -7,13 +7,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import multiprocessing
-from multiprocessing.queues import Queue
-from multiprocessing.synchronize import Barrier
 import os
 from pathlib import Path
 import stat
 import threading
 import time
+from types import SimpleNamespace
 from urllib.parse import parse_qs
 
 import httpx
@@ -144,44 +143,48 @@ class _GatedRefreshTransport(httpx.AsyncBaseTransport):
     )
 
 
-def _cross_process_refresh_worker(
-  store_path: str,
-  server_url: str,
-  barrier: Barrier,
-  captured: Queue[str],
-) -> None:
-  settings = resolve_xai_oauth_settings({"auth_store_path": store_path})
-  caller_record = _load_stored_record(Path(store_path))
-  refresh_token = caller_record["refresh_token"]
-  assert isinstance(refresh_token, str)
-  captured.put(refresh_token)
-  barrier.wait()
+_CROSS_PROCESS_REFRESH_SOURCE = """
+import asyncio
+from pathlib import Path
+import httpx
+from hank_model_transport.providers.xai_oauth import (
+  load_xai_token_record, refresh_xai_oauth_token, resolve_xai_oauth_settings,
+)
 
-  class ForwardTransport(httpx.AsyncBaseTransport):
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-      async with httpx.AsyncClient() as forwarding_client:
-        response = await forwarding_client.post(
-          server_url,
-          content=request.content,
-          headers={"Content-Type": request.headers["content-type"]},
-        )
-      return httpx.Response(
-        response.status_code,
-        content=response.content,
-        headers=response.headers,
-        request=request,
+settings = resolve_xai_oauth_settings({"auth_store_path": store_path})
+caller_record = load_xai_token_record(Path(store_path))
+assert caller_record is not None
+refresh_token = caller_record["refresh_token"]
+assert isinstance(refresh_token, str)
+captured.put(refresh_token)
+barrier.wait()
+
+class ForwardTransport(httpx.AsyncBaseTransport):
+  async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+    async with httpx.AsyncClient() as forwarding_client:
+      response = await forwarding_client.post(
+        server_url,
+        content=request.content,
+        headers={"Content-Type": request.headers["content-type"]},
       )
+    return httpx.Response(
+      response.status_code,
+      content=response.content,
+      headers=response.headers,
+      request=request,
+    )
 
-  async def run() -> None:
-    async with httpx.AsyncClient(transport=ForwardTransport()) as client:
-      await refresh_xai_oauth_token(
-        caller_record,
-        settings=settings,
-        client=client,
-        force=True,
-      )
+async def run() -> None:
+  async with httpx.AsyncClient(transport=ForwardTransport()) as client:
+    await refresh_xai_oauth_token(
+      caller_record,
+      settings=settings,
+      client=client,
+      force=True,
+    )
 
-  asyncio.run(run())
+asyncio.run(run())
+"""
 
 
 def test_store_defaults_under_user_data_dir_and_is_mode_0600(tmp_path: Path) -> None:
@@ -1777,6 +1780,13 @@ def test_grace_retry_timeout_is_isolated_from_caller_client_and_pool(
   save_xai_token_record(store, original)
   monkeypatch.setattr(xai_oauth, "_GRACE_HARD_BUDGET_S", 0.05)
   monkeypatch.setattr(xai_oauth, "_MIN_RETRY_BUDGET_S", 0.001)
+  # Only retry execution consumes the budget in this test. Keep client setup
+  # from exhausting it before the deliberately blocked retry has started.
+  monkeypatch.setattr(
+    xai_oauth,
+    "time",
+    SimpleNamespace(monotonic=lambda: 0.0, time=time.time, sleep=time.sleep),
+  )
 
   class CallerTransport(httpx.AsyncBaseTransport):
     def __init__(self) -> None:
@@ -2467,8 +2477,18 @@ def test_cross_process_refreshers_capture_same_record_but_never_post_same_token(
   server_url = f"http://127.0.0.1:{server.server_port}/token"
   workers = [
     context.Process(
-      target=_cross_process_refresh_worker,
-      args=(str(store), server_url, barrier, captured),
+      # A built-in target is spawn-importable even when pytest collected this
+      # package's tests under the same ``tests`` name as the repository suite.
+      target=exec,
+      args=(
+        _CROSS_PROCESS_REFRESH_SOURCE,
+        {
+          "store_path": str(store),
+          "server_url": server_url,
+          "barrier": barrier,
+          "captured": captured,
+        },
+      ),
     )
     for _ in range(2)
   ]

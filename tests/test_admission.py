@@ -1,4 +1,7 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from agent_gateway.registry_scope import NoRegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 import asyncio
 import copy
@@ -25,6 +28,7 @@ from agent_workflow_contracts.models import (
   SelectionProvenance,
 )
 from agent_gateway.admission import (
+  default_root_provenance,
   AdmittedChildIdentity,
   AdmittedContext,
   AdmissionOwners,
@@ -51,6 +55,7 @@ from agent_gateway.admission import (
   root_context_from_identity,
 )
 from agent_gateway.child_environment import AUTONOMOUS_CHILD_ENVIRONMENT, CHILD_ENVIRONMENT_ALLOWLISTS
+from agent_gateway.autonomous_runner_start import _positive_autonomous_child_env
 from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.approval_route import (
   NO_APPROVAL_ROUTE,
@@ -73,6 +78,7 @@ from gateway_test_support.capability_execution_test_support import (
 )
 from gateway_test_support.host_policy import owner_session_host_policy
 from model_authority.selection import SelectionSnapshot, capture_selection_snapshot
+from model_authority.run_route import read_entry_run_route, serialize_run_route
 
 
 def _session() -> GatewaySession:
@@ -128,6 +134,10 @@ class _PlainResolver:
     if self.run_mode == _BIND.run_mode:
       return _BIND
     return _BIND.model_copy(update={"run_mode": self.run_mode})
+
+  def selection_lane(self, bind: Any) -> None:
+    """This owner records no selection, so it names no lane."""
+    return None
 
 
 def _owners(
@@ -186,6 +196,7 @@ def _root(**changes: Any) -> ParentContext:
     _session(),
     withheld_tools=frozenset(),
     research_file_id=None,
+    selection_provenance=None,
   )
   return replace(root, **changes)
 
@@ -262,6 +273,7 @@ def test_spawn_keeps_the_turns_snapshot_and_a_later_mint_does_not_inherit_it() -
   root_context(
     session, withheld_tools=frozenset({"memory_read"}), research_file_id=42,
     selection_snapshot=turn,
+    selection_provenance=default_root_provenance(resolver.selection_policy),
   )
   runner = _BackgroundRunner()
   handler = make_run_agent_handler(
@@ -281,7 +293,7 @@ def test_spawn_keeps_the_turns_snapshot_and_a_later_mint_does_not_inherit_it() -
   assert admitted.selection_snapshot == turn.to_json()
   # A root minted later without its own capture (schedule run-now, batch stage)
   # resolves under current policy, not this turn's snapshot.
-  later = root_context(session, withheld_tools=frozenset(), research_file_id=None)
+  later = root_context(session, withheld_tools=frozenset(), research_file_id=None, selection_provenance=default_root_provenance(resolver.selection_policy))
   assert later.selection_snapshot is None
 
 
@@ -766,6 +778,7 @@ def test_child_session_cannot_regain_the_roots_spawn_authority() -> None:
   )
   parent = root_context(
     session, withheld_tools=frozenset(), research_file_id=None,
+    selection_provenance=None,
   )
   result = admit(_request(), parent, owners=_owners(_PlainResolver()))
 
@@ -907,7 +920,7 @@ def test_root_tenant_storage_id_is_the_minted_owner_not_the_channel_user_id() ->
     risk_user_id=1,
     role="owner",
   )
-  root = root_context(session, withheld_tools=frozenset(), research_file_id=None)
+  root = root_context(session, withheld_tools=frozenset(), research_file_id=None, selection_provenance=None)
   assert root.tenant is not None
   assert root.tenant.storage_id == "1"
 
@@ -1005,6 +1018,7 @@ def test_child_records_into_the_roots_captured_ledger_by_delegation() -> None:
   session.approval_route = route
   parent = root_context(
     session, withheld_tools=frozenset(), research_file_id=None,
+    selection_provenance=None,
   )
   session.approval_route = NO_APPROVAL_ROUTE
   owners = _owners(_resolver())
@@ -1032,6 +1046,7 @@ def test_sessionless_root_children_carry_the_control_plane_route() -> None:
     tenant=root.tenant, job_id="schedule:one", tool_ids=None,
     withheld_tools=frozenset(), research_binding=root.research_binding,
     approval_route=control,
+    selection_provenance=None,
   )
   result = admit(
     _request(), parent,
@@ -1129,6 +1144,68 @@ def test_placement_and_env_follow_bind_run_mode(
   assert isinstance(batch, AdmittedContext)
   assert batch.wire.placement == "in_process"
   assert batch.wire.env_projection == ()
+
+@pytest.mark.parametrize("run_mode", ["autonomous", "cron"])
+@pytest.mark.parametrize("cause", ["continuation", "revive", "placement_lost"])
+@pytest.mark.parametrize("route_present", [True, False], ids=["frozen-route", "no-route"])
+def test_admitted_and_continued_model_children_preserve_loopback_routing(
+  run_mode: str,
+  cause: Any,
+  tmp_path: Path,
+  route_present: bool,
+  caplog: pytest.LogCaptureFixture,
+  owner_session_host_policy: Any,
+) -> None:
+  owner_session_host_policy.get_local_tool_effect = lambda _name: "read"
+  route_file = tmp_path / "run-route.json"
+  route_file.write_bytes(serialize_run_route({
+    "schema": "run-route/2", "preset": "kimi_dev", "pool": ["ollama_cloud", "ollama"],
+    "enforcement": "strict",
+    "set_by": "test", "set_at": "2026-11-05T18:00:00Z", "reason": "replay fixture",
+  }))
+  endpoints = {
+    "OLLAMA_CLOUD_BASE_URL": "http://127.0.0.1:18081",
+    "OLLAMA_BASE_URL": "http://127.0.0.1:18082",
+  }
+  routing = {**endpoints, "HANK_RUN_ROUTE_FILE": str(route_file) if route_present else ""}
+  environment = {
+    **endpoints,
+    **({"HANK_RUN_ROUTE_FILE": str(route_file)} if route_present else {}),
+    "OLLAMA_CLOUD_API_KEY": "production-key-must-not-travel",
+  }
+  admitted = admit(
+    _request(), _root(),
+    owners=_owners(_PlainResolver(run_mode), env_names=frozenset(environment)),
+  )
+  assert isinstance(admitted, AdmittedContext)
+  assert admitted.wire.env_projection == tuple(sorted(endpoints))
+  task = _continuation_task(caplog, admitted_context=admitted.wire)
+  payload = task.model_dump(mode="json")
+  payload["model_bind"] = admitted.wire.capability_bind.model_dump(mode="json")
+  payload["model_bind_digest"] = sha256_digest(admitted.wire.capability_bind)
+  payload.pop("admitted_task_digest")
+  seal_admitted_task_payload(payload)
+  task = AdmittedTask.model_validate(payload)
+  continued = admit(
+    ContinueRequest(task.attempt.physical_task_id, cause=cause),
+    _root(),
+    owners=ContinuationOwners(
+      task=task, research_binding=admitted.wire.research_binding,
+      env_names=frozenset(environment),
+    ),
+  )
+  assert isinstance(continued, AdmittedContext)
+  for context in (admitted, continued):
+    assert context.wire.placement == "local_stub"
+    assert context.wire.env_projection == tuple(sorted(endpoints))
+    child = _positive_autonomous_child_env(
+      environment, provider="ollama_cloud", profile="analyst", deliver=False,
+      env_projection=context.wire.env_projection,
+    )
+    assert {name: child[name] for name in routing} == routing
+    assert read_entry_run_route(child) == read_entry_run_route(routing)
+    assert "OLLAMA_CLOUD_API_KEY" not in child
+
 
 # --- (d) unknown names are logged, never refused ------------------------
 
@@ -1546,11 +1623,13 @@ def test_root_turn_refreshes_but_reads_keep_the_captured_authority() -> None:
   session = _session()
   first = root_context(
     session, withheld_tools=frozenset({"write_record"}), research_file_id=41,
+    selection_provenance=None,
   )
   session.role = "invite"
   assert current_parent_context(session) is first
   second = root_context(
     session, withheld_tools=frozenset({"run_agent"}), research_file_id=42,
+    selection_provenance=None,
   )
   assert current_parent_context(session) is second
   assert second.tenant is not None and second.tenant.role == "invite"
@@ -1567,6 +1646,7 @@ def test_identity_root_cannot_grant_outside_live_roster_or_withheld_tools() -> N
     withheld_tools=frozenset({"write_record"}),
     research_binding=root.research_binding,
     approval_route=root.approval_route,
+    selection_provenance=None,
   )
   result = admit(
     _request(), parent,
@@ -1595,6 +1675,21 @@ def test_frozen_bind_is_authorized_without_reselection(
   )
   assert isinstance(result, AdmittedContext)
   assert result.wire.capability_bind is frozen
+
+
+def test_admission_records_the_lane_its_resolver_selected_the_bind_in() -> None:
+  """C1 ee450375 Phase 2: the wire carries the lane; an unselected frozen bind has none."""
+  frozen_elsewhere = admit(
+    _request(), _root(), owners=replace(_owners(_resolver()), frozen_bind=_BIND),
+  )
+  fresh = admit(_request(), _root(), owners=_owners(_resolver()))
+
+  assert isinstance(frozen_elsewhere, AdmittedContext)
+  assert isinstance(fresh, AdmittedContext)
+  assert frozen_elsewhere.wire.selection_lane is None
+  assert fresh.wire.selection_lane == "authored_primary"
+  restored = AdmittedContextWire.model_validate_json(fresh.wire.model_dump_json())
+  assert restored.selection_lane == "authored_primary"
 
 
 def test_default_root_lead_worker_bound_keeps_declared_child_authority() -> None:
@@ -1713,10 +1808,12 @@ def test_root_turn_admission_preserves_exact_owner_facts_and_mints_once(
   credential_ref: str,
 ) -> None:
   session = _session()
-  snapshot = capture_selection_snapshot(_resolver().selection_policy)
+  selection_policy = _resolver().selection_policy
+  snapshot = capture_selection_snapshot(selection_policy)
   context = root_context(
     session, withheld_tools=frozenset({"write_record"}),
     research_file_id=42, selection_snapshot=snapshot,
+    selection_provenance=default_root_provenance(selection_policy),
   )
   execution = _root_execution(credential_ref)
   arguments: dict[str, Any] = {
@@ -1731,6 +1828,7 @@ def test_root_turn_admission_preserves_exact_owner_facts_and_mints_once(
   assert first.capability_bind is execution.bind
   assert first.research_binding is context.research_binding
   assert first.selection_snapshot is snapshot
+  assert first.selection_provenance is context.selection_provenance
   assert first.tool_grant == arguments["tool_grant"]
   assert first.approval_route_kind == "no_approval_route"
   assert first.credential_generation_ref == (
@@ -1762,6 +1860,7 @@ async def _root_approval(
     run_context=RunContext(
       user_id=session.owner_user_id, session_id=session.session_id,
       request_id="root-request", run_id="root-run",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
     state="pending_user",
   )
@@ -1770,7 +1869,10 @@ async def _root_approval(
     await store.record_executable_binding(
       approval_id=request.approval_id, job_id=session.session_id,
       tool_call_id=call_id, nonce=nonce, tenant_storage_id=session.owner_user_id,
-      tool_name="file_read", prepared_call=prepared, dispatch_context={},
+      tool_name="file_read", prepared_call=prepared,
+      dispatch_context={
+        "registry_scope": {"scope_type": "run", "scope_id": "test-run", "store_dir": "/tmp/test-store"},
+      },
       credential_generation_ref=None,
     )
   return request.approval_id, call_id, nonce
@@ -1794,9 +1896,11 @@ def test_interactive_sdk_and_autonomous_bound_root_parks_locate_after_cold_reope
     assert session.owner_user_id is not None
     policy = SingleUserApprovalPolicy(store=store)
     route = DurableLocalApprovalRoute(store, policy, session)
+    selection_policy = _resolver().selection_policy
     context = root_context(
       session, withheld_tools=frozenset(), research_file_id=42,
-      selection_snapshot=capture_selection_snapshot(_resolver().selection_policy),
+      selection_snapshot=capture_selection_snapshot(selection_policy),
+      selection_provenance=default_root_provenance(selection_policy),
     )
     initial = admit_root_turn(
       context, execution=_root_execution(
@@ -1825,6 +1929,8 @@ def test_interactive_sdk_and_autonomous_bound_root_parks_locate_after_cold_reope
     assert json.loads(record.research_binding_json) == context.research_binding.model_dump(mode="json")
     assert context.selection_snapshot is not None
     assert json.loads(record.selection_snapshot_json) == context.selection_snapshot.to_json()
+    assert context.selection_provenance is not None
+    assert json.loads(record.selection_provenance_json) == context.selection_provenance.model_dump(mode="json")
     assert record.approval_route_kind == "durable_local"
     approval_id, call_id, nonce = await _root_approval(
       reopened, session=session, with_binding=with_binding,
@@ -1867,6 +1973,7 @@ def test_interactive_root_turn_records_before_tools_in_dispatchers_store(
     old_store = SQLiteApprovalStore(tmp_path / "session.sqlite3")
     session = _session()
     assert session.owner_user_id is not None
+    owner_user_id = session.owner_user_id
     old_route = DurableLocalApprovalRoute(old_store, SingleUserApprovalPolicy(store=old_store), session)
     session.approval_route = old_route
     deps = GatewayDispatcherDeps(
@@ -1899,6 +2006,7 @@ def test_interactive_root_turn_records_before_tools_in_dispatchers_store(
 
     def prepare_runtime_tooling(**_kwargs: Any) -> Any:
       return SimpleNamespace(
+        registry_scope=_kwargs["registry_scope"],
         active_tool_definitions=lambda: [{"name": "file_read"}, {"name": "unbound"}],
         unregistered_needs_approval=lambda *_args: False,
         input_preparation_context_factory=None,
@@ -1916,6 +2024,11 @@ def test_interactive_root_turn_records_before_tools_in_dispatchers_store(
       return build_tool_dispatcher(
         deps, principal=InvocationPrincipal.from_session(session), profile="interactive",
         capability_bind=execution.bind,
+        run_context=run_context_for_test(
+          registry_scope=NoRegistryScope(),
+          user_id=owner_user_id,
+          request_id="root-request",
+        ),
         event_log=EventLog(), session_id=session.session_id, request_approval=None,
         needs_approval=lambda *_args: False,
         local_tool_handlers={"file_read": tool_handler},
@@ -1942,6 +2055,7 @@ def test_interactive_root_turn_records_before_tools_in_dispatchers_store(
 
     prompting = SimpleNamespace(
       skill_application=skill_application, research_turn=None, trusted_research_file_id=None,
+      research_file_brief=None,
       prompt_context={}, profile_composition=SimpleNamespace(config=SimpleNamespace(name="analyst")),
       profile_denied_mcp_servers=set(), skill_catalog_entries=[],
       workspace_dir=None, local_tool_handlers={"file_read": tool_handler},
@@ -1988,5 +2102,61 @@ def test_interactive_root_turn_records_before_tools_in_dispatchers_store(
     assert result == {"content": "retained"}
     assert calls == ["file_read"]
     assert root_count(store) == (1 if durable else 0)
+
+  asyncio.run(case())
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_historical_root_provenance_migration_keeps_unknown_and_integrity(
+  tmp_path: Path, corrupt: bool,
+) -> None:
+  import agent_gateway.approval_store as store_owner
+
+  async def case() -> None:
+    path = tmp_path / "historical-root.sqlite3"
+    store = SQLiteApprovalStore(path)
+    session = _session()
+    assert session.owner_user_id is not None
+    policy = SingleUserApprovalPolicy(store=store)
+    selection_policy = _resolver().selection_policy
+    context = root_context(
+      session, withheld_tools=frozenset(), research_file_id=None,
+      selection_snapshot=capture_selection_snapshot(selection_policy),
+      selection_provenance=default_root_provenance(selection_policy),
+    )
+    admission = await record_root_turn_admission(store, admit_root_turn(
+      context, execution=_root_execution(),
+      tool_grant={"tool_ids": None, "withheld_tools": []},
+      approval_route=DurableLocalApprovalRoute(store, policy, session),
+    ))
+    # Recreate the historical table shape, which retained no provenance.
+    with store._connection() as conn:
+      conn.execute("ALTER TABLE approval_root_turns DROP COLUMN selection_provenance_json")
+      row = conn.execute("SELECT * FROM approval_root_turns").fetchone()
+      assert row is not None
+      snapshot = {
+        key: row[key] for key in row.keys()
+        if key not in {"snapshot_digest", "executable_refs_json"}
+      }
+      digest = store_owner._root_turn_snapshot_digest(snapshot)
+      conn.execute(
+        "UPDATE approval_root_turns SET snapshot_digest = ?",
+        ("corrupted" if corrupt else digest,),
+      )
+      conn.commit()
+    reopened = SQLiteApprovalStore(path)
+    read = reopened._read_root_turn_for_executor(
+      job_id=session.session_id, turn_id=admission.turn_id,
+      tenant_storage_id=session.owner_user_id,
+    )
+    if corrupt:
+      with pytest.raises(store_owner.RootTurnRecordError, match="snapshot_mismatch"):
+        await read
+    else:
+      record = await read
+      assert record is not None
+      assert json.loads(record.selection_provenance_json) is None
+      assert context.selection_snapshot is not None
+      assert json.loads(record.selection_snapshot_json) == context.selection_snapshot.to_json()
 
   asyncio.run(case())

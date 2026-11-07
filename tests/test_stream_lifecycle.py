@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
@@ -459,6 +461,12 @@ class _HangingDispatcher:
     self.cancel_delay = cancel_delay
     self.dispatch_calls = 0
     self.cancelled_calls = 0
+    self.run_context = run_context_for_test(
+      registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
+    )
+
+  def bind_research_file_activity_owner(self, ensure_activity: Any) -> None:
+    self.ensure_research_file_activity = ensure_activity
 
   async def dispatch(
     self,
@@ -629,6 +637,7 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
     local_tool_handlers={},
     event_log=event_log or EventLog(),
     session_id="sess-stream-lifecycle",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
@@ -961,6 +970,112 @@ def test_chat_cancel_rejects_different_session(make_test_app) -> None:
 
       assert cancel_response.status_code == 403
       assert cancel_response.json()["detail"] == "Cannot cancel a different session"
+      await app.state.user_event_bus.shutdown()
+
+  _run(case())
+
+
+async def _init_control_session(client: httpx.AsyncClient, user_id: str) -> dict[str, Any]:
+  response = await client.post(
+    "/api/control/session",
+    json={"api_key": "gateway-key", "user_id": user_id, "context": {"channel": "mcp"}},
+  )
+  assert response.status_code == 200, response.text
+  return response.json()
+
+
+async def _start_detached_turn(app, client: httpx.AsyncClient, session_info: dict[str, Any]):
+  session = app.state.auth.session_store.get_session(session_info["session_id"])
+  assert session is not None
+  async with client.stream(
+    "POST",
+    "/api/chat",
+    headers={"Authorization": f"Bearer {session_info['session_token']}"},
+    json=_chat_payload(),
+  ) as response:
+    assert response.status_code == 200
+    assert (await _read_sse_event(response))["type"] == "text_delta"
+  await _wait_for(
+    lambda: session.active_turn is not None
+    and session.active_turn.subscribers == {}
+    and session.active_turn.is_running,
+    timeout=1.0,
+  )
+  return session
+
+
+def test_control_bearer_cancels_same_owner_chat_session(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_HangingProvider(), runner_class=_ObservedAgentRunner)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      control = await _init_control_session(client, "alice")
+      session = await _start_detached_turn(app, client, session_info)
+
+      cancel_response = await client.post(
+        "/api/chat/cancel",
+        headers={"Authorization": f"Bearer {control['session_token']}"},
+        json={"session_id": session_info["session_id"]},
+      )
+
+      assert cancel_response.status_code == 200
+      assert cancel_response.json() == {"status": "cancelled", "session_id": session_info["session_id"]}
+      assert session.active_turn is None
+      assert getattr(app.state.test_state.runner, "cancelled_calls", 0) == 1
+      await app.state.user_event_bus.shutdown()
+
+  _run(case())
+
+
+def test_control_bearer_subscribes_same_owner_chat_session(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_HangingProvider(), runner_class=_ObservedAgentRunner)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      control = await _init_control_session(client, "alice")
+      session = await _start_detached_turn(app, client, session_info)
+
+      async with client.stream(
+        "GET",
+        f"/api/chat/subscribe?session_id={session_info['session_id']}&after_seq=0",
+        headers={"Authorization": f"Bearer {control['session_token']}"},
+      ) as subscriber_response:
+        assert subscriber_response.status_code == 200
+        assert (await _read_sse_event(subscriber_response))["type"] == "text_delta"
+        assert session.active_turn.subscribers
+
+      await app.state.user_event_bus.shutdown()
+
+  _run(case())
+
+
+def test_control_bearer_refused_for_different_owner_chat_session(make_test_app) -> None:
+  async def case() -> None:
+    app = make_test_app(provider=_HangingProvider(), runner_class=_ObservedAgentRunner)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+      session_info = await _init_session(client)
+      other_control = await _init_control_session(client, "bob")
+      session = await _start_detached_turn(app, client, session_info)
+      other_session = app.state.auth.session_store.get_session(other_control["session_id"])
+      assert other_session is not None
+      other_session.owner_user_id = "2"
+      headers = {"Authorization": f"Bearer {other_control['session_token']}"}
+
+      cancel_response = await client.post(
+        "/api/chat/cancel", headers=headers, json={"session_id": session_info["session_id"]},
+      )
+      subscribe_response = await client.get(
+        f"/api/chat/subscribe?session_id={session_info['session_id']}&after_seq=0", headers=headers,
+      )
+
+      assert cancel_response.status_code == 403
+      assert cancel_response.json()["detail"] == "Cannot cancel a different session"
+      assert subscribe_response.status_code == 403
+      assert subscribe_response.json()["detail"] == "Cannot subscribe to a different session"
+      assert session.active_turn is not None
       await app.state.user_event_bus.shutdown()
 
   _run(case())
@@ -2386,6 +2501,7 @@ def test_credential_rotation_retries_stream_with_new_auth_config(monkeypatch: py
         local_tool_handlers={},
         event_log=event_log,
         session_id="sess-refresh",
+        run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
       ),
       session_id="sess-refresh",
       capability_execution=_dispatcher_execution_1556,
@@ -2468,6 +2584,7 @@ def test_runner_apply_refreshed_auth_config_updates_request_and_runner_config() 
       local_tool_handlers={},
       event_log=event_log,
       session_id="sess-refresh",
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     ),
     session_id="sess-refresh",
     capability_execution=_dispatcher_execution_1625,

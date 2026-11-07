@@ -1,4 +1,6 @@
 """`tool_calls_planned`: one event per tool-using model turn, before execution."""
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
@@ -157,6 +159,7 @@ def _run_turns(turns: list[list[StreamEvent]]) -> list[dict[str, Any]]:
       event_log=event_log,
       session_id="sess-planned",
       role="owner",
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     ),
     session_id="sess-planned",
     capability_execution=_dispatcher_execution_145,

@@ -18,7 +18,6 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-import agent_gateway.sub_agent as sub_agent_module
 import agent_gateway.sub_agent_skill_state as skill_state
 from agent_workflow_contracts import (
   ActivityHandle,
@@ -178,27 +177,6 @@ def test_task_result_outcome_drives_skill_state_classification() -> None:
   )
 
 
-def test_parent_skill_state_wrappers_delegate_to_sidecar(monkeypatch) -> None:
-  calls: list[tuple[str, Any]] = []
-
-  def fake_response_text(result: Any | None) -> str:
-    calls.append(("response", result))
-    return "patched-response"
-
-  def fake_prompt(skill_name: str, previous_state: dict[str, Any]) -> str:
-    calls.append(("prompt", (skill_name, previous_state)))
-    return "patched-prompt"
-
-  monkeypatch.setattr(skill_state, "result_response_text", fake_response_text)
-  monkeypatch.setattr(skill_state, "skill_state_prompt", fake_prompt)
-
-  task_result = _task_result("raw")
-  assert sub_agent_module._result_response_text(task_result) == "patched-response"
-  assert sub_agent_module._skill_state_prompt("skill-a", {"runs": 1}) == "patched-prompt"
-  assert calls == [
-    ("response", task_result),
-    ("prompt", ("skill-a", {"runs": 1})),
-  ]
 
 
 def test_classify_child_outcome_uses_execution_settlement_failure() -> None:
@@ -553,6 +531,37 @@ def test_terminal_fms_result_disposition_fails_non_error_stop_gate() -> None:
       "mutation_mode": "preview",
     }
   ) == "failure"
+
+def test_terminal_fms_result_disposition_succeeds_applied_stop_gate() -> None:
+  assert skill_state.terminal_fms_result_disposition(
+    {
+      "status": "applied",
+      "gate_code": "STOP",
+      "subcommand": "persist_ticker_triage",
+      "mutation_mode": "model_writer",
+      "verdict_echo": {"verdict": "FINGERPRINT_DISMISS"},
+      "is_error": False,
+      "error": None,
+    }
+  ) == "success"
+
+def test_applied_stop_is_not_a_door_refusal() -> None:
+  event = {
+    "type": "tool_call_complete",
+    "tool_name": "fms_persist_ticker_triage",
+    "result": {
+      "status": "applied",
+      "gate_code": "STOP",
+      "verdict_echo": {"verdict": "FINGERPRINT_DISMISS"},
+      "is_error": False,
+      "error": None,
+    },
+  }
+
+  assert skill_state.latest_declared_door_refusal(
+    {"fms_persist_ticker_triage"},
+    (event,),
+  ) is None
 
 
 def test_terminal_result_projection_reads_one_successful_appended_event() -> None:

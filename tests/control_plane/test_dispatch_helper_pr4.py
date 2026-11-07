@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 import asyncio
 import logging
@@ -131,6 +133,7 @@ class _TestRunner(AgentRunner):
         local_tool_handlers={},
         event_log=event_log,
         session_id="dispatch-helper-pr4",
+        run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
       ),
       session_id="dispatch-helper-pr4",
       capability_execution=capability_execution,

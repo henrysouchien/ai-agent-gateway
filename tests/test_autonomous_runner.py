@@ -6,6 +6,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 import fcntl
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -28,6 +29,16 @@ if TYPE_CHECKING:
   from model_authority.binding import RunMode
   from agent_gateway.autonomous_runner import AutonomousRegistry
   from agent_gateway.skill_limits import AutonomousSkillAdmissionPolicyResolver
+
+# Resolve by path because importlib collection binds `tests` to this package.
+_signal_fence_spec = importlib.util.spec_from_file_location(
+  "_test_signal_fence",
+  Path(__file__).resolve().parents[3] / "tests" / "scripts" / "signal_fence.py",
+)
+assert _signal_fence_spec is not None and _signal_fence_spec.loader is not None
+_signal_fence_module = importlib.util.module_from_spec(_signal_fence_spec)
+_signal_fence_spec.loader.exec_module(_signal_fence_module)
+_signal_fence = _signal_fence_module.signal_fence_fixture()
 
 HMAC_KEY = "test-hmac-key-at-least-32-bytes-long"
 USER_ID = "1"
@@ -998,6 +1009,7 @@ sys.stderr.flush()
 """
   event_read, event_write = os.pipe()
   claim_read, claim_write = os.pipe()
+  status_read, status_write = os.pipe()
   owner_read, owner_write = os.pipe()
   lease_path = tmp_path / ("oversized.lease" if oversized else "normal.lease")
   lease_fd = os.open(lease_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1023,6 +1035,7 @@ sys.stderr.flush()
           str(owner_read),
           str(lease_fd),
           "0.01",
+          str(status_write),
           sys.executable,
           "-c",
           target_source,
@@ -1030,21 +1043,42 @@ sys.stderr.flush()
         ],
         stdin=subprocess.PIPE,
         stdout=log_handle,
-        stderr=subprocess.PIPE,
+        stderr=log_handle,
         env=env,
-        pass_fds=(event_write, claim_write, owner_read, lease_fd),
+        pass_fds=(event_write, claim_write, owner_read, lease_fd, status_write),
         start_new_session=True,
       )
+      os.close(status_write)
+      status_write = -1
       assert proc.stdin is not None
       proc.stdin.write(handoff)
       proc.stdin.close()
-      assert proc.stderr is not None
-      status = json.loads(proc.stderr.readline())
+      with os.fdopen(status_read, "rb") as status_pipe:
+        status_read = -1
+        status = json.loads(status_pipe.readline())
   finally:
     os.close(owner_write)
     if proc is not None:
-      proc.wait(timeout=5)
-    for fd in (event_read, event_write, claim_read, claim_write, owner_read, lease_fd):
+      try:
+        proc.wait(timeout=5)
+      except subprocess.TimeoutExpired:
+        try:
+          os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+          pass
+        proc.wait()
+    for fd in (
+      event_read,
+      event_write,
+      claim_read,
+      claim_write,
+      owner_read,
+      lease_fd,
+      status_read,
+      status_write,
+    ):
+      if fd < 0:
+        continue
       try:
         os.close(fd)
       except OSError:
@@ -1082,7 +1116,10 @@ def test_real_owned_sentinel_output_projection_failure_is_value_free(
     "kind": "error",
     "version": 1,
   }
-  assert persisted == b"<secret-sanitization-failed>\n"
+  # Import-time diagnostics share the log; the oversized child line does not.
+  assert persisted.endswith(b"<secret-sanitization-failed>\n")
+  assert persisted.count(b"<secret-sanitization-failed>") == 1
+  assert b"x" * 131073 not in persisted
   assert b"CUSTOM-ACTIVE-CREDENTIAL-autonomous-output-8f21d7" not in persisted
 
   class AsyncStatus:
@@ -1294,6 +1331,10 @@ def _write_manifest(tmp_path: Path, task_id: str = "bg_0", **overrides) -> dict:
     "context": "Review current packet",
     "ticker": "AAPL",
     "capability_bind": _test_capability_bind("autonomous").to_json(),
+    "launch_approval_settings": {
+      "approval_policy": "approve_all",
+      "approve_live_orders": False,
+    },
   }
   manifest_overrides.update(overrides)
   return write_v6_manifest(tmp_path, task_id, **manifest_overrides)
@@ -1667,6 +1708,227 @@ def test_autonomous_start_commits_the_claim_before_the_child_holds_credentials(
   asyncio.run(launch())
 
 
+_APPROVAL_FLIPS = [("ask_all", "approve_all"), ("approve_all", "ask_all")]
+
+
+def _operator_file(monkeypatch, tmp_path: Path, **values: object) -> None:
+  from agent_gateway.run_settings import set_operator_setting
+
+  monkeypatch.setenv("HANK_RUN_SETTINGS_PATH", str(tmp_path / "operator-run-settings.json"))
+  for key, value in values.items():
+    set_operator_setting(key, value)
+
+
+def _launched_workload(env: dict[str, str]):
+  from agent_gateway.autonomous_launch_envelope import (
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
+    verify_autonomous_launch_envelope,
+  )
+
+  return verify_autonomous_launch_envelope(
+    HMAC_KEY,
+    Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"),
+  ).workload
+
+
+def _resume_for_approval(
+  monkeypatch,
+  tmp_path: Path,
+  *,
+  continuation: dict | None,
+):
+  """Run the real start() as the successor of `run-source`; return what it spawned."""
+  from agent_gateway import autonomous_runner
+  from agent_gateway.control_plane import autonomous_approval_delivery
+
+  spawned: list[dict[str, str]] = []
+
+  async def fake_exec(*args, **kwargs):
+    _ = args
+    spawned.append(dict(kwargs["env"]))
+    return FakeProcess()
+
+  async def claim(*, store, continuation):
+    _ = store, continuation
+
+  monkeypatch.setattr(autonomous_runner.asyncio, "create_subprocess_exec", fake_exec)
+  monkeypatch.setattr(
+    autonomous_approval_delivery, "claim_continued_executable_attempt", claim,
+  )
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+  registry = _registry(tmp_path)
+
+  async def launch() -> None:
+    payload = await registry.start(
+      role="owner", profile="analyst", mode="task", task="resume",
+      user_id=USER_ID, user_email=USER_EMAIL,
+      resumed_from="run-source", approval_continuation=continuation,
+    )
+    await registry.wait(payload["task_id"], timeout_sec=1)
+
+  return registry, spawned, launch
+
+
+@pytest.mark.parametrize(("launch_value", "flipped"), _APPROVAL_FLIPS)
+def test_first_launch_signs_and_persists_the_operator_snapshot_it_took(
+  monkeypatch,
+  tmp_path,
+  launch_value: str,
+  flipped: str,
+) -> None:
+  """The parent snapshots the operator file once; a later flip never reaches the run."""
+  from agent_gateway.single_user_policy import current_approval_settings
+
+  _operator_file(monkeypatch, tmp_path, approval_policy=launch_value)
+  env = asyncio.run(_start_and_capture_env(monkeypatch, tmp_path))
+  _operator_file(monkeypatch, tmp_path, approval_policy=flipped, approve_live_orders=True)
+
+  record = {"approval_policy": launch_value, "approve_live_orders": False}
+  assert _launched_workload(env).approval_settings == record
+  manifest = json.loads(_manifest_path(tmp_path).read_text(encoding="utf-8"))
+  assert manifest["launch_approval_settings"] == record
+  assert current_approval_settings().approval_policy == flipped
+
+
+@pytest.mark.parametrize(("pinned", "flipped"), _APPROVAL_FLIPS)
+def test_approval_successor_runs_on_the_source_launch_snapshot(
+  monkeypatch,
+  tmp_path,
+  pinned: str,
+  flipped: str,
+) -> None:
+  """A policy change between park and approve leaves the successor on the launch snapshot."""
+  _operator_file(monkeypatch, tmp_path, approval_policy=flipped, approve_live_orders=True)
+  record = {"approval_policy": pinned, "approve_live_orders": False}
+  _write_manifest(
+    tmp_path, control_run_id="run-source", state="interrupted",
+    launch_approval_settings=record,
+  )
+  registry, spawned, launch = _resume_for_approval(
+    monkeypatch, tmp_path, continuation=dict(_APPROVED_CONTINUATION),
+  )
+  asyncio.run(launch())
+
+  assert len(spawned) == 1
+  assert _launched_workload(spawned[0]).approval_settings == record
+  successor = registry._tasks["bg_1"]
+  assert successor.launch_approval_settings == record
+
+
+def test_approval_successor_never_reads_a_mode_the_source_child_reported(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  """No widening: a continuation naming approve_all cannot move a source pinned to ask_all."""
+  _operator_file(monkeypatch, tmp_path, approval_policy="approve_all")
+  pinned = {"approval_policy": "ask_all", "approve_live_orders": False}
+  _write_manifest(
+    tmp_path, control_run_id="run-source", state="interrupted",
+    launch_approval_settings=pinned,
+    approval_continuation={
+      **_APPROVED_CONTINUATION,
+      "approval_settings": {"approval_policy": "approve_all", "approve_live_orders": True},
+    },
+  )
+  reported = {
+    **_APPROVED_CONTINUATION,
+    "approval_settings": {"approval_policy": "approve_all", "approve_live_orders": True},
+  }
+  _, spawned, launch = _resume_for_approval(
+    monkeypatch, tmp_path, continuation=reported,
+  )
+  asyncio.run(launch())
+
+  assert _launched_workload(spawned[0]).approval_settings == pinned
+
+
+def test_a_launch_snapshot_altered_after_signing_fails_the_envelope_verification(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway.autonomous_launch_envelope import (
+    AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV,
+    verify_autonomous_launch_envelope,
+  )
+
+  _operator_file(monkeypatch, tmp_path, approval_policy="ask_all")
+  env = asyncio.run(_start_and_capture_env(monkeypatch, tmp_path))
+  raw = Path(env[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8")
+  verify_autonomous_launch_envelope(HMAC_KEY, raw)
+
+  for forged in (
+    {"approval_policy": "approve_all", "approve_live_orders": False},
+    {"approval_policy": "ask_all", "approve_live_orders": True},
+    None,
+  ):
+    payload = json.loads(raw)
+    payload["workload"]["approval_settings"] = forged
+    with pytest.raises(ValueError, match="signature is invalid"):
+      verify_autonomous_launch_envelope(
+        HMAC_KEY, json.dumps(payload, separators=(",", ":"), sort_keys=True),
+      )
+
+
+def test_resume_of_a_run_that_predates_the_pin_is_refused_by_name(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway.single_user_policy import ApprovalSettingsPinError
+
+  _write_manifest(
+    tmp_path, control_run_id="run-source", state="interrupted",
+    launch_approval_settings=None,
+  )
+  registry, spawned, launch = _resume_for_approval(
+    monkeypatch, tmp_path, continuation=dict(_APPROVED_CONTINUATION),
+  )
+  with pytest.raises(
+    ApprovalSettingsPinError,
+    match=r"run-source.*predates the approval-settings pin.*Re-run it from the start",
+  ):
+    asyncio.run(launch())
+  assert spawned == []
+  assert set(registry._tasks) == {"bg_0"}
+
+
+def test_plain_resume_of_a_pre_pin_run_is_a_new_launch_with_a_fresh_snapshot(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  _operator_file(monkeypatch, tmp_path, approval_policy="ask_all")
+  _write_manifest(
+    tmp_path, control_run_id="run-source", state="interrupted",
+    launch_approval_settings=None,
+  )
+  registry, spawned, launch = _resume_for_approval(
+    monkeypatch, tmp_path, continuation=None,
+  )
+  asyncio.run(launch())
+
+  assert _launched_workload(spawned[0]).approval_settings == {
+    "approval_policy": "ask_all", "approve_live_orders": False,
+  }
+  assert registry._tasks["bg_1"].launch_approval_settings is not None
+
+
+def test_resume_with_an_invalid_persisted_snapshot_is_refused_by_name(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  from agent_gateway.single_user_policy import ApprovalSettingsPinError
+
+  _write_manifest(
+    tmp_path, control_run_id="run-source", state="interrupted",
+    launch_approval_settings={"approval_policy": "live_orders_only", "approve_live_orders": False},
+  )
+  registry, spawned, launch = _resume_for_approval(
+    monkeypatch, tmp_path, continuation=dict(_APPROVED_CONTINUATION),
+  )
+  with pytest.raises(ApprovalSettingsPinError, match="run-source.*invalid approval settings"):
+    asyncio.run(launch())
+  assert spawned == []
+
+
 def test_autonomous_start_signs_exact_session_authority_only(
   monkeypatch,
   tmp_path,
@@ -1902,6 +2164,10 @@ def test_autonomous_start_signs_exact_executable_workload(
     "admitted_skill_execution_limits"
   )
   assert workload_receipt.pop("approval_continuation") is None
+  assert workload_receipt.pop("approval_settings") == {
+    "approval_policy": "approve_all",
+    "approve_live_orders": False,
+  }
   assert workload_receipt == expected_workload
   assert admitted_limits == (
     {}
@@ -2685,6 +2951,50 @@ def test_effective_resume_projection_preserves_dynamic_narrowing_order(
   record.state = "interrupted"
   record.skill_resume_allowed = False
   assert _autonomous_task_resumable(record) is False
+
+
+@pytest.mark.parametrize(
+  ("internal_state", "public_state", "resumable"),
+  [
+    ("blocked", "failed", True),
+    ("failed", "failed", True),
+    ("interrupted", "interrupted", True),
+    ("budget_limited", "interrupted", True),
+    ("killed", "cancelled", True),
+    ("cancelled", "cancelled", True),
+    ("finished", "completed", False),
+    ("completed", "completed", False),
+    ("continued", "completed", False),
+    ("awaiting_approval", "approval_pending", False),
+    ("remediating", "running", False),
+    ("running", "running", False),
+  ],
+)
+def test_resume_eligibility_is_the_public_state_classification(
+  tmp_path,
+  internal_state,
+  public_state,
+  resumable,
+) -> None:
+  from agent_gateway.control_plane.runs_helpers import (
+    _autonomous_run_from_task,
+    _autonomous_task_resumable,
+  )
+
+  _write_manifest(
+    tmp_path,
+    state="interrupted",
+    skill="frozen-skill",
+    skill_resume_allowed=True,
+  )
+  record = _registry(tmp_path)._tasks["bg_0"]
+  record.state = internal_state
+
+  run = _autonomous_run_from_task(record)
+
+  assert run.state == public_state
+  assert _autonomous_task_resumable(record) is resumable
+  assert run.resumable is resumable
 
 
 @pytest.mark.parametrize("schedule_id", [None, "schedule-1"])
@@ -3815,6 +4125,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
           "skill_resume_allowed",
           "admitted_skill_execution_limits",
         "admitted_context",
+        "selection_provenance",
         "tool_authority",
         "context",
         "ticker",
@@ -3846,6 +4157,7 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
         "resumed_from",
         "resumed_as",
         "approval_continuation",
+        "launch_approval_settings",
         "resumed_approval_id",
         "schedule_id",
         "schedule_name",
@@ -3927,6 +4239,10 @@ def test_autonomous_manifest_committed_before_spawn_with_full_field_set(monkeypa
       assert manifest["resumed_from"] is None
       assert manifest["resumed_as"] == []
       assert manifest["approval_continuation"] is None
+      assert manifest["launch_approval_settings"] == {
+        "approval_policy": "approve_all",
+        "approve_live_orders": False,
+      }
       assert manifest["resumed_approval_id"] is None
       assert manifest["schedule_id"] is None
       assert manifest["schedule_name"] is None
@@ -4861,6 +5177,181 @@ def test_carried_terminal_cause_renders_in_run_record(
 
 
 
+@pytest.mark.parametrize(
+  ("channel_outcome", "expected_error"),
+  [
+    (
+      "cleanup-cancel",
+      "reaper failed: autonomous process sentinel status is malformed",
+    ),
+    (
+      "failure",
+      "autonomous event channel failed: RuntimeError: channel boom",
+    ),
+    (
+      "self-cancel",
+      "autonomous event channel failed: CancelledError: channel cancelled itself",
+    ),
+  ],
+)
+def test_sentinel_status_failure_is_not_masked_by_cleanup_channel_cancellation(
+  monkeypatch,
+  tmp_path,
+  channel_outcome: str,
+  expected_error: str,
+) -> None:
+  async def _case() -> None:
+    from agent_gateway import autonomous_runner
+
+    channel_started = asyncio.Event()
+    channel_cancelled = asyncio.Event()
+
+    class MalformedStatusPipe:
+      async def readline(self) -> bytes:
+        await channel_started.wait()
+        return b"not a sentinel status\n"
+
+    class SentinelProcess(SlowFakeProcess):
+      def __init__(self) -> None:
+        super().__init__()
+        self.stderr = MalformedStatusPipe()
+
+    process = SentinelProcess()
+
+    async def fake_exec(*args, **kwargs):
+      _ = args, kwargs
+      return process
+
+    async def held_channel(_self, _task_id):
+      channel_started.set()
+      if channel_outcome == "failure":
+        raise RuntimeError("channel boom")
+      if channel_outcome == "self-cancel":
+        raise asyncio.CancelledError("channel cancelled itself")
+      try:
+        await asyncio.Future()
+      except asyncio.CancelledError:
+        channel_cancelled.set()
+        raise
+
+    monkeypatch.setattr(
+      autonomous_runner.asyncio,
+      "create_subprocess_exec",
+      fake_exec,
+    )
+    monkeypatch.setattr(
+      autonomous_runner.AutonomousRegistry,
+      "_drain_event_channel",
+      held_channel,
+    )
+    monkeypatch.setattr(autonomous_runner, "_SPAWN_CLEANUP_GRACE_SEC", 0.01)
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+    registry = _registry(tmp_path)
+    payload = await registry.start(
+      role="owner",
+      profile="analyst",
+      mode="task",
+      task="summarize",
+      user_id=USER_ID,
+      user_email=USER_EMAIL,
+    )
+    record = registry._tasks[payload["task_id"]]
+    assert record.reaper_task is not None
+    await asyncio.wait_for(record.reaper_task, timeout=1)
+
+    assert channel_cancelled.is_set() is (channel_outcome == "cleanup-cancel")
+    assert record.state == "failed"
+    assert record.exit_code is None
+    assert record.error == expected_error
+    manifest = _read_manifest(tmp_path)
+    assert manifest["state"] == "failed"
+    assert manifest["error"] == expected_error
+
+  asyncio.run(_case())
+
+
+def test_sentinel_status_failure_is_not_masked_by_real_event_channel_abort(
+  monkeypatch,
+  tmp_path,
+) -> None:
+  """The reaper's own abort of the real event channel makes the blocked reader
+  raise a transport/protocol error, not a cancellation; that error is cleanup
+  collateral and must not replace the sentinel status failure."""
+
+  async def _case() -> None:
+    from agent_gateway import autonomous_event_channel
+    from agent_gateway import autonomous_runner
+    from agent_gateway import autonomous_runner_start
+
+    peer_fds: list[int] = []
+
+    class MalformedStatusPipe:
+      async def readline(self) -> bytes:
+        # Let the real drain block in its first receive before status fails.
+        await asyncio.sleep(0.2)
+        return b"not a sentinel status\n"
+
+    class SentinelProcess(SlowFakeProcess):
+      def __init__(self) -> None:
+        super().__init__()
+        self.stderr = MalformedStatusPipe()
+
+    process = SentinelProcess()
+
+    async def fake_exec(*args, **kwargs):
+      _ = args
+      # A live child keeps its end of the socketpair open, so the real
+      # drain blocks in recv instead of seeing a peer close.
+      peer_fds.append(
+        os.dup(int(kwargs["env"]["AGENT_AUTONOMOUS_EVENT_CHANNEL_FD"]))
+      )
+      return process
+
+    monkeypatch.setattr(
+      autonomous_runner_start,
+      "create_autonomous_event_channel",
+      autonomous_event_channel.create_autonomous_event_channel,
+    )
+    monkeypatch.setattr(
+      autonomous_runner.asyncio,
+      "create_subprocess_exec",
+      fake_exec,
+    )
+    monkeypatch.setattr(autonomous_runner, "_SPAWN_CLEANUP_GRACE_SEC", 0.5)
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+    registry = _registry(tmp_path)
+    try:
+      payload = await registry.start(
+        role="owner",
+        profile="analyst",
+        mode="task",
+        task="summarize",
+        user_id=USER_ID,
+        user_email=USER_EMAIL,
+      )
+      record = registry._tasks[payload["task_id"]]
+      assert isinstance(
+        record.event_channel,
+        autonomous_event_channel.AutonomousEventChannelParent,
+      )
+      assert record.reaper_task is not None
+      await asyncio.wait_for(record.reaper_task, timeout=5)
+
+      assert record.event_channel.fileno() == -1
+      assert record.state == "failed"
+      assert record.exit_code is None
+      expected_error = (
+        "reaper failed: autonomous process sentinel status is malformed"
+      )
+      assert record.error == expected_error
+      assert _read_manifest(tmp_path)["error"] == expected_error
+    finally:
+      for peer_fd in peer_fds:
+        os.close(peer_fd)
+
+  asyncio.run(_case())
+
+
 def test_autonomous_manifest_updates_on_reaper_failure(monkeypatch, tmp_path) -> None:
   from agent_gateway import autonomous_runner
 
@@ -5637,6 +6128,7 @@ def test_autonomous_skill_start_seals_session_authority_from_admitted_identity(
     withheld_tools=frozenset(),
     research_binding=AdmittedResearchBinding(),
     approval_route=NO_APPROVAL_ROUTE,
+    selection_provenance=None,
   )
   requests = []
 
@@ -6994,6 +7486,7 @@ sys.exit(3)
   event_read, event_write = os.pipe()
   claim_read, claim_write = os.pipe()
   owner_read, owner_write = os.pipe()
+  status_read, status_write = os.pipe()
   lease_fd = os.open(
     tmp_path / "startup-death.lease",
     os.O_RDWR | os.O_CREAT | os.O_EXCL,
@@ -7008,6 +7501,7 @@ sys.exit(3)
     [str(package_dir), env.get("PYTHONPATH", "")]
   ).rstrip(os.pathsep)
   proc = None
+  status_pipe = None
   grandchild_pid = None
   try:
     with (tmp_path / "startup-death.log").open("wb") as log_handle:
@@ -7020,6 +7514,7 @@ sys.exit(3)
           str(owner_read),
           str(lease_fd),
           "0.01",
+          str(status_write),
           sys.executable,
           "-c",
           target_source,
@@ -7027,17 +7522,20 @@ sys.exit(3)
         ],
         stdin=subprocess.PIPE,
         stdout=log_handle,
-        stderr=subprocess.PIPE,
+        stderr=log_handle,
         env=env,
-        pass_fds=(event_write, claim_write, owner_read, lease_fd),
+        pass_fds=(event_write, claim_write, owner_read, lease_fd, status_write),
         start_new_session=True,
       )
+      os.close(status_write)
+      status_write = -1
       assert proc.stdin is not None
       proc.stdin.write(handoff)
       proc.stdin.close()
-      assert proc.stderr is not None
-      assert select.select([proc.stderr], [], [], 10)[0], "sentinel did not report exit"
-      assert json.loads(proc.stderr.readline()) == {
+      status_pipe = os.fdopen(status_read, "rb")
+      status_read = -1
+      assert select.select([status_pipe], [], [], 10)[0], "sentinel did not report exit"
+      assert json.loads(status_pipe.readline()) == {
         "kind": "exited",
         "returncode": 3,
         "version": 1,
@@ -7133,11 +7631,22 @@ sys.exit(3)
           pass
         proc.wait(timeout=5)
     finally:
-      if proc is not None:
-        for stream in (proc.stdin, proc.stderr):
-          if stream is not None:
-            stream.close()
-      for fd in (event_read, event_write, claim_read, claim_write, owner_read, lease_fd):
+      if proc is not None and proc.stdin is not None:
+        proc.stdin.close()
+      if status_pipe is not None:
+        status_pipe.close()
+      for fd in (
+        event_read,
+        event_write,
+        claim_read,
+        claim_write,
+        owner_read,
+        lease_fd,
+        status_read,
+        status_write,
+      ):
+        if fd < 0:
+          continue
         try:
           os.close(fd)
         except OSError:
@@ -7244,6 +7753,196 @@ def test_user_revocation_terminates_runs_and_disables_schedules(
     assert sched_store.schedules["bob"][0]["enabled"] is True
     assert ("bob", "sched_b1", False) not in sched_store.disabled_calls
 
+    await registry.shutdown(grace_sec=0.1)
+
+  asyncio.run(_case())
+
+
+@pytest.mark.parametrize("user_id", [None, 42, True, "", " alice ", "../alice", "042", "Alice"])
+def test_revocation_preserves_malformed_owner_finding(
+  tmp_path: Path, user_id: object,
+) -> None:
+  from agent_gateway.user_identity_mapping import StorageIdentityFinding
+
+  registry = _registry(tmp_path)
+  with pytest.raises(StorageIdentityFinding) as finding:
+    asyncio.run(registry.revoke_user(user_id))  # pyright: ignore[reportArgumentType]  # negative: raw revocation identity is malformed
+  assert finding.value.input == user_id
+
+
+def test_a_cancelled_run_reports_its_exit_code_when_the_sentinel_status_never_arrives(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  """gate aab95e429f57: registry.cancel() returned state 'killed' without exit_code.
+
+  The cancellation kill takes the sentinel with its child, so the status pipe
+  reaches EOF and no child status is harvested (the production shape, and what
+  suite load produced when the status read missed the cleanup window). The
+  observed process-group exit (-9) is then the run's exit code.
+  """
+  from agent_gateway import autonomous_runner, autonomous_runner_start
+
+  class _StatusPipe:
+    def __init__(self, killed: asyncio.Event) -> None:
+      self._killed = killed
+
+    async def readline(self) -> bytes:
+      await self._killed.wait()
+      return b""  # the sentinel died with its child: EOF, no status line
+
+  class _SentinelProcess(SlowFakeProcess):
+    def __init__(self) -> None:
+      super().__init__()
+      self._killed = asyncio.Event()
+      self.stderr = _StatusPipe(self._killed)
+
+    async def wait(self) -> int:
+      await self._killed.wait()
+      if self.returncode is None:
+        self.returncode = -9
+      return self.returncode
+
+  async def _case() -> None:
+    proc = _SentinelProcess()
+    pair = _FakeEventChannelPair()
+    monkeypatch.setattr(
+      autonomous_runner_start, "create_autonomous_event_channel", lambda **_kw: pair,
+    )
+    monkeypatch.setattr(
+      autonomous_runner.asyncio, "create_subprocess_exec", lambda *_a, **_kw: asyncio.sleep(0, result=proc),
+    )
+    monkeypatch.setattr(autonomous_runner, "_SPAWN_CLEANUP_GRACE_SEC", 0.05)
+    monkeypatch.setattr(autonomous_runner_start, "_SPAWN_CLEANUP_GRACE_SEC", 0.05)
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+
+    def _fake_signal_group(pgid: int, sig: int) -> None:
+      _ = pgid
+      if sig == signal.SIGKILL:
+        proc.returncode = -9
+        proc._killed.set()
+
+    monkeypatch.setattr(autonomous_runner, "_signal_process_group", _fake_signal_group)
+    monkeypatch.setattr(autonomous_runner_start, "_signal_process_group", _fake_signal_group)
+    monkeypatch.setattr(autonomous_runner, "_get_process_group_id", lambda pid: pid)
+    monkeypatch.setattr(autonomous_runner_start, "_get_process_group_id", lambda pid: pid)
+
+    registry = _registry(tmp_path)
+    started = await registry.start(
+      user_id="alice",
+      user_email="alice@example.com",
+      **_START_KWARGS,
+    )
+    status = await registry.cancel(started["task_id"])
+    assert status["state"] == "killed"
+    assert status["exit_code"] == -9
+    await registry.shutdown(grace_sec=0.1)
+
+  asyncio.run(_case())
+
+
+def test_cancel_waits_for_reaper_post_exit_settlement_after_sigkill_without_500(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+) -> None:
+  from agent_gateway import autonomous_runner, autonomous_runner_start
+
+  class _SigkillOnlyProcess(SlowFakeProcess):
+    def __init__(self) -> None:
+      super().__init__()
+      self._killed = asyncio.Event()
+
+    async def wait(self) -> int:
+      await self._killed.wait()
+      if self.returncode is None:
+        self.returncode = -9
+      return self.returncode
+
+  async def _case() -> None:
+    proc = _SigkillOnlyProcess()
+    pair = _FakeEventChannelPair()
+    monkeypatch.setattr(
+      autonomous_runner_start, "create_autonomous_event_channel", lambda **_kw: pair,
+    )
+    monkeypatch.setattr(
+      autonomous_runner.asyncio, "create_subprocess_exec", lambda *_a, **_kw: asyncio.sleep(0, result=proc),
+    )
+    monkeypatch.setattr(autonomous_runner, "_SPAWN_CLEANUP_GRACE_SEC", 0.05)
+    monkeypatch.setattr(autonomous_runner_start, "_SPAWN_CLEANUP_GRACE_SEC", 0.05)
+    monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
+
+    def _fake_signal_group(pgid: int, sig: int) -> None:
+      _ = pgid
+      if sig == signal.SIGKILL:
+        proc.returncode = -9
+        proc._killed.set()
+
+    monkeypatch.setattr(autonomous_runner, "_signal_process_group", _fake_signal_group)
+    monkeypatch.setattr(autonomous_runner_start, "_signal_process_group", _fake_signal_group)
+    monkeypatch.setattr(autonomous_runner, "_get_process_group_id", lambda pid: pid)
+    monkeypatch.setattr(autonomous_runner_start, "_get_process_group_id", lambda pid: pid)
+
+    registry = _registry(tmp_path)
+    orig_expire = registry._expire_autonomous_gateway_session
+
+    async def _slow_post_exit_expire(record: autonomous_runner.AutonomousTask) -> None:
+      await asyncio.sleep(0.12)
+      await orig_expire(record)
+
+    monkeypatch.setattr(registry, "_expire_autonomous_gateway_session", _slow_post_exit_expire)
+    started = await registry.start(
+      user_id="alice",
+      user_email="alice@example.com",
+      **_START_KWARGS,
+    )
+    status = await registry.cancel(started["task_id"])
+    assert status["state"] == "killed"
+    assert status["exit_code"] == -9
+
+    # A process that stays live after SIGKILL raises a typed conflict refusal naming run_id/pid/pgid.
+    class _UnkillableProcess(SlowFakeProcess):
+      def __init__(self) -> None:
+        super().__init__()
+        self._done = asyncio.Event()
+
+      async def wait(self) -> int:
+        await self._done.wait()
+        return -9
+    unkillable = _UnkillableProcess()
+    pair_2 = _FakeEventChannelPair()
+    monkeypatch.setattr(
+      autonomous_runner_start, "create_autonomous_event_channel", lambda **_kw: pair_2,
+    )
+    monkeypatch.setattr(
+      autonomous_runner.asyncio, "create_subprocess_exec", lambda *_a, **_kw: asyncio.sleep(0, result=unkillable),
+    )
+    monkeypatch.setattr(autonomous_runner, "_signal_process_group", lambda _pgid, _sig: None)
+    monkeypatch.setattr(autonomous_runner_start, "_signal_process_group", lambda _pgid, _sig: None)
+    started_2 = await registry.start(
+      user_id="alice",
+      user_email="alice@example.com",
+      **_START_KWARGS,
+    )
+    with pytest.raises(autonomous_runner.AutonomousCancelUnsettledError) as exc_info:
+      await registry.cancel(started_2["task_id"])
+    assert exc_info.value.code == "cancel_process_unsettled"
+    assert exc_info.value.http_status == 409
+    assert exc_info.value.run_id == started_2["run_id"]
+    assert exc_info.value.pid == unkillable.pid
+    assert exc_info.value.process_group_id == unkillable.pid
+    assert exc_info.value.settlement_pending is False
+    assert exc_info.value.to_detail()["next_call"] == {
+      "method": "GET",
+      "path": f"/control/runs/{started_2['run_id']}",
+    }
+    monkeypatch.setattr(autonomous_runner, "_POST_EXIT_SETTLE_SECONDS", 0.05)
+    registry._tasks[started_2["task_id"]].event_channel_ack_started = True
+    with pytest.raises(autonomous_runner.AutonomousCancelUnsettledError) as ack_live_exc:
+      await registry.cancel(started_2["task_id"])
+    assert ack_live_exc.value.code == "cancel_process_unsettled"
+    assert ack_live_exc.value.settlement_pending is False
+    unkillable.returncode = -9
+    unkillable._done.set()
     await registry.shutdown(grace_sec=0.1)
 
   asyncio.run(_case())

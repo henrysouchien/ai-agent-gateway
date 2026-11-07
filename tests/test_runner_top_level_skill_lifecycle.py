@@ -4,7 +4,6 @@ from collections.abc import AsyncGenerator
 import json
 import os
 import stat
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -12,12 +11,6 @@ from typing import Any, cast
 import pytest
 
 
-ROOT = Path(__file__).resolve().parents[3]
-PKG_DIR = Path(__file__).resolve().parents[1]
-TESTS_DIR = Path(__file__).resolve().parent
-for path in (PKG_DIR, TESTS_DIR):
-  if str(path) not in sys.path:
-    sys.path.insert(0, str(path))
 
 from agent_gateway import AgentRunner, AgentSessionLog, EventLog  # noqa: E402
 from agent_gateway.agent_session_log_records import EVENT_SCHEMA_VERSION  # noqa: E402
@@ -29,6 +22,7 @@ from agent_gateway.runner_session_events import (  # noqa: E402
   build_skill_run_started_event,
 )
 from agent_gateway.operation_catalog import SemanticScope  # noqa: E402
+from agent_gateway.run_control import run_control_root  # noqa: E402
 from agent_gateway.skill_lifecycle import (  # noqa: E402
   TopLevelServerTerminalCause,
   TopLevelSkillAdmission,
@@ -1707,7 +1701,9 @@ def test_sync_result_failure_retries_exact_success_after_state_effect(
   tmp_path: Path,
 ) -> None:
   lifecycle = _metadata()
-  state_path = tmp_path / "state.json"
+  control = run_control_root(tmp_path)
+  control.mkdir(exist_ok=True)
+  state_path = control / "state.json"
   state_path.write_bytes(b'{"state":"before"}\n')
 
   def _prepare_state_plan(
@@ -1719,7 +1715,7 @@ def test_sync_result_failure_retries_exact_success_after_state_effect(
       terminal_event,
       effect=(
         TopLevelSkillCompletionEffectPlan.canonical_json_update(
-          workspace_path=tmp_path,
+          workspace_path=control,
           target_path=state_path,
           update=lambda _exists, _before: {
             "state": "success",
@@ -1847,6 +1843,105 @@ def test_completion_effect_failure_leaves_recoverable_intent(
   assert [event["type"] for event in pair] == ["skill_result_captured", "stream_complete"]
   assert pair[0]["outcome"] == "success"
   assert pair[1]["terminal_disposition"] == "completed"
+
+
+@pytest.mark.parametrize("identity", ["legacy_workspace", "foreign_workspace"])
+def test_recovery_settles_pre_relocation_completion_intent(
+  tmp_path: Path,
+  identity: str,
+) -> None:
+  from agent_gateway.run_control import relocate_workspace_run_stores
+
+  workspace = tmp_path / "workspace"
+  state_path = workspace / "notes" / "default" / "skill_state.json"
+  state_path.parent.mkdir(parents=True)
+  state_path.write_text('{"run_count":3}\n', encoding="utf-8")
+  lifecycle = _metadata()
+  log = AgentSessionLog(tmp_path / "sessions" / "pre-relocation.jsonl")
+  fresh_lifecycle = TopLevelSkillLifecycleMetadata(
+    skill_run_id="after-pre-relocation-recovery",
+    skill=lifecycle.skill,
+    scope=lifecycle.scope,
+    ticker=lifecycle.ticker,
+  )
+  runner = _runner(
+    log=log,
+    provider=_ScriptedProvider([]),
+    lifecycle=fresh_lifecycle,
+    policy=_policy(fresh_lifecycle),
+    workspace_dir=workspace,
+  )
+  terminal = {
+    "type": "stream_complete",
+    "terminal_disposition": "completed",
+    **lifecycle.identity_fields(),
+  }
+  log.append_sync(_top_level_started_event(lifecycle, started_at=1.0))
+
+  def increment(_exists: bool, before: Any) -> dict[str, int]:
+    assert before is not None
+    return {"run_count": before["run_count"] + 1}
+
+  effect = TopLevelSkillCompletionEffectPlan.canonical_json_update(
+    workspace_path=workspace,
+    target_path=state_path,
+    update=increment,
+  ).durable_payload()
+  if identity == "foreign_workspace":
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    foreign_stat = foreign.stat()
+    effect["workspace_identity"] = {
+      "dev": foreign_stat.st_dev,
+      "ino": foreign_stat.st_ino,
+      "uid": foreign_stat.st_uid,
+    }
+  admission = runner._top_level_skill_admission
+  assert admission is not None
+  wal = SkillCompletionWal(log.path)
+  intent = wal.store({
+    "record_type": "intent",
+    "skill_run_id": lifecycle.skill_run_id,
+    "lifecycle": lifecycle.identity_fields(),
+    "result": _durable_writer_event(_result_event(lifecycle, terminal)),
+    "terminal": _durable_writer_event(terminal),
+    "effect": effect,
+    "fence": admission.fence,
+  })
+  # The process stopped after intent persistence, before the state CAS.
+  assert json.loads(state_path.read_text(encoding="utf-8")) == {"run_count": 3}
+  relocate_workspace_run_stores(workspace)
+  relocated_state = run_control_root(workspace) / state_path.relative_to(workspace)
+  assert not state_path.exists()
+  assert wal.load() == intent
+
+  async def recover() -> None:
+    try:
+      await runner._acquire_writer_lease_and_recover()
+    finally:
+      runner._release_write_lease()
+
+  if identity == "foreign_workspace":
+    with pytest.raises(
+      SkillCompletionEffectConflict,
+      match="completion effect workspace identity changed",
+    ):
+      _run(recover())
+    assert json.loads(relocated_state.read_text(encoding="utf-8")) == {"run_count": 3}
+    blocked = wal.load()
+    assert blocked is not None
+    assert blocked["record_type"] == "ambiguous"
+  else:
+    _run(recover())
+    settled = wal.load()
+    assert settled is not None
+    assert settled["record_type"] == "settled"
+    assert json.loads(relocated_state.read_text(encoding="utf-8")) == {"run_count": 4}
+    entries, _ = _run(log.query(order="asc"))
+    assert not any(
+      entry.event.get("guard") == "top_level_skill_completion_ambiguous"
+      for entry in entries
+    )
 
 
 @pytest.mark.parametrize(
@@ -2034,10 +2129,12 @@ def test_conflicting_partial_result_blocks_before_recovery_effect(
     )
   )
   _run(log.append(_durable_writer_event(conflicting_result)))
-  state_path = tmp_path / "state.json"
+  control = run_control_root(tmp_path)
+  control.mkdir(exist_ok=True)
+  state_path = control / "state.json"
   state_path.write_bytes(b'{"state":"before"}\n')
   effect = TopLevelSkillCompletionEffectPlan.canonical_json_update(
-    workspace_path=tmp_path,
+    workspace_path=control,
     target_path=state_path,
     update=lambda _exists, _before: {"state": "after"},
   )
@@ -2171,22 +2268,27 @@ def test_repeated_cancellation_during_plan_drain_commits_once(
         messages=[{"role": "user", "content": "Run the skill"}]
       )
     )
-    await asyncio.wait_for(provider.stream_entered.wait(), timeout=1.0)
-    task.cancel()
-    await asyncio.wait_for(plan_entered.wait(), timeout=1.0)
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    plan_release.set()
-    with pytest.raises(asyncio.CancelledError):
-      await asyncio.wait_for(task, timeout=1.0)
+    try:
+      await provider.stream_entered.wait()
+      task.cancel()
+      await plan_entered.wait()
+      task.cancel()
+      await asyncio.sleep(0)
+      assert not task.done()
+      plan_release.set()
+      with pytest.raises(asyncio.CancelledError):
+        await task
+    finally:
+      plan_release.set()
+      task.cancel()
+      await asyncio.gather(task, return_exceptions=True)
 
     entries, _ = await log.query(order="asc")
     types = [entry.event["type"] for entry in entries]
     assert types.count("skill_run_started") == 1
     assert types.count("skill_result_captured") == 1
 
-  _run(_case())
+  _run(asyncio.wait_for(_case(), timeout=60))
 
 
 class _RequestParamsFailingProvider(_ScriptedProvider):
@@ -2748,6 +2850,103 @@ def test_completion_wal_is_private_checksummed_and_exact(
   ) == 0o600
 
 
+def _persist_business_model_envelope(index: int) -> dict[str, Any]:
+  """One ``fms_persist_business_model`` door envelope in its recorded shape.
+
+  Pipeline c858d8472b7e, stage business-model-construction (R27): each
+  commit door answer carried ~2.5 MB of ``readback`` -- the acceptance handoff
+  (62 sources) once under ``typed_outputs`` and again under ``provenance`` --
+  and the run captured five of them in ``fms_results``.
+  """
+  acceptance = {
+    "handoff": {
+      "artifact": {
+        "sources": [
+          {
+            "source_id": f"src-{index}-{source}",
+            "excerpts": [{"text": "e" * 18_000}],
+            "text": "t" * 18_000,
+          }
+          for source in range(62)
+        ],
+      },
+    },
+  }
+  return {
+    "status": "ok",
+    "subcommand": "persist_business_model",
+    "mutation_mode": "commit",
+    "ticker": "CTAS",
+    "gate_code": "PROCEED",
+    "tool_name": "fms_persist_business_model",
+    "readback": {
+      "typed_outputs": {"acceptance": acceptance},
+      "provenance": {"acceptance": acceptance},
+    },
+  }
+
+
+def test_completion_wal_stages_a_result_carrying_every_door_envelope(
+  tmp_path: Path,
+) -> None:
+  log_path = tmp_path / "sessions" / "wal-large-result.jsonl"
+  log_path.parent.mkdir(parents=True)
+  wal = SkillCompletionWal(log_path)
+  record = _wal_intent_record()
+  record["result"] = {
+    "type": "skill_result_captured",
+    "fms_results": [_persist_business_model_envelope(i) for i in range(5)],
+  }
+  assert len(json.dumps(record)) > 10 * 1024 * 1024
+
+  stored = wal.store(record)
+
+  assert wal.load() == stored
+  assert len(stored["result"]["fms_results"]) == 5
+
+
+def test_top_level_commit_keeps_a_result_carrying_every_door_envelope(
+  tmp_path: Path,
+) -> None:
+  log = AgentSessionLog(path=tmp_path / "sessions" / "large-result.jsonl")
+  lifecycle = _metadata()
+  envelopes = [_persist_business_model_envelope(i) for i in range(5)]
+  policy = TopLevelSkillResultPolicy(
+    prepare_provider=lambda proposed_prompt: proposed_prompt,
+    prepare_completion=lambda _event_log, terminal_event: _completion_plan(
+      {
+        **_result_event(lifecycle, terminal_event),
+        "fms_results": envelopes,
+      },
+      terminal_event,
+    ),
+  )
+  runner = _runner(
+    log=log,
+    provider=_ScriptedProvider([_text_turn("done")]),
+    lifecycle=lifecycle,
+    policy=policy,
+  )
+
+  _run(
+    runner.run(
+      messages=[{"role": "user", "content": "Run the skill"}],
+      system_prompt="system prompt",
+    )
+  )
+
+  entries, _ = _run(log.query(order="asc"))
+  result = next(
+    entry.event
+    for entry in entries
+    if entry.event["type"] == "skill_result_captured"
+  )
+  assert result["fms_results"] == envelopes
+  settled = SkillCompletionWal(log.path).load()
+  assert settled is not None
+  assert settled["record_type"] == "settled"
+
+
 def test_completion_wal_rejects_dangling_directory_symlink(
   tmp_path: Path,
 ) -> None:
@@ -2899,7 +3098,9 @@ def test_recovery_preserves_awaiting_approval_skill_without_final_settlement(
     lifecycle = _metadata()
     event_log = EventLog()
     prepared_terminals: list[dict[str, Any]] = []
-    state_path = tmp_path / "skill-state.json"
+    control = run_control_root(tmp_path)
+    control.mkdir(exist_ok=True)
+    state_path = control / "skill-state.json"
     state_path.write_text('{"status":"open"}\n', encoding="utf-8")
 
     def prepare_completion(
@@ -2911,7 +3112,7 @@ def test_recovery_preserves_awaiting_approval_skill_without_final_settlement(
         result,
         terminal,
         effect=TopLevelSkillCompletionEffectPlan.canonical_json_update(
-          workspace_path=tmp_path,
+          workspace_path=control,
           target_path=state_path,
           update=lambda _exists, _before: {"status": result["outcome"]},
         ),
@@ -3151,7 +3352,9 @@ def test_named_approval_park_completes_physical_settlement_handshake(
       root_turn_id="turn:admitted-handshake",
     )
     preparation_calls: list[dict[str, Any]] = []
-    state_path = tmp_path / "named-skill-state.json"
+    control = run_control_root(tmp_path)
+    control.mkdir(exist_ok=True)
+    state_path = control / "named-skill-state.json"
     state_path.write_text('{"state":"open"}\n', encoding="utf-8")
 
     def prepare_completion(
@@ -3162,7 +3365,7 @@ def test_named_approval_park_completes_physical_settlement_handshake(
         _result_event(lifecycle, terminal),
         terminal,
         effect=TopLevelSkillCompletionEffectPlan.canonical_json_update(
-          workspace_path=tmp_path,
+          workspace_path=control,
           target_path=state_path,
           update=lambda _exists, _before: {"state": "final"},
         ),

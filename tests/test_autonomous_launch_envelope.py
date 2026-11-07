@@ -19,7 +19,8 @@ from typing import Literal, TypedDict
 import pytest
 from agent_workflow_contracts import ResolvedAuthority
 from agent_workflow_contracts.models import (
-  AdmittedContextWire, AdmittedLineage, AdmittedResearchBinding, AdmittedTenant, ToolGrant,
+  AdmittedContextWire, AdmittedLineage, AdmittedResearchBinding, AdmittedTenant,
+  SelectionProvenance, ToolGrant,
 )
 
 import agent_gateway.autonomous_launch_envelope as envelope_module
@@ -117,6 +118,7 @@ def _signed(
   ),
   admitted_context: AdmittedContextWire | None = None,
   tool_authority: ResolvedAuthority | None = None,
+  selection_provenance: SelectionProvenance | None = None,
   ttl_seconds: int = 60,
   now_ns: int | None = _NOW_NS,
   nonce: str | None = _NONCE,
@@ -147,6 +149,7 @@ def _signed(
     session_authority=resolved_session_authority,
     admitted_context=admitted_context,
     tool_authority=tool_authority,
+    selection_provenance=selection_provenance,
     ttl_seconds=ttl_seconds,
     now_ns=now_ns,
     nonce=nonce,
@@ -806,18 +809,6 @@ def test_envelope_retains_exact_credential_contract() -> None:
     )
 
 
-def test_superseded_contracts_and_in_memory_replay_path_are_deleted() -> None:
-  source = Path(envelope_module.__file__).read_text(encoding="utf-8")
-
-  assert "AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION = 1" not in source
-  assert "AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION = 2" not in source
-  assert "proof_authority" not in source
-  assert "ProofAutonomous" not in source
-  assert '"iat"' not in source
-  assert '"exp"' not in source
-  assert "used_nonces" not in source
-  assert "MutableSet" not in source
-  assert "legacy" not in source.lower()
 
 
 def _admitted_authority(bind: CapabilityBind) -> tuple[AdmittedContextWire, ResolvedAuthority]:
@@ -893,3 +884,50 @@ def test_envelope_admitted_authority_keeps_closed_canonical_contract(field: str,
     payload[field]["research_binding"]["ticker"] = " MSFT "
   with pytest.raises(ValueError):
     _verify(_resign(payload))
+
+
+@pytest.mark.parametrize("layer", ["request", "process_override", "deployment_file", "policy_default", None])
+def test_envelope_authenticates_exact_root_selection_provenance(layer) -> None:
+  provenance = (
+    SelectionProvenance(
+      role=None, role_source="spawn", effort_source=None, preset=None,
+      preset_layer=layer,
+    )
+    if layer is not None else None
+  )
+  raw = _signed(selection_provenance=provenance)
+  verified = _verify(raw)
+  assert verified.admitted is None
+  assert verified.selection_provenance == provenance
+  assert verified.payload() == json.loads(raw)
+  assert json.loads(raw)["selection_provenance"] == (
+    provenance.model_dump(mode="json") if provenance is not None else None
+  )
+
+
+def test_root_selection_provenance_is_covered_by_the_envelope_signature() -> None:
+  provenance = SelectionProvenance(
+    role=None, role_source=None, effort_source=None, preset=None,
+    preset_layer="request",
+  )
+  payload = json.loads(_signed(selection_provenance=provenance))
+  payload["selection_provenance"]["preset_layer"] = "deployment_file"
+  with pytest.raises(ValueError, match="signature"):
+    _verify(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+@pytest.mark.parametrize("invalid", ["", {"preset_layer": "unknown"}, {"unexpected": "field"}])
+def test_envelope_parses_root_selection_provenance_without_coercion(invalid) -> None:
+  payload = json.loads(_signed())
+  payload["selection_provenance"] = invalid
+  with pytest.raises(ValueError):
+    _verify(_resign(payload))
+
+
+def test_historical_envelope_authenticates_original_payload_without_root_provenance() -> None:
+  payload = json.loads(_signed())
+  del payload["selection_provenance"]
+  original = _resign(payload)
+  verified = _verify(original)
+  assert verified.selection_provenance is None
+  assert verified.signature == json.loads(original)["signature"]

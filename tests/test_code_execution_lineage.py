@@ -7,17 +7,12 @@ The sticky-kernel journey runs real interpreters through the real dispatcher.
 """
 import asyncio
 import json
-import sys
 import textwrap
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-PKG_DIR = Path(__file__).resolve().parents[1]
-for path in (PKG_DIR, Path(__file__).resolve().parent):
-  if str(path) not in sys.path:
-    sys.path.insert(0, str(path))
 
 from agent_gateway import SessionStore, ToolDispatcher, tool_dispatch_declarations
 from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution

@@ -141,6 +141,16 @@ class ServiceAuthConfigResolver(Protocol):
   ) -> MaterializedCredential: ...
 
 
+class ServiceAdmissionCheck(Protocol):
+  def __call__(
+    self,
+    handle: CredentialHandle,
+    *,
+    risk_user_id: int,
+    auth_config: Mapping[str, Any] | None = None,
+  ) -> bool: ...
+
+
 class ScheduledRetentionSweeper(Protocol):
   interval_seconds: float
 
@@ -208,7 +218,10 @@ def _looks_like_commercial_jwt(value: str) -> bool:
     ))
   except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
     return False
-  return isinstance(payload, dict) and payload.get("iss") in _COMMERCIAL_TOKEN_ISSUERS
+  if not isinstance(payload, dict):
+    return False
+  issuer = payload.get("iss")
+  return type(issuer) is str and issuer in _COMMERCIAL_TOKEN_ISSUERS
 
 
 def _assert_no_commercial_bearer_material(value: Any) -> None:
@@ -677,6 +690,13 @@ class ChatRequest(BaseModel):
   )
   _selection_snapshot: SelectionSnapshot | None = PrivateAttr(default=None)
   _selection_provenance: SelectionProvenance | None = PrivateAttr(default=None)
+  # False only for a read-only composition (open_direct_turn claim_active_turn=False):
+  # the runtime build then captures no root or job onto the session.
+  _claims_turn: bool = PrivateAttr(default=True)
+
+  @property
+  def claims_turn(self) -> bool:
+    return self._claims_turn
 
   @property
   def selection_snapshot(self) -> SelectionSnapshot | None:
@@ -866,6 +886,7 @@ class ChatTurnInputs:
     repr=False,
   )
   commercial_dispatch_owner: object | None = field(default=None, repr=False)
+  claims_turn: bool = True
 
 
 @dataclass(frozen=True)
@@ -1010,7 +1031,7 @@ def _build_runner_with_started_at(
   return build_runner(event_log, session_id, started_at)
 
 
-async def _call_build_chat_runtime(
+async def call_build_chat_runtime(
   build_chat_runtime: BuildChatRuntime,
   *,
   session: GatewaySession,
@@ -1080,6 +1101,9 @@ class GatewayServerConfig:
     service_auth_config_resolver: Trusted server callback that materializes the
       selected service credential after principal resolution, called as
       `resolver(handle, user_scope=<effective run scope>)`.
+    service_admission: Trusted, user-scoped admission of owner seats and Bedrock
+      service credentials for user-key providers. Absent admits no such service
+      handle; deployment API keys never qualify.
     capability_adapter_resolver: Trusted callback that returns the exact
       adapter implementation for a bound adapter ID. Preparation uses it to
       validate credential material and exact effort before any durable or
@@ -1207,6 +1231,7 @@ class GatewayServerConfig:
   model_preference_store: ModelPreferenceStore | None = None
   service_provider_handles: Mapping[str, CredentialHandle] = field(default_factory=dict)
   service_auth_config_resolver: ServiceAuthConfigResolver | None = None
+  service_admission: ServiceAdmissionCheck | None = None
   capability_adapter_resolver: CapabilityAdapterResolver | None = None
   autonomous_capability_binding_resolver: (
     AutonomousCapabilityBindingResolver | None

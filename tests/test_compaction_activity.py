@@ -1,16 +1,12 @@
 """A child streaming a portable-compaction summary is live to its parent's guard."""
 
 import asyncio
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-TESTS_DIR = Path(__file__).resolve().parent
-if str(TESTS_DIR) not in sys.path:
-  sys.path.insert(0, str(TESTS_DIR))
 
 import agent_gateway.provider_summarize as provider_summarize  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402

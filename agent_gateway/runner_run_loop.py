@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import asyncio
 import copy
 import json
@@ -98,6 +98,7 @@ from .runner_soft_budget import (
 )
 from .commercial_work_start import commercial_budget_stop_fields
 from .runner_state import (
+  FinalAnswerVerdict,
   NoToolUseTurnOutcome,
   SessionDrainState,
   TurnReminderState,
@@ -108,6 +109,9 @@ from .runner_state import (
   model_visible_extra_blocks as _model_visible_extra_blocks,
   no_tool_use_turn_outcome as _no_tool_use_turn_outcome,
   normalized_run_config as _normalized_run_config,
+  record_reminder_hash as _record_reminder_hash,
+  request_messages_aged as _request_messages_aged,
+  request_messages_with_reminders as _request_messages_with_reminders,
   session_drain_state as _session_drain_state,
   stream_turn_log_summary as _stream_turn_log_summary,
   sub_agent_batch_error as _sub_agent_batch_error,
@@ -351,6 +355,46 @@ def _planned_tool_calls(
     }
     for block in blocks
   ]
+
+
+def _settle_held_repair_turn(
+  runner: Any,
+  turn: StreamTurnResult,
+  transform: Callable[[str], str] | None,
+  *,
+  logger: logging.Logger,
+  turn_count: int,
+) -> Callable[[str], str] | None:
+  """What a hold repair's splice does after a reply; returns the transform the
+  next turn carries (a tool turn keeps it), or ``None`` once the reply is consumed.
+
+  A completed reply was spliced and emitted by the stream. A reply the
+  provider cut off at ``max_tokens`` stays held: the continuation's text is
+  appended to it and the whole reply spliced once. A reply that failed
+  mid-stream, or an empty reply, settles on the draft, so the client that
+  cleared its draft on ``answer_revision_started`` shows the whole answer again
+  and no clause is replaced by a fragment (audit 1b7646d5b287)."""
+  if transform is None or turn.tool_uses:
+    return transform
+  if turn.stop_reason == "end_turn" and turn.full_text:
+    return None
+  if turn.stop_reason == "max_tokens":
+    held = turn.full_text
+    logger.info(
+      "[%s] Repair reply hit max_tokens on turn %d; holding %d chars for its continuation",
+      runner._sid, turn_count, len(held),
+    )
+    # An empty tail is the settlement signal: a continuation that fails or
+    # comes back empty settles on the draft, never on the cut-off prefix.
+    return lambda tail: transform(held + tail) if tail else transform("")
+  settled = transform("")
+  turn.full_text = settled
+  turn.content_blocks = [
+    block for block in turn.content_blocks
+    if not (isinstance(block, dict) and block.get("type") == "text")
+  ] + [{"type": "text", "text": settled}]
+  runner._append({"type": "text_delta", "text": settled})
+  return None
 
 
 def _tool_result_ids(messages: list[dict[str, Any]]) -> set[str]:
@@ -630,8 +674,33 @@ def _task_collection_snapshot(
   return unfinished, fingerprints
 
 
+def _completion_task_collection_read(
+  values: Any,
+  fingerprints: tuple[tuple[Any, ...], ...],
+) -> dict[str, Any]:
+  """Project the owner's task inspection, retaining unknown collections."""
+
+  inspectable = (
+    isinstance(values, (set, frozenset, list, tuple))
+    and not any(row[0] == "malformed_collection" for row in fingerprints)
+  )
+  return {
+    "count": len(fingerprints) if inspectable else None,
+    "refs": [
+      {
+        "ref": str(row[1]) if len(row) > 1 else None,
+        "done": row[2] if row and row[0] == "task" and len(row) > 2 else None,
+        "inspection": row[0] if row else "unknown",
+      }
+      for row in fingerprints
+    ] if inspectable else None,
+  }
+
+
 def _background_success_snapshot(
   runner: Any,
+  *,
+  completion_read: dict[str, Any] | None = None,
 ) -> tuple[tuple[str, ...], tuple[Any, ...]]:
   """Return blockers and an immutable terminal-settlement fingerprint."""
 
@@ -644,17 +713,19 @@ def _background_success_snapshot(
     if entry is not self_task
   ]
 
+  pending_initializations = getattr(
+    runner, "_pending_background_initializations", None
+  )
   initialization_unfinished, initialization_fingerprint = (
-    _task_collection_snapshot(
-      getattr(runner, "_pending_background_initializations", ())
-    )
+    _task_collection_snapshot(pending_initializations)
   )
   if initialization_unfinished:
     blockers.append("background_initialization_or_reconciliation")
+  pending_completion_appends = getattr(
+    runner, "_pending_background_completion_appends", None
+  )
   completion_unfinished, completion_fingerprint = (
-    _task_collection_snapshot(
-      getattr(runner, "_pending_background_completion_appends", ())
-    )
+    _task_collection_snapshot(pending_completion_appends)
   )
   if completion_unfinished:
     blockers.append("background_completion_persistence")
@@ -859,6 +930,61 @@ def _background_success_snapshot(
     acknowledgement_fingerprint,
     obligation_fingerprint,
   )
+  if completion_read is not None:
+    queue_inspectable = queue_pending_count != -1
+    acknowledgements_inspectable = isinstance(pending_acknowledgements, dict)
+    obligations_inspectable = (
+      "background_delivery_obligations_uninspectable" not in blockers
+    )
+    completion_read.update({
+      "blockers": list(dict.fromkeys(blockers)),
+      "pending_initializations": _completion_task_collection_read(
+        pending_initializations, initialization_fingerprint
+      ),
+      "pending_completion_appends": _completion_task_collection_read(
+        pending_completion_appends, completion_fingerprint
+      ),
+      "notifications": {
+        "count": queue_pending_count if queue_inspectable else None,
+        "refs": [
+          {
+            "queue_token": row[0],
+            "task_id": row[1],
+            "notification_generation": row[2],
+            "event": row[3],
+            "omission_reason_override": row[4],
+          }
+          for row in queue_fingerprint
+        ] if queue_inspectable else None,
+      },
+      "pending_acknowledgements": {
+        "count": (
+          len(acknowledgement_fingerprint)
+          if acknowledgements_inspectable else None
+        ),
+        "refs": [
+          {
+            "tool_use_id": tool_use_id,
+            "task_id": row[1] if row[0] == "valid" else None,
+            "notification_generation": row[2] if row[0] == "valid" else None,
+            "inspection": row[0],
+          }
+          for tool_use_id, row in acknowledgement_fingerprint
+        ] if acknowledgements_inspectable else None,
+      },
+      "delivery_obligations": {
+        "count": len(obligation_fingerprint) if obligations_inspectable else None,
+        "refs": [
+          {
+            "task_id": task_id,
+            "notification_generation": generation,
+            "phase": phase,
+            "credits": credits,
+          }
+          for task_id, generation, phase, credits in obligation_fingerprint
+        ] if obligations_inspectable else None,
+      },
+    })
   return tuple(dict.fromkeys(blockers)), fingerprint
 
 
@@ -942,6 +1068,11 @@ class _NoToolTurnOutcome:
   max_tokens_continuations: int
   terminal_failure: tuple[str, str] | None
   terminal_success_reason: str | None
+  final_answer_check_performed: bool
+  # A hold repair's splice still pending for the next reply.
+  next_turn_text_transform: Callable[[str], str] | None = None
+  # This answer's max_tokens segments so far, for the final answer check.
+  continued_answer_text: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -983,6 +1114,18 @@ def _anchored_compaction_estimate(
 class RunnerRunLoopMixin:
   _stream_started_at: float | None = None
   _approval_park: ApprovalPark | None = None
+  _final_answer_check: Callable[
+    [str], Awaitable[FinalAnswerVerdict | None]
+  ] | None = None
+  _final_answer_check_mode: Literal["hold", "append", "off"] = "hold"
+  _record_reminder: Callable[[], str] | None = None
+
+  def background_completion_read(self) -> tuple[dict[str, Any], tuple[Any, ...]]:
+    """Copy native background facts and the exact terminal fence fingerprint."""
+
+    facts: dict[str, Any] = {}
+    _, fingerprint = _background_success_snapshot(self, completion_read=facts)
+    return facts, fingerprint
 
   if TYPE_CHECKING:
     _agent_session_log: AgentSessionLog | None
@@ -991,6 +1134,7 @@ class RunnerRunLoopMixin:
     _capability_execution: BoundCapabilityExecution
     _compaction_instructions: str | None
     _context_builder: SessionContextBuilder | None
+    _tool_result_aging_stubs: dict[str, str]
     _context_capture: ContextCapture | None
     _context_pressure_next_reminder_pct: int
     _background_notifications_enabled: bool
@@ -1048,6 +1192,7 @@ class RunnerRunLoopMixin:
     ) -> Any | None: ...
 
     async def _await_write_lease_handoff(self) -> bool: ...
+    async def _restore_resume_approved_capability_execution(self) -> None: ...
 
 
     async def _call_on_before_stream_complete(
@@ -1162,6 +1307,8 @@ class RunnerRunLoopMixin:
     async def _append_user_message_event(
       self,
       message: Dict[str, Any],
+      *,
+      analyst_turn: bool = False,
     ) -> LogEntry | None: ...
 
     async def _emit_attach_event(self) -> None: ...
@@ -1320,6 +1467,8 @@ class RunnerRunLoopMixin:
       system_chars: int,
       tools_chars: int,
       usage_totals: Dict[str, Any],
+      text_transform: Callable[[str], str] | None = None,
+      request_reminders: Sequence[str] = (),
     ) -> Tuple[object, StreamTurnResult] | StreamTurnFailure | None: ...
 
   async def _prepare_run_durable_context(
@@ -1434,6 +1583,15 @@ class RunnerRunLoopMixin:
           else:
             await self._append_user_message_event(tail)
       self._admitted_self_task = entry
+    if (
+      self._context_builder is not None
+      and self._containment.tool_result_aging_after_replies is not None
+    ):
+      # The history below is rebuilt from the log, so the stubs the earlier
+      # turns' receipts registered are reloaded with it.
+      self._tool_result_aging_stubs.update(
+        await self._context_builder.aging_stubs()
+      )
     if resume_initial_messages is not None:
       messages = [dict(message) for message in resume_initial_messages]
       # A parked transcript can end on an assistant turn with no pending
@@ -1470,7 +1628,7 @@ class RunnerRunLoopMixin:
       )
       if new_user_input is not None:
         user_entry = await self._append_user_message_event(
-          new_user_input
+          new_user_input, analyst_turn=True,
         )
         selected_content_committed = user_entry is not None
         if (
@@ -1492,7 +1650,7 @@ class RunnerRunLoopMixin:
       )
       if new_user_input is not None:
         user_entry = await self._append_user_message_event(
-          new_user_input
+          new_user_input, analyst_turn=True,
         )
         selected_content_committed = user_entry is not None
         if (
@@ -1872,6 +2030,7 @@ class RunnerRunLoopMixin:
         )
         return
 
+      self._post_turn_fork_handoff = None
       if (
         getattr(
           self,
@@ -1880,7 +2039,6 @@ class RunnerRunLoopMixin:
         )
         is not None
       ):
-        self._post_turn_fork_handoff = None
         if not fork_credential_identity_available(self):
           if not getattr(
             self,
@@ -1906,6 +2064,12 @@ class RunnerRunLoopMixin:
               "[%s] Post-turn fork capture failed | failure=true",
               self._sid,
             )
+      else:
+        logger.info(
+          "[%s] Post-turn fork capture unavailable: the last request "
+          "has no message prefix boundary",
+          self._sid,
+        )
 
     if len(staged_terminal_events) > 1:
       staged_terminal_events.clear()
@@ -1986,7 +2150,8 @@ class RunnerRunLoopMixin:
     queue_empty: type[BaseException],
     reset_logical_response_lineage: Callable[[], None],
     user_turn_message: Callable[[Any], Dict[str, Any]],
-  ) -> tuple[bool, int]:
+    continued_answer_text: str = "",
+  ) -> tuple[bool, int, str]:
     parent_messages: list[ParentMessage] = []
     if self._message_inbox is not None:
       while not self._message_inbox.empty():
@@ -1997,6 +2162,9 @@ class RunnerRunLoopMixin:
         except queue_empty:
           break
     if parent_messages:
+      # Guidance changed the task: the next reply is a new answer, not the
+      # continuation of a max_tokens-cut one.
+      continued_answer_text = ""
       if (
         is_child_logical_response
         and max_tokens_continuation_pending
@@ -2036,7 +2204,7 @@ class RunnerRunLoopMixin:
         )
         self._append(steer_event)
         await self._append_durable_event(steer_event)
-    return max_tokens_continuation_pending, max_tokens_continuations
+    return max_tokens_continuation_pending, max_tokens_continuations, continued_answer_text
 
   def _log_turn_context_estimate(
     self,
@@ -2370,6 +2538,7 @@ class RunnerRunLoopMixin:
     pending_notifications_at_render: int,
     turn_count: int,
     turn_system_prompt: Optional[Union[str, List[Tuple[str, bool]]]],
+    record_reminder_hash: str | None,
   ) -> tuple[bool, bool]:
     if self._context_capture is not None:
       surfaces = self._context_surface_records()
@@ -2382,6 +2551,7 @@ class RunnerRunLoopMixin:
         digest = canonical_manifest_digest(
           surfaces,
           system_prompt_hash,
+          record_reminder_hash=record_reminder_hash,
         )
         if digest != self._last_context_manifest_digest:
           manifest_event = build_context_manifest_event(
@@ -2390,6 +2560,7 @@ class RunnerRunLoopMixin:
             session_id=self._full_session_id,
             request_id=self._request_id,
             turn=turn_count,
+            record_reminder_hash=record_reminder_hash,
           )
           await self._append_durable_event(manifest_event)
           self._append(manifest_event)
@@ -2491,6 +2662,7 @@ class RunnerRunLoopMixin:
     turn: Any,
     turn_count: int,
     turn_system_prompt: Any,
+    request_reminders: Sequence[str],
     base_kwargs: Dict[str, Any],
     system_chars: int,
   ) -> None:
@@ -2498,7 +2670,9 @@ class RunnerRunLoopMixin:
     (``session_recap.CONTEXT_COMPOSITION_FIELDS``): what the request carried,
     per disclosure layer. Counters, not names; the names are already in the
     log's tool events. Sizes fold as the run's peak; the invoked counts are
-    cumulative so the peak is the total. A measurement, never a gate."""
+    cumulative so the peak is the total. ``reminders`` is the system prompt's
+    growth past the base prompt (the child-result trust policy) plus the
+    request-tail reminder text. A measurement, never a gate."""
     self._context_tools_invoked += len(turn.tool_uses)
     self._context_skills_invoked += sum(
       1 for _tid, tool_name, _input in turn.tool_uses
@@ -2510,7 +2684,9 @@ class RunnerRunLoopMixin:
         turn=turn_count,
         group_chars=self._context_group_chars,
         system_total=system_total,
-        reminders=max(0, system_total - system_chars),
+        reminders=max(0, system_total - system_chars) + sum(
+          len(reminder) for reminder in request_reminders
+        ),
         tools_advertised=len(base_kwargs.get("tools") or []),
         tools_invoked=self._context_tools_invoked,
         skills_invoked=self._context_skills_invoked,
@@ -2552,6 +2728,7 @@ class RunnerRunLoopMixin:
     str | None,
     dict[str, Any] | None,
     Optional[Union[str, List[Tuple[str, bool]]]],
+    tuple[str, ...],
     bool,
     bool,
     int,
@@ -2582,28 +2759,36 @@ class RunnerRunLoopMixin:
         delivery_request_nudge_message
       )
 
-    combined_reminder = "\n\n".join(
-      part
-      for part in (
-        turn_reminder.text,
-        wrap_up_reminder_text,
+    # The child-result trust policy is a standing instruction, so it stays
+    # system-authored: the system prompt carries it where child results are
+    # possible. Every other reminder changes from request to request and
+    # rides the request tail (``_request_messages_with_reminders``), so the
+    # rest of the system prompt stays byte-stable. Context pressure is decided
+    # from the request's size, so the estimate carries every other reminder
+    # and the decision's reminder joins the tail after.
+    turn_system_prompt = (
+      self._inject_system_prompt_reminder(
+        system_prompt,
+        turn_reminder.notification_reminder,
       )
-      if part
+      if turn_reminder.notification_reminder
+      else system_prompt
     )
-    if combined_reminder:
-      provisional_system_prompt = (
-        self._inject_system_prompt_reminder(
-          system_prompt,
-          combined_reminder,
-        )
-      )
-    else:
-      provisional_system_prompt = system_prompt
+    standing_reminders = (
+      turn_reminder.text,
+      wrap_up_reminder_text or "",
+      turn_reminder.record_reminder,
+    )
     request_estimate = token_estimate_snapshot(
-      system_text=system_prompt_estimate_text(
-        provisional_system_prompt
+      system_text=system_prompt_estimate_text(turn_system_prompt),
+      messages=_request_messages_with_reminders(
+        _request_messages_aged(
+          current_messages,
+          self._containment,
+          self._tool_result_aging_stubs,
+        ),
+        standing_reminders,
       ),
-      messages=current_messages,
       tools=base_kwargs.get("tools") or [],
     )
     containment = self._containment
@@ -2628,23 +2813,7 @@ class RunnerRunLoopMixin:
       if context_pressure.reminder_pct is not None
       else ""
     )
-    reminder_text = "\n\n".join(
-      filter(
-        None,
-        [
-          context_pressure_reminder,
-          turn_reminder.text,
-          wrap_up_reminder_text,
-        ],
-      )
-    )
-    if reminder_text:
-      turn_system_prompt = self._inject_system_prompt_reminder(
-        system_prompt,
-        reminder_text,
-      )
-    else:
-      turn_system_prompt = system_prompt
+    request_reminders = (context_pressure_reminder, *standing_reminders)
     (
       delivered_notifications_recorded,
       delivery_request_nudge_recorded,
@@ -2664,12 +2833,14 @@ class RunnerRunLoopMixin:
       ),
       turn_count=turn_count,
       turn_system_prompt=turn_system_prompt,
+      record_reminder_hash=_record_reminder_hash(turn_reminder.record_reminder),
     )
     return (
       last_ordinary_turn,
       wrap_up_reminder_text,
       delivery_request_nudge_message,
       turn_system_prompt,
+      request_reminders,
       delivered_notifications_recorded,
       delivery_request_nudge_recorded,
       request_estimate.est_total_tokens,
@@ -2705,6 +2876,9 @@ class RunnerRunLoopMixin:
     unread_handle_reminded_task_ids: set[str],
     upstream_model: str,
     user_turn_message: Callable[[Any], Dict[str, Any]],
+    final_answer_check_performed: bool = False,
+    next_turn_text_transform: Callable[[str], str] | None = None,
+    continued_answer_text: str = "",
   ) -> _NoToolTurnOutcome:
     def finish(action: Literal["break", "continue"]) -> _NoToolTurnOutcome:
       return _NoToolTurnOutcome(
@@ -2717,6 +2891,9 @@ class RunnerRunLoopMixin:
         max_tokens_continuations=max_tokens_continuations,
         terminal_failure=terminal_failure,
         terminal_success_reason=terminal_success_reason,
+        final_answer_check_performed=final_answer_check_performed,
+        next_turn_text_transform=next_turn_text_transform,
+        continued_answer_text=continued_answer_text,
       )
 
     if turn.stop_reason == "end_turn" and bool(turn.full_text.strip()):
@@ -2748,6 +2925,10 @@ class RunnerRunLoopMixin:
     elif turn.stop_reason == "compaction":
       logger.info("[%s] Compaction pause — continuing", self._sid)
     elif no_tool_outcome.reason == "max_tokens_continue":
+      if next_turn_text_transform is None:
+        # The segment is part of the answer the client holds; a held repair
+        # reply is carried by its transform instead.
+        continued_answer_text += turn.full_text
       if is_child_logical_response:
         logger.warning(
           "[%s] Turn %d logical response segment %d hit "
@@ -2764,6 +2945,12 @@ class RunnerRunLoopMixin:
           turn_count,
           max_tokens_continuations,
         )
+    # The answer the client holds: this reply after the segments max_tokens
+    # cut it into. The final answer check, and a hold repair's base, read it
+    # whole (audit 1b7646d5b287); any other reply starts a new answer.
+    answer_text = continued_answer_text + turn.full_text
+    if no_tool_outcome.reason != "max_tokens_continue":
+      continued_answer_text = ""
     if no_tool_outcome.runtime_guard is not None:
       guard, message = no_tool_outcome.runtime_guard
       self._append(build_runtime_guard_event(guard=guard, message=message))
@@ -2787,11 +2974,11 @@ class RunnerRunLoopMixin:
     }
     # Ack follows delivery: this response consumed the reminder that
     # rendered `delivered_notifications`, so the model has seen them
-    # (A-M7, T3-I01). Reached only on a completed model turn — the
-    # `error` arm broke earlier at `terminal_failure`, and the
-    # pause/compaction/max_tokens continuation arm `continue`d above
-    # (D-A7-1).
-    if delivered_notifications:
+    # (A-M7, T3-I01). A partial stream did not finish answering those
+    # notifications, so they remain unacknowledged. The error arm broke
+    # earlier at terminal_failure, and pause/compaction/max_tokens
+    # continuation continued above (D-A7-1).
+    if delivered_notifications and turn.stop_reason != "partial_stream_failure":
       self._ack_delivered_notifications(delivered_notifications)
       delivered_notifications = []
     if (
@@ -3013,8 +3200,59 @@ class RunnerRunLoopMixin:
         )
       )
       return finish("continue")
+    if (
+      no_tool_outcome.reason == "no_tool_use_terminal"
+      and turn.stop_reason in {"end_turn", "refusal"}
+      and self._final_answer_check is not None
+    ):
+      # Every terminal answer is checked (that is where the judge runs and the
+      # answer's record is made); a verdict revises at most once per run, so a
+      # repair's own answer — however many turns it took — is checked but not
+      # revised again.
+      self._append({
+        "type": "citation_check_started",
+        "turn": turn_count,
+        "mode": self._final_answer_check_mode,
+      })
+      try:
+        verdict = await self._final_answer_check(answer_text)
+      except Exception as exc:
+        logger.warning(
+          "[%s] Final answer check failed | exception_type=%s",
+          self._sid,
+          type(exc).__name__,
+        )
+      else:
+        if (
+          verdict is not None
+          and verdict.violation_count > 0
+          and not final_answer_check_performed
+          and self._final_answer_check_mode != "off"
+        ):
+          final_answer_check_performed = True
+          current_messages.extend([
+            assistant_turn_message(
+              turn.content_blocks,
+              provider=self._provider.name,
+              model=upstream_model,
+              stop_reason=turn.stop_reason,
+            ),
+            user_turn_message(verdict.revise_message),
+          ])
+          self._append({
+            "type": "answer_revision_started",
+            "turn": turn_count,
+            "mode": verdict.mode,
+            "violation_count": verdict.violation_count,
+          })
+          return replace(finish("continue"), next_turn_text_transform=verdict.text_transform)
     if turn.stop_reason in {"end_turn", "refusal"}:
       terminal_success_reason = turn.stop_reason
+    elif turn.stop_reason == "partial_stream_failure":
+      terminal_failure = (
+        "partial_stream_failure",
+        f"partial_stream_failure: {(turn.stop_details or {}).get('error') or 'provider stream failed after partial output; partial output preserved.'}",
+      )
     else:
       terminal_failure = (
         "terminal_outcome_unproven",
@@ -3283,7 +3521,12 @@ class RunnerRunLoopMixin:
     its dispatcher's `RunContext` instead.
     """
     admission_token = set_current_skill(None)
-    with spend_context(run_owner=self._usage_user_id):
+    run_owner = (
+      str(self._gateway_session.risk_user_id)
+      if self._gateway_session is not None and self._gateway_session.risk_user_id > 0
+      else self._usage_user_id
+    )
+    with spend_context(run_owner=run_owner):
       try:
         await self._run_chat_loop(
           messages,
@@ -3301,6 +3544,8 @@ class RunnerRunLoopMixin:
     resume_initial_messages: List[Dict[str, Any]] | None = None,
   ) -> None:
     _require_fresh_runner(self._summary_emitted)
+    if self._final_answer_check is not None and self._final_answer_check_mode == "hold":
+      self._append({"type": "citation_hold_active", "mode": "hold"})
     self._approval_park = None
     self._session_usage_summary = None
     self._stream_started_at = None
@@ -3458,6 +3703,7 @@ class RunnerRunLoopMixin:
         system_prompt = prepend_system_prompt_preamble(system_prompt, preamble)
 
       self._capability_execution.validate()
+      await self._restore_resume_approved_capability_execution()
       upstream_model = self._capability_execution.bind.upstream_model
       bound_effort = self._capability_execution.bind.effort
       config = normalized_run_config(
@@ -3603,6 +3849,13 @@ class RunnerRunLoopMixin:
       self._last_reported_cost = 0.0
       self._ensure_sub_agent_semaphore()
       turn_count = 0
+      final_answer_check_performed = False
+      # A hold repair's splice; it stays pending until a completed no-tool
+      # reply consumes it (a tool turn or a cut-off reply in between keeps it).
+      next_turn_text_transform: Callable[[str], str] | None = None
+      # The text of this answer's earlier max_tokens segments: the final answer
+      # check sees the whole answer the client holds, not the last segment.
+      continued_answer_text = ""
       todo_state = await self._load_todo_run_state()
       delivery_grace_credits: dict[
         tuple[str, int, str],
@@ -3723,6 +3976,7 @@ class RunnerRunLoopMixin:
         (
           max_tokens_continuation_pending,
           max_tokens_continuations,
+          continued_answer_text,
         ) = await self._consume_parent_messages(
           current_messages=current_messages,
           format_parent_messages=format_parent_messages,
@@ -3735,6 +3989,7 @@ class RunnerRunLoopMixin:
           queue_empty=queue_empty,
           reset_logical_response_lineage=reset_logical_response_lineage,
           user_turn_message=user_turn_message,
+          continued_answer_text=continued_answer_text,
         )
         _deliver_todo_analyst_note(todo_state, current_messages, user_turn_message)
 
@@ -3881,12 +4136,16 @@ class RunnerRunLoopMixin:
 
         bg_reminder = self._background_task_reminder_text()
         notif_reminder = self._child_trust_reminder(base_kwargs)
+        # The run record's reminder is rebuilt per provider request, so the
+        # request after the last tool batch carries the settled record.
+        record_reminder = self._record_reminder() if self._record_reminder is not None else ""
         turn_reminder = turn_reminder_state(
           bg_reminder,
           notif_reminder,
           pending_notification_count=self._notification_queue.pending_count,
           max_notifications_per_turn=max_notifications_per_turn,
           delivered=self._notification_delivery_set(),
+          record_reminder=record_reminder,
         )
         # The delivered set for this provider request. Recorded once per
         # outer turn (the inner request-preparation loop re-sends the same
@@ -4146,6 +4405,7 @@ class RunnerRunLoopMixin:
             wrap_up_reminder_text,
             delivery_request_nudge_message,
             turn_system_prompt,
+            request_reminders,
             delivered_notifications_recorded,
             delivery_request_nudge_recorded,
             request_est_input_tokens,
@@ -4166,12 +4426,24 @@ class RunnerRunLoopMixin:
             })
             soft_budget_notice_recorded = True
           request_tool_result_ids = _tool_result_ids(current_messages)
+          turn_text_transform = next_turn_text_transform
           turn_result = await self._stream_turn(
             client=client,
             config=config,
             model_info=model_info,
             system_prompt=turn_system_prompt,
-            current_messages=current_messages,
+            # The tail reminders ride after the history for this request only
+            # (``_stream_turn`` appends them after normalizing), so the system
+            # prompt and the durable history stay byte-stable; aged results are
+            # likewise swapped for their stubs in the request only
+            # (``tool_result_aging``), and the prefix boundary is read from the
+            # history the request sends.
+            current_messages=_request_messages_aged(
+              current_messages,
+              self._containment,
+              self._tool_result_aging_stubs,
+            ),
+            request_reminders=request_reminders,
             base_kwargs=base_kwargs,
             max_tokens=max_tokens,
             turn_count=turn_count,
@@ -4180,6 +4452,7 @@ class RunnerRunLoopMixin:
             system_chars=system_chars,
             tools_chars=tools_chars,
             usage_totals=usage_totals,
+            text_transform=turn_text_transform,
           )
           # A model_fallback hop inside the stream turn rebinds the runner:
           # the serving model's facts bill this request and shape the next.
@@ -4243,6 +4516,9 @@ class RunnerRunLoopMixin:
           break
 
         client, turn = turn_result
+        next_turn_text_transform = _settle_held_repair_turn(
+          self, turn, turn_text_transform, logger=logger, turn_count=turn_count,
+        )
         durable_assistant_projection = sanitize_tool_event(
           {
             "type": "assistant_message",
@@ -4358,7 +4634,11 @@ class RunnerRunLoopMixin:
         # beside, not inside, the usage counters (usage payloads are summed
         # across turns and include any compaction call).
         self._append({
-          **build_turn_complete_event(turn=turn_count, usage=turn_usage_payload),
+          **build_turn_complete_event(
+            turn=turn_count,
+            usage=turn_usage_payload,
+            upstream_model=upstream_model,
+          ),
           "est_input_tokens": request_est_input_tokens,
           "request_input_tokens": real_stream_input,
           "context_window": context_limit,
@@ -4367,7 +4647,8 @@ class RunnerRunLoopMixin:
         # what this request carried, per disclosure layer. Counters, not names;
         # the names are already in the log's tool events.
         self._record_context_composition(
-          turn, turn_count, turn_system_prompt, base_kwargs, system_chars
+          turn, turn_count, turn_system_prompt, request_reminders, base_kwargs,
+          system_chars,
         )
         self._append_tool_calls_planned(turn, turn_count)
 
@@ -4454,6 +4735,9 @@ class RunnerRunLoopMixin:
             unread_handle_reminded_task_ids=unread_handle_reminded_task_ids,
             upstream_model=upstream_model,
             user_turn_message=user_turn_message,
+            final_answer_check_performed=final_answer_check_performed,
+            next_turn_text_transform=next_turn_text_transform,
+            continued_answer_text=continued_answer_text,
           )
           delivery_epoch_active = no_tool_turn.delivery_epoch_active
           delivery_turn_compelled = no_tool_turn.delivery_turn_compelled
@@ -4467,6 +4751,11 @@ class RunnerRunLoopMixin:
           max_tokens_continuations = no_tool_turn.max_tokens_continuations
           terminal_failure = no_tool_turn.terminal_failure
           terminal_success_reason = no_tool_turn.terminal_success_reason
+          final_answer_check_performed = (
+            no_tool_turn.final_answer_check_performed
+          )
+          next_turn_text_transform = no_tool_turn.next_turn_text_transform
+          continued_answer_text = no_tool_turn.continued_answer_text
           if no_tool_turn.action == "continue":
             continue
           break

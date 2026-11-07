@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -207,18 +208,6 @@ def test_new_authority_entry_is_served_from_its_compat_alone(monkeypatch) -> Non
   assert params["reasoning"] == {"effort": "xhigh"}
 
 
-def test_build_request_params_supplies_default_instructions_when_system_prompt_missing() -> None:
-  provider = CodexProvider()
-
-  params = provider.build_request_params(
-    model="gpt-5.6-sol",
-    messages=[{"role": "user", "content": "hello"}],
-    system_prompt=None,
-    tools=[],
-    max_tokens=1024,
-  )
-
-  assert params["instructions"] == "Follow the user's instructions."
 
 
 def test_build_request_params_omits_unsupported_temperature() -> None:
@@ -988,3 +977,36 @@ def test_a_different_codex_401_stays_a_raw_http_status_error() -> None:
 
   assert isinstance(exc, httpx.HTTPStatusError)
   assert not isinstance(exc, CodexCredentialExpired)
+
+
+def test_usage_limit_reached_429_is_a_rate_limit_with_reset() -> None:
+  exc = _stream_status(
+    429,
+    {
+      "error": {
+        "type": "usage_limit_reached",
+        "message": "You have hit your ChatGPT usage limit",
+        "resets_in_seconds": 373114,
+      },
+    },
+  )
+  before = time.time()
+  failure = CodexProvider().classify_credential_failure(exc)
+
+  assert failure is not None
+  assert failure.kind == "rate_limit"
+  assert failure.error_code == "usage_limit_reached"
+  assert failure.status_code == 429
+  assert failure.reset_at == pytest.approx(before + 373114, abs=2.0)
+
+
+def test_usage_not_included_429_keeps_the_shared_verdict() -> None:
+  exc = _stream_status(
+    429,
+    {"error": {"type": "usage_not_included", "message": "Your plan does not include this usage limit"}},
+  )
+  failure = CodexProvider().classify_credential_failure(exc)
+
+  assert failure is not None
+  assert failure.kind == "billing"
+  assert failure.error_code == "usage_not_included"

@@ -1,3 +1,4 @@
+from agent_gateway.registry_scope import RegistryScope
 import asyncio
 import sys
 from dataclasses import replace
@@ -52,6 +53,7 @@ def _request(
       run_id="bg-1",
       profile="analyst",
       channel="web",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
   )
   return replace(request, notification_policy=notification_policy)
@@ -359,7 +361,7 @@ def test_lifecycle_persistence_failure_emits_no_notification_intent() -> None:
         qualifier="execute_trade",
         reason="needs approval",
         allow_persistent=False,
-        resolve_run_context_fn=lambda: RunContext(user_id="alice", request_id="request-1"),
+        resolve_run_context_fn=lambda: RunContext(user_id="alice", request_id="request-1", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
         current_skill_admission_fn=lambda: None,
         redact_for_approval_request_fn=lambda _tool_name, _tool_input: ({}, "hash"),
         resolve_tool_class_fn=lambda _tool_name: "irreversible",

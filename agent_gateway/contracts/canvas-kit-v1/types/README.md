@@ -25,7 +25,7 @@ What is here, and why each package is needed:
 | `recharts` | `.d.ts` files only (the runtime is the host's `HankCanvasRuntime.Recharts` external) |
 | `victory-vendor`, `@types/d3-scale`, `@types/d3-shape`, `@types/d3-path`, `@types/d3-time` | imported by recharts' declarations |
 | `eventemitter3` | imported by recharts' declarations |
-| `@types/lodash` | recharts' declarations import `lodash` types (`DebouncedFunc` in `types/chart/generateCategoricalChart.d.ts` and every `*Chart.d.ts`). `skipLibCheck` is `false`, so `tsc` must resolve them. It is by far the largest package here (702 of the 835 vendored files under `types/node_modules/` on 2026-09-23). |
+| `@types/lodash` | recharts' declarations import `lodash` types (`DebouncedFunc` in `node_modules/recharts/types/chart/generateCategoricalChart.d.ts` and every `*Chart.d.ts`). `skipLibCheck` is `false`, so `tsc` must resolve them. It is by far the largest package here (702 of the 835 vendored files under `types/node_modules/` on 2026-09-23). |
 
 `canvas_kit_manifest.v1.json` pins React, Recharts, TypeScript and esbuild; the declaration
 packages above are whatever versions the Risk frontend resolved when the contract was last
@@ -36,7 +36,7 @@ generated (each package's own `package.json` is kept beside its `.d.ts` files an
 The whole `canvas-kit-v1/` directory is a byte-identical copy of the Risk repository's
 `contracts/canvas_kit/v1/`, which that repository generates. The generator is
 `risk_module/frontend/scripts/canvas-kit-contract/lib.mjs` (`emitTypes`): it runs `tsc` over
-`frontend/packages/canvas-kit/tsconfig.contract.json` to emit `@hank/canvas-kit`, then copies
+`risk_module/frontend/packages/canvas-kit/tsconfig.contract.json` (in the Risk checkout) to emit `@hank/canvas-kit`, then copies
 every `.d.ts` and `package.json` of the dependency list above out of the frontend's installed
 `node_modules`, rewrites `canvas_kit_manifest.v1.json` and `tsconfig.typecheck.json`, and runs a
 hermetic `tsc -p tsconfig.typecheck.json` over `fixtures/valid-canvas.tsx` before it writes.

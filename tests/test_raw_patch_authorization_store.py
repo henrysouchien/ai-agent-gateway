@@ -1,4 +1,5 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
 
 from datetime import UTC, datetime
 import json
@@ -27,7 +28,7 @@ async def test_reference_resolution_and_receipt_consumption_are_exact_and_idempo
     tool_class="state_write",
     tool_args_redacted={},
     args_hash="args-hash",
-    run_context=RunContext(user_id="alice", request_id="request-1"),
+    run_context=RunContext(user_id="alice", request_id="request-1", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   prepared = json.dumps(
     {"schema_version": 1, "binding": {"change_set_id": "bound"}},
@@ -75,7 +76,7 @@ async def test_raw_patch_approval_and_prepared_bytes_are_created_atomically(
     tool_class="state_write",
     tool_args_redacted={},
     args_hash="args-hash",
-    run_context=RunContext(user_id="alice", request_id="request-invalid"),
+    run_context=RunContext(user_id="alice", request_id="request-invalid", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   with pytest.raises(RawPatchAuthorizationError):
@@ -104,7 +105,7 @@ async def test_claim_excludes_approval_state_transition_until_finalization(
     tool_class="state_write",
     tool_args_redacted={},
     args_hash="args-hash",
-    run_context=RunContext(user_id="alice", request_id="request-claimed"),
+    run_context=RunContext(user_id="alice", request_id="request-claimed", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   await store.create(request)
   digest = "sha256:" + "a" * 64
@@ -176,7 +177,7 @@ async def test_claim_accepts_an_approval_past_its_expires_at_but_not_a_changed_i
     tool_class="state_write",
     tool_args_redacted={},
     args_hash="args-hash",
-    run_context=RunContext(user_id="alice", request_id="request-late"),
+    run_context=RunContext(user_id="alice", request_id="request-late", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     approval_identity=identity,
   )
   prepared_payload = json.dumps(

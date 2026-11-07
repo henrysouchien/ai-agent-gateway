@@ -485,7 +485,7 @@ class ReservationMismatchErrorBody(_ErrorBody):
 
 
 class ApprovalRemoteProtocolError(RuntimeError):
-  """Transport, version, schema, operation-mismatch, or unknown-server-error."""
+  """Transport, authentication, version, schema, operation-mismatch, or unknown-server-error."""
 
   def __init__(self, message: str, *, code: str = "malformed_envelope") -> None:
     self.code = code
@@ -499,6 +499,7 @@ class ProtocolErrorBody(_ErrorBody):
     "version_mismatch",
     "operation_mismatch",
     "unknown_exception",
+    "invalid_signed_claim",
     "unavailable",
     "unhandled",
   ]
@@ -905,6 +906,7 @@ class ApprovalRemoteClient(Protocol):
     capability_bind: Mapping[str, object], credential_generation_ref: str | None,
     effective_grant: Mapping[str, object], research_binding: Mapping[str, object] | None,
     selection_snapshot: Mapping[str, object], approval_route_kind: str,
+    selection_provenance: Mapping[str, object] | None = None,
     policy_generation_ref: str, created_at: datetime | None = None,
   ) -> None: ...
   async def _read_root_turn_for_executor(
@@ -1173,8 +1175,9 @@ class ApprovalRemoteClient(Protocol):
 # Advisory server status, not a client branch: KeyError 404; migration 423
 # retryable; reservation_active 429 retryable; runtime_identity_mismatch 403;
 # malformed_envelope / version_mismatch / operation_mismatch 400; unavailable
-# 503; unhandled 500; stale_placement_generation and reservation_mismatch 409.
-# ValueError may be 400 or 409. The client still re-raises ValueError for
+# 503; invalid_signed_claim 401; unhandled 500; stale_placement_generation and
+# reservation_mismatch 409. ValueError may be 400 or 409. The client still
+# re-raises ValueError for
 # either. Other store exceptions are sent as 409; the client still re-raises
 # by exception name on any non-200.
 #
@@ -1269,6 +1272,7 @@ _PROTOCOL_CODES = frozenset({
   "version_mismatch",
   "operation_mismatch",
   "unknown_exception",
+  "invalid_signed_claim",
   "unavailable",
   "unhandled",
 })
@@ -1277,6 +1281,7 @@ _PROTOCOL_STATUS: dict[str, int] = {
   "version_mismatch": 400,
   "operation_mismatch": 400,
   "unknown_exception": 400,
+  "invalid_signed_claim": 401,
   "unavailable": 503,
   "unhandled": 500,
 }
@@ -1962,11 +1967,13 @@ def _store_exception_body(
 
 def _encode_protocol_error(exc: ApprovalRemoteProtocolError) -> tuple[int, bytes]:
   message = _exception_message(exc)
-  if exc.code == "version_mismatch":
+  if exc.code == "invalid_signed_claim":
     code: Literal[
       "malformed_envelope", "version_mismatch", "operation_mismatch",
-      "unknown_exception", "unavailable", "unhandled",
-    ] = "version_mismatch"
+      "unknown_exception", "invalid_signed_claim", "unavailable", "unhandled",
+    ] = "invalid_signed_claim"
+  elif exc.code == "version_mismatch":
+    code = "version_mismatch"
   elif exc.code == "operation_mismatch":
     code = "operation_mismatch"
   elif exc.code == "unknown_exception":
@@ -2542,6 +2549,7 @@ class BoundApprovalRemoteClient:
     capability_bind: Mapping[str, object], credential_generation_ref: str | None,
     effective_grant: Mapping[str, object], research_binding: Mapping[str, object] | None,
     selection_snapshot: Mapping[str, object], approval_route_kind: str,
+    selection_provenance: Mapping[str, object] | None = None,
     policy_generation_ref: str, created_at: datetime | None = None,
   ) -> None:
     return await self._acall(
@@ -2550,6 +2558,7 @@ class BoundApprovalRemoteClient:
       credential_generation_ref=credential_generation_ref,
       effective_grant=effective_grant, research_binding=research_binding,
       selection_snapshot=selection_snapshot, approval_route_kind=approval_route_kind,
+      selection_provenance=selection_provenance,
       policy_generation_ref=policy_generation_ref, created_at=created_at,
     )
 

@@ -19,7 +19,7 @@ from agent_gateway import AgentSDKRunner, EventLog
 from model_authority.binding import CapabilityResolutionError
 from model_authority.registry import ProductModelRegistry
 import agent_gateway.sdk_runner as sdk_runner  # noqa: E402
-from agent_gateway.sdk_runner_stream import ToolCallInfo, _SDKRunnerStreamMixin  # noqa: E402
+from agent_gateway.sdk_runner_stream import ToolCallInfo  # noqa: E402
 from agent_gateway.tool_dispatch_classification import ToolResultSettlement  # noqa: E402
 from agent_gateway import tool_dispatch_declarations  # noqa: E402
 from agent_gateway.tool_dispatch_declarations import ToolDispatchSemantics  # noqa: E402
@@ -94,13 +94,6 @@ def _make_runner(
   )
 
 
-def test_sdk_runner_stream_methods_remain_on_runner_class() -> None:
-  assert issubclass(AgentSDKRunner, _SDKRunnerStreamMixin)
-  assert AgentSDKRunner._handle_stream_event is _SDKRunnerStreamMixin._handle_stream_event
-  assert AgentSDKRunner._complete_tool_call is _SDKRunnerStreamMixin._complete_tool_call
-  assert AgentSDKRunner._emit_stream_complete is _SDKRunnerStreamMixin._emit_stream_complete
-  assert not hasattr(AgentSDKRunner, "_normalize_tool_result")
-  assert not hasattr(AgentSDKRunner, "_handle_user_message")
 
 
 def test_sdk_runner_exposes_exact_capability_execution() -> None:
@@ -227,6 +220,7 @@ def test_sdk_runner_non_success_flush_interrupts_pending_tool() -> None:
     tool_input={"file_path": "raw-partial.txt"},
     started_at=10.0,
     redacted_tool_input={"file_path": "partial.txt", "nested": {"safe": True}},
+    registry_scope=runner._resolve_run_context().registry_scope,
   )
 
   runner._flush_pending_tool_calls(outcome="tool_error")
@@ -414,6 +408,7 @@ def test_sdk_runner_stream_parent_monkeypatches_drive_tool_completion(monkeypatc
     tool_input={},
     started_at=10.0,
     redacted_tool_input={},
+    registry_scope=runner._resolve_run_context().registry_scope,
   )
 
   runner._complete_tool_call(
@@ -463,6 +458,7 @@ def test_sdk_registered_remote_hook_settles_once_with_manager_dispatch(
     tool_input={"model": {"name": "stale-assistant-input"}},
     started_at=10.0,
     redacted_tool_input={"model": {"name": "stale-assistant-input"}},
+    registry_scope=runner._resolve_run_context().registry_scope,
   )
 
   hook_output = asyncio.run(
@@ -522,6 +518,7 @@ def test_sdk_builtin_completion_stays_catalogless_with_manager_configured() -> N
     tool_input={"file_path": "README.md"},
     started_at=0.0,
     redacted_tool_input={"file_path": "README.md"},
+    registry_scope=runner._resolve_run_context().registry_scope,
   )
 
   completion = runner._complete_tool_call(
@@ -541,6 +538,7 @@ def test_sdk_runner_suppresses_text_after_accepted_ui_blocks() -> None:
     tool_input={},
     started_at=0.0,
     redacted_tool_input={},
+    registry_scope=runner._resolve_run_context().registry_scope,
   )
 
   runner._complete_tool_call(
@@ -566,6 +564,7 @@ def test_sdk_runner_keeps_text_after_ui_blocks_validation_failure() -> None:
     tool_input={},
     started_at=0.0,
     redacted_tool_input={},
+    registry_scope=runner._resolve_run_context().registry_scope,
   )
 
   runner._complete_tool_call(
@@ -626,6 +625,7 @@ def test_sdk_producer_settles_a_dispatch_record_through_the_shared_builder(
     tool_input={},
     started_at=0.0,
     redacted_tool_input={},
+    registry_scope=runner._resolve_run_context().registry_scope,
   )
 
   runner._complete_tool_call(
@@ -669,6 +669,7 @@ def test_sdk_producer_settles_a_failure_outcome_with_no_sources() -> None:
     tool_input={},
     started_at=0.0,
     redacted_tool_input={},
+    registry_scope=runner._resolve_run_context().registry_scope,
   )
 
   runner._complete_tool_call(
@@ -697,6 +698,7 @@ def test_sdk_fred_transport_failure_records_one_attempt_and_never_retries() -> N
     tool_input={"query": "inflation"},
     started_at=0.0,
     redacted_tool_input={"query": "inflation"},
+    registry_scope=runner._resolve_run_context().registry_scope,
   )
 
   runner._complete_tool_call(

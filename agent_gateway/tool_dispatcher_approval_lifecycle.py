@@ -10,7 +10,6 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Protocol, TYPE_CHECKING
 
 from .approval_policy import (
-  MONEY_BOUNDARY_TOOL_CLASSES,
   ApprovalConstraint,
   ApprovalReuseMode,
   ApprovalState,
@@ -49,6 +48,7 @@ from .secret_boundary import (
 from .skill_limits import reconcile_skill_admission
 from . import tool_redaction as _redaction
 from .tool_policy_registry import PreparedToolCall
+from .single_user_policy import needs_human_approval
 from . import admission
 
 if TYPE_CHECKING:
@@ -217,13 +217,12 @@ async def _run_delegated_approval_lifecycle(
   public request in order. A restorable child then parks; legacy callers without
   a durable journal retain their live decision queue.
 
-  A delegated run is unattended by construction — no human sits at its decision
-  channel — so every class outside the money boundary and non-sandboxed compute
-  is settled here under the run owner's own authority, the same rule the
-  interactive policy applies. Only a live order and non-sandboxed compute ask.
+  A delegated run shares the interactive owner's class/constraint decision,
+  including the operator's careful-run mode. Only calls that owner says need
+  a human are sent to the parent decision channel.
   """
 
-  if request.tool_class not in MONEY_BOUNDARY_TOOL_CLASSES and request.tool_name != "code_execute":
+  if not needs_human_approval(request.tool_class, request.approval_constraint):
     decided_at = utc_now_fn()
     request = replace(
       request,
@@ -896,35 +895,13 @@ def approval_transport_input(
 
 def resolve_run_context(
   *,
-  run_context: RunContext | None,
+  run_context: RunContext,
   session: Any | None,
-  user_id: str | None,
-  channel: str | None,
-  role: str | None,
-  session_id: str,
-  approval_policy: object | None,
 ) -> RunContext:
-  if run_context is not None:
-    owner_user_id = str(getattr(session, "owner_user_id", None) or "").strip()
-    if owner_user_id and run_context.user_id != owner_user_id:
-      return replace(run_context, user_id=owner_user_id)
-    return run_context
-  resolved_user_id = str(
-    getattr(session, "owner_user_id", None)
-    or user_id
-    or getattr(session, "user_id", "")
-    or "unknown"
-  )
-  resolved_channel = str(channel or getattr(session, "channel", None) or "web")
-  return RunContext(
-    user_id=resolved_user_id,
-    request_id=str(getattr(session, "request_id", "") or session_id or "request-unknown"),
-    session_id=session_id or getattr(session, "session_id", None),
-    profile="chat",
-    channel=resolved_channel,
-    decider_role=role,
-    policy_bundle_hash=str(getattr(approval_policy, "policy_bundle_hash", "unknown")),
-  )
+  owner_user_id = str(getattr(session, "owner_user_id", None) or "").strip()
+  if owner_user_id and run_context.user_id != owner_user_id:
+    return replace(run_context, user_id=owner_user_id)
+  return run_context
 
 
 def resolve_tool_class(

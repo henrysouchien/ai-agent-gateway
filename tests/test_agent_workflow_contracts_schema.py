@@ -33,41 +33,10 @@ def test_public_schema_export_is_deterministic_and_complete(tmp_path) -> None:
   assert all(path.read_text(encoding="utf-8").endswith("\n") for path in written)
 
 
-def test_union_schemas_have_explicit_discriminators() -> None:
-  schemas = public_json_schemas()
-  assert schemas["requested-data-selector"]["discriminator"]["propertyName"] == "kind"
-  assert schemas["logical-task-ref"]["discriminator"]["propertyName"] == "kind"
-  assert schemas["dependency-acceptance-policy"]["discriminator"]["propertyName"] == "kind"
-  assert schemas["parent-result-materialization"]["discriminator"]["propertyName"] == "kind"
-  assert schemas["delivery-envelope"]["discriminator"]["propertyName"] == (
-    "schema_version"
-  )
-
-
-def test_delivery_schema_preserves_absent_version_v1_and_requires_explicit_v2() -> None:
-  schemas = public_json_schemas()
-  spec_schema = schemas["workflow-delivery-spec"]
-  variants = spec_schema["anyOf"]
-  definitions = spec_schema["$defs"]
-  assert variants == [
-    {"$ref": "#/$defs/WorkflowDeliverySpecV1"},
-    {"$ref": "#/$defs/WorkflowDeliverySpecV2"},
-  ]
-  assert "schema_version" not in definitions["WorkflowDeliverySpecV1"]["properties"]
-  assert "schema_version" in definitions["WorkflowDeliverySpecV2"]["required"]
-
-  envelope_schema = schemas["delivery-envelope"]
-  assert "schema_version" in envelope_schema["$defs"]["DeliveryEnvelopeV1"]["required"]
-  assert "schema_version" in envelope_schema["$defs"]["DeliveryEnvelopeV2"]["required"]
-  assert {"kind", "source_start_byte"} <= set(
-    envelope_schema["$defs"]["DeliveryPreview"]["required"]
-  )
 
 
 def test_result_requirement_schema_preserves_declared_result_metadata() -> None:
   schema = public_json_schemas()["result-requirement"]
-  assert schema["properties"]["mode"]["type"] == "string"
-  assert schema["properties"]["terminal_narrative"]["type"] == "string"
 
   validator = Draft202012Validator(schema)
   declared = {

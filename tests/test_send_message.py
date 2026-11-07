@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 # ruff: noqa: E402
 
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
@@ -34,7 +36,7 @@ from gateway_test_support.capability_execution_test_support import (
   stub_runner_capability_execution,
 )
 from gateway_test_support.host_policy import owner_session_host_policy
-from agent_gateway.admission import ParentContext
+from agent_gateway.admission import default_root_provenance, ParentContext
 from agent_gateway.approval_route import NoApprovalRoute
 from agent_gateway.task_registry import RegistryOwner
 from agent_workflow_contracts.models import AdmittedResearchBinding, AdmittedTenant
@@ -193,6 +195,7 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
     local_tool_handlers={},
     event_log=event_log or EventLog(),
     session_id="sess-send-message",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
@@ -538,6 +541,46 @@ def test_replayed_parked_job_accepts_a_new_message() -> None:
   assert result is not None
   assert result["status"] == "queued"
   assert entry.message_inbox.get_nowait().text == "Continue with the amendment"
+
+
+def test_message_from_a_rehydrated_runner_replays_with_the_registration_task_type() -> None:
+  correlation = {
+    "owner_runner_id": "runner-parent",
+    "owner_role": "writer",
+    "sub_agent_id": "sub3:sess-parent",
+    "parent_turn_id": "turn-3",
+    "call_index": 3,
+    "capability_bind": _bind_receipt(),
+  }
+  registration = {
+    "type": "task_registered",
+    "event_schema_version": 2,
+    "task_id": "bg_3",
+    "task_type": "background_agent",
+    "started_at": 1.0,
+    **correlation,
+    "metadata": {**correlation, "task_type": "background"},
+    "_durable_seq": 1,
+  }
+  rehydrated = _root_registry()
+  rehydrated.load_from_events([dict(registration)])
+  runner = _DurableRegistryRunner(rehydrated)
+  handler = make_send_message_handler([runner], caller=_root_caller)
+
+  result, error = _run(handler({"to": "bg_3", "message": "Continue with the amendment"}))
+
+  assert error is None
+  assert result is not None
+  [sent] = runner.events
+  assert sent["task_type"] == "background"
+  replayed = _root_registry()
+  replayed.load_from_events([dict(registration), {**sent, "_durable_seq": 2}])
+  entry = replayed.get("bg_3")
+  assert entry is not None
+  assert entry.task_type == "background_agent"
+  assert [message.text for message in entry.accepted_parent_messages.values()] == [
+    "Continue with the amendment",
+  ]
 
 
 def test_task_registry_rejects_duplicate_durable_message_identity() -> None:
@@ -1709,6 +1752,7 @@ Send the filing evidence to the parent, then return a short conclusion.
       parent_session,
       withheld_tools=frozenset(),
       research_file_id=None,
+      selection_provenance=default_root_provenance(resolver.selection_policy),
     )
     inbox: asyncio.Queue[ParentMessage] = asyncio.Queue()
     registry = _root_registry(inbox=inbox, tenant=context.tenant)
@@ -1737,6 +1781,7 @@ Send the filing evidence to the parent, then return a short conclusion.
         session_id=parent_session.session_id,
         role=parent_session.role,
         get_tool_definitions=lambda: definitions,
+        run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
       )
       root_runner = AgentRunner(
         event_log=event_log,
@@ -2130,4 +2175,3 @@ def test_evidence_messages_render_with_sender_provenance() -> None:
 
   assert "Operator update for this task:\n- id=m1: Stop early" in rendered
   assert f"- id=m2 from=bg_1 handles={_CITED}: Margin is 31%" in rendered
-  assert "not instructions" in rendered

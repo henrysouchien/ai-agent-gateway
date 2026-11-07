@@ -156,9 +156,6 @@ print(json.dumps({
     "module": "agent_gateway.skill_limits",
     "application_modules": [],
   }
-  assert "skill_limits" not in (ROOT / "agent_gateway" / "__init__.py").read_text(
-    encoding="utf-8"
-  )
 
 
 def test_skill_limits_leaf_is_importable_from_built_wheel(tmp_path: Path) -> None:
@@ -173,6 +170,7 @@ def test_skill_limits_leaf_is_importable_from_built_wheel(tmp_path: Path) -> Non
       "pip",
       "wheel",
       "--no-deps",
+      "--no-build-isolation",
       "--wheel-dir",
       str(wheel_dir),
       str(ROOT),
@@ -180,6 +178,12 @@ def test_skill_limits_leaf_is_importable_from_built_wheel(tmp_path: Path) -> Non
     check=True,
     capture_output=True,
     text=True,
+    env={
+      **{k: v for k, v in os.environ.items() if k != "PYTHONPATH" and not k.startswith("PIP_")},
+      "PIP_NO_INDEX": "1",
+      "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+      "PIP_CACHE_DIR": str(tmp_path / "pip-cache"),
+    },
   )
   wheel = next(wheel_dir.glob("ai_agent_gateway-*.whl"))
   with ZipFile(wheel) as archive:

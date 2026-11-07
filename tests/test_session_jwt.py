@@ -14,9 +14,12 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.session import (
+  AGENT_TOOL_CALLBACK_PURPOSE,
+  AUTONOMOUS_RUNTIME_SESSION_PURPOSE,
   AuthManager,
   JWT_ALGORITHM,
   SessionStore,
+  caller_kind_for_channel,
 )
 from agent_gateway.session_capabilities import TEAM_WORKSPACE_WRITE_CAPABILITY
 from agent_gateway.ttl_policy import SESSION_TTL
@@ -59,6 +62,85 @@ def test_session_channel_fields_and_jwt_round_trip_new_claims() -> None:
   assert claims["is_public"] is True
   assert session.channel == "public"
   assert session.is_public is True
+
+
+def test_tool_callback_bearer_is_the_sessions_identity_marked_agent_once_per_turn() -> None:
+  """An agent tool's callback into a product route presents a gateway-signed bearer
+  with purpose=agent_tool_callback: the session's own identity, role and channel,
+  minted once per turn (product-labelling §3, design agent-tool-callback-caller-kind)."""
+  store = SessionStore(ttl=3600)
+  auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
+  session = store.create_session(
+    api_key_hash="hash", user_id="alice", user_email="alice@example.com",
+    risk_user_id=101, role="owner",
+  )
+  session.channel = "excel"
+  session.caller_kind = caller_kind_for_channel("excel")
+  assert session.caller_kind == "human"
+  own = auth.issue_token(session)
+  assert callable(session.tool_callback_token_issuer)
+
+  delegated = session.tool_callback_token_issuer("turn-1")
+  assert delegated != own
+  assert session.tool_callback_token_issuer("turn-1") == delegated  # one mint per turn
+  assert session.tool_callback_token_issuer("turn-2") != delegated
+
+  verified, kind = auth.verify_token_caller_kind(delegated)
+  assert verified is session and kind == "agent"
+  _own_session, own_kind = auth.verify_token_caller_kind(own)
+  assert own_kind == "human"
+  claims = jwt.decode(delegated, _JWT_SECRET, algorithms=[JWT_ALGORITHM])
+  assert claims["purpose"] == AGENT_TOOL_CALLBACK_PURPOSE
+  assert claims["turn_id"] == "turn-1"
+  assert (claims["user_id"], claims["risk_user_id"], claims["role"], claims["channel"]) == (
+    "alice", 101, "owner", "excel",
+  )
+  # Verifying the delegated bearer never replaces the session's own token.
+  assert session.session_token == own
+
+
+
+@pytest.mark.parametrize(
+  ("caller_kind", "purpose", "expected"),
+  [
+    ("human", None, "human"),
+    ("human", "normalizer", "human"),  # a turn's context purpose never changes who the caller is
+    ("agent", None, "agent"),
+    ("agent", AUTONOMOUS_RUNTIME_SESSION_PURPOSE, "agent"),
+    (None, None, None),
+    (None, "normalizer", None),
+  ],
+)
+def test_caller_kind_is_positive_on_both_sides(caller_kind, purpose, expected) -> None:
+  """C1 condition 4: human only for a session its door minted as a human client's;
+  an agent client and a runtime child are agents; a session no door classified is
+  unresolved (the reader refuses), never attributed by absence. `purpose` is the
+  turn's context purpose, rewritten per /api/chat turn (DEFECT-DESK b2c72ce2), and
+  plays no part."""
+  store = SessionStore(ttl=3600)
+  auth = AuthManager(secret=_JWT_SECRET, valid_keys={"gateway-key"}, session_store=store)
+  session = store.create_session(api_key_hash="hash", user_id="alice", risk_user_id=101, role="owner")
+  session.caller_kind = caller_kind
+  session.purpose = purpose
+  _session, kind = auth.verify_token_caller_kind(auth.issue_token(session))
+  assert kind == expected
+  # The delegated bearer is an agent's whatever the session's own kind.
+  _session, delegated_kind = auth.verify_token_caller_kind(
+    auth.issue_tool_callback_token(session, turn_id="turn-1")
+  )
+  assert delegated_kind == "agent"
+
+
+@pytest.mark.parametrize(
+  ("channel", "caller_kind"),
+  [
+    ("excel", "human"), ("web", "human"), ("cli", "human"),
+    ("tui", "human"), ("telegram", "human"), ("discord", "human"),
+    ("mcp", "agent"), ("public", None), (None, None),
+  ],
+)
+def test_chat_init_caller_kind_follows_the_client_channel(channel, caller_kind) -> None:
+  assert caller_kind_for_channel(channel) == caller_kind
 
 
 def test_auth_manager_rejects_short_hs256_secret() -> None:
@@ -112,7 +194,7 @@ def test_session_store_resolves_ttl_per_normalized_user_with_default_fallback() 
   store = SessionStore(ttl=3600, ttl_resolver=ttl_resolver)
   sessions = [
     store.create_session(api_key_hash="hash", user_id=user_id)
-    for user_id in (" alice ", "bob", "carol")
+    for user_id in ("alice", "bob", "carol")
   ]
 
   assert [item.expires_at - item.created_at for item in sessions] == [120, 480, 3600]

@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 import asyncio
 from pathlib import Path
@@ -443,6 +445,7 @@ class _TerminalRunner(AgentRunner):
         mcp_client=_NullMcp(),
         event_log=event_log,
         session_id="sess-ui-blocks",
+        run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
       ),
       session_id="sess-ui-blocks",
       capability_execution=capability_execution,
@@ -522,10 +525,12 @@ def test_pin_and_run_object_survive_full_gateway_dispatch_chain(tmp_path) -> Non
         user_id="alice",
         request_id=str(request.request_id),
         session_id="sess-ui-blocks",
+        registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
       )
       captured["run_context"] = run_context
       dispatcher = ToolDispatcher(capability_bind=capability_bind, mcp_client=_NullMcp(), run_context=run_context)
       captured["tool_context"] = dispatcher._new_tool_execution_context(
+        registry_scope=run_context.registry_scope,
         tool_call_id="call-1",
         tool_name="emit_ui_blocks",
         qualifier="emit_ui_blocks",

@@ -13,11 +13,16 @@ import secrets
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Mapping, Protocol, TextIO
+from typing import Any, Callable, Mapping, Protocol, TextIO, cast
 import urllib.parse
 import webbrowser
 
 import httpx
+
+from hank_contracts.user_provider_keys import KeyView, Provider, StatusOperation
+from hank_model_transport.user_provider_keys import IdentityUnresolved
+
+from .user_provider_keys_client import RiskUserKeyClient
 
 from hank_model_transport.providers.google_oauth import (
   load_google_token_record,
@@ -112,17 +117,31 @@ def run_loopback_oauth_flow(
   callback_params: dict[str, list[str]] = {}
   callback_event = threading.Event()
 
+  def callback_failure(params: dict[str, list[str]]) -> str | None:
+    if "error" in params:
+      err = params["error"][0]
+      desc = params.get("error_description", [""])[0]
+      return f"OAuth authorization failed: {err} ({desc})"
+    if "state" not in params or not params["state"][0] or params["state"][0] != state:
+      return "OAuth state mismatch in callback; authorization rejected"
+    if "code" not in params or not params["code"][0]:
+      return "No authorization code in callback"
+    return None
+
   class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-      parsed = urllib.parse.urlsplit(self.path)
-      params = urllib.parse.parse_qs(parsed.query)
-      callback_params.update(params)
-      self.send_response(200)
+      # The first callback is the verdict: the page and the console both judge that one request,
+      # and a later stray request (a second redirect hit, a browser prefetch) cannot merge into it.
+      if not callback_event.is_set():
+        callback_params.update(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query))
+      failure = callback_failure(callback_params)
+      self.send_response(400 if failure else 200)
       self.send_header("Content-Type", "text/html; charset=utf-8")
       self.end_headers()
+      heading = "Authorization failed" if failure else "Authorization response received"
       self.wfile.write(
         b"<!DOCTYPE html><html><body style='font-family: sans-serif; text-align: center; padding: 40px;'>"
-        b"<h2>Authentication successful</h2><p>You can return to the console.</p></body></html>"
+        + f"<h2>{heading}</h2><p>You can return to the console.</p></body></html>".encode()
       )
       callback_event.set()
 
@@ -164,18 +183,9 @@ def run_loopback_oauth_flow(
 
   try:
     if callback_event.wait(timeout):
-      if "error" in callback_params:
-        err = callback_params["error"][0]
-        desc = callback_params.get("error_description", [""])[0]
-        raise RuntimeError(f"OAuth authorization failed: {err} ({desc})")
-      if (
-        "state" not in callback_params
-        or not callback_params["state"][0]
-        or callback_params["state"][0] != state
-      ):
-        raise RuntimeError("OAuth state mismatch in callback; authorization rejected")
-      if "code" not in callback_params or not callback_params["code"][0]:
-        raise RuntimeError("No authorization code in callback")
+      failure = callback_failure(callback_params)
+      if failure is not None:
+        raise RuntimeError(failure)
       code = callback_params["code"][0]
       return token_exchange(code, verifier, redirect_uri)
   finally:
@@ -1125,19 +1135,113 @@ class OllamaLoginFlow:
     return 0
 
 
-class AnthropicLoginFlow:
+class UserAPIKeyLoginFlow:
+  """Enroll user-owned keys in Risk, never in gateway credential files.
+
+  The host's resolver HMAC authorizes this operator door; --user is a roster
+  alias, not a caller-provided Risk id. Roster binding precedes prompting or I/O.
+  """
+
+  name = ""
+  kind = "user_api_key"
+
+  def _target(self, args: argparse.Namespace) -> tuple[RiskUserKeyClient, int]:
+    from .user_identity_mapping import mapped_risk_user_id
+
+    identifier = getattr(args, "user", None) or ""
+    try:
+      risk_user_id = mapped_risk_user_id(
+        identifier, field="email" if "@" in identifier else "slug",
+      )
+    except ValueError as exc:
+      raise IdentityUnresolved(self.name) from exc
+    return RiskUserKeyClient(
+      resolve_url=os.environ.get("RISK_MODULE_RESOLVER_URL", ""),
+      hmac_key=os.environ.get("GATEWAY_RESOLVER_HMAC_KEY", ""),
+    ), risk_user_id
+
+  def login(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
+    client, risk_user_id = self._target(args)
+    api_key = getpass.getpass(f"Paste your {self.name.title()} API key: ").strip()
+    if not api_key:
+      raise RuntimeError(f"No {self.name.title()} API key provided.")
+    result = client.add_key(
+      risk_user_id=risk_user_id,
+      provider=cast(Provider, self.name),
+      api_key=api_key,
+      label=getattr(args, "label", "cli"),
+      workspace_id=getattr(args, "workspace_id", None),
+    )
+    stdout.write(f"{self.name.title()} API key connected.\n")
+    self._print_keys(result.keys, stdout=stdout)
+    return 0
+
+  def _print_keys(self, keys: tuple[KeyView, ...], *, stdout: TextIO) -> None:
+    stdout.write("label\tfingerprint\tstatus\tlast_validated_at\tstop_kind\n")
+    for key in keys:
+      stdout.write(
+        f"{key.label}\t{key.fingerprint}\t{key.status}\t"
+        f"{key.last_validated_at}\t{key.stop_kind}\n"
+      )
+
+  def status(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
+    client, risk_user_id = self._target(args)
+    return self._status_for_target(client, risk_user_id, stdout=stdout)
+
+  def _status_for_target(
+    self, client: RiskUserKeyClient, risk_user_id: int, *, stdout: TextIO,
+  ) -> int:
+    result = client.list_keys(risk_user_id=risk_user_id, provider=cast(Provider, self.name))
+    stdout.write(f"{self.name.title()} API keys: {len(result.keys)} connected\n")
+    self._print_keys(result.keys, stdout=stdout)
+    return 0
+
+  def logout(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
+    client, risk_user_id = self._target(args)
+    fingerprint = getattr(args, "key", None)
+    if not fingerprint:
+      raise RuntimeError("Specify --key <fingerprint>; list keys with auth status --user <name>.")
+    operation: StatusOperation = "remove"
+    if getattr(args, "disable", False):
+      operation = "disable"
+    elif getattr(args, "enable", False):
+      operation = "enable"
+    client.set_key_status(
+      risk_user_id=risk_user_id, provider=cast(Provider, self.name),
+      fingerprint=fingerprint, operation=operation,
+    )
+    stdout.write(f"{self.name.title()} API key {fingerprint}: {operation} complete.\n")
+    return 0
+
+
+class AnthropicLoginFlow(UserAPIKeyLoginFlow):
   name = "anthropic"
   kind = "oauth_code"
 
   def login(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
+    if getattr(args, "api_key", False):
+      return super().login(args, stdout=stdout)
     from .cli import _auth_login_anthropic
     return _auth_login_anthropic(args, stdout=stdout)
 
   def status(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
     from .cli import _auth_status_anthropic
+    if getattr(args, "user", None) is not None or getattr(args, "api_key", False):
+      client, risk_user_id = self._target(args)
+      seat_args = argparse.Namespace(**vars(args))
+      seat_args.user = risk_user_id
+      _auth_status_anthropic(seat_args, stdout=stdout)
+      return self._status_for_target(client, risk_user_id, stdout=stdout)
     return _auth_status_anthropic(args, stdout=stdout)
 
   def logout(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
+    if (
+      getattr(args, "key", None) is not None
+      or getattr(args, "api_key", False)
+      or getattr(args, "disable", False)
+      or getattr(args, "enable", False)
+    ):
+      return super().logout(args, stdout=stdout)
     from .cli import _anthropic_store_path
     from hank_model_transport.providers.anthropic_oauth import remove_anthropic_oauth_record
     path = _anthropic_store_path(args)
@@ -1291,36 +1395,8 @@ class XAILoginFlow:
     stdout.write(f"Removed xAI OAuth token store: {path}\n")
     return 0
 
-class OpenAILoginFlow:
+class OpenAILoginFlow(UserAPIKeyLoginFlow):
   name = "openai"
-  kind = "api_key"
-
-  def login(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
-    raise RuntimeError(
-      "The OpenAI API does not provide ChatGPT subscription OAuth login. "
-      "Use OPENAI_API_KEY for provider=openai, or run "
-      "`python3 -m agent_gateway.cli auth login codex` "
-      "for ChatGPT subscription authentication. No credentials were changed."
-    )
-
-  def status(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
-    from hank_model_transport.providers.openai import OPENAI_AUTH_TOKEN_ENV
-
-    api_key_present = bool(os.environ.get("OPENAI_API_KEY", "").strip())
-    access_token_present = bool(os.environ.get(OPENAI_AUTH_TOKEN_ENV, "").strip())
-    if api_key_present or access_token_present:
-      kind = "API key" if api_key_present else "bearer access token"
-      stdout.write(f"OpenAI API: {kind} configured in the environment; no gateway OAuth store.\n")
-      return 0
-    stdout.write(
-      "OpenAI API: no credential configured. Set OPENAI_API_KEY; for ChatGPT subscription "
-      "auth use provider=codex and `python3 -m agent_gateway.cli auth login codex`.\n"
-    )
-    return 1
-
-  def logout(self, args: argparse.Namespace, *, stdout: TextIO) -> int:
-    stdout.write("OpenAI uses OPENAI_API_KEY from environment; no stored token to remove.\n")
-    return 0
 
 
 _REGISTERED_FLOWS: dict[str, LoginFlow] = {

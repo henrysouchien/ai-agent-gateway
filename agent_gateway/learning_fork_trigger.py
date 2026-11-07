@@ -184,12 +184,8 @@ def _gateway_session(runner: Any) -> Any | None:
 
 
 def _owner(session: Any) -> str:
-  owner = str(
-    getattr(session, "owner_user_id", None)
-    or getattr(session, "user_id", None)
-    or ""
-  ).strip()
-  if not owner:
+  owner = session.owner_user_id
+  if owner is None:
     raise ValueError("learning fork owner is required")
   return owner
 
@@ -387,6 +383,8 @@ def submit_learning_fork_after_turn(
       extra={
         "data": {
           "event": "learning_fork_decision",
+          "session_id": str(session.session_id),
+          "request_id": getattr(runner, "_request_id", None),
           "individual_subject": factors["individual_subject"],
           "billing_not_byok": factors["billing_not_byok"],
           "credential_principal_service": factors["credential_principal_service"],
@@ -423,7 +421,7 @@ def submit_learning_fork_after_turn(
       ledger=ledger,
       session_id=str(session.session_id),
       owner=_owner(session),
-      user_id=str(getattr(session, "user_id", "") or _owner(session)),
+      user_id=_owner(session),
     )
     launch = registry.submit(
       fork_id=fork_id,

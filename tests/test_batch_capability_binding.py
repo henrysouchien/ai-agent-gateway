@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,8 @@ from typing import Any
 import pytest
 from fastapi import HTTPException
 
+from model_authority.bind import CapabilityBind
+from model_authority.selection import TierModelsDefault
 from model_authority.binding import (
   AuthContext,
   CapabilityResolutionError,
@@ -17,6 +21,9 @@ from model_authority.binding import (
   resolve_capability_model,
 )
 from hank_model_transport.capability_execution import MaterializedCredential
+from hank_model_transport.user_provider_keys import (
+  IdentityUnresolved, NO_API_KEY_CONSUMER, UserKeyMissing, UserKeyResolverUnavailable, consumer_key_hash_for,
+)
 from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )
@@ -24,7 +31,7 @@ from agent_gateway.control_plane import batches
 from hank_model_transport.providers import ModelInfo, ModelProvider
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
 from agent_gateway.session import AuthManager, GatewaySession, SessionStore
-from agent_gateway.admission import AdmittedContext, root_context
+from agent_gateway.admission import default_root_provenance, AdmittedContext, root_context
 from agent_gateway.approval_route import child_approval_route
 from agent_workflow_contracts import ResolvedAuthority
 from agent_workflow_contracts.models import (
@@ -32,6 +39,16 @@ from agent_workflow_contracts.models import (
   AdmittedLineage,
   ToolGrant,
 )
+
+@pytest.fixture(autouse=True)
+def _batch_user_roster(monkeypatch: pytest.MonkeyPatch) -> None:
+  monkeypatch.setenv("GATEWAY_USER_KEYS", json.dumps([
+    {"key": "batch-owner", "slug": "alice", "risk_user_id": 7, "role": "owner"},
+  ]))
+  # Pools are process-global: a test elsewhere in the worker that leaves them installed
+  # must not decide this module's enrollment. Tests that need pools install their own.
+  _uninstall_batch_pools(monkeypatch)
+
 
 
 class _Provider(ModelProvider):
@@ -59,16 +76,83 @@ def _session(
 ) -> GatewaySession:
   return GatewaySession(
     session_id="sess-batch-test",
-    api_key_hash="hash",
+    api_key_hash=hashlib.sha256(b"risk-api-key").hexdigest(),
     created_at=int(time.time()),
     expires_at=int(time.time()) + 60,
     user_id="alice",
     owner_user_id="alice",
     kind="control",
+    risk_user_id=7,
     auth_config=auth_config,
     tenant_id="tenant-a",
     session_credential_handle=handle,
   )
+
+
+class _BatchPools:
+  """A stand-in for the installed UserKeyPools that records every probe and lease."""
+
+  def __init__(self, *, enrolled: frozenset[str], outage: bool) -> None:
+    self._enrolled = enrolled
+    self._outage = outage
+    self.probes: list[dict[str, Any]] = []
+    self.leases: list[dict[str, Any]] = []
+
+  def enrolled(self, **kwargs: Any) -> bool:
+    self.probes.append(kwargs)
+    if self._outage:
+      raise UserKeyResolverUnavailable(kwargs["provider"], "transport")
+    return kwargs["provider"] in self._enrolled
+
+  def lease(self, **kwargs: Any) -> SimpleNamespace:
+    self.leases.append(kwargs)
+    provider = kwargs["provider"]
+    if provider not in self._enrolled:
+      raise UserKeyMissing(provider, kwargs["risk_user_id"])
+    return SimpleNamespace(auth_config=lambda: {
+      "provider": provider, "auth_mode": "api",
+      "api_key": "user-key-secret", "billing_mode": "byok",
+      "entitlement_kind": "commercial_byok",
+    })
+
+
+def _install_batch_pools(
+  monkeypatch: pytest.MonkeyPatch, *, enrolled: frozenset[str], outage: bool = False,
+) -> _BatchPools:
+  pools = _BatchPools(enrolled=enrolled, outage=outage)
+  monkeypatch.setattr(batches, "installed_user_key_pools", lambda provider=None: pools)
+  return pools
+
+
+def _uninstall_batch_pools(monkeypatch: pytest.MonkeyPatch) -> _BatchPools:
+  """No pools installed: the real accessor raises ``not_configured``."""
+
+  def not_installed(provider: str | None = None) -> _BatchPools:
+    raise UserKeyResolverUnavailable(provider, "not_configured")
+
+  monkeypatch.setattr(batches, "installed_user_key_pools", not_installed)
+  return _BatchPools(enrolled=frozenset(), outage=True)
+
+
+def _deployment_config(provider: str) -> tuple[SimpleNamespace, CredentialHandle]:
+  deployment_handle = CredentialHandle(
+    handle_id=f"service:deployment:{provider}", provider=provider,
+    principal="service", tenant_id="tenant-a", actor_id=None,
+  )
+  config = _config()
+  config.service_provider_handles = {provider: deployment_handle}
+  config.service_admission = None
+  config.service_auth_config_resolver = lambda *_args, **_kwargs: pytest.fail(
+    "service materializer called for the session handle",
+  )
+  config.capability_adapter_resolver = lambda _adapter: _Provider(provider)
+  return config, deployment_handle
+
+
+def _deployment_session(handle: CredentialHandle, provider: str) -> GatewaySession:
+  return _session(handle=handle, auth_config={
+    "provider": provider, "api_key": "deployment-secret", "entitlement_kind": "org_commercial",
+  })
 
 
 def _config(
@@ -85,6 +169,7 @@ def _config(
         auth_config={
           "provider": "anthropic",
           "api_key": "service-secret",
+          "entitlement_kind": "operator_personal_subscription",
         },
       )
     }
@@ -115,6 +200,12 @@ def _config(
     service_auth_config_resolver=(
       _materialize if service_handle is not None else None
     ),
+    service_admission=lambda handle, *, risk_user_id, auth_config=None: (
+      risk_user_id in {1, 7} and (
+        handle is service_handle
+        or (auth_config is not None and auth_config.get("entitlement_kind") == "operator_personal_subscription")
+      )
+    ),
     capability_adapter_resolver=lambda adapter: (
       provider
       if adapter == "anthropic.messages"
@@ -124,7 +215,10 @@ def _config(
   )
 
 
-def test_authenticated_batch_marks_exact_user_handle_run_scoped() -> None:
+def test_authenticated_batch_marks_exact_user_handle_run_scoped(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_batch_pools(monkeypatch, enrolled=frozenset({"anthropic", "openai"}))
   handle = CredentialHandle(
     handle_id="user:alice:anthropic",
     provider="anthropic",
@@ -150,7 +244,7 @@ def test_authenticated_batch_marks_exact_user_handle_run_scoped() -> None:
   assert resolver.auth_context.run_mode == "batch"
   assert resolver.auth_context.user_provider_handles["anthropic"] is handle
   assert resolver.auth_context.run_scoped_user_providers == frozenset({
-    "anthropic"
+    "anthropic", "openai"
   })
   assert execution.bind.credential_principal == "user"
   assert execution.auth_config["api_key"] == "user-secret"
@@ -160,7 +254,7 @@ def test_authenticated_batch_marks_exact_user_handle_run_scoped() -> None:
   assert "anthropic.claude-opus-5-5" in resolver.auth_context.entitled_model_keys
 
 
-def test_standalone_batch_materializes_only_service_principal() -> None:
+def test_standalone_batch_materializes_admitted_owner_seat() -> None:
   service_handle = CredentialHandle(
     handle_id="service:batch:anthropic",
     provider="anthropic",
@@ -182,8 +276,8 @@ def test_standalone_batch_materializes_only_service_principal() -> None:
     authenticated_session=None,
   )
 
-  assert materialized_scopes == ["1"]
-  assert resolver.auth_context.user_provider_handles == {}
+  assert materialized_scopes == [1]
+  assert set(resolver.auth_context.user_provider_handles) == {"openai"}
   assert (
     resolver.auth_context.service_provider_handles["anthropic"]
     is service_handle
@@ -202,7 +296,7 @@ def test_authenticated_batch_materializes_service_principal_for_the_session_risk
   )
   session = GatewaySession(
     session_id="sess-batch-service-scope",
-    api_key_hash="hash",
+    api_key_hash=hashlib.sha256(b"batch-api-key").hexdigest(),
     created_at=int(time.time()),
     expires_at=int(time.time()) + 60,
     user_id="alice",
@@ -266,7 +360,7 @@ def test_batch_parent_rebinds_authenticated_alias_to_canonical_owner() -> None:
   now = int(time.time())
   session = GatewaySession(
     session_id="sess-batch-alias",
-    api_key_hash="hash",
+    api_key_hash=hashlib.sha256(b"batch-api-key").hexdigest(),
     created_at=now,
     expires_at=now + 60,
     user_id="henry",
@@ -277,6 +371,7 @@ def test_batch_parent_rebinds_authenticated_alias_to_canonical_owner() -> None:
     auth_config={
       "provider": "anthropic",
       "api_key": "user-secret",
+      "entitlement_kind": "operator_personal_subscription",
     },
     tenant_id="tenant-a",
     session_credential_handle=handle,
@@ -331,7 +426,7 @@ def test_batch_parent_rebind_carries_authenticated_session_token() -> None:
   now = int(time.time())
   session = GatewaySession(
     session_id="sess-batch-alias-token",
-    api_key_hash="hash",
+    api_key_hash=hashlib.sha256(b"batch-api-key").hexdigest(),
     created_at=now,
     expires_at=now + 60,
     user_id="henry",
@@ -341,6 +436,7 @@ def test_batch_parent_rebind_carries_authenticated_session_token() -> None:
     auth_config={
       "provider": "anthropic",
       "api_key": "user-secret",
+      "entitlement_kind": "operator_personal_subscription",
     },
     session_token="caller-issued-jwt",
     tenant_id="tenant-a",
@@ -432,7 +528,10 @@ def test_batch_parent_preserves_exact_authenticated_owner_session() -> None:
   assert parent is session
 
 
-def test_authenticated_cross_provider_batch_preserves_session_selection() -> None:
+def test_authenticated_cross_provider_batch_preserves_session_selection(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  _install_batch_pools(monkeypatch, enrolled=frozenset({"anthropic", "openai"}))
   user_handle = CredentialHandle(
     handle_id="user:alice:openai",
     provider="openai",
@@ -513,7 +612,7 @@ def test_authenticated_cross_provider_batch_preserves_session_selection() -> Non
   )
 
   assert resolver.auth_context.run_scoped_user_providers == frozenset({
-    "openai"
+    "anthropic", "openai"
   })
   assert execution.bind.provider == "openai"
   assert execution.bind.model_key == "openai.gpt-6-1-sol"
@@ -525,6 +624,13 @@ def test_authenticated_cross_provider_batch_preserves_session_selection() -> Non
 class _DispatchRegistry:
   def __init__(self) -> None:
     self.status = "running"
+    self.launch_record = {
+      "approval_policy": "approve_all",
+      "approve_live_orders": False,
+    }
+
+  def launch_approval_settings(self, _batch_id: int) -> dict[str, object]:
+    return dict(self.launch_record)
 
   def close(self) -> None:
     return None
@@ -542,6 +648,20 @@ class _DispatchRegistry:
       "status": self.status,
       "cost_usd": 0.0,
     }
+
+  def transition_status_if_current(
+    self,
+    _batch_id: int,
+    status: str,
+    *,
+    expected_statuses: set[str],
+    error: str | None = None,
+  ) -> bool:
+    _ = error
+    if self.status not in expected_statuses:
+      return False
+    self.status = status
+    return True
 
 
 class _DispatchEventBus:
@@ -685,11 +805,12 @@ def test_dispatch_threads_one_pre_materialized_execution_into_task(
     assert execution.bind.registry_revision == resolver.registry.revision
     assert execution.bind.policy_revision == resolver.selection_policy.revision
     assert materialized_handles == [service_handle]
-    assert materialized_scopes == ["alice"]
+    assert materialized_scopes == [7]
     parent = root_context(
       captured["parent_session"],
       withheld_tools=frozenset(),
       research_file_id=None,
+      selection_provenance=default_root_provenance(resolver.selection_policy),
     )
     assert parent.tenant is not None
     admitted = AdmittedContext(
@@ -780,9 +901,11 @@ def test_authenticated_dispatch_keeps_its_session_token_live_until_terminal(
       session_store=store,
     )
     session = store.create_session(
-      api_key_hash="hash",
+      api_key_hash=hashlib.sha256(b"batch-api-key").hexdigest(),
       user_id="alice",
+      owner_user_id="alice",
       kind="control",
+      risk_user_id=7,
       auth_config={"provider": "anthropic", "api_key": "user-secret"},
       tenant_id="tenant-a",
       session_credential_handle=CredentialHandle(
@@ -879,3 +1002,297 @@ def test_batch_credential_unavailable_remains_a_503(monkeypatch: pytest.MonkeyPa
       )
     )
   assert raised.value.status_code == 503
+
+
+def _batch_bind_for_handle(handle: CredentialHandle) -> CapabilityBind:
+  auth = AuthContext(
+    run_mode="batch",
+    actor_id="alice",
+    tenant_id="tenant-a",
+    user_provider_handles={handle.provider: handle} if handle.principal == "user" else {},
+    service_provider_handles={handle.provider: handle} if handle.principal == "service" else {},
+    entitled_capabilities=frozenset({"session.driver"}),
+    entitled_model_keys=INITIAL_MODEL_SELECTION_POLICY.capabilities["session.driver"].allowed_model_keys,
+    run_scoped_user_providers=frozenset({handle.provider}) if handle.principal == "user" else frozenset(),
+  )
+  entry = next(
+    entry for entry in INITIAL_MODEL_REGISTRY.models.values()
+    if entry.provider == handle.provider and entry.lifecycle in {"active", "hidden"}
+    and "session.driver" in entry.capabilities
+  )
+  if entry.lifecycle == "active":
+    return resolve_capability_model(
+      "session.driver", auth=auth,
+      registry=INITIAL_MODEL_REGISTRY,
+      selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      explicit_intent=ModelSelectionIntent(
+        model_key=entry.key, effort=entry.default_effort, source="explicit_user",
+      ),
+    )
+  return resolve_capability_model(
+    "session.driver", auth=auth,
+    registry=INITIAL_MODEL_REGISTRY,
+    selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+    role_map={"default": TierModelsDefault(
+      models=(entry.key,),
+      effort="none" if "none" in entry.supported_efforts else entry.default_effort,
+    )},
+    role_map_source="internal_policy",
+  )
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_batch_unenrolled_session_user_keeps_deployment_handle_without_a_lease(
+  monkeypatch: pytest.MonkeyPatch,
+  provider: str,
+) -> None:
+  pools = _install_batch_pools(monkeypatch, enrolled=frozenset())
+  config, deployment_handle = _deployment_config(provider)
+  session = _deployment_session(deployment_handle, provider)
+
+  resolver, execution = batches._batch_capability_execution_context(
+    app_state=SimpleNamespace(gateway_config=config),
+    user_id="alice", authenticated_session=session,
+    required_bind=_batch_bind_for_handle(deployment_handle),
+  )
+
+  assert resolver.user_key_handles == {}
+  assert resolver.auth_context.service_provider_handles[provider] is deployment_handle
+  assert provider not in resolver.auth_context.user_provider_handles
+  assert execution.bind.credential_principal == "service"
+  assert execution.auth_config["api_key"] == "deployment-secret"
+  assert {call["provider"] for call in pools.probes} == {"anthropic", "openai"}
+  assert pools.leases == []
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+@pytest.mark.parametrize("outage", ["resolver_unavailable", "not_installed"])
+def test_batch_risk_outage_is_not_enrolled_and_serves_the_deployment_handle(
+  monkeypatch: pytest.MonkeyPatch,
+  provider: str,
+  outage: str,
+) -> None:
+  pools = (
+    _install_batch_pools(monkeypatch, enrolled=frozenset(), outage=True)
+    if outage == "resolver_unavailable"
+    else _uninstall_batch_pools(monkeypatch)
+  )
+  config, deployment_handle = _deployment_config(provider)
+  session = _deployment_session(deployment_handle, provider)
+
+  resolver, execution = batches._batch_capability_execution_context(
+    app_state=SimpleNamespace(gateway_config=config),
+    user_id="alice", authenticated_session=session,
+    required_bind=_batch_bind_for_handle(deployment_handle),
+  )
+
+  assert resolver.user_key_handles == {}
+  assert resolver.auth_context.service_provider_handles[provider] is deployment_handle
+  assert execution.auth_config["api_key"] == "deployment-secret"
+  assert pools.leases == []
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+@pytest.mark.parametrize("with_session", [False, True])
+def test_batch_enrolled_user_leases_its_key_and_never_uses_the_deployment_handle(
+  monkeypatch: pytest.MonkeyPatch,
+  provider: str,
+  with_session: bool,
+) -> None:
+  pools = _install_batch_pools(monkeypatch, enrolled=frozenset({provider}))
+  config, deployment_handle = _deployment_config(provider)
+  session = _deployment_session(deployment_handle, provider) if with_session else None
+  key_handle = CredentialHandle(
+    handle_id=f"user-key:7:{provider}", provider=provider,
+    principal="user", tenant_id="tenant-a", actor_id="alice",
+  )
+
+  resolver, execution = batches._batch_capability_execution_context(
+    app_state=SimpleNamespace(gateway_config=config),
+    user_id="alice", authenticated_session=session,
+    required_bind=_batch_bind_for_handle(key_handle),
+  )
+
+  assert provider not in resolver.auth_context.service_provider_handles
+  assert resolver.auth_context.user_provider_handles[provider] == key_handle
+  # A session offers only enrolled providers; sessionless dispatch has no
+  # deployment fallback, so every provider stays a user-key handle (N2).
+  assert set(resolver.user_key_handles) == (
+    {provider} if with_session else {"anthropic", "openai"}
+  )
+  assert execution.bind.credential_ref == key_handle.handle_id
+  assert execution.auth_config["api_key"] == "user-key-secret"
+  assert execution.auth_config["billing_mode"] == "byok"
+  assert resolver.risk_user_id == 7
+  assert [call["provider"] for call in pools.leases] == [provider]
+  assert pools.leases[0]["risk_user_id"] == 7
+  assert pools.leases[0]["context"].consumer_key_hash == (
+    consumer_key_hash_for("risk-api-key") if with_session else NO_API_KEY_CONSUMER
+  )
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_batch_sessionless_dispatch_keeps_the_typed_credential_error_not_the_deployment_handle(
+  monkeypatch: pytest.MonkeyPatch,
+  provider: str,
+) -> None:
+  pools = _install_batch_pools(monkeypatch, enrolled=frozenset())
+  config, deployment_handle = _deployment_config(provider)
+  key_handle = CredentialHandle(
+    handle_id=f"user-key:7:{provider}", provider=provider,
+    principal="user", tenant_id="tenant-a", actor_id="alice",
+  )
+
+  with pytest.raises(CapabilityResolutionError, match="connect your .* API key") as refused:
+    batches._batch_capability_execution_context(
+      app_state=SimpleNamespace(gateway_config=config),
+      user_id="alice", authenticated_session=None,
+      required_bind=_batch_bind_for_handle(key_handle),
+    )
+  assert refused.value.code == "credential_unavailable"
+  assert isinstance(refused.value.__cause__, UserKeyMissing)
+  assert pools.probes == []
+  assert pools.leases[0]["provider"] == provider
+  assert pools.leases[0]["context"].consumer_key_hash == NO_API_KEY_CONSUMER
+
+
+@pytest.mark.parametrize("with_session", [False, True])
+def test_batch_unmapped_identity_has_typed_refusal(
+  monkeypatch: pytest.MonkeyPatch,
+  with_session: bool,
+) -> None:
+  monkeypatch.setenv("GATEWAY_USER_KEYS", "[]")
+  session = GatewaySession(
+    session_id="unmapped", api_key_hash=hashlib.sha256(b"batch-api-key").hexdigest(), created_at=1, expires_at=2,
+    user_id="alice", owner_user_id="alice", tenant_id="tenant-a", kind="control",
+  ) if with_session else None
+  with pytest.raises(CapabilityResolutionError) as refused:
+    batches._batch_capability_execution_context(
+      app_state=SimpleNamespace(gateway_config=_config()),
+      user_id="alice", authenticated_session=session,
+    )
+  if with_session:
+    # A session's legacy 0 identity names no user key to lease: no handle
+    # reaches the resolver, so it refuses by selection, never by a lease.
+    assert refused.value.code == "default_not_eligible"
+    return
+  assert refused.value.code == "credential_unavailable"
+  assert isinstance(refused.value.__cause__, IdentityUnresolved)
+  assert str(refused.value) == refused.value.__cause__.user_message
+
+
+@pytest.mark.parametrize("provider", ["xai", "google", "kimi_code", "muse", "ollama_cloud", "anthropic_bedrock"])
+def test_batch_preserves_r4_and_admitted_bedrock_service_material(
+  provider: str,
+) -> None:
+  handle = CredentialHandle(
+    handle_id=f"service:batch:{provider}", provider=provider,
+    principal="service", tenant_id="tenant-a", actor_id=None,
+  )
+  seen: list[int] = []
+  config = _config()
+  config.service_provider_handles = {provider: handle}
+
+  def materialize(selected: CredentialHandle, *, user_scope: int) -> MaterializedCredential:
+    assert selected is handle
+    seen.append(user_scope)
+    return MaterializedCredential(handle=selected, auth_config={
+      "provider": provider, "api_key": "existing-service-secret",
+    })
+
+  config.service_auth_config_resolver = materialize
+  config.service_admission = lambda selected, *, risk_user_id, auth_config=None: (
+    provider == "anthropic_bedrock" and selected is handle and risk_user_id == 7
+  )
+  config.capability_adapter_resolver = lambda _adapter: _Provider(provider)
+  resolver, execution = batches._batch_capability_execution_context(
+    app_state=SimpleNamespace(gateway_config=config),
+    user_id="alice", authenticated_session=None,
+    required_bind=_batch_bind_for_handle(handle),
+  )
+  assert resolver.auth_context.service_provider_handles[provider] is handle
+  assert execution.auth_config["api_key"] == "existing-service-secret"
+  assert seen == [7]
+
+
+@pytest.mark.parametrize(
+  ("launch_value", "flipped"), [("ask_all", "approve_all"), ("approve_all", "ask_all")],
+)
+def test_batch_keeps_its_launch_approval_settings_after_the_operator_file_flips(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  launch_value: str,
+  flipped: str,
+) -> None:
+  """A headless batch decides under the snapshot taken when its row was created."""
+
+  from agent_gateway.run_settings import set_operator_setting
+  from agent_gateway.single_user_policy import current_approval_settings
+
+  async def _run() -> None:
+    monkeypatch.setenv("HANK_RUN_SETTINGS_PATH", str(tmp_path / "operator.json"))
+    set_operator_setting("approval_policy", launch_value)
+    launch_record = {
+      "approval_policy": launch_value,
+      "approve_live_orders": False,
+    }
+    seen: list[dict[str, object]] = []
+    service_handle = CredentialHandle(
+      handle_id="service:batch:anthropic",
+      provider="anthropic",
+      principal="service",
+      tenant_id="tenant-a",
+      actor_id=None,
+    )
+    registry = _DispatchRegistry()
+    registry.launch_record = launch_record
+
+    def read_persisted_launch(_batch_id: int) -> dict[str, object]:
+      # The row is the launch snapshot. Flipping the file in this read is the
+      # mid-batch change: a pin that re-snapshots the live file binds the flip.
+      set_operator_setting("approval_policy", flipped)
+      return dict(launch_record)
+
+    registry.launch_approval_settings = read_persisted_launch
+
+    class _Controller:
+      def acquire_batch_run(self, _payload: dict[str, Any], **_kwargs: Any):
+        return 17, "alice", None
+
+      async def run_acquired_batch(self, *_args: Any, **_kwargs: Any) -> None:
+        async def stage_body() -> None:
+          seen.append(current_approval_settings().record())
+
+        await stage_body()
+        registry.status = "completed"
+
+      async def open_captured_run_context(self, **kwargs: Any) -> dict[str, Any]:
+        return kwargs
+
+    task_registry = batches.BatchTaskRegistry()
+    app_state = _dispatch_app_state(
+      tmp_path=tmp_path,
+      registry=registry,
+      controller=_Controller(),
+      task_registry=task_registry,
+      gateway_config=_config(service_handle=service_handle),
+    )
+    monkeypatch.setattr(
+      batches,
+      "require_corpus_readiness",
+      lambda payload, **_kwargs: asyncio.sleep(0, result=(payload, None)),
+    )
+    await batches.dispatch_batch_in_process(
+      {"source": "quality_screen", "universe": ["MSFT"]},
+      app_state=app_state,
+      user_id="alice",
+      role="invite",
+      dispatch_key="batch-approval-pin",
+    )
+    task = task_registry.get(owner_user_id="alice", batch_id=17)
+    assert task is not None
+    await task
+    assert seen == [launch_record]
+    assert current_approval_settings().approval_policy == flipped
+
+  asyncio.run(_run())

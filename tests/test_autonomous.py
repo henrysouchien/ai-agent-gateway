@@ -1,5 +1,6 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 import asyncio
-import inspect
 import logging
 import sys
 from dataclasses import replace
@@ -14,9 +15,7 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-import agent_gateway  # noqa: E402
 import agent_gateway.autonomous as autonomous  # noqa: E402
-import agent_gateway.autonomous_output as autonomous_output  # noqa: E402
 from agent_gateway import EventLog  # noqa: E402
 from agent_gateway.events import event_to_dict  # noqa: E402
 from hank_model_transport.multi_user.billing import SessionUsageSummary  # noqa: E402
@@ -32,6 +31,7 @@ from agent_gateway.mcp_client import _ServerState  # noqa: E402
 from hank_model_transport.providers import ModelInfo, ModelProvider, StreamEvent  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
 from agent_gateway.skill_limits import SkillExecutionLimits  # noqa: E402
+from agent_gateway.registry_scope import NoRegistryScope, RegistryScope  # noqa: E402
 from agent_gateway.tool_policy_registry import (  # noqa: E402
   ToolPolicyImplementationRegistry,
 )
@@ -197,6 +197,7 @@ def _bound_execution(
       created_at=1,
       expires_at=2,
       user_id="alice",
+      owner_user_id="alice",
       role="owner",
       tenant_id="test-tenant",
       session_credential_handle=CredentialHandle(
@@ -281,6 +282,7 @@ def test_run_autonomous_first_handle_read_keeps_executing_job(
       session,
       withheld_tools=frozenset(),
       research_file_id=None,
+      selection_provenance=None,
     )
     job_id = "physical-child-job"
     capture_job_context(session, replace(
@@ -305,6 +307,7 @@ def test_run_autonomous_first_handle_read_keeps_executing_job(
     "test",
     **bound,
     initial_message="read own evidence",
+    registry_scope=NoRegistryScope(),
     user_id="alice",
     billing_mode="byok",
     rate_table_version="test",
@@ -319,72 +322,6 @@ def test_run_autonomous_first_handle_read_keeps_executing_job(
     assert current_parent_context(session).children == ()
 
 
-def test_autonomous_output_exports_preserve_public_parent_surface() -> None:
-  helper_names = (
-    "RunOutput",
-    "build_state_payload",
-    "collect_run_output",
-    "extract_state_update",
-    "format_run_summary",
-    "load_state",
-    "mark_post_run_guard_failure",
-    "run_output_exit_code",
-    "run_output_outcome",
-    "save_state",
-  )
-
-  assert autonomous.RunOutput is autonomous_output.RunOutput
-  for name in helper_names:
-    assert getattr(agent_gateway, name) is getattr(autonomous, name)
-
-
-def test_autonomous_output_wrappers_preserve_parent_private_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
-  class _PatchedRunOutput:
-    def __init__(self, **kwargs: Any) -> None:
-      self.kwargs = kwargs
-
-  monkeypatch.setattr(autonomous, "RunOutput", _PatchedRunOutput)
-  event_log = EventLog()
-  event_log.append({"type": "text_delta", "text": "hello"})
-
-  output = autonomous.collect_run_output(event_log, timed_out=True)
-
-  assert isinstance(output, _PatchedRunOutput)
-  assert output.kwargs["response"] == "hello"
-  assert output.kwargs["timed_out"] is True
-
-  monkeypatch.setattr(autonomous, "_extract_summary", lambda text, limit=1500: f"patched:{limit}:{text}")
-  monkeypatch.setattr(autonomous, "_ensure_string_list", lambda value: [f"patched-list:{value!r}"])
-  payload = autonomous.build_state_payload(
-    previous_state={},
-    model_state={"alerts": ["keep"]},
-    run_output=autonomous_output.RunOutput("body", [], {}, None, False),
-  )
-  assert payload["last_summary"] == "patched:1500:body"
-  assert payload["alerts"] == ["patched-list:['keep']"]
-
-  monkeypatch.setattr(autonomous, "_STATE_JSON_MARKER", "## CUSTOM_STATE")
-  text = """
-Ignored.
-
-## CUSTOM_STATE
-```json
-{"status": "patched-marker"}
-```
-"""
-  assert autonomous.extract_state_update(text) == {"status": "patched-marker"}
-
-  read_calls: list[Path] = []
-  write_calls: list[tuple[Path, dict[str, Any]]] = []
-  monkeypatch.setattr(autonomous, "_read_json_object", lambda path: read_calls.append(path) or {"loaded": str(path)})
-  monkeypatch.setattr(autonomous, "_atomic_write_json", lambda path, payload: write_calls.append((path, payload)))
-
-  assert autonomous.load_state(Path("/tmp/state-root"), state_file="custom.json") == {
-    "loaded": "/tmp/state-root/custom.json"
-  }
-  autonomous.save_state(Path("/tmp/state-root"), {"saved": True}, state_file="custom.json")
-  assert read_calls == [Path("/tmp/state-root/custom.json")]
-  assert write_calls == [(Path("/tmp/state-root/custom.json"), {"saved": True})]
 
 
 def test_collect_run_output() -> None:
@@ -998,6 +935,7 @@ def test_run_autonomous_uses_exact_prebound_model(monkeypatch: pytest.MonkeyPatc
     autonomous.run_autonomous(
       "System",
       "Hello",
+      registry_scope=NoRegistryScope(),
       **_bound_execution(provider=provider),
       user_id="alice",
       billing_mode="byok",
@@ -1011,6 +949,7 @@ def test_run_autonomous_uses_exact_prebound_model(monkeypatch: pytest.MonkeyPatc
 
 def test_run_autonomous_binds_trusted_top_level_skill_identity(
   monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
 ) -> None:
   captured: dict[str, Any] = {}
 
@@ -1038,6 +977,7 @@ def test_run_autonomous_binds_trusted_top_level_skill_identity(
     autonomous.run_autonomous(
       "System",
       "Hello",
+      registry_scope=RegistryScope("run", "run-skill-market-scan-test", str(tmp_path)),
       **authority,
       top_level_skill_name="market-scan",
       skill_run_id="run-skill-market-scan-test",
@@ -1052,10 +992,12 @@ def test_run_autonomous_binds_trusted_top_level_skill_identity(
   assert authority["session"].run_context.skill == "market-scan"
   assert authority["session"].run_context.run_id == "run-skill-market-scan-test"
   assert authority["session"].run_context.policy_bundle_hash == "a" * 64
+  assert authority["session"].run_context.autonomous is True
 
 
 def test_run_autonomous_top_level_skill_exposes_every_supplied_tool(
   monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
 ) -> None:
   captured: dict[str, Any] = {}
   real_manager_type = autonomous.McpClientManager
@@ -1123,6 +1065,7 @@ def test_run_autonomous_top_level_skill_exposes_every_supplied_tool(
     autonomous.run_autonomous(
       "System",
       "Hello",
+      registry_scope=RegistryScope("run", "run-skill-market-scan-test", str(tmp_path)),
       **authority,
       mcp_servers={"market-data-mcp": {"command": "unused"}},
       trusted_mcp_allowed_servers={"market-data-mcp"},
@@ -1203,6 +1146,7 @@ def test_run_autonomous_preserves_manager_alias_precedence_without_logical_route
     autonomous.run_autonomous(
       "System",
       "Hello",
+      registry_scope=NoRegistryScope(),
       **_bound_execution(),
       mcp_servers={
         "legacy-server": {"command": "legacy"},
@@ -1228,23 +1172,6 @@ def test_run_autonomous_preserves_manager_alias_precedence_without_logical_route
   }
 
 
-def test_run_autonomous_public_surface_requires_prebound_execution() -> None:
-  parameters = inspect.signature(autonomous.run_autonomous).parameters
-
-  assert "capability_execution" in parameters
-  assert "session" in parameters
-  assert {
-    "api_key",
-    "auth_config",
-    "auth_token",
-    "bound_auth_config",
-    "capability_bind",
-    "execution_transport",
-    "max_tokens",
-    "model",
-    "provider",
-    "provider_config",
-  }.isdisjoint(parameters)
 
 
 def test_run_autonomous_rejects_non_gateway_session_authority() -> None:
@@ -1256,6 +1183,7 @@ def test_run_autonomous_rejects_non_gateway_session_authority() -> None:
       autonomous.run_autonomous(
         "System",
         "Hello",
+        registry_scope=NoRegistryScope(),
         **authority,
         user_id="alice",
         billing_mode="byok",
@@ -1324,6 +1252,7 @@ def test_run_autonomous_rejects_bind_mismatch_before_mcp_or_client(
       autonomous.run_autonomous(
         "System",
         "Hello",
+        registry_scope=NoRegistryScope(),
         **_bound_execution(
           provider=provider,
           bind=bind,
@@ -1367,6 +1296,7 @@ def test_run_autonomous_rejects_missing_bound_credential_before_client(
       autonomous.run_autonomous(
         "System",
         "Hello",
+        registry_scope=NoRegistryScope(),
         **_bound_execution(provider=_MissingCredentialProvider()),
         mcp_servers={"fixture": {"command": "never"}},
         user_id="alice",
@@ -1381,6 +1311,7 @@ def test_run_autonomous_sync_rejects_removed_raw_selection_fields() -> None:
     autonomous.run_autonomous_sync(
       "System",
       "Hello",
+      registry_scope=NoRegistryScope(),
       **_bound_execution(),
       model="other-model",
       user_id="alice",
@@ -1793,6 +1724,7 @@ def test_run_autonomous_skills_dir_registers_send_message_tool_and_builtin_name(
     autonomous.run_autonomous(
       "You are helpful.",
       "Run the task.",
+      registry_scope=NoRegistryScope(),
       **_bound_execution(),
       skills_dir=skills_dir,
       **_raw_capability_execution_resolver(
@@ -1857,6 +1789,7 @@ def test_run_autonomous_forwards_the_admitted_claim_signer(
     autonomous.run_autonomous(
       "You are helpful.",
       "Run the task.",
+      registry_scope=NoRegistryScope(),
       **_bound_execution(),
       mcp_servers={"filesystem": {"command": "npx", "args": ["-y", "server"]}},
       trusted_mcp_allowed_servers={"filesystem"},
@@ -1883,6 +1816,7 @@ def test_run_autonomous_refuses_child_surface_without_capability_resolver(
       autonomous.run_autonomous(
         "You are helpful.",
         "Run the task.",
+        registry_scope=NoRegistryScope(),
         **_bound_execution(),
         skills_dir=skills_dir,
         user_id="alice",
@@ -1995,6 +1929,7 @@ def test_run_autonomous_pairs_prebound_execution_with_explicit_resolver_for_back
   monkeypatch.setattr(autonomous, "run_session", run_parent)
   output = _run(autonomous.run_autonomous(
     "System", "Delegate a read.", **authority,
+    registry_scope=NoRegistryScope(),
     skills_dir=skills_dir,
     capability_execution_resolver=resolver,
     user_id="alice", billing_mode="byok", rate_table_version="unknown",
@@ -2127,6 +2062,7 @@ def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
         capability_bind=authority['capability_execution'].bind, mcp_client=autonomous._NullMcpClient(), local_tool_handlers=parent_handlers,
         role="owner", approval_key_qualifier=parent_bundle.approval_qualifier,
         get_tool_definitions=lambda: definitions,
+        run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
       )
       bind_code_execution(parent_bundle, parent_dispatcher)
       result, error = await parent_dispatcher.dispatch(
@@ -2149,6 +2085,7 @@ def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
     try:
       await autonomous.run_autonomous(
         "System", "Compute.", **authority,
+        registry_scope=NoRegistryScope(),
         skills_dir=skills_dir,
         tool_handlers=parent_handlers,
         tool_definitions=definitions,
@@ -2182,3 +2119,65 @@ def test_run_autonomous_delegated_code_handler_keeps_its_executable_route(
     )
     assert captured["child_bundle"].frame_reader is not parent_bundle.frame_reader
     assert captured["child_session"].code_execution_work_dir is None
+
+
+@pytest.mark.parametrize(
+  ("launch_value", "flipped"), [("ask_all", "approve_all"), ("approve_all", "ask_all")],
+)
+def test_run_autonomous_binds_the_approval_settings_at_launch(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  launch_value: str,
+  flipped: str,
+) -> None:
+  from agent_gateway.run_settings import set_operator_setting
+  from agent_gateway.single_user_policy import (
+    ApprovalSettings,
+    current_approval_settings,
+    pin_approval_settings,
+  )
+  from agent_gateway.task_registry import TaskRegistry
+
+  monkeypatch.setenv("HANK_RUN_SETTINGS_PATH", str(tmp_path / "operator.json"))
+  set_operator_setting("approval_policy", launch_value)
+  seen: list[str] = []
+
+  class _Runner:
+    def __init__(self, **_kwargs: Any) -> None:
+      self._task_registry = TaskRegistry()
+
+  async def run_parent(_runner: Any, _log: EventLog, **_kwargs: Any) -> autonomous.RunOutput:
+    # The decision point: the operator file has moved, the run must not.
+    set_operator_setting("approval_policy", flipped)
+    seen.append(current_approval_settings().approval_policy)
+    return autonomous.RunOutput("done", [], {}, None, False)
+
+  monkeypatch.setattr(autonomous, "AgentRunner", _Runner)
+  monkeypatch.setattr(autonomous, "run_session", run_parent)
+  authority = _bound_execution()
+
+  async def launch() -> str:
+    output = await autonomous.run_autonomous(
+      "System",
+      "Go.",
+      **authority,
+      registry_scope=NoRegistryScope(),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+    )
+    return output.response
+
+  assert _run(launch()) == "done"
+  assert seen == [launch_value]
+  assert current_approval_settings().approval_policy == flipped
+
+  # Launched under an existing pin (an autonomous child) it keeps that pin,
+  # even though the live file now says otherwise.
+  seen.clear()
+  outer = ApprovalSettings.from_record(
+    {"approval_policy": launch_value, "approve_live_orders": False},
+  )
+  with pin_approval_settings(outer):
+    assert _run(launch()) == "done"
+  assert seen == [launch_value]

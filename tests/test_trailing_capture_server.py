@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import functools
 from types import SimpleNamespace
 from typing import Any
 
@@ -336,6 +337,46 @@ def test_deferred_dispatch_cancelled_mid_drain_keeps_first_terminal() -> None:
       "usage": {},
     }]
     assert event_log.closed is True
+
+  _run(case())
+
+def test_dispatch_cancelled_at_first_await_after_publish_finishes_cleanup() -> None:
+  async def case() -> None:
+    session = _session()
+    event_log = EventLog(defer_terminal_close=True)
+    turn = SessionStream(event_log=event_log, runner_task=None)
+    original_builder = _runtime_builder(lambda log, _sid: _AppendingRunner(log, []))
+    entered_builder = asyncio.Event()
+
+    @functools.wraps(original_builder)
+    async def cancel_at_first_await(*args: Any, **kwargs: Any) -> ChatRuntime:
+      current_task = asyncio.current_task()
+      assert current_task is not None
+      assert session.active_turn is turn
+      assert turn.runner_task is current_task
+      entered_builder.set()
+      current_task.cancel()
+      await asyncio.sleep(0)
+      return await original_builder(*args, **kwargs)
+
+    task = asyncio.create_task(
+      _dispatch_chat_turn(
+        session,
+        _inputs(),
+        turn=turn,
+        on_event=_no_event,
+        build_chat_runtime=cancel_at_first_await,
+        transcript_dir=None,
+      )
+    )
+    with pytest.raises(asyncio.CancelledError):
+      await task
+
+    assert entered_builder.is_set()
+    assert turn.settled.is_set()
+    assert session.stream_active is False
+    assert event_log.closed is True
+    assert [entry.event["type"] for entry in event_log.entries].count("stream_complete") == 1
 
   _run(case())
 

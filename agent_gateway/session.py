@@ -15,9 +15,12 @@ import jwt
 from fastapi import HTTPException
 
 from agent_workflow_contracts import WorkflowContentPage
-from agent_workflow_contracts.models import AdmittedResearchBinding, AdmittedTenant
+from agent_workflow_contracts.models import AdmittedResearchBinding, AdmittedTenant, SelectionProvenance
+from agent_gateway.user_identity_mapping import parse_storage_identity
 
 from .approval_route import NO_APPROVAL_ROUTE, ApprovalRoute
+from .auth import validate_user_key_providers
+from model_authority.bind import CapabilityBind
 from model_authority.binding import (
   CapabilityId,
   CredentialHandle,
@@ -31,6 +34,7 @@ from .mcp_activation import McpActivationFold
 from .session_event_history import SessionEventHistory
 from .session_capabilities import normalize_session_capabilities
 from hank_model_transport.policy_imports import require_inherited_role
+from hank_model_transport.user_provider_keys import is_user_key_provider, user_key_handle_id, user_key_marker
 from .ttl_policy import SESSION_TTL, TtlResolver, default_ttl_resolver, resolve_ttl_seconds
 
 if TYPE_CHECKING:
@@ -50,6 +54,8 @@ if TYPE_CHECKING:
   from .tool_result_spill import SpillSink
   from .dispatcher_factory import GatewayDispatcherDeps
 
+CallerKind = Literal["human", "agent"]
+
 
 JWT_ALGORITHM = "HS256"
 JWT_HS256_MIN_SECRET_BYTES = 32
@@ -58,13 +64,6 @@ OnSessionExpiry = Callable[["GatewaySession"], Awaitable[None] | None]
 SessionExpiryBlocker = Callable[["GatewaySession"], int]
 WorkflowOutputReader = Callable[[str, str, int], Awaitable[WorkflowContentPage]]
 WorkflowSettlementObstructionReader = Callable[[], tuple[Any, ...]]
-
-
-def _normalize_required_user_id(user_id: str | None) -> str:
-  normalized = str(user_id or "").strip()
-  if not normalized:
-    raise ValueError("user_id is required")
-  return normalized
 
 
 def _normalize_optional_identity_value(value: str | None) -> str | None:
@@ -79,18 +78,10 @@ def session_owner_user_id(
 ) -> str:
   """Return the canonical event-bus owner for a trusted session."""
 
-  owner_user_id = (
-    str(
-      getattr(session, "owner_user_id", None)
-      or getattr(session, "user_id", None)
-      or ""
-    ).strip()
-    if session is not None
-    else ""
-  )
+  owner_user_id = getattr(session, "owner_user_id", None) if session is not None else None
   if not owner_user_id and required:
     raise ValueError("session owner_user_id is required")
-  return owner_user_id
+  return owner_user_id if owner_user_id is not None else ""
 
 
 def session_research_binding(
@@ -266,12 +257,18 @@ class GatewaySession:
   capabilities: frozenset[str] = field(default_factory=frozenset)
   model_entitled_capabilities: frozenset[str] = field(default_factory=frozenset)
   model_entitled_keys: frozenset[str] = field(default_factory=frozenset)
+  enrolled_user_key_providers: frozenset[str] = frozenset()
+  unavailable_user_key_providers: frozenset[str] = frozenset()
   kind: Literal["chat", "control"] = "chat"
   auth_config: dict[str, Any] | None = field(default=None, repr=False)
   session_token: str | None = field(default=None, repr=False)
   tenant_id: str | None = None
   session_credential_handle: CredentialHandle | None = None
   allow_service_for_interactive: bool = False
+  #: Set only by /chat/init for a keyless session-driver provider opened under a
+  #: verified commercial claim. It holds no credential: each turn binds only the
+  #: metered seat a verified V4 mints, else refuses with ``user_key_missing``.
+  metered_pending_provider: str | None = None
   capability_run_overrides: Mapping[CapabilityId, ModelSelectionIntent] = field(
     default_factory=lambda: MappingProxyType({})
   )
@@ -283,6 +280,7 @@ class GatewaySession:
   raw_user_id: str | None = None
   user_slug: str | None = None
   user_aliases: tuple[str, ...] = field(default_factory=tuple)
+
   identity_status: str | None = None
   is_public: bool = False
   schema_version: int = DEFAULT_SCHEMA_VERSION
@@ -358,6 +356,10 @@ class GatewaySession:
   # The session-log factory opens exactly this path instead of minting one
   # keyed by `session_id`.
   resume_log_path: Path | None = None
+  # The session id that log was created under. The durable log is the
+  # conversation, so whatever is keyed by its session — the session-scoped
+  # citation registry above all — is keyed by this id, not the resumed one.
+  resumed_from_session_id: str | None = None
   # The caller's existing log an init-time fork seeds its history from: read
   # once, never bound; this session's own log is minted from `session_id`.
   fork_source_log_path: Path | None = None
@@ -368,6 +370,8 @@ class GatewaySession:
   autonomous_task_id: str | None = None
   autonomous_channel_id: str | None = None
   autonomous_launch_nonce: str | None = None
+  # Projected only from the authenticated autonomous launch envelope.
+  autonomous_selection_provenance: SelectionProvenance | None = None
   autonomous_control_authority: AutonomousControlAuthority | None = field(
     default=None,
     repr=False,
@@ -397,6 +401,19 @@ class GatewaySession:
   dispatch_scope: dict[str, Any] | None = None
   stage_skill_route: dict[str, str] | None = None
   purpose: str | None = None
+  #: Who this session is for, minted positively by the door that creates it
+  #: (`caller_kind_for_channel` at chat init; the control plane and the runtime
+  #: child set `agent`). A product door that needs the caller's kind reads it and
+  #: refuses a session no door classified. Distinct from `purpose`, which is the
+  #: turn's context purpose and is rewritten on every /api/chat turn.
+  caller_kind: CallerKind | None = None
+  #: Mints the per-turn delegated bearer an agent tool callback presents (the
+  #: AuthManager sets it when it issues or verifies this session's token); the
+  #: dispatcher injects that bearer into MCP meta instead of the session's own.
+  tool_callback_token_issuer: Callable[[str], str] | None = field(
+    default=None, repr=False, compare=False,
+  )
+  tool_callback_tokens: Dict[str, str] = field(default_factory=dict, repr=False, compare=False)
   learn_memory_nudge_turns: int = 0
   learn_skill_nudge_iters: int = 0
   learning_fork_config: LearningForkConfig | None = field(default=None, repr=False)
@@ -432,12 +449,30 @@ class GatewaySession:
   )
   _expiring: bool = False
 
+  def __post_init__(self) -> None:
+    self.enrolled_user_key_providers = validate_user_key_providers(
+      self.enrolled_user_key_providers, field_name="enrolled_user_key_providers",
+    )
+    self.unavailable_user_key_providers = validate_user_key_providers(
+      self.unavailable_user_key_providers, field_name="unavailable_user_key_providers",
+    )
+    if self.enrolled_user_key_providers & self.unavailable_user_key_providers:
+      raise ValueError("user-key provider enrollment cannot be both known and unavailable")
+    if self.owner_user_id is not None:
+      self.owner_user_id = parse_storage_identity(self.owner_user_id).storage_id
+
   @property
   def turn_in_progress(self) -> bool:
     """Whether this session holds a chat turn that has not published its terminal."""
 
     turn = self.active_turn
     return turn is not None and turn.in_progress
+
+  @property
+  def conversation_session_id(self) -> str:
+    """The session id the durable log was created under: the origin's after an init-time resume."""
+
+    return self.resumed_from_session_id or self.session_id
 
 
 def child_gateway_session(
@@ -461,6 +496,8 @@ def child_gateway_session(
     owner_user_id=tenant.storage_id if tenant is not None else None,
     role=tenant.role if tenant is not None else require_inherited_role(parent),
     capabilities=normalize_session_capabilities(getattr(parent, "capabilities", ())),
+    enrolled_user_key_providers=parent.enrolled_user_key_providers,
+    unavailable_user_key_providers=parent.unavailable_user_key_providers,
     auth_config=dict(auth_config),
     channel=parent.channel,
     is_public=parent.is_public,
@@ -527,6 +564,22 @@ def bind_session_credentials(
     if credential_provider == "anthropic" and isinstance(credential_source, Mapping)
     else None
   )
+  user_key = user_key_marker(session.auth_config or {})
+  if user_key is not None:
+    handle_id = user_key_handle_id(
+      risk_user_id=user_key.risk_user_id, provider=credential_provider,
+    )
+  elif (
+    credential_principal == "user"
+    and is_user_key_provider(credential_provider)
+    and (session.auth_config or {}).get("auth_mechanism") == "api_key"
+    and (session.auth_config or {}).get("entitlement_kind") == "commercial_byok"
+  ):
+    # Credit-exhausted session starts have a user API route but no leased
+    # material. The capability materializer resolves this exact user's pool.
+    handle_id = user_key_handle_id(
+      risk_user_id=session.risk_user_id, provider=credential_provider,
+    )
   handle = CredentialHandle(
     handle_id=handle_id or generation_ref or f"cred_{uuid.uuid4().hex}",
     provider=credential_provider,
@@ -621,6 +674,8 @@ class SessionStore:
     capabilities: frozenset[str] | set[str] | tuple[str, ...] | list[str] = frozenset(),
     model_entitled_capabilities: frozenset[str] = frozenset(),
     model_entitled_keys: frozenset[str] = frozenset(),
+    enrolled_user_key_providers: frozenset[str] = frozenset(),
+    unavailable_user_key_providers: frozenset[str] = frozenset(),
     kind: Literal["chat", "control"] = "chat",
     auth_config: dict[str, Any] | None = None,
     ttl_seconds: int | None = None,
@@ -637,7 +692,7 @@ class SessionStore:
   ) -> GatewaySession:
     now = int(time.time())
     session_id = f"sess_{uuid.uuid4().hex}"
-    normalized_user_id = _normalize_required_user_id(user_id)
+    normalized_user_id = user_id
     ttl = (
       resolve_ttl_seconds(self.ttl_resolver, normalized_user_id, SESSION_TTL, self.ttl)
       if ttl_seconds is None
@@ -647,9 +702,9 @@ class SessionStore:
       normalized_risk_user_id = int(risk_user_id or 0)
     except (TypeError, ValueError):
       normalized_risk_user_id = 0
-    normalized_owner_user_id = _normalize_optional_identity_value(owner_user_id)
+    normalized_owner_user_id = owner_user_id
     if normalized_owner_user_id is None:
-      normalized_owner_user_id = str(normalized_risk_user_id) if normalized_risk_user_id > 0 else normalized_user_id
+      normalized_owner_user_id = str(normalized_risk_user_id) if normalized_risk_user_id > 0 else user_id
     normalized_raw_user_id = _normalize_optional_identity_value(raw_user_id) or normalized_user_id
     normalized_user_slug = _normalize_optional_identity_value(user_slug)
     if (
@@ -675,6 +730,8 @@ class SessionStore:
       capabilities=normalize_session_capabilities(capabilities),
       model_entitled_capabilities=frozenset(model_entitled_capabilities),
       model_entitled_keys=frozenset(model_entitled_keys),
+      enrolled_user_key_providers=enrolled_user_key_providers,
+      unavailable_user_key_providers=unavailable_user_key_providers,
       kind=kind,
       auth_config=dict(auth_config) if auth_config is not None else None,
       owner_user_id=normalized_owner_user_id,
@@ -906,6 +963,31 @@ class SessionStore:
     session.tool_result_spill_sink = None
 
 
+#: The purpose claim of a delegated bearer minted for an agent tool's callback into
+#: a product route. The gateway signs it; a bearer cannot drop the claim, so a
+#: product route that reads it knows the caller is an agent, never a human.
+AGENT_TOOL_CALLBACK_PURPOSE = "agent_tool_callback"
+#: The stored purpose of a detached runtime child's session (set at launch).
+AUTONOMOUS_RUNTIME_SESSION_PURPOSE = "autonomous_runtime"
+#: Chat init mints the session's caller kind from its client channel: a human at
+#: a product client, or an agent program operating the user's session (the `mcp`
+#: channel). Classification is positive on both sides; a session with no caller
+#: kind is refused by a door that needs it.
+HUMAN_SESSION_CHANNELS = frozenset({"excel", "web", "cli", "tui", "telegram", "discord"})
+AGENT_CLIENT_SESSION_CHANNELS = frozenset({"mcp"})
+
+
+def caller_kind_for_channel(channel: str | None) -> CallerKind | None:
+  """The caller kind a chat session minted for `channel` carries; None for a
+  channel no door attributes (`public`), which a caller-kind reader then refuses."""
+  if channel in HUMAN_SESSION_CHANNELS:
+    return "human"
+  if channel in AGENT_CLIENT_SESSION_CHANNELS:
+    return "agent"
+  return None
+_TOOL_CALLBACK_TOKEN_TURNS_KEPT = 8
+
+
 class AuthManager:
   """Issue and verify JWT session tokens for the gateway HTTP API."""
 
@@ -919,6 +1001,7 @@ class AuthManager:
       )
     self._secret = secret
     self._valid_keys = set(valid_keys)
+    self._requires_api_key = bool(self._valid_keys)
     self.session_store = session_store
 
   @staticmethod
@@ -933,20 +1016,61 @@ class AuthManager:
       raise HTTPException(status_code=401, detail="Missing Authorization header")
     return authorization.split(" ", 1)[1]
 
+  def register_api_key(self, api_key: str) -> None:
+    """Admit a credential to the authoritative valid-key set."""
+    self._valid_keys.add(api_key)
+
+  def revoke_api_key(self, api_key: str) -> None:
+    """Remove a credential without changing the initial authentication mode."""
+    self._valid_keys.discard(api_key)
+
   def validate_api_key(self, api_key: str) -> None:
     """Partition holders of a configured gateway key from everyone else at session init.
 
-    An empty key set means no partition, by `create_agent`'s contract (`easy.py`: any
-    non-empty key is accepted); a deployment that must partition configures keys, and
-    the product composition root (`api/auth.py`) refuses to boot without them.
+    An initially empty key set means no partition, by `create_agent`'s contract
+    (`easy.py`: any non-empty key is accepted); a deployment that must partition
+    configures keys, and the product composition root (`api/auth.py`) refuses to
+    boot without them. Revoking keys never changes that initial mode.
     """
     if not api_key:
       raise HTTPException(status_code=401, detail="Missing API key")
-    if self._valid_keys and api_key not in self._valid_keys:
+    if self._requires_api_key and api_key not in self._valid_keys:
       raise HTTPException(status_code=401, detail="Invalid API key")
 
   def issue_token(self, session: GatewaySession) -> str:
+    token = jwt.encode(self._token_payload(session), self._secret, algorithm=JWT_ALGORITHM)
+    session.session_token = token
+    self._bind_tool_callback_issuer(session)
+    return token
+
+  def issue_tool_callback_token(self, session: GatewaySession, *, turn_id: str) -> str:
+    """The delegated bearer an agent tool callback presents on `session`'s behalf
+    during one turn: the session's identity, role, channel and entitlements with
+    `purpose=agent_tool_callback`, minted once per turn and cached on the session."""
+    if type(turn_id) is not str or not turn_id.strip():
+      raise ValueError("tool callback token requires a turn id")
+    cached = session.tool_callback_tokens.get(turn_id)
+    if cached is not None:
+      return cached
     payload = {
+      **self._token_payload(session),
+      "purpose": AGENT_TOOL_CALLBACK_PURPOSE,
+      "turn_id": turn_id,
+    }
+    token = jwt.encode(payload, self._secret, algorithm=JWT_ALGORITHM)
+    tokens = session.tool_callback_tokens
+    while len(tokens) >= _TOOL_CALLBACK_TOKEN_TURNS_KEPT:
+      del tokens[next(iter(tokens))]
+    tokens[turn_id] = token
+    return token
+
+  def _bind_tool_callback_issuer(self, session: GatewaySession) -> None:
+    session.tool_callback_token_issuer = (
+      lambda turn_id: self.issue_tool_callback_token(session, turn_id=turn_id)
+    )
+
+  def _token_payload(self, session: GatewaySession) -> dict[str, Any]:
+    return {
       "session_id": session.session_id,
       "api_key_hash": session.api_key_hash,
       "created_at": session.created_at,
@@ -962,9 +1086,6 @@ class AuthManager:
       "is_public": session.is_public,
       "schema_version": session.schema_version,
     }
-    token = jwt.encode(payload, self._secret, algorithm=JWT_ALGORITHM)
-    session.session_token = token
-    return token
 
   def _decode_token(self, token: str) -> dict[str, Any]:
     try:
@@ -974,6 +1095,14 @@ class AuthManager:
 
     if "kind" in payload or "session_class" in payload:
       raise HTTPException(status_code=401, detail="Session class claims are forbidden")
+    if "purpose" in payload or "turn_id" in payload:
+      turn_id = payload.get("turn_id")
+      if (
+        payload.get("purpose") != AGENT_TOOL_CALLBACK_PURPOSE
+        or type(turn_id) is not str
+        or not turn_id.strip()
+      ):
+        raise HTTPException(status_code=401, detail="Invalid delegated bearer claims")
 
     session_id = payload.get("session_id")
     api_key_hash = payload.get("api_key_hash")
@@ -1009,13 +1138,9 @@ class AuthManager:
 
     # A bearer cannot reassert a different user, email, risk user or a higher
     # role than the session store recorded when it issued the session.
-    token_user_id = str(payload.get("user_id") or "").strip()
-    if not token_user_id:
+    token_user_id = payload.get("user_id")
+    if not isinstance(token_user_id, str) or not token_user_id.strip():
       raise HTTPException(status_code=401, detail="Invalid session user_id")
-    try:
-      token_user_id = _normalize_required_user_id(token_user_id)
-    except ValueError as exc:
-      raise HTTPException(status_code=401, detail=str(exc)) from exc
     if token_user_id != session.user_id:
       raise HTTPException(status_code=401, detail="Session user mismatch")
     token_user_email = payload.get("user_email")
@@ -1091,8 +1216,20 @@ class AuthManager:
     session = self.session_store.get_session(session_id)
     if session is None:
       raise HTTPException(status_code=401, detail="Unknown session")
-    session.session_token = token
+    if payload.get("purpose") != AGENT_TOOL_CALLBACK_PURPOSE:
+      session.session_token = token
+    self._bind_tool_callback_issuer(session)
     return session, payload
+
+  def verify_token_caller_kind(self, token: str) -> tuple[GatewaySession, CallerKind | None]:
+    """The session plus who presents it, classified positively on both sides:
+    `agent` for the delegated tool-callback bearer (its gateway-signed claim), else
+    the caller kind the session's door minted (`human` or `agent`); None for a
+    session no door classified, which the reader refuses rather than attributes."""
+    session, payload = self.verify_token_with_payload(token)
+    if payload.get("purpose") == AGENT_TOOL_CALLBACK_PURPOSE:
+      return session, "agent"
+    return session, session.caller_kind
 
   def verify_token(self, token: str) -> GatewaySession:
     session, _payload = self.verify_token_with_payload(token)
@@ -1101,6 +1238,11 @@ class AuthManager:
 
 
 __all__ = [
+  "AGENT_TOOL_CALLBACK_PURPOSE",
+  "AUTONOMOUS_RUNTIME_SESSION_PURPOSE",
+  "CallerKind",
+  "HUMAN_SESSION_CHANNELS",
+  "caller_kind_for_channel",
   "AuthManager",
   "GatewaySession",
   "SessionStore",

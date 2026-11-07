@@ -22,7 +22,23 @@ from agent_gateway.mcp_client import (
   _resolve_mcp_config_path,
   _stdio_connect_retry_delay,
 )
-from agent_gateway.mcp_client_config import McpEnvExpansionError
+from agent_gateway.mcp_client_config import MCP_CHILD_FIXED_ENV, McpEnvExpansionError
+
+FASTMCP_CHILD_ENV = {
+  "FASTMCP_SHOW_SERVER_BANNER": "false",
+  "FASTMCP_CHECK_FOR_UPDATES": "off",
+}
+
+
+def test_every_child_env_turns_off_the_fastmcp_banner_and_update_check() -> None:
+  assert MCP_CHILD_FIXED_ENV == FASTMCP_CHILD_ENV
+  assert mcp_client_config.build_mcp_env(None, environ={}, base_environ={}) == {
+    "HANK_RUN_ROUTE_FILE": "", **FASTMCP_CHILD_ENV,
+  }
+  # An entry that asks for the banner explicitly still gets it.
+  assert mcp_client_config.build_mcp_env(
+    {"FASTMCP_SHOW_SERVER_BANNER": "true"}, environ={}, base_environ={},
+  )["FASTMCP_SHOW_SERVER_BANNER"] == "true"
 
 
 def test_config_helper_builds_env_and_headers_from_explicit_environ() -> None:
@@ -42,6 +58,8 @@ def test_config_helper_builds_env_and_headers_from_explicit_environ() -> None:
   ) == {
     "PATH": "/usr/bin",
     "HOME": "/tmp/home",
+    "HANK_RUN_ROUTE_FILE": "",
+    **FASTMCP_CHILD_ENV,
     "AUTH": "Bearer secret",
   }
   assert mcp_client_config.build_http_headers(
@@ -79,6 +97,8 @@ def test_parent_wrappers_use_parent_module_environ(monkeypatch) -> None:
     {"TOKEN": "${HEADER_TOKEN}"}, environ={"HEADER_TOKEN": "abc"},
   ) == {
     "PATH": "/bin",
+    "HANK_RUN_ROUTE_FILE": "",
+    **FASTMCP_CHILD_ENV,
     "TOKEN": "abc",
   }
   assert _build_http_headers(
@@ -117,10 +137,10 @@ def test_env_and_header_helpers_ignore_non_dict_mappings(monkeypatch) -> None:
   mapping = UserDict({"Authorization": "Bearer ${TOKEN}"})
 
   assert mcp_client_config.build_mcp_env(mapping, environ={"PATH": "/bin", "TOKEN": "secret"}) == {
-    "PATH": "/bin"
+    "PATH": "/bin", "HANK_RUN_ROUTE_FILE": "", **FASTMCP_CHILD_ENV,
   }
   assert mcp_client_config.build_http_headers(mapping, environ={"TOKEN": "secret"}) == {}
-  assert _build_mcp_env(mapping, environ={}) == {"PATH": "/bin"}  # pyright: ignore[reportArgumentType]  # negative: non-dict environment mapping ignored
+  assert _build_mcp_env(mapping, environ={}) == {"PATH": "/bin", "HANK_RUN_ROUTE_FILE": "", **FASTMCP_CHILD_ENV}  # pyright: ignore[reportArgumentType]  # negative: non-dict environment mapping ignored
   assert _build_http_headers(mapping, environ={}) == {}  # pyright: ignore[reportArgumentType]  # negative: non-dict header mapping ignored
 
 

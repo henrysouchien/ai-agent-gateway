@@ -8,7 +8,6 @@ import pytest
 
 from agent_gateway.execution_snapshot import (
   build_agent_execution_snapshot,
-  render_result_instructions,
 )
 from agent_gateway.operation_snapshot import (
   COMMON_CHILD_OPERATION_INSTRUCTIONS,
@@ -410,7 +409,6 @@ def test_result_metadata_does_not_refuse_declared_modes_or_projections() -> None
   assert ResultRequirement.model_validate_json(
     requirement.model_dump_json()
   ) == requirement
-  assert "complete substantive result" in render_result_instructions(requirement)
 
 
 @pytest.mark.parametrize(

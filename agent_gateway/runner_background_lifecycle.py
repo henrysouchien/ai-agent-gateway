@@ -542,7 +542,9 @@ class RunnerBackgroundLifecycleMixin:
     now = _runner_attr(self, "time", time).time()
     resumed_task_ids = (
       self._resumed_task_ids_from_registry(bg_task.task_id)
-      if getattr(bg_task, "state", None) in {TaskState.INTERRUPTED, TaskState.PARKED}
+      if getattr(bg_task, "state", None) in {
+        TaskState.INTERRUPTED, TaskState.PARKED, TaskState.AWAITING_APPROVAL,
+      }
       else None
     )
     return _runner_attr(self, "_background_task_payload", _background_task_payload)(

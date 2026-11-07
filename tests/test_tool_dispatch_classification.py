@@ -18,6 +18,7 @@ from agent_gateway.tool_dispatch_classification import (  # noqa: E402
   build_route_id,
   classify_semantic_tool_error,
   classify_tool_outcome,
+  classify_tool_error_type,
   extract_source_identities,
   resolve_dispatch_entry,
   retry_decision,
@@ -159,6 +160,45 @@ def test_dispatcher_error_codes_map_to_normalized_outcomes(
   expected: str,
 ) -> None:
   assert classify_tool_outcome(_entry(), None, error) == expected
+
+
+def test_a_server_recorded_down_is_a_settled_upstream_failure_never_retried() -> None:
+  # The message names "Connection closed", which text classification reads as a
+  # transient transport failure; the manager's recovery owns the retry, so the
+  # dispatcher must settle this answer instead of waiting on it.
+  error = {
+    "code": "mcp_tool_error",
+    "sub_code": "mcp_server_unavailable",
+    "message": "MCP server unavailable: edgar-parser-mcp; could not be reconnected: Connection closed",
+  }
+
+  outcome = classify_tool_outcome(_entry(), None, error)
+
+  assert outcome == "error_semantic"
+  assert outcome not in RETRYABLE_OUTCOMES
+  assert classify_tool_error_type(error) == "upstream_failure"
+
+  # The relayed connect error may itself contain words the text classifier reads as a
+  # rate limit; the typed sub_code still settles first.
+  relayed = {**error, "message": "MCP server unavailable: x; could not be reconnected: upstream returned HTTP 429 overloaded"}
+  assert classify_tool_outcome(_entry(), None, relayed) == "error_semantic"
+
+
+@pytest.mark.parametrize(
+  "error",
+  [
+    {"code": "tool_error", "sub_code": "connection_error", "message": "MCPError: Connection closed"},
+    {"code": "mcp_tool_error", "message": "MCP server unavailable: edgar-parser-mcp; Connection closed"},
+  ],
+  ids=["plain-transport-error", "same-words-without-the-typed-sub-code"],
+)
+def test_only_the_typed_down_server_code_stops_a_connection_closed_retry(
+  error: dict[str, Any],
+) -> None:
+  outcome = classify_tool_outcome(_entry(), None, error)
+
+  assert outcome == "error_transport"
+  assert outcome in RETRYABLE_OUTCOMES
 
 
 def test_success_signal_satisfied_classifies_ok() -> None:
@@ -641,3 +681,92 @@ def test_declaration_lookup_requires_explicit_exact_route() -> None:
     server=None,
     original_tool_name="filings_search",
   ) is None
+
+
+# The declared-type table, the payload key and the payload location are independent
+# lookups: every declared type is read once (type key, dispatcher error), and every
+# key/location pair once with one declared type that the payload's code contradicts.
+@pytest.mark.parametrize("declared, expected, key, location", [
+  ("bad_input", "bad_input", "type", "error"),
+  ("not_found", "integrity_refusal", "type", "error"),
+  ("integrity_refusal", "integrity_refusal", "type", "error"),
+  ("confirmation_required", "confirmation_required", "type", "error"),
+  ("needs_decision", "needs_decision", "type", "error"),
+  ("upstream_failure", "upstream_failure", "type", "error"),
+  ("timeout", "timeout", "type", "error"),
+  ("interrupted", "interrupted", "type", "error"),
+  ("operational_failure", "operational_failure", "type", "error"),
+  *(("upstream_failure", "upstream_failure", key, location)
+    for key in ("type", "error_type")
+    for location in ("error", "data", "nested", "result", "semantic")
+    if (key, location) != ("type", "error")),
+])
+def test_owner_error_type_wins(declared, expected, key, location):
+  owner = {key: declared, "code": "invalid_input"}
+  error, result, semantic = None, None, None
+  if location == "error":
+    error = owner
+  elif location == "data":
+    error = {"code": "timeout", "data": owner}
+  elif location == "nested":
+    result = {"status": "error", "error": owner}
+  elif location == "result":
+    result = {"status": "error", **owner}
+  else:
+    semantic = owner
+  assert classify_tool_error_type(error, result, semantic) == expected
+
+
+_ERROR_CODE_FAMILIES = [
+  ("tool_timeout", "timeout"), ("provider_timeout_error", "timeout"),
+  ("cancelled", "interrupted"), ("interrupted", "interrupted"),
+  ("invalid_period", "bad_input"), ("validation_error", "bad_input"),
+  ("bad_input", "bad_input"), ("workflow_invalid_input", "bad_input"),
+  ("not_found", "integrity_refusal"), ("permission_denied", "integrity_refusal"),
+  ("unknown_tool", "integrity_refusal"), ("artifact_not_found", "integrity_refusal"),
+  ("spill_unavailable", "bad_input"), ("spill_access_denied", "integrity_refusal"),
+  ("role_policy_denied", "confirmation_required"), ("approval_denied", "confirmation_required"),
+  ("user_denied", "confirmation_required"), ("needs_decision", "needs_decision"),
+  ("transport_error", "upstream_failure"), ("rate_limited", "upstream_failure"),
+  ("unclassified", "operational_failure"),
+]
+# `code` and `sub_code` are read through the same list in the owner: every code is
+# pinned on `code`, and `sub_code` carries one code of each family.
+_SUB_CODE_REPRESENTATIVES = frozenset({
+  "tool_timeout", "cancelled", "invalid_period", "not_found", "role_policy_denied",
+  "needs_decision", "transport_error", "rate_limited", "unclassified",
+})
+
+
+@pytest.mark.parametrize("code, expected, key", [
+  *((code, expected, "code") for code, expected in _ERROR_CODE_FAMILIES),
+  *((code, expected, "sub_code") for code, expected in _ERROR_CODE_FAMILIES
+    if code in _SUB_CODE_REPRESENTATIVES),
+])
+def test_error_code_family(code, expected, key):
+  assert classify_tool_error_type({key: code.upper()}) == expected
+
+
+def test_fastmcp_validation_message_and_type_precedence():
+  assert classify_tool_error_type({"code": "mcp_tool_error", "message": "1 validation error"}) == "bad_input"
+  assert classify_tool_error_type({"type": "upstream_failure", "error_type": "bad_input"}) == "upstream_failure"
+  assert classify_tool_error_type(None) == "operational_failure"
+  assert classify_tool_error_type(None, {"status": "error", "error": {"data": {"code": "invalid_period"}}}) == "bad_input"
+
+
+def test_producer_validation_error_flag_is_a_caller_refusal():
+  refusal = {
+    "status": "error",
+    "error": "unverified_citation: register_sources did not register S1",
+    "validation_error": True,
+    "error_type": "fms_invalid_judgment",
+  }
+  semantic = {"code": "tool_status_error", "sub_code": "fms_invalid_judgment"}
+  assert classify_tool_error_type(None, refusal, semantic) == "bad_input"
+  # Without the producer's flag the same unknown code stays an operational failure.
+  assert classify_tool_error_type(
+    None, {key: value for key, value in refusal.items() if key != "validation_error"}, semantic,
+  ) == "operational_failure"
+  # Declared families and transport/timeout settlements still win over the flag.
+  assert classify_tool_error_type(None, {**refusal, "error_type": "upstream_failure"}, semantic) == "upstream_failure"
+  assert classify_tool_error_type(None, {**refusal, "code": "tool_timeout"}, semantic) == "timeout"

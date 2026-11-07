@@ -14,6 +14,7 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 import agent_gateway.autonomous as autonomous  # noqa: E402
+from agent_gateway.registry_scope import NoRegistryScope
 from hank_model_transport.capability_execution import BoundCapabilityExecution
 from agent_gateway import EventLog  # noqa: E402
 from agent_gateway.session import GatewaySession  # noqa: E402
@@ -46,6 +47,7 @@ def _bound_execution() -> dict[str, Any]:
       created_at=1,
       expires_at=2,
       user_id="alice",
+      owner_user_id="alice",
       role="owner",
     ),
   }
@@ -82,6 +84,7 @@ def test_mcp_configuration_without_trusted_allowlist_fails_before_manager_constr
       autonomous.run_autonomous(
         "System",
         "Run",
+        registry_scope=NoRegistryScope(),
         **_run_kwargs(),
         **mcp_configuration,
       )
@@ -111,6 +114,7 @@ def test_disallowed_inline_names_and_aliases_fail_before_manager_construction(
       autonomous.run_autonomous(
         "System",
         "Run",
+        registry_scope=NoRegistryScope(),
         **_run_kwargs(),
         mcp_servers={inline_name: {"command": "never"}},
         trusted_mcp_allowed_servers={"portfolio-reads-mcp"},
@@ -179,6 +183,7 @@ def test_trusted_product_allowed_configuration_reaches_mocked_startup(
     autonomous.run_autonomous(
       "System",
       "Run",
+      registry_scope=NoRegistryScope(),
       **_run_kwargs(),
       **mcp_configuration,
       trusted_mcp_allowed_servers={"portfolio-reads-mcp"},

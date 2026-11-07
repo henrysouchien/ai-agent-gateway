@@ -119,7 +119,7 @@ def status_error_has_detail(result: dict[str, Any]) -> bool:
   elif nested not in (None, "", {}, []):
     return True
 
-  for key in ("message", "error_message", "detail", "reason", "code", "sub_code", "error_code", "error_type"):
+  for key in ("message", "error_message", "detail", "reason", "code", "sub_code", "error_code", "error_type", "type"):
     value = result.get(key)
     if isinstance(value, str) and value.strip():
       return True
@@ -218,11 +218,11 @@ def _validation_errors_summary(result: dict[str, Any]) -> str:
 def _nested_error_code(result: dict[str, Any]) -> str:
   nested = result.get("error")
   if isinstance(nested, dict):
-    for key in ("code", "sub_code", "error_code", "error_type"):
+    for key in ("code", "sub_code", "error_code", "error_type", "type"):
       value = nested.get(key)
       if value is not None and str(value).strip():
         return str(value).strip()
-  for key in ("code", "sub_code", "error_code", "error_type"):
+  for key in ("code", "sub_code", "error_code", "error_type", "type"):
     value = result.get(key)
     if value is not None and str(value).strip():
       return str(value).strip()

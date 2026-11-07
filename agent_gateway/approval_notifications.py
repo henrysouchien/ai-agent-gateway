@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable, Literal, Sequence
 
 from .approval_policy import ApprovalRequest
+from .production_identity import require_production_runtime
 
 
 ApprovalNotificationChannel = Literal["telegram", "email", "push"]
@@ -138,6 +139,9 @@ def build_env_telegram_approval_notification_sender(env: dict[str, str] | None =
     return None
 
   async def _sender(row: dict[str, Any]) -> None:
+    # A held send fails the outbox row as ProductionSendHeld (retryable from a
+    # production runtime) before any destination is read.
+    require_production_runtime("telegram")
     if row.get("channel") != "telegram":
       raise RuntimeError("approval notification channel has no configured sender")
     destination = str(row.get("destination") or "").strip()

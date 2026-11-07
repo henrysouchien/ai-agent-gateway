@@ -97,6 +97,10 @@ _POLICY_ERROR_CODES = frozenset(
   }
 )
 _POLICY_ERROR_CODE_PREFIXES = ("planned_write_",)
+# A server the MCP manager has recorded down and is already recovering off every
+# call's path: the typed answer is settled. A dispatch retry only waits on the
+# same refusal (the manager's recovery, not the caller, is the retry owner).
+_SERVER_DOWN_SUB_CODE = "mcp_server_unavailable"
 
 # Untyped tool-transport text is classified here; retry_eligible below is the
 # containment owner that prevents write and approval replay.
@@ -262,6 +266,9 @@ def _classify_failure_payload(payload: Mapping[str, Any] | None) -> str:
     return OUTCOME_CANCELLED
   if code in _TIMEOUT_ERROR_CODES or sub_code in _TIMEOUT_ERROR_CODES:
     return OUTCOME_TIMEOUT
+  if sub_code == _SERVER_DOWN_SUB_CODE:
+    # Before text matching: the connect error it relays may say "429" or "overloaded".
+    return OUTCOME_SEMANTIC
   if _is_rate_limited(code, sub_code, text):
     return OUTCOME_RATE_LIMITED
   if _is_policy_refusal(code):
@@ -324,6 +331,122 @@ def classify_tool_outcome(
   if satisfied is False:
     return OUTCOME_SEMANTIC
   return OUTCOME_OK
+
+
+ToolErrorType = Literal[
+  "bad_input", "integrity_refusal", "confirmation_required", "needs_decision",
+  "upstream_failure", "timeout", "interrupted", "operational_failure",
+]
+
+
+def classify_tool_error_type(
+  error: Mapping[str, Any] | None,
+  result: Any = None,
+  semantic_error: Mapping[str, Any] | None = None,
+) -> ToolErrorType:
+  """Project the owner's error family, classifying only otherwise untyped failures."""
+  if isinstance(error, Mapping):
+    primary = error
+  elif isinstance(result, Mapping) and isinstance(result.get("error"), Mapping):
+    primary = result["error"]
+  elif isinstance(result, Mapping):
+    primary = result
+  elif isinstance(semantic_error, Mapping):
+    primary = semantic_error
+  else:
+    primary = {}
+  payloads = [primary]
+  nested_data = primary.get("data")
+  if isinstance(nested_data, Mapping):
+    payloads.append(nested_data)
+  if error is None and isinstance(result, Mapping):
+    payloads.append(result)
+    result_data = result.get("data")
+    if isinstance(result_data, Mapping):
+      payloads.append(result_data)
+  if isinstance(semantic_error, Mapping):
+    payloads.append(semantic_error)
+  declared_types: dict[str, ToolErrorType] = {
+    "bad_input": "bad_input",
+    "not_found": "integrity_refusal",
+    "integrity_refusal": "integrity_refusal",
+    "confirmation_required": "confirmation_required",
+    "needs_decision": "needs_decision",
+    "upstream_failure": "upstream_failure",
+    "timeout": "timeout",
+    "interrupted": "interrupted",
+    "operational_failure": "operational_failure",
+  }
+  for payload in payloads:
+    for key in ("type", "error_type", "code", "sub_code"):
+      if key in payload and not isinstance(payload[key], str):
+        return "operational_failure"
+  for payload in payloads:
+    for key in ("type", "error_type"):
+      value = payload.get(key)
+      if isinstance(value, str) and value in declared_types:
+        return declared_types[value]
+  codes = [
+    value.strip().lower()
+    for payload in payloads
+    for key in ("code", "sub_code")
+    if isinstance(value := payload.get(key), str)
+  ]
+  if any("timeout" in value for value in codes):
+    return "timeout"
+  if any(value in {"cancelled", "interrupted"} for value in codes):
+    return "interrupted"
+  # A producer's own `validation_error: true` says the caller's input was
+  # refused before anything changed (the Risk research adapter marks every typed
+  # caller refusal this way, e.g. `fms_invalid_judgment` for an unverified
+  # citation); its code names the reason, not a family this table knows.
+  # ``tool_result_read``'s declared refusals: the reference names no spill this
+  # reader can read (missing, expired, changed, or no reading job at a door),
+  # which the caller can act on through the refusal's ``next_call``; an
+  # unadmitted member is a foreign-resource refusal.
+  if (
+    is_mcp_validation_error(primary)
+    or any(payload.get("validation_error") is True for payload in payloads)
+    or any(
+      value.startswith("invalid_")
+      or value in {"validation_error", "bad_input", "workflow_invalid_input", "spill_unavailable"}
+      for value in codes
+    )
+  ):
+    return "bad_input"
+  if any(
+    value in {"not_found", "permission_denied", "unknown_tool", "spill_access_denied"}
+    or value.endswith("_not_found")
+    for value in codes
+  ):
+    return "integrity_refusal"
+  # Refused authority (operations contract §3: 403 / exit 5): the caller's role,
+  # session or profile does not hold what the call needs; the owner's next_call
+  # names the recourse.
+  if any(
+    value in {
+      "role_policy_denied", "approval_denied", "user_denied",
+      "operation_unavailable", "skill_not_allowed",
+    }
+    for value in codes
+  ):
+    return "confirmation_required"
+  if "needs_decision" in codes:
+    return "needs_decision"
+  if _SERVER_DOWN_SUB_CODE in codes:
+    return "upstream_failure"
+  outcome = classify_tool_outcome(
+    None, result,
+    error if isinstance(error, Mapping) else None,
+    semantic_error if isinstance(semantic_error, Mapping) else None,
+  )
+  if outcome == OUTCOME_TIMEOUT:
+    return "timeout"
+  if outcome == OUTCOME_CANCELLED:
+    return "interrupted"
+  if outcome in {OUTCOME_TRANSPORT, OUTCOME_RATE_LIMITED}:
+    return "upstream_failure"
+  return "operational_failure"
 
 
 def extract_source_identities(

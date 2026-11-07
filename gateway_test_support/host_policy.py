@@ -20,6 +20,7 @@ def owner_session_host_policy():
     get_forbidden_tools_for_session=lambda _session, *, profile_name=None, role=None: frozenset(),
     get_server_for_policy_tool=lambda _tool_name: None,
     get_tool_class=None,
+    get_local_tool_registration_effect=lambda _tool_name: None,
   )
   previous = load_server_policy_module()
   configure_server_policy(policy)

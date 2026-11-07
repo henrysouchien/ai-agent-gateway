@@ -8,31 +8,21 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
-from agent_gateway import SubAgentConfig as PackageSubAgentConfig, ToolResultContext as PackageToolResultContext  # noqa: E402
-import agent_gateway.runner as gateway_runner  # noqa: E402
+from agent_gateway.registry_scope import NoRegistryScope  # noqa: E402
 from agent_gateway.runner_state import (  # noqa: E402
   BackgroundTask,
   budget_cost_progress,
   CostAccumulator,
   StreamTurnResult,
-  SubAgentConfig,
   ToolResultContext,
 )
 
 
-def test_runner_preserves_state_helper_aliases() -> None:
-  assert gateway_runner.ToolResultContext is ToolResultContext
-  assert PackageToolResultContext is ToolResultContext
-  assert gateway_runner.SubAgentConfig is SubAgentConfig
-  assert PackageSubAgentConfig is SubAgentConfig
-  assert gateway_runner.StreamTurnResult is StreamTurnResult
-  assert gateway_runner.BackgroundTask is BackgroundTask
-  assert gateway_runner.CostAccumulator is CostAccumulator
-  assert gateway_runner._budget_cost_progress is budget_cost_progress
 
 
 def test_tool_result_context_defaults_are_optional() -> None:
   ctx = ToolResultContext(
+    registry_scope=NoRegistryScope(),
     tool_name="lookup",
     tool_input={"symbol": "MSFT"},
     redacted_tool_input={"symbol": "MSFT"},
@@ -53,6 +43,7 @@ def test_tool_result_context_defaults_are_optional() -> None:
 
 def test_tool_result_context_carries_trusted_routing_provider() -> None:
   ctx = ToolResultContext(
+    registry_scope=NoRegistryScope(),
     tool_name="fetch_financials",
     tool_input={"symbol": "MSFT"},
     redacted_tool_input={"symbol": "MSFT"},

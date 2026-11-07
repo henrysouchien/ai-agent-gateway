@@ -3,6 +3,7 @@ from pathlib import Path
 
 from hank_model_transport.capability_execution import BoundCapabilityExecution
 from agent_gateway import DeliveryConfig, GatewaySession, run_autonomous_sync
+from agent_gateway.registry_scope import NoRegistryScope
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
@@ -82,6 +83,7 @@ if __name__ == "__main__":
     "You are a concise operations assistant. Always call read_status before you reply.",
     "Check the current service status and send a short summary.",
     capability_execution=capability_execution,
+    registry_scope=NoRegistryScope(),
     admitted_skill_execution_limits=None,
     session=GatewaySession(
       session_id="autonomous-example",

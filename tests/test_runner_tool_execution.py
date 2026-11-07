@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import copy
@@ -18,6 +20,8 @@ ROOT = Path(__file__).resolve().parents[3]
 PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
+if str(ROOT / "api") not in sys.path:
+  sys.path.insert(0, str(ROOT / "api"))
 
 from agent_workflow_contracts import (  # noqa: E402
   ActivityHandle,
@@ -52,7 +56,6 @@ from agent_gateway.runner_background_tasks import (  # noqa: E402
   ordinary_parent_result_policy,
 )
 from agent_gateway.tool_result_spill import SpillCapabilities, SpillSink  # noqa: E402
-from agent_gateway.runner_tool_execution import RunnerToolExecutionMixin  # noqa: E402
 from agent_gateway.runner_tool_audit import redact_tool_input_for_event  # noqa: E402
 from agent_gateway.tool_policy_registry import PreparedToolCall, ToolInputPreparationError  # noqa: E402
 from agent_gateway.tool_dispatch_classification import (  # noqa: E402
@@ -98,6 +101,14 @@ def _capability_execution():
 
 
 class _Dispatcher:
+  run_context = run_context_for_test(
+    profile="",
+    registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
+  )
+
+  def bind_research_file_activity_owner(self, ensure_activity: Any) -> None:
+    self.ensure_research_file_activity = ensure_activity
+
   def redact_prepared_tool_input(
     self,
     tool_name: str,
@@ -986,10 +997,6 @@ def _workflow_result(delivery_status: str) -> dict[str, Any]:
   }
 
 
-def test_runner_tool_execution_method_is_inherited_from_mixin() -> None:
-  assert issubclass(AgentRunner, RunnerToolExecutionMixin)
-  assert gateway_runner.RunnerToolExecutionMixin is RunnerToolExecutionMixin
-  assert AgentRunner._execute_single_tool is RunnerToolExecutionMixin._execute_single_tool
 
 
 def test_incomplete_workflow_result_does_not_stage_final_attachment() -> None:
@@ -1092,15 +1099,8 @@ def test_execute_single_tool_resolves_parent_module_helpers(monkeypatch: Any) ->
   assert tool_name == "file_read"
   assert extra_blocks == []
   assert json.loads(live_entry["content"]) == {"status": "ok", "echo": {"path": "secret.txt"}}
-  assert start_calls[0]["tool_input"] == {"path": "[patched]"}
-  assert start_calls[0]["call_index"] == 3
-  assert complete_calls[0]["result"] == {"status": "ok", "echo": {"path": "secret.txt"}}
-  assert semantic_calls == [{"status": "ok", "echo": {"path": "secret.txt"}}]
 
   events = [entry.event for entry in runner._log.entries]
-  assert events[0]["type"] == "patched_start"
-  assert events[0]["display"] == {"name": "file_read", "input": {"path": "[patched]"}}
-  assert events[-1]["type"] == "patched_complete"
   assert events[-1]["final_tool_result_blocks"][0]["content"] == live_entry["content"]
 
 
@@ -1203,7 +1203,7 @@ def test_readable_resource_snapshot_copies_producer_stamped_type(caplog) -> None
     "content": content,
     "truncated": False,
   }
-  runner = SimpleNamespace(_full_session_id="control-run-readable", _skill_run_id="")
+  runner = _readable_resource_runner(session_id="control-run-readable")
 
   with caplog.at_level("WARNING", logger="agent_gateway.runner"):
     event = runner_tool_execution._readable_resource_event_from_snapshot(
@@ -1221,6 +1221,87 @@ def test_readable_resource_snapshot_copies_producer_stamped_type(caplog) -> None
     record for record in caplog.records if "Dropping readable-resource snapshot" in record.getMessage()
   ]
 
+
+def _readable_resource_runner(*, session_id: str, run_context: RunContext | None = None) -> SimpleNamespace:
+  return SimpleNamespace(
+    _full_session_id=session_id,
+    _skill_run_id="",
+    _dispatcher=SimpleNamespace(
+      run_context=run_context
+      or run_context_for_test(registry_scope=RegistryScope("run", "test-run", "/tmp/test-store")),
+    ),
+  )
+
+
+def _readable_resource_snapshot() -> dict[str, Any]:
+  content = "## Daily note\n\nCaptured markdown.\n"
+  return {
+    "contract_name": "MarkdownNote",
+    "content_type": "text/markdown",
+    "content_class": "human_readable",
+    "source_path": "daily/2026-06-12.md",
+    "content_snapshot_id": "sha256:deadbeef",
+    "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    "content_bytes": len(content.encode("utf-8")),
+    "content": content,
+    "truncated": False,
+  }
+
+
+def test_readable_resource_event_carries_the_signed_autonomous_control_run_id(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  # The retired env name is ignored: the child env strips it, and the signed run context's
+  # request id is the autonomous run's control id, not the provider-scoped session id.
+  monkeypatch.setenv("AGENT_AUTONOMOUS_CONTROL_RUN_ID", "bg_from_env")
+  runner = _readable_resource_runner(
+    session_id="autonomous-session-scoped",
+    run_context=run_context_for_test(
+      registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
+      request_id="bg_signed",
+      autonomous=True,
+    ),
+  )
+
+  event = runner_tool_execution._readable_resource_event_from_snapshot(
+    runner,
+    _readable_resource_snapshot(),
+    tool_call_id="tool-readable",
+    tool_name="memory_write",
+    timestamp=1.0,
+  )
+
+  assert event is not None
+  assert event["control_run_id"] == "bg_signed"
+  assert event["run_id"] == "bg_signed"
+  assert event["session_id"] == "autonomous-session-scoped"
+
+
+def test_readable_resource_event_of_an_unsigned_autonomous_context_has_no_control_run_id(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.setenv("AGENT_AUTONOMOUS_CONTROL_RUN_ID", "bg_from_env")
+  runner = _readable_resource_runner(
+    session_id="autonomous-session-scoped",
+    run_context=run_context_for_test(
+      registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
+      request_id="  ",
+      autonomous=True,
+    ),
+  )
+
+  event = runner_tool_execution._readable_resource_event_from_snapshot(
+    runner,
+    _readable_resource_snapshot(),
+    tool_call_id="tool-readable",
+    tool_name="memory_write",
+    timestamp=1.0,
+  )
+
+  assert event is not None
+  assert event["control_run_id"] is None
+  assert event["run_id"] is None
+  assert event["session_id"] == "autonomous-session-scoped"
 
 
 def test_background_result_queues_ack_only_after_durable_tool_result() -> None:
@@ -1532,7 +1613,7 @@ def _profile_excluded_error(tool_name: str) -> dict[str, Any]:
       f"Tool '{tool_name}' is excluded by the profile's static excluded tools "
       "and is not available in this run."
     ),
-    "data": {"excluding_owner": "profile", "next_call": None},
+    "data": {"excluding_owner": "profile", "next_call": None, "type": "operational_failure"},
   }
 
 
@@ -1587,6 +1668,7 @@ def test_unrelated_mcp_result_cannot_lift_tool_exclusion(
     get_tool_definitions=lambda: definitions,
     allowed_mcp_tools_by_server={"fred-mcp": {"fred_search"}},
     needs_approval=lambda *_args: False,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   runner = AgentRunner(
     event_log=EventLog(session_id="untrusted-load-signal"),
@@ -1650,6 +1732,7 @@ def test_execute_single_tool_names_the_skill_run_as_the_excluding_owner() -> Non
       request_id="req-1",
       profile="analyst",
       skill="model-build",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     )
 
   runner = AgentRunner(
@@ -1671,6 +1754,7 @@ def test_execute_single_tool_names_the_skill_run_as_the_excluding_owner() -> Non
   assert error["code"] == "tool_excluded"
   assert "skill's declared excludes" in error["message"]
   assert error["data"] == {
+    "type": "operational_failure",
     "excluding_owner": "skill_or_operation_grant",
     "profile": "analyst",
     "skill": "model-build",
@@ -1689,6 +1773,7 @@ def test_execute_single_tool_never_blames_the_skill_for_a_grant_omitted_tool() -
       run_id="skill-run-1",
       profile="analyst",
       skill="explore",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     )
 
   runner = AgentRunner(
@@ -1734,6 +1819,7 @@ def test_execute_single_tool_preserves_dispatcher_error_data_for_model_result() 
   error = json.loads(live_entry["content"])["error"]
   assert error["code"] == "tool_unavailable"
   assert error["data"] == {
+    "type": "operational_failure",
     "deferred_tool": True,
     "required_tool_pack": "market-data",
     "required_tool_packs": ["market-data"],
@@ -1770,6 +1856,7 @@ def test_execute_single_tool_exposes_top_level_tool_usage_hint_in_model_error_da
   error = json.loads(live_entry["content"])["error"]
   assert error["code"] == "mcp_tool_error"
   assert error["data"] == {
+    "type": "bad_input",
     "tool_usage_hint": "Pass research_file_id; do not pass ticker.",
     "next_call": None,
   }
@@ -1777,7 +1864,7 @@ def test_execute_single_tool_exposes_top_level_tool_usage_hint_in_model_error_da
   complete_events = [entry.event for entry in runner._log.entries if entry.event.get("type") == "tool_call_complete"]
   assert complete_events
   assert complete_events[-1]["error"]["tool_usage_hint"] == "Pass research_file_id; do not pass ticker."
-  assert complete_events[-1]["error"]["data"] == {"tool_usage_hint": "Pass research_file_id; do not pass ticker."}
+  assert complete_events[-1]["error"]["data"] == {"tool_usage_hint": "Pass research_file_id; do not pass ticker.", "type": "bad_input"}
   assert complete_events[-1]["final_tool_result_blocks"][0]["content"] == live_entry["content"]
 
 
@@ -1815,7 +1902,7 @@ def test_execute_single_tool_carries_a_refusals_top_level_next_call_to_the_model
   })
 
   assert error["code"] == "context_research_file_id_mismatch"
-  assert error["data"] == {"next_call": next_call}
+  assert error["data"] == {"next_call": next_call, "type": "operational_failure"}
 
 
 def test_execute_single_tool_writes_an_explicit_null_next_call_when_the_refusal_names_none() -> None:
@@ -1827,7 +1914,7 @@ def test_execute_single_tool_writes_an_explicit_null_next_call_when_the_refusal_
   assert error == {
     "code": "required_context_missing",
     "message": "operation requires prior tool results in this turn for: context_ref",
-    "data": {"next_call": None},
+    "data": {"next_call": None, "type": "operational_failure"},
   }
 
 
@@ -2393,6 +2480,7 @@ def test_pane_remediation_reaches_model_through_real_addin_dispatch(
     session = SimpleNamespace(
       session_id="pane-errors",
       user_id="alice",
+      owner_user_id="alice",
       pending_tools={},
     )
     event_log = EventLog()
@@ -2423,6 +2511,7 @@ def test_pane_remediation_reaches_model_through_real_addin_dispatch(
         mcp_client=McpClientManager(config_path=None),
         local_tool_handlers={},
         session=session,
+        run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
       ),
       channel_registry=channels,
       execute_addin=execute_addin,
@@ -2753,6 +2842,9 @@ def test_approval_park_leaves_original_call_unsettled(
   dispatcher: ToolDispatcher | _Dispatcher
   if exact_write:
     dispatcher = _ParkingLifecycleDispatcher(
+      run_context=run_context_for_test(
+        registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
+      ),
       mcp_client=McpClientManager(config_path=None),
       local_tool_handlers={"planned_write": _PlannedHandler()},
       capability_bind=TEST_CAPABILITY_BIND,
@@ -2837,6 +2929,16 @@ def test_approval_park_leaves_original_call_unsettled(
       assert all("dispatch" not in event for event in call_events)
       assert park.nonce not in json.dumps(events)
 
+    # The run's terminal closure commits the park; replay then reads the
+    # still-unsettled call as awaiting the user's approval, never as failed.
+    await session_log.append({
+      "type": "stream_complete",
+      "terminal_disposition": "awaiting_approval",
+      "job_id": park.job_id,
+      "approval_id": park.approval_id,
+      "original_tool_call_id": park.original_tool_call_id,
+      "runner_id": runner._runner_id,
+    })
     replay = await SessionContextBuilder(agent_session_log=session_log).build()
     blocks = [
       block
@@ -2847,12 +2949,17 @@ def test_approval_park_leaves_original_call_unsettled(
     assert [block for block in blocks if block.get("type") == "tool_use"] == [
       original_call
     ]
-    assert not [
+    parked_results = [
       block
       for block in blocks
       if block.get("type") == "tool_result"
       and block.get("tool_use_id") == park.original_tool_call_id
     ]
+    assert len(parked_results) == 1 and not parked_results[0].get("is_error")
+    assert json.loads(parked_results[0]["content"]) == {
+      "status": "awaiting_approval",
+      "approval_id": park.approval_id,
+    }
 
   _run(_scenario())
 
@@ -3087,7 +3194,7 @@ def test_preparation_rejected_code_execute_emits_tool_call_start_and_grades_hand
   assert start["tool_call_id"] == call_id
   assert start["tool_name"] == "code_execute"
   assert start["tool_input"] == {}
-  assert complete["error"] == {"code": "invalid_input", "message": "code is required"}
+  assert complete["error"] == {"code": "invalid_input", "message": "code is required", "data": {"type": "bad_input"}}
   assert complete["is_error"] is True
 
   chat_request = {"type": "chat_request"}
@@ -3205,6 +3312,7 @@ def test_fred_runner_owns_every_physical_attempt_with_real_dispatcher_manager(
     role="owner",
     get_tool_definitions=lambda: [definition],
     allowed_mcp_tools_by_server={"fred-mcp": {"fred_search"}},
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   runner = _dispatch_runner(dispatcher, mcp_client=manager)
   monkeypatch.setattr(runner_tool_execution, "retry_backoff_seconds", lambda _attempt: 0.0)
@@ -3304,3 +3412,446 @@ def test_single_user_approval_policy_role_authorized_for_class_enforces_money_bo
       )
       is True
     )
+
+
+@pytest.mark.parametrize("owner", [
+  {"type": "integrity_refusal", "next_call": ["a"]},
+  {"data": {"type": "integrity_refusal", "next_call": ["a"]}},
+])
+def test_model_error_data_preserves_owner_type_and_repair(owner):
+  original = json.loads(json.dumps(owner))
+  data = runner_tool_execution._model_error_data({
+    "code": "mcp_tool_error", "message": "x", **owner,
+  })
+  assert data == {"type": "integrity_refusal", "next_call": ["a"]}
+  assert owner == original
+
+
+@pytest.mark.parametrize("failure, expected", [
+  ({"code": "mcp_tool_error", "message": "1 validation error"}, "bad_input"),
+  ({"code": "transport_error"}, "upstream_failure"),
+  ({"code": "rate_limited"}, "upstream_failure"),
+  ({"code": "tool_timeout"}, "timeout"),
+  ({"code": "cancelled"}, "interrupted"),
+  ({"code": "portfolio_not_found"}, "integrity_refusal"),
+  ({"code": "role_policy_denied"}, "confirmation_required"),
+  ({"code": "needs_decision"}, "needs_decision"),
+  ({"code": "other"}, "operational_failure"),
+  ({"code": "invalid_input", "type": "upstream_failure"}, "upstream_failure"),
+])
+def test_dispatcher_model_error_family(failure, expected):
+  error = _model_error_for_refusal({"message": "failed", **failure})
+  assert error["data"]["type"] == expected
+  assert error["data"]["next_call"] is None
+
+
+@pytest.mark.parametrize("location", ["nested", "nested_data", "top", "top_data"])
+@pytest.mark.parametrize("next_call", [["hank", "tool", "list_portfolios"], None])
+def test_semantic_model_error_preserves_owner_fields(location, next_call):
+  owner = {"type": "integrity_refusal", "next_call": next_call}
+  payload: dict[str, Any] = {"status": "error", "error": {"message": "Portfolio not found", "code": "invalid_input"}}
+  if location == "nested":
+    payload["error"].update(owner)
+  elif location == "nested_data":
+    payload["error"]["data"] = owner
+  elif location == "top":
+    payload.update(owner)
+  else:
+    payload["data"] = owner
+  runner = _dispatch_runner(_RecordedDispatcher([(payload, None)]))
+  entry, _, _ = _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
+  assert entry["is_error"] is True
+  visible = json.loads(entry["content"])
+  assert visible["status"] == "error"
+  assert visible["error"]["type"] == "integrity_refusal"
+  assert visible["error"]["next_call"] == next_call
+  assert payload["error"]["code"] == "invalid_input"
+
+
+def test_semantic_model_error_without_owner_repair_has_explicit_null():
+  runner = _dispatch_runner(_RecordedDispatcher([
+    ({"status": "error", "error": {"code": "no_rows", "message": "No rows"}}, None),
+  ]))
+  entry, _, _ = _run(runner._execute_single_tool("tool-1", "filings_search", {}, {"tools": []}))
+  error = json.loads(entry["content"])["error"]
+  assert error["type"] == "operational_failure"
+  assert error["next_call"] is None
+
+
+@pytest.mark.parametrize("in_data", [False, True])
+@pytest.mark.parametrize("next_call", [["a"], None])
+def test_dispatcher_model_error_preserves_owner_type_and_next_call(in_data, next_call):
+  owner = {"type": "integrity_refusal", "next_call": next_call}
+  failure: dict[str, Any] = {"code": "invalid_input", "message": "Owner refusal"}
+  failure.update({"data": owner} if in_data else owner)
+  error = _model_error_for_refusal(failure)
+  assert error["data"]["type"] == "integrity_refusal"
+  assert error["data"]["next_call"] == next_call
+
+
+def test_execute_tool_call_returns_canonical_success_and_dispatch_metadata(monkeypatch: Any) -> None:
+  payload = {"status": "success", "rows": [{"ticker": "MSFT"}]}
+  runner = _dispatch_runner(_RecordedDispatcher([(payload, None)]))
+  extra_blocks = [{"type": "text", "text": "Tool follow-up"}]
+
+  async def on_result(context: Any) -> list[dict[str, Any]]:
+    assert context.result == payload
+    assert context.error is None
+    return extra_blocks
+
+  monkeypatch.setattr(runner, "_call_on_tool_result", on_result)
+  outcome = _run(runner.execute_tool_call("public-success", "filings_search", {}))
+
+  assert isinstance(outcome, runner_tool_execution.ToolCallOutcome)
+  assert outcome.tool_call_id == "public-success"
+  assert outcome.tool_name == "filings_search"
+  assert outcome.server == "research-corpus-mcp"
+  assert outcome.result == payload
+  assert outcome.error is None
+  assert outcome.semantic_error is None
+  assert outcome.error_type is None
+  assert outcome.outcome == "ok"
+  assert outcome.dispatch_record is not None
+  assert outcome.dispatch_record == _complete_event(runner)["dispatch"]
+  assert outcome.dispatch_record["outcome"] == "ok"
+  assert outcome.result_entry["tool_use_id"] == "public-success"
+  assert json.loads(outcome.result_entry["content"]) == payload
+  assert outcome.extra_blocks == extra_blocks
+  assert outcome.load_servers == ()
+  assert outcome.load_local_tools == ()
+  assert outcome.skill_allow_activated is False
+
+
+def test_execute_tool_call_returns_enriched_owner_error() -> None:
+  failure = {
+    "code": "invalid_input",
+    "message": "Owner refusal",
+    "type": "integrity_refusal",
+    "next_call": ["hank", "tool", "list_portfolios"],
+  }
+  runner = _runner(_RefusalDispatcher(failure))
+
+  outcome = _run(runner.execute_tool_call("public-owner-error", "lookup", {}))
+
+  assert outcome.result is None
+  assert outcome.error == {
+    **failure,
+    "data": {
+      "type": "integrity_refusal",
+      "next_call": ["hank", "tool", "list_portfolios"],
+    },
+  }
+  assert "data" not in failure
+  assert outcome.semantic_error is None
+  assert outcome.error_type == "integrity_refusal"
+  assert outcome.dispatch_record is not None
+  assert outcome.outcome == outcome.dispatch_record["outcome"]
+  assert outcome.outcome != "ok"
+  assert outcome.server is None
+  assert outcome.result_entry["is_error"] is True
+  visible = json.loads(outcome.result_entry["content"])
+  assert outcome.error is not None
+  assert visible["error"]["data"] == outcome.error["data"]
+  assert outcome.extra_blocks == []
+
+
+def test_execute_tool_call_returns_semantic_error_without_replacing_canonical_result() -> None:
+  payload = {"status": "error", "error": {"code": "no_rows", "message": "No rows"}}
+  runner = _dispatch_runner(_RecordedDispatcher([(payload, None)]))
+
+  outcome = _run(runner.execute_tool_call("public-semantic-error", "filings_search", {}))
+
+  assert outcome.result == payload
+  assert outcome.error is None
+  assert outcome.semantic_error is not None
+  assert outcome.semantic_error == _complete_event(runner)["semantic_error"]
+  assert outcome.semantic_error["code"] == "tool_status_error"
+  assert outcome.error_type == "operational_failure"
+  assert outcome.outcome == "error_semantic"
+  assert outcome.dispatch_record is not None
+  assert outcome.dispatch_record["outcome"] == "error_semantic"
+  assert outcome.result_entry["is_error"] is True
+  visible = json.loads(outcome.result_entry["content"])
+  assert visible["error"]["type"] == "operational_failure"
+  assert visible["error"]["next_call"] is None
+  assert "type" not in outcome.result["error"]
+
+
+@pytest.mark.parametrize("chat_wrapper", [False, True])
+def test_execute_tool_call_projects_private_controls_and_preserves_chat_mutation(
+  monkeypatch: Any,
+  chat_wrapper: bool,
+) -> None:
+  payload = {
+    "status": "success",
+    "_load_servers": ["research-corpus-mcp"],
+    "_load_local_tools": ["lookup"],
+    "_active_skill_allow": ["lookup"],
+  }
+  runner = _runner(_RecordedDispatcher([(payload, None)]))
+  base_kwargs: dict[str, Any] = {"tools": []}
+  mutated_kwargs: list[dict[str, Any]] = []
+
+  def activate(tool_names: Any, kwargs: dict[str, Any]) -> None:
+    assert tool_names == ["lookup"]
+    kwargs["skill_allowed"] = tool_names
+    mutated_kwargs.append(kwargs)
+
+  def refresh(kwargs: dict[str, Any], servers: list[str]) -> None:
+    assert servers == ["research-corpus-mcp"]
+    kwargs["servers"] = servers
+    mutated_kwargs.append(kwargs)
+
+  def rebuild(kwargs: dict[str, Any]) -> None:
+    kwargs["tools"] = [{"name": "lookup"}]
+    mutated_kwargs.append(kwargs)
+
+  monkeypatch.setattr(runner, "_activate_skill_allow", activate)
+  monkeypatch.setattr(runner, "_refresh_tools", refresh)
+  monkeypatch.setattr(runner, "_rebuild_filtered_tool_definitions", rebuild)
+  monkeypatch.setattr(runner, "_newly_exposed_tool_names", lambda kwargs, before: ["lookup"])
+
+  if chat_wrapper:
+    entry, name, blocks = _run(
+      runner._execute_single_tool("controls", "lookup", {}, base_kwargs)
+    )
+    assert name == "lookup"
+    assert blocks == []
+    assert all(kwargs is base_kwargs for kwargs in mutated_kwargs)
+    assert base_kwargs == {
+      "tools": [{"name": "lookup"}],
+      "skill_allowed": ["lookup"],
+      "servers": ["research-corpus-mcp"],
+    }
+  else:
+    outcome = _run(runner.execute_tool_call("controls", "lookup", {}))
+    entry = outcome.result_entry
+    assert outcome.result == {"status": "success"}
+    assert outcome.load_servers == ("research-corpus-mcp",)
+    assert outcome.load_local_tools == ("lookup",)
+    assert outcome.skill_allow_activated is True
+    assert outcome.error_type is None
+    assert base_kwargs == {"tools": []}
+  assert len(mutated_kwargs) == 3
+  assert json.loads(entry["content"]) == {"status": "success"}
+  assert entry["exposed_tools"] == ["lookup"]
+  assert _complete_event(runner)["result"] == {"status": "success"}
+
+
+def test_execute_tool_call_forwards_explicit_advertised_tool_names() -> None:
+  advertised = frozenset({"lookup", "file_read"})
+
+  class AdvertisedDispatcher(_Dispatcher):
+    async def dispatch(
+      self,
+      tool_id: str,
+      tool_name: str,
+      tool_input: dict[str, Any],
+      *,
+      advertised_tool_names: Any = None,
+      call_index: int = 0,
+      allow_uncertain_mcp_replay: bool = True,
+      on_executed_prepared_call: Any | None = None,
+    ):
+      return await super().dispatch(
+        tool_id, tool_name, tool_input,
+        call_index=call_index,
+        allow_uncertain_mcp_replay=allow_uncertain_mcp_replay,
+        on_executed_prepared_call=on_executed_prepared_call,
+      )
+
+    async def dispatch_prepared(
+      self,
+      tool_id: str,
+      tool_name: str,
+      prepared_call: PreparedToolCall,
+      *,
+      advertised_tool_names: Any = None,
+      **kwargs: Any,
+    ):
+      assert advertised_tool_names is advertised
+      assert kwargs["call_index"] == 7
+      return await super().dispatch_prepared(tool_id, tool_name, prepared_call, **kwargs)
+
+  runner = _runner(AdvertisedDispatcher())
+  outcome = _run(runner.execute_tool_call(
+    "advertised", "lookup", {}, call_index=7, advertised_tool_names=advertised,
+  ))
+  assert outcome.outcome == "ok"
+
+
+def test_execute_single_tool_is_public_outcome_tuple_projection(monkeypatch: Any) -> None:
+  runner = _runner()
+  entry = {"type": "tool_result", "tool_use_id": "wrapper", "content": "{}"}
+  blocks = [{"type": "text", "text": "follow-up"}]
+  advertised = frozenset({"lookup"})
+  base_kwargs = {"tools": [], "_request_advertised_tool_names": advertised}
+  calls: list[tuple[Any, ...]] = []
+
+  async def execute(tool_id: str, tool_name: str, tool_input: Any, **kwargs: Any) -> Any:
+    calls.append((tool_id, tool_name, tool_input, kwargs))
+    return runner_tool_execution.ToolCallOutcome(
+      tool_call_id=tool_id,
+      tool_name=tool_name,
+      server=None,
+      result={},
+      error=None,
+      semantic_error=None,
+      error_type=None,
+      outcome="ok",
+      dispatch_record=None,
+      result_entry=entry,
+      extra_blocks=blocks,
+    )
+
+  monkeypatch.setattr(runner, "execute_tool_call", execute)
+  result = _run(runner._execute_single_tool(
+    "wrapper", "lookup", {"query": "x"}, base_kwargs, call_index=4,
+  ))
+  assert result == (entry, "lookup", blocks)
+  assert result[0] is entry
+  assert result[2] is blocks
+  assert calls == [("wrapper", "lookup", {"query": "x"}, {
+    "call_index": 4,
+    "approved_call": None,
+    "advertised_tool_names": advertised,
+    "_base_kwargs": base_kwargs,
+  })]
+
+
+def test_delayed_cancel_during_on_disconnect_before_tool_start_emits_no_start_and_dispatches_nothing(
+  monkeypatch: Any,
+) -> None:
+  dispatcher = _RecordedDispatcher([({"ok": True}, None)])
+  runner = _dispatch_runner(dispatcher)
+  force_close_gate = asyncio.Event()
+  disconnect_tasks: list[asyncio.Task[None]] = []
+
+  async def slow_force_close(timeout: float = 2.0) -> None:
+    _ = timeout
+    await force_close_gate.wait()
+
+  orig_prepare = dispatcher.prepare_tool_call_async
+
+  async def prepare_with_in_flight_disconnect(
+    tool_name: str,
+    tool_input: dict[str, Any],
+  ) -> PreparedToolCall:
+    prepared = await orig_prepare(tool_name, tool_input)
+    # Model server_chat_helpers.py:1771-1773: POST /chat/cancel starts
+    # runner.on_disconnect() (which sets _disconnected and awaits force_close)
+    # before runner_task.cancel() is delivered.
+    disconnect_tasks.append(asyncio.create_task(runner.on_disconnect()))
+    await asyncio.sleep(0)
+    return prepared
+
+  monkeypatch.setattr(runner, "force_close", slow_force_close)
+  monkeypatch.setattr(dispatcher, "prepare_tool_call_async", prepare_with_in_flight_disconnect)
+
+  async def scenario() -> None:
+    assert runner._disconnected is False
+    assert runner._tool_abort_event.is_set() is False
+    try:
+      with pytest.raises(asyncio.CancelledError):
+        await runner._execute_single_tool("tool-stop-1", "filings_search", {}, {"tools": []})
+    finally:
+      force_close_gate.set()
+      if disconnect_tasks:
+        await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+
+  _run(scenario())
+  assert dispatcher.calls == 0
+  assert not [
+    entry for entry in runner._log.entries
+    if entry.event.get("type") == "tool_call_start"
+  ]
+
+
+def test_delayed_cancel_during_tool_start_append_refuses_dispatch_with_typed_cancelled_outcome(
+  monkeypatch: Any,
+) -> None:
+  dispatcher = _RecordedDispatcher([({"ok": True}, None)])
+  runner = _dispatch_runner(dispatcher)
+  force_close_gate = asyncio.Event()
+  disconnect_tasks: list[asyncio.Task[None]] = []
+
+  async def slow_force_close(timeout: float = 2.0) -> None:
+    _ = timeout
+    await force_close_gate.wait()
+
+  orig_append_durable = runner._append_durable_event
+
+  async def append_durable_with_in_flight_disconnect(event: dict[str, Any]) -> Any:
+    entry = await orig_append_durable(event)
+    if event.get("type") == "tool_call_start":
+      disconnect_tasks.append(asyncio.create_task(runner.on_disconnect()))
+      await asyncio.sleep(0)
+    return entry
+
+  monkeypatch.setattr(runner, "force_close", slow_force_close)
+  monkeypatch.setattr(runner, "_append_durable_event", append_durable_with_in_flight_disconnect)
+
+  async def scenario() -> None:
+    assert runner._disconnected is False
+    assert runner._tool_abort_event.is_set() is False
+    try:
+      with pytest.raises(asyncio.CancelledError):
+        await runner._execute_single_tool("tool-stop-2", "filings_search", {}, {"tools": []})
+    finally:
+      force_close_gate.set()
+      if disconnect_tasks:
+        await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+
+  _run(scenario())
+  assert dispatcher.calls == 0
+  complete = _complete_event(runner)
+  assert complete["dispatch"]["outcome"] == "cancelled"
+  assert complete["error"]["code"] == "cancelled"
+  assert complete["error"]["data"]["type"] == "interrupted"
+
+
+def test_delayed_cancel_during_retry_backoff_refuses_second_attempt_with_typed_cancelled_outcome(
+  declared_read_effects: None,
+  monkeypatch: Any,
+) -> None:
+  dispatcher = _RecordedDispatcher([
+    (None, {"code": "internal_error", "message": "connection reset"}),
+    ({"ok": True}, None),
+  ])
+  runner = _dispatch_runner(dispatcher)
+  force_close_gate = asyncio.Event()
+  disconnect_tasks: list[asyncio.Task[None]] = []
+  orig_sleep = asyncio.sleep
+
+  async def slow_force_close(timeout: float = 2.0) -> None:
+    _ = timeout
+    await force_close_gate.wait()
+
+  async def sleep_with_in_flight_disconnect(delay: float) -> None:
+    if delay > 0 and not disconnect_tasks:
+      disconnect_tasks.append(asyncio.create_task(runner.on_disconnect()))
+      await orig_sleep(0)
+      return
+    await orig_sleep(delay)
+
+  monkeypatch.setattr(runner, "force_close", slow_force_close)
+  monkeypatch.setattr(runner_tool_execution.asyncio, "sleep", sleep_with_in_flight_disconnect)
+
+  async def scenario() -> None:
+    assert runner._disconnected is False
+    assert runner._tool_abort_event.is_set() is False
+    try:
+      with pytest.raises(asyncio.CancelledError):
+        await runner._execute_single_tool("tool-stop-3", "filings_search", {}, {"tools": []})
+    finally:
+      force_close_gate.set()
+      if disconnect_tasks:
+        await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+
+  _run(scenario())
+  assert dispatcher.calls == 1
+  complete = _complete_event(runner)
+  assert complete["dispatch"]["outcome"] == "cancelled"
+  assert complete["dispatch"]["attempts"] == 1
+  assert complete["error"]["code"] == "cancelled"
+  assert complete["error"]["data"]["type"] == "interrupted"

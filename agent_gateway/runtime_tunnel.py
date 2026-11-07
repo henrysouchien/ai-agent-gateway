@@ -25,11 +25,17 @@ A request body travels whole; a response streams (SSE stays incremental) or,
 when negotiated via ``bootstrap`` ``tunnel_features: ["resp"]`` (or enabled on
 the endpoint), travels as one ``resp`` frame when its declared non-SSE body fits
 inside one frame.
+
+Every field above is required and exactly typed (``b64``/``body`` strict base64).
+A received frame that breaks the grammar raises ``TunnelFrameError`` from
+``feed``, except a ``req`` whose fields (not ``id``) are malformed: that one
+request is answered with a ``fail`` frame and never reaches the handler.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import collections
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -72,12 +78,53 @@ class TunnelClosed(ConnectionError):
   """The socket ended; in-flight requests on it fail."""
 
 
+class TunnelFrameError(TunnelClosed):
+  """A received frame breaks the frame grammar; the peer's bytes are not trusted."""
+
+
 Handler = Callable[[TunnelRequest], Awaitable[TunnelResponse]]
 ControlHandler = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
-def _pairs(raw: Any) -> Headers:
-  return [(str(name), str(value)) for name, value in raw or ()]
+def _field(frame: dict[str, Any], key: str, kind: type, label: str) -> Any:
+  value = frame.get(key)
+  if type(value) is not kind:
+    raise TunnelFrameError(f"{frame.get('t')!r} frame field {key!r} must be {label}")
+  return value
+
+
+def _pairs(frame: dict[str, Any]) -> Headers:
+  raw = _field(frame, "headers", list, "a list of [name, value] string pairs")
+  pairs: Headers = []
+  for pair in raw:
+    if type(pair) is not list or len(pair) != 2 or not all(type(item) is str for item in pair):
+      raise TunnelFrameError(f"{frame.get('t')!r} frame field 'headers' must be a list of [name, value] string pairs")
+    pairs.append((pair[0], pair[1]))
+  return pairs
+
+
+def _blob(frame: dict[str, Any], key: str) -> bytes:
+  try:
+    return base64.b64decode(_field(frame, key, str, "a base64 string"), validate=True)
+  except binascii.Error as exc:
+    raise TunnelFrameError(f"{frame.get('t')!r} frame field {key!r} is not valid base64") from exc
+
+
+def _decode_frame(text: str) -> dict[str, Any]:
+  try:
+    frame = json.loads(text)
+  except ValueError as exc:
+    raise TunnelFrameError("tunnel frame is not valid JSON") from exc
+  if type(frame) is not dict:
+    raise TunnelFrameError("tunnel frame must be a JSON object")
+  return frame
+
+
+def _request_from_frame(frame: dict[str, Any]) -> TunnelRequest:
+  return TunnelRequest(
+    method=_field(frame, "method", str, "a string"), path=_field(frame, "path", str, "a string"),
+    headers=_pairs(frame), body=_blob(frame, "body"),
+  )
 
 
 class TunnelEndpoint:
@@ -181,66 +228,70 @@ class TunnelEndpoint:
     return TunnelResponse(status, response_headers, chunks())
 
   async def feed(self, text: str) -> None:
-    frame = json.loads(text)
+    frame = _decode_frame(text)
     kind = frame.get("t")
     if kind == "frag":
-      self._fragments.append(str(frame.get("s") or ""))
-      if not frame.get("last"):
+      self._fragments.append(_field(frame, "s", str, "a string"))
+      if not _field(frame, "last", bool, "a boolean"):
         return
       whole, self._fragments = "".join(self._fragments), []
       await self.feed(whole)
       return
     if kind == "req":
-      task = asyncio.create_task(self._serve(frame))
+      task = asyncio.create_task(self._serve(_field(frame, "id", int, "an integer"), frame))
       self._tasks.add(task)
       task.add_done_callback(self._tasks.discard)
       return
     if kind == "control":
-      body = dict(frame.get("body") or {})
-      features = body.get("tunnel_features")
-      if (
-        frame.get("kind") == "bootstrap"
-        and isinstance(features, Sequence)
-        and not isinstance(features, (str, bytes))
-        and "resp" in features
-      ):
+      control_kind = _field(frame, "kind", str, "a string")
+      body = _field(frame, "body", dict, "an object")
+      features = body.get("tunnel_features", [])
+      if type(features) is not list or not all(type(feature) is str for feature in features):
+        raise TunnelFrameError("'control' frame body field 'tunnel_features' must be a list of strings")
+      if control_kind == "bootstrap" and "resp" in features:
         self.single_frame_responses = True
       if self._on_control is not None:
-        await self._on_control(str(frame.get("kind")), body)
+        await self._on_control(control_kind, body)
       return
-    pending = self._pending.get(int(frame.get("id", 0)))
-    if pending is None:
+    if kind not in {"resp", "head", "data", "end", "fail"}:
       return
+    request_id = _field(frame, "id", int, "an integer")
     if kind == "resp":
-      if not pending.head.done():
-        pending.head.set_result((int(frame["status"]), _pairs(frame.get("headers"))))
-      body_bytes = base64.b64decode(frame.get("b64") or "")
-      if body_bytes:
-        pending.chunks.put_nowait(body_bytes)
-      pending.chunks.put_nowait(None)
-      return
-    if kind == "head":
-      if not pending.head.done():
-        pending.head.set_result((int(frame["status"]), _pairs(frame.get("headers"))))
+      status, headers, body_bytes = _field(frame, "status", int, "an integer"), _pairs(frame), _blob(frame, "b64")
+      if (pending := self._pending.get(request_id)) is not None:
+        if not pending.head.done():
+          pending.head.set_result((status, headers))
+        if body_bytes:
+          pending.chunks.put_nowait(body_bytes)
+        pending.chunks.put_nowait(None)
+    elif kind == "head":
+      status, headers = _field(frame, "status", int, "an integer"), _pairs(frame)
+      if (pending := self._pending.get(request_id)) is not None and not pending.head.done():
+        pending.head.set_result((status, headers))
     elif kind == "data":
-      pending.chunks.put_nowait(base64.b64decode(frame["b64"]))
+      data = _blob(frame, "b64")
+      if (pending := self._pending.get(request_id)) is not None:
+        pending.chunks.put_nowait(data)
     elif kind == "end":
-      pending.chunks.put_nowait(None)
-    elif kind == "fail":
-      error = TunnelClosed(str(frame.get("error") or "peer failed the request"))
-      if not pending.head.done():
-        pending.head.set_exception(error)
-      pending.chunks.put_nowait(error)
+      if (pending := self._pending.get(request_id)) is not None:
+        pending.chunks.put_nowait(None)
+    else:
+      error = TunnelClosed(_field(frame, "error", str, "a string"))
+      if (pending := self._pending.get(request_id)) is not None:
+        if not pending.head.done():
+          pending.head.set_exception(error)
+        pending.chunks.put_nowait(error)
 
-  async def _serve(self, frame: dict[str, Any]) -> None:
-    request_id = int(frame["id"])
+  async def _serve(self, request_id: int, frame: dict[str, Any]) -> None:
+    try:
+      request = _request_from_frame(frame)
+    except TunnelFrameError as exc:
+      await self._fail(request_id, exc)
+      return
     try:
       if self._handler is None:
         raise RuntimeError("this endpoint serves no requests")
-      response = await self._handler(TunnelRequest(
-        method=str(frame["method"]), path=str(frame["path"]),
-        headers=_pairs(frame.get("headers")), body=base64.b64decode(frame.get("body") or ""),
-      ))
+      response = await self._handler(request)
       if self.single_frame_responses and await self._send_resp(request_id, response):
         return
       await self._send({
@@ -254,10 +305,13 @@ class TunnelEndpoint:
     except TunnelClosed:
       return
     except Exception as exc:  # The peer must learn the request failed, not hang.
-      try:
-        await self._send({"t": "fail", "id": request_id, "error": type(exc).__name__})
-      except TunnelClosed:
-        return
+      await self._fail(request_id, exc)
+
+  async def _fail(self, request_id: int, exc: Exception) -> None:
+    try:
+      await self._send({"t": "fail", "id": request_id, "error": type(exc).__name__})
+    except TunnelClosed:
+      return
 
   async def _send_resp(self, request_id: int, response: TunnelResponse) -> bool:
     if any(

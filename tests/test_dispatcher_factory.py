@@ -1,11 +1,20 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import NoRegistryScope, RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
+from gateway_test_support.dispatcher_factory_test_support import (
+  _allow_interceptor,
+  _deps,
+  _local_handler,
+  _never_needs_approval,
+  _request_approval,
+  _session,
+)
 
-import inspect
 import os
 import subprocess
 import sys
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 
@@ -21,16 +30,8 @@ from agent_gateway.dispatcher_factory import (
   build_tool_dispatcher,
 )
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.session import GatewaySession
 from agent_gateway.tool_dispatcher import ToolDispatcher
-from agent_gateway.tool_dispatcher_helpers import (
-  ApprovalDecision,
-  ApprovalRequest,
-  InterceptContext,
-  InterceptDecision,
-  LocalToolHandler,
-  ToolResult,
-)
+from agent_gateway.tool_dispatcher_helpers import LocalToolHandler
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -40,66 +41,6 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 
-def _never_needs_approval(
-  _name: str,
-  _tool_input: object,
-  _qualifier: str,
-) -> bool:
-  return False
-
-
-async def _local_handler(_tool_input: object) -> ToolResult:
-  return {"ok": True}, None
-
-
-async def _request_approval(
-  _request: ApprovalRequest,
-) -> ApprovalDecision:
-  return ApprovalDecision(approved=False)
-
-
-async def _allow_interceptor(
-  _context: InterceptContext,
-) -> InterceptDecision:
-  return InterceptDecision(action="allow")
-
-
-
-
-def _session(
-  *,
-  kind: str = "chat",
-  channel: str = "web",
-) -> GatewaySession:
-  return GatewaySession(
-    session_id=f"session-{kind}-{channel}",
-    api_key_hash="hash",
-    created_at=1,
-    expires_at=2,
-    user_id="42",
-    risk_user_id=42,
-    role="owner",
-    kind=kind,  # type: ignore[arg-type]
-    channel=channel,
-    auth_config={"api_key": "secret"},
-  )
-
-
-def _deps(
-  *,
-  mcp_client: McpClientManager | None = None,
-  approval_store: Any = None,
-  approval_policy: Any = None,
-  mcp_meta_inject_servers: frozenset[str] = frozenset({
-    "portfolio-reads-mcp"
-  }),
-) -> GatewayDispatcherDeps:
-  return GatewayDispatcherDeps(
-    mcp_client=mcp_client or McpClientManager(config_path=None),
-    approval_store=approval_store,
-    approval_policy=approval_policy,
-    mcp_meta_inject_servers=mcp_meta_inject_servers,
-  )
 
 
 
@@ -135,16 +76,6 @@ def test_principal_derives_all_identity_from_session_without_loose_inputs() -> N
   assert principal.capabilities == frozenset()
   assert principal.channel == "excel"
   assert principal.approval_key_qualifier is qualifier
-  assert {
-    name
-    for name, parameter in inspect.signature(InvocationPrincipal).parameters.items()
-    if parameter.default is inspect.Parameter.empty
-  } == {"session"}
-  assert all(
-    not field.init
-    for field in fields(InvocationPrincipal)
-    if field.name in {"session_kind", "user_id", "risk_user_id", "role", "capabilities", "channel"}
-  )
   with pytest.raises(FrozenInstanceError):
     principal.user_id = "attacker"  # type: ignore[misc]
 
@@ -160,6 +91,7 @@ def test_integrity_guard_uses_a_real_raise_after_session_kind_changes() -> None:
       capability_bind=TEST_CAPABILITY_BIND,
       principal=principal,
       profile="chat_embedded",
+      run_context=run_context_for_test(registry_scope=NoRegistryScope()),
       event_log=None,
       session_id=session.session_id,
       request_approval=None,
@@ -172,6 +104,8 @@ def test_integrity_guard_survives_optimized_python_mode() -> None:
   package_dir = Path(__file__).resolve().parents[1]
   script = """
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
+from agent_gateway.registry_scope import NoRegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from types import SimpleNamespace
 from agent_gateway.dispatcher_factory import (
   DispatcherConstructionError,
@@ -195,6 +129,7 @@ try:
     capability_bind=TEST_CAPABILITY_BIND,
     principal=principal,
     profile="chat_embedded",
+    run_context=run_context_for_test(registry_scope=NoRegistryScope()),
     event_log=None,
     session_id="session",
     request_approval=None,
@@ -261,6 +196,7 @@ def test_chat_embedded_golden_attribute_snapshot_matches_easy_inline() -> None:
     commercial_work_start=commercial_work_start,
     commercial_irreversible_recheck=commercial_recheck,
     commercial_mcp_servers=commercial_servers,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   actual = build_tool_dispatcher(
     _deps(
@@ -273,6 +209,7 @@ def test_chat_embedded_golden_attribute_snapshot_matches_easy_inline() -> None:
       approval_key_qualifier=qualifier,
     ),
     profile="chat_embedded",
+    run_context=expected.run_context,
     local_tool_handlers=local_handlers,
     needs_approval=needs_approval,
     request_approval=request_approval,

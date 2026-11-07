@@ -14,7 +14,7 @@ import stat
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, ContextManager, Iterator, Literal, Mapping, Protocol, TYPE_CHECKING
+from typing import Any, Callable, ContextManager, Iterator, Literal, Mapping, Protocol, TYPE_CHECKING, get_args
 from uuid import uuid4
 
 from agent_workflow_contracts import AgentCompletionEnvelope, TaskResult
@@ -37,6 +37,7 @@ from .approval_policy import (
   ApprovalVote,
   DelegationGrant,
   PersistentGrant,
+  TerminalDecision,
   approval_is_executable,
   canonical_json_strict,
   new_approval_id,
@@ -69,7 +70,13 @@ class _ApprovalAuditEmitter(Protocol):
   ) -> None: ...
 
 
-TERMINAL_STATES = frozenset({"auto_approved", "auto_denied", "approved", "denied", "expired"})
+TERMINAL_STATES = frozenset(get_args(TerminalDecision))
+# `decision_reason` stored by `terminalize_pending_for_cancellation`; a cancelled
+# approval reads `denied` plus one of these, so no reader matches the literal.
+RUN_CANCELLED_REASON = "run_cancelled"
+BATCH_CANCELLED_REASON = "batch_cancelled"
+GATEWAY_SHUTDOWN_REASON = "gateway_shutdown"
+CONVERSATION_CLOSED_REASON = "conversation_closed"
 APPROVAL_DB_PATH_ENV = "GATEWAY_APPROVAL_DB_PATH"
 _AUTONOMOUS_APPROVAL_DELIVERY_OUTBOX_COLUMNS = frozenset({
   "delivery_sequence",
@@ -1021,6 +1028,7 @@ class RootTurnRecord:
   grant_digest: str
   research_binding_json: str
   selection_snapshot_json: str
+  selection_provenance_json: str
   approval_route_kind: str
   policy_generation_ref: str
   created_at: datetime
@@ -1355,6 +1363,7 @@ class ApprovalRequestStore(Protocol):
     capability_bind: Mapping[str, object], credential_generation_ref: str | None,
     effective_grant: Mapping[str, object], research_binding: Mapping[str, object] | None,
     selection_snapshot: Mapping[str, object], approval_route_kind: str,
+    selection_provenance: Mapping[str, object] | None = None,
     policy_generation_ref: str, created_at: datetime | None = None,
   ) -> None: ...
   async def _read_root_turn_for_executor(
@@ -1643,6 +1652,7 @@ class SQLiteApprovalStore:
       raise ApprovalRemoteReservationActive()
 
   def _init_schema(self) -> None:
+    """Serialize root-schema upgrades and retain each row's integrity status."""
     with self._connection() as conn:
       existing_outbox_columns = {
         str(row["name"])
@@ -1795,6 +1805,7 @@ class SQLiteApprovalStore:
           grant_digest TEXT NOT NULL,
           research_binding_json TEXT NOT NULL,
           selection_snapshot_json TEXT NOT NULL,
+          selection_provenance_json TEXT NOT NULL DEFAULT 'null',
           approval_route_kind TEXT NOT NULL,
           policy_generation_ref TEXT NOT NULL
             REFERENCES approval_policy_generations(generation_ref),
@@ -1976,12 +1987,14 @@ class SQLiteApprovalStore:
         );
         """
       )
+      # Inspect the root schema only after acquiring SQLite's writer lock:
+      # another opener may have completed both migrations while this waited.
+      conn.execute("BEGIN IMMEDIATE")
       root_columns = {
         str(row["name"])
         for row in conn.execute("PRAGMA table_info(approval_root_turns)")
       }
       if "routes_json" in root_columns:
-        conn.execute("BEGIN IMMEDIATE")
         index_definitions = [
           row["sql"] for row in conn.execute(
             "SELECT sql FROM sqlite_master "
@@ -2029,7 +2042,9 @@ class SQLiteApprovalStore:
             "snapshot_digest": (
               _root_turn_snapshot_digest(snapshot)
               if verified
-              else _UNVERIFIED_ROOT_TURN_DIGEST_PREFIX + str(row["snapshot_digest"])
+              else _UNVERIFIED_ROOT_TURN_DIGEST_PREFIX + str(row["snapshot_digest"]).removeprefix(
+                _UNVERIFIED_ROOT_TURN_DIGEST_PREFIX,
+              )
             ),
             "executable_refs_json": row["executable_refs_json"],
           }
@@ -2044,7 +2059,34 @@ class SQLiteApprovalStore:
         conn.execute("ALTER TABLE approval_root_turns_new RENAME TO approval_root_turns")
         for definition in index_definitions:
           conn.execute(definition)
-        conn.commit()
+      if "selection_provenance_json" not in root_columns:
+        conn.execute(
+          "ALTER TABLE approval_root_turns ADD COLUMN "
+          "selection_provenance_json TEXT NOT NULL DEFAULT 'null'"
+        )
+        for row in conn.execute("SELECT * FROM approval_root_turns"):
+          old_snapshot = {
+            key: row[key] for key in row.keys()
+            if key not in {
+              "snapshot_digest", "executable_refs_json", "selection_provenance_json",
+            }
+          }
+          verified = row["snapshot_digest"] == _root_turn_snapshot_digest(old_snapshot)
+          snapshot = {**old_snapshot, "selection_provenance_json": "null"}
+          # Successive migrations retain one marker over the original digest.
+          conn.execute(
+            "UPDATE approval_root_turns SET snapshot_digest = ? "
+            "WHERE job_id = ? AND turn_id = ?",
+            (
+              _root_turn_snapshot_digest(snapshot)
+              if verified
+              else _UNVERIFIED_ROOT_TURN_DIGEST_PREFIX + str(row["snapshot_digest"]).removeprefix(
+                _UNVERIFIED_ROOT_TURN_DIGEST_PREFIX,
+              ),
+              row["job_id"], row["turn_id"],
+            ),
+          )
+      conn.commit()
       outbox_columns = {
         str(row["name"])
         for row in conn.execute(
@@ -2473,6 +2515,7 @@ class SQLiteApprovalStore:
     research_binding: Mapping[str, object] | None,
     selection_snapshot: Mapping[str, object],
     approval_route_kind: str,
+    selection_provenance: Mapping[str, object] | None = None,
     policy_generation_ref: str,
     created_at: datetime | None = None,
   ) -> None:
@@ -2495,6 +2538,7 @@ class SQLiteApprovalStore:
           effective_grant=effective_grant,
           research_binding=research_binding,
           selection_snapshot=selection_snapshot,
+          selection_provenance=selection_provenance,
           approval_route_kind=approval_route_kind,
           policy_generation_ref=policy_generation_ref,
           created_at=created_at,
@@ -2513,6 +2557,7 @@ class SQLiteApprovalStore:
     effective_grant: Mapping[str, object],
     research_binding: Mapping[str, object] | None,
     selection_snapshot: Mapping[str, object],
+    selection_provenance: Mapping[str, object] | None,
     approval_route_kind: str,
     policy_generation_ref: str,
     created_at: datetime | None,
@@ -2533,6 +2578,9 @@ class SQLiteApprovalStore:
           dict(research_binding) if research_binding is not None else None
         ),
         selection_snapshot_json=_rows.identity_json_dumps(dict(selection_snapshot)),
+        selection_provenance_json=_rows.identity_json_dumps(
+          dict(selection_provenance) if selection_provenance is not None else None
+        ),
       )
     except (TypeError, ValueError):
       raise RootTurnRecordError("snapshot_mismatch") from None
@@ -2562,12 +2610,12 @@ class SQLiteApprovalStore:
       INSERT INTO approval_root_turns (
         job_id, turn_id, tenant_storage_id, capability_bind_json,
         credential_generation_ref, effective_grant_json,
-        grant_digest, research_binding_json, selection_snapshot_json,
+        grant_digest, research_binding_json, selection_snapshot_json, selection_provenance_json,
         approval_route_kind, policy_generation_ref, created_at, snapshot_digest
       ) VALUES (
         :job_id, :turn_id, :tenant_storage_id, :capability_bind_json,
         :credential_generation_ref, :effective_grant_json,
-        :grant_digest, :research_binding_json, :selection_snapshot_json,
+        :grant_digest, :research_binding_json, :selection_snapshot_json, :selection_provenance_json,
         :approval_route_kind, :policy_generation_ref, :created_at, :snapshot_digest
       )
       """,
@@ -2616,7 +2664,7 @@ class SQLiteApprovalStore:
     try:
       for key in (
         "capability_bind_json", "effective_grant_json",
-        "research_binding_json", "selection_snapshot_json",
+        "research_binding_json", "selection_snapshot_json", "selection_provenance_json",
       ):
         _rows.identity_json_loads(row[key])
       refs = _rows.identity_json_loads(row["executable_refs_json"])
@@ -3273,6 +3321,7 @@ class SQLiteApprovalStore:
           effective_grant=_rows.identity_json_loads(record.effective_grant_json),
           research_binding=_rows.identity_json_loads(record.research_binding_json),
           selection_snapshot=_rows.identity_json_loads(record.selection_snapshot_json),
+          selection_provenance=_rows.identity_json_loads(record.selection_provenance_json),
           approval_route_kind=record.approval_route_kind,
           policy_generation_ref=generation.generation_ref,
           created_at=None,
@@ -5671,7 +5720,6 @@ class SQLiteApprovalStore:
       "auto_approved": _prepared_bm.PreparedBusinessModelLifecycle.AUTHORIZED,
       "denied": _prepared_bm.PreparedBusinessModelLifecycle.DENIED,
       "auto_denied": _prepared_bm.PreparedBusinessModelLifecycle.DENIED,
-      "cancelled": _prepared_bm.PreparedBusinessModelLifecycle.DENIED,
       "expired": _prepared_bm.PreparedBusinessModelLifecycle.EXPIRED,
     }.get(approval_state)
     if target is None:

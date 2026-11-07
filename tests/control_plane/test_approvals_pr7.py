@@ -4,6 +4,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -14,8 +15,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+import httpx
+
+from agent_gateway_cli.control.client import ControlSession
+from agent_gateway_cli.transport import AsyncGatewayTransport, GatewayEndpoint
 
 from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 from agent_gateway import AgentRunner
@@ -38,12 +46,14 @@ from agent_gateway.approval_continuation import (
 from agent_gateway.approval_policy import (
   ApprovalRequest,
   ApprovalRequestPayload,
+  ApprovalVote,
   DelegationGrant,
   RunContext,
   utc_now,
   sha256_args,
 )
-from agent_gateway.approval_store import SQLiteApprovalStore
+from agent_gateway.approval_store import RUN_CANCELLED_REASON, SQLiteApprovalStore
+from agent_gateway.approvals import ApprovalActionError, _record_vote_and_unblock
 from agent_gateway.audit_writer import JSONLAuditWriter
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
@@ -483,7 +493,7 @@ def _install_captured_approval(
     tenant_storage_id=user_id,
     tool_name=approval.tool_name,
     prepared_call=prepared,
-    dispatch_context={"call_index": 0},
+    dispatch_context={"call_index": 0, "registry_scope": {"scope_type": "none"}},
     credential_generation_ref="private-original-generation",
   ))
   return approval, nonce
@@ -729,6 +739,144 @@ def _install_pinned_batch_pending_approval(
   return request_record, queue
 
 
+def test_durable_identity_read_survives_client_and_gateway_restart(tmp_path) -> None:
+  app, store, _, _ = _make_app(tmp_path)
+  target = _approval_record(
+    chat_payload={"session_id": "retired-telegram-session"},
+    tool_call_id="target-call",
+    approval_id="target-approval",
+    user_id="alice",
+    channel="telegram",
+  )
+  terminal = replace(
+    target,
+    approval_id="terminal-approval",
+    tool_call_id="terminal-call",
+    state="denied",
+    decision="denied",
+    decided_at=utc_now(),
+    decider_id="alice",
+    decision_reason="not this trade",
+  )
+  unrelated = replace(target, approval_id="unrelated-approval", tool_call_id="unrelated-call")
+  foreign = replace(target, approval_id="foreign-approval", tool_call_id="foreign-call", user_id="bob")
+  other_channel = replace(target, approval_id="excel-approval", tool_call_id="excel-call", channel="excel")
+  for record in (target, terminal, unrelated, foreign, other_channel):
+    _run(store.create(record))
+
+  async def read_with_new_bot_client(current_app, control, approval_id):
+    async with AsyncGatewayTransport(
+      endpoint=GatewayEndpoint(base_url="http://testserver", api_key="not-used", channel="telegram"),
+      http_transport=httpx.ASGITransport(app=current_app),
+    ) as transport:
+      return await transport.get_approval(approval_id, control_session=control)
+
+  for gateway_generation in range(2):
+    if gateway_generation:
+      app, store, _, _ = _make_app(tmp_path)
+    with TestClient(app) as client:
+      control_payload = _control_session(client, "alice", channel="telegram")
+      _set_session_channel(app, control_payload["session_id"], "telegram")
+      control = ControlSession(
+        token=control_payload["session_token"],
+        session_id=control_payload["session_id"],
+        expires_at=control_payload["expires_at"],
+        channel="telegram",
+        owner_user_id=control_payload["identity"]["owner_user_id"],
+        mcp_authority=control_payload["identity"]["mcp_authority"],
+      )
+      # Neither gateway generation has a live chat session or pending-tool map.
+      assert all(session.kind == "control" for session in app.state.auth.session_store.visible_sessions_snapshot())
+      for _ in range(2):
+        read = _run(read_with_new_bot_client(app, control, target.approval_id))
+        assert read["approval_id"] == target.approval_id
+        assert read["tool_call_id"] == target.tool_call_id
+        assert read["state"] == "pending_user"
+        assert "approvals" not in read
+        assert "nonce" not in read
+        assert all(record.approval_id not in json.dumps(read) for record in (unrelated, foreign, other_channel))
+      decided = _run(read_with_new_bot_client(app, control, terminal.approval_id))
+      assert decided["state"] == "denied"
+      assert decided["decision_reason"] == "not this trade"
+      missing = client.get("/api/control/approvals/not-found", headers=_headers(control_payload))
+      assert missing.status_code == 404
+      for hidden in (foreign, other_channel):
+        response = client.get(f"/api/control/approvals/{hidden.approval_id}", headers=_headers(control_payload))
+        assert response.status_code == missing.status_code
+        assert response.content == missing.content
+        assert hidden.approval_id not in response.text
+    assert _run(store.get(target.approval_id)) == target
+    assert _run(store.get(terminal.approval_id)) == terminal
+
+
+def test_durable_identity_read_keeps_control_auth_and_channel_delegation(tmp_path) -> None:
+  app, store, _, _ = _make_app(tmp_path)
+  approval = _approval_record(
+    chat_payload={"session_id": "retired-session"},
+    tool_call_id="delegated-call",
+    approval_id="delegated-approval",
+    user_id="alice",
+    channel="excel",
+    delegation_id="delegation-read",
+  )
+  _run(store.create(approval))
+  with TestClient(app) as client:
+    control = _control_session(client, "alice", channel="telegram")
+    _set_session_channel(app, control["session_id"], "telegram")
+    chat = _chat_session(client, "alice", channel="telegram")
+    path = f"/api/control/approvals/{approval.approval_id}"
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers=_headers(chat)).status_code == 401
+    assert client.get(path, headers=_headers(control)).status_code == 404
+    _create_delegation_grant(
+      store,
+      delegation_id="delegation-read",
+      delegator_user_id="alice",
+      excel_session_id="retired-session",
+      delegator_channel="telegram",
+    )
+    response = client.get(path, headers=_headers(control))
+    assert response.status_code == 200, response.text
+    assert response.json()["approval_id"] == approval.approval_id
+
+
+def test_durable_identity_read_uses_authenticated_canonical_and_raw_owner_ids(tmp_path) -> None:
+  app, store, _, _ = _make_app(tmp_path)
+  canonical = _approval_record(
+    chat_payload={"session_id": "retired-session"},
+    tool_call_id="canonical-call",
+    approval_id="canonical-approval",
+    user_id="42",
+    channel="telegram",
+  )
+  legacy = replace(canonical, approval_id="raw-owner-approval", tool_call_id="raw-owner-call", user_id="alice")
+  foreign = replace(canonical, approval_id="foreign-owner-approval", tool_call_id="foreign-owner-call", user_id="bob")
+  for record in (canonical, legacy, foreign):
+    _run(store.create(record))
+
+  with TestClient(app) as client:
+    control = _control_session(client, "alice", channel="telegram")
+    authenticated = _session(app, control)
+    authenticated.owner_user_id = "42"
+    authenticated.risk_user_id = 42
+    authenticated.raw_user_id = "alice"
+    authenticated.user_id = "alice"
+    authenticated.channel = "telegram"
+    control["session_token"] = app.state.auth.issue_token(authenticated)
+    for expected in (canonical, legacy):
+      response = client.get(f"/api/control/approvals/{expected.approval_id}", headers=_headers(control))
+      assert response.status_code == 200, response.text
+      assert response.json()["approval_id"] == expected.approval_id
+      assert response.json()["user_id"] == expected.user_id
+      assert _run(store.get(expected.approval_id)) == expected
+    missing = client.get("/api/control/approvals/absent", headers=_headers(control))
+    hidden = client.get(f"/api/control/approvals/{foreign.approval_id}", headers=_headers(control))
+    assert hidden.status_code == missing.status_code == 404
+    assert hidden.content == missing.content
+    assert foreign.approval_id not in hidden.text
+    assert _run(store.get(foreign.approval_id)) == foreign
+
+
 def test_control_approval_list_resolve_unblocks_queue_persists_grant_and_audits(tmp_path) -> None:
   app, store, policy, writer = _make_app(tmp_path)
   with TestClient(app) as client:
@@ -970,6 +1118,17 @@ def test_control_approval_list_resolve_routes_approval_pending_autonomous_decisi
 ) -> None:
   from agent_gateway import autonomous_runner
 
+  constructed_sessions: list[Any] = []
+  original_session = approvals_module.GatewaySession
+
+  def capture_session(**kwargs: Any):
+    session = original_session(**kwargs)
+    assert session.owner_user_id == kwargs["user_id"]
+    constructed_sessions.append(session)
+    return session
+
+  monkeypatch.setattr(approvals_module, "GatewaySession", capture_session)
+
   async def fake_exec(*args, **kwargs):
     _ = args
     return _FakeAutonomousProcess(os.dup(kwargs["pass_fds"][0]))
@@ -1006,8 +1165,10 @@ def test_control_approval_list_resolve_routes_approval_pending_autonomous_decisi
     record = app.state.subprocess_registry._find_by_control_run_id(run_id)
     assert record is not None
     record.state = "approval_pending"
+    record.owner_user_id = "alice"
 
     listed = client.get("/api/control/approvals", headers=_headers(control))
+    record.user_id = "henry"
     assert listed.status_code == 200, listed.text
     approvals = listed.json()["approvals"]
     assert [item["approval_id"] for item in approvals] == [approval.approval_id]
@@ -1022,6 +1183,8 @@ def test_control_approval_list_resolve_routes_approval_pending_autonomous_decisi
     assert response.status_code == 200, response.text
     assert response.json()["approval"]["state"] == "approved"
     assert policy.resolved == [approval.approval_id]
+    assert len(constructed_sessions) == 1
+    assert constructed_sessions[0].owner_user_id == "alice"
 
     delivery = _run(
       store.get_autonomous_approval_delivery(
@@ -1035,6 +1198,68 @@ def test_control_approval_list_resolve_routes_approval_pending_autonomous_decisi
     assert delivery["allow_tool_type"] is False
     assert record.approval_decisions_path is None
     assert record.approval_channel is not None
+
+    decided = _run(store.get(approval.approval_id))
+    for requested_vote, outcome in ((True, "already_decided"), (False, "conflict")):
+      replay = client.post(
+        f"/api/control/runs/{run_id}/approvals/{approval.approval_id}",
+        headers=_headers(control),
+        json={"approved": requested_vote, "reason": "retry must not replace the vote"},
+      )
+      assert replay.status_code == 200, replay.text
+      result = replay.json()
+      assert result["outcome"] == outcome
+      assert result["state_unchanged"] is True
+      assert result["requested_act"] == ("approve" if requested_vote else "deny")
+      readback = client.get(result["next_call"]["path"], headers=_headers(control))
+      assert readback.status_code == 200, readback.text
+      assert readback.json() == result["approval"]
+      assert _run(store.get(approval.approval_id)) == decided
+      assert policy.resolved == [approval.approval_id]
+      replayed_delivery = _run(store.get_autonomous_approval_delivery(
+        approval.approval_id,
+        tool_call_id=approval.tool_call_id,
+        nonce=f"nonce-{approval.approval_id}",
+      ))
+      assert replayed_delivery is not None
+      assert replayed_delivery["approved"] is True
+
+    # A terminal vote made through another native consumer has no outbox.
+    # Replaying it must not create/deliver an autonomous effect.
+    record.state = "approval_pending"
+    no_outbox = _install_autonomous_pending_approval(
+      app=app,
+      store=store,
+      run_id=run_id,
+      user_id="alice",
+    )
+    settled = _run(store.record_vote(no_outbox.approval_id, ApprovalVote(
+      vote_id="native-denial",
+      approval_id=no_outbox.approval_id,
+      decider_id="alice",
+      decider_role="owner",
+      decision="denied",
+      decision_reason="native owner already declined",
+      decided_at=utc_now(),
+    )))
+    events_before = list(record.event_lines)
+    for requested_vote, outcome in ((False, "already_decided"), (True, "conflict")):
+      replay = client.post(
+        f"/api/control/runs/{run_id}/approvals/{no_outbox.approval_id}",
+        headers=_headers(control),
+        json={"approved": requested_vote},
+      )
+      assert replay.status_code == 200, replay.text
+      assert replay.json()["outcome"] == outcome
+      assert replay.json()["state_unchanged"] is True
+      assert _run(store.get(no_outbox.approval_id)) == settled
+      assert _run(store.get_autonomous_approval_delivery(
+        no_outbox.approval_id,
+        tool_call_id=no_outbox.tool_call_id,
+        nonce=f"nonce-{no_outbox.approval_id}",
+      )) is None
+      assert policy.resolved == [approval.approval_id]
+      assert record.event_lines == events_before
 
 
 def test_batch_approval_list_and_vote_use_canonical_owner_and_exact_durable_join(
@@ -1251,6 +1476,19 @@ def test_cancel_autonomous_run_denies_pending_approval_and_clears_queue(
   tmp_path,
 ) -> None:
   from agent_gateway import autonomous_runner
+  from agent_gateway.control_plane import runs_helpers
+
+  constructed_sessions: list[Any] = []
+  original_session = runs_helpers.GatewaySession
+
+  def capture_session(**kwargs: Any):
+    session = original_session(**kwargs)
+    assert session.owner_user_id == kwargs["user_id"]
+    constructed_sessions.append(session)
+    return session
+
+  monkeypatch.setattr(runs_helpers, "GatewaySession", capture_session)
+
 
   async def fake_exec(*args, **kwargs):
     _ = args
@@ -1260,7 +1498,7 @@ def test_cancel_autonomous_run_denies_pending_approval_and_clears_queue(
   monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", HMAC_KEY)
   app, store, policy, _writer = _make_app(tmp_path)
   with TestClient(app) as client:
-    control = _control_session(client, "alice")
+    control = _control_session(client, "1")
     start = client.post(
       "/api/control/runs",
       headers=_headers(control),
@@ -1278,11 +1516,13 @@ def test_cancel_autonomous_run_denies_pending_approval_and_clears_queue(
       app=app,
       store=store,
       run_id=run_id,
-      user_id="alice",
+      user_id="1",
     )
     record = app.state.subprocess_registry._find_by_control_run_id(run_id)
     assert record is not None
     record.state = "approval_pending"
+    record.owner_user_id = "1"
+    record.user_id = "henry"
 
     listed = client.get("/api/control/approvals", headers=_headers(control))
     assert listed.status_code == 200, listed.text
@@ -1291,13 +1531,16 @@ def test_cancel_autonomous_run_denies_pending_approval_and_clears_queue(
     cancelled = client.delete(f"/api/control/runs/{run_id}", headers=_headers(control))
     assert cancelled.status_code == 200, cancelled.text
     assert cancelled.json()["state"] == "cancelled"
+    assert len(constructed_sessions) == 1
+    assert constructed_sessions[0].owner_user_id == record.owner_user_id
 
     stored = _run(store.get(approval.approval_id))
     assert stored is not None
     assert stored.state == "denied"
-    assert stored.decider_id == "alice"
+    assert stored.decider_id == "1"
     assert stored.decision == "denied"
-    assert stored.decision_reason == "run_cancelled"
+    assert stored.decision_reason == RUN_CANCELLED_REASON
+    assert _vote_count(store, approval.approval_id) == 0
     assert policy.resolved == [approval.approval_id]
 
     after_cancel = client.get("/api/control/approvals", headers=_headers(control))
@@ -1317,6 +1560,89 @@ def test_cancel_autonomous_run_denies_pending_approval_and_clears_queue(
     assert delivery["allow_tool_type"] is False
     assert record.approval_decisions_path is None
     assert record.approval_channel is None
+
+
+def _vote_count(store: SQLiteApprovalStore, approval_id: str) -> int:
+  with sqlite3.connect(store.path) as conn:
+    row = conn.execute(
+      "SELECT COUNT(*) FROM approval_votes WHERE approval_id = ?",
+      (approval_id,),
+    ).fetchone()
+  return int(row[0])
+
+
+def test_chat_run_delete_cancels_pending_approval_without_vote_row(tmp_path) -> None:
+  app, store, policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    approval, queue = _install_pending_approval(
+      app=app,
+      store=store,
+      chat_payload=chat,
+      user_id="alice",
+    )
+
+    deleted = client.delete(
+      f"/api/control/runs/{chat['session_id']}",
+      headers=_headers(control),
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["state"] == "cancelled"
+
+    stored = _run(store.get(approval.approval_id))
+    assert stored is not None
+    assert stored.state == "denied"
+    assert stored.decision == "denied"
+    assert stored.decision_reason == RUN_CANCELLED_REASON
+    assert stored.decider_id == "alice"
+    assert _vote_count(store, approval.approval_id) == 0
+    assert policy.resolved == [approval.approval_id]
+    assert policy.authorization_checks == []
+    assert queue.get_nowait() == {
+      "approved": False,
+      "allow_tool_type": False,
+      "approval_id": approval.approval_id,
+    }
+    assert app.state.auth.session_store.get_session(chat["session_id"]) is None
+
+
+def test_chat_run_delete_after_approval_resolved_keeps_first_terminal(tmp_path) -> None:
+  app, store, policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    approval, _queue = _install_pending_approval(
+      app=app,
+      store=store,
+      chat_payload=chat,
+      user_id="alice",
+    )
+    _run(
+      store.transition_state(
+        approval.approval_id,
+        "approved",
+        decider_id="alice",
+        decision="approved",
+        decision_reason="reviewed",
+      )
+    )
+
+    deleted = client.delete(
+      f"/api/control/runs/{chat['session_id']}",
+      headers=_headers(control),
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["state"] == "cancelled"
+
+    stored = _run(store.get(approval.approval_id))
+    assert stored is not None
+    assert stored.state == "approved"
+    assert stored.decision == "approved"
+    assert stored.decision_reason == "reviewed"
+    assert _vote_count(store, approval.approval_id) == 0
+    assert policy.resolved == []
+    assert app.state.auth.session_store.get_session(chat["session_id"]) is None
 
 
 def test_autonomous_cancel_after_approval_commit_fences_grant_and_sends_no_denial(
@@ -1523,7 +1849,11 @@ def test_autonomous_cancel_terminalization_wins_and_delivers_only_denial(
       release_cancellation.set()
       cancel_response = cancel_future.result(timeout=3)
 
-    assert approve_response.status_code == 409, approve_response.text
+    assert approve_response.status_code == 200, approve_response.text
+    assert approve_response.json()["outcome"] == "conflict"
+    assert approve_response.json()["requested_act"] == "approve"
+    assert approve_response.json()["state_unchanged"] is True
+    assert approve_response.json()["approval"]["state"] == "denied"
     assert cancel_response.status_code == 200, cancel_response.text
     assert cancel_response.json()["state"] == "cancelled"
     assert record.proc is not None
@@ -1930,7 +2260,7 @@ def test_delegated_chat_approval_hidden_when_grant_delegator_differs(tmp_path) -
     assert queue.empty()
 
 
-def test_terminal_and_expired_approval_states_are_rejected(tmp_path) -> None:
+def test_terminal_replay_is_read_only_and_expired_approval_stays_expired(tmp_path) -> None:
   app, store, _policy, _writer = _make_app(tmp_path)
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -1961,7 +2291,9 @@ def test_terminal_and_expired_approval_states_are_rejected(tmp_path) -> None:
       json={"approved": True},
     )
 
-    assert terminal_response.status_code == 409
+    assert terminal_response.status_code == 200
+    assert terminal_response.json()["outcome"] == "already_decided"
+    assert terminal_response.json()["state_unchanged"] is True
     assert expired_response.status_code == 410
 
     terminal_retry = client.post(
@@ -2060,6 +2392,8 @@ def test_control_captured_approval_votes_after_cache_clear_and_stale_address(tmp
       json={"approved": False, "reason": "cannot replace durable decision"},
     )
     assert replay.status_code == 200, replay.text
+    assert replay.json()["outcome"] == "conflict"
+    assert replay.json()["requested_act"] == "deny"
     assert _run(store.get(approval.approval_id)) == stored
     assert policy.resolved == [approval.approval_id]
 
@@ -2248,7 +2582,9 @@ def test_linked_live_sdk_approval_uses_original_queue_once_without_native_restor
       headers=_headers(control),
       json={"approved": False},
     )
-    assert replay.status_code == 409
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["outcome"] == "conflict"
+    assert replay.json()["requested_act"] == "deny"
     assert queue.empty()
     assert policy.resolved == [approval.approval_id]
     locator = _run(store.locate_request(
@@ -2256,6 +2592,128 @@ def test_linked_live_sdk_approval_uses_original_queue_once_without_native_restor
     ))
     assert locator is not None
     assert locator.executable_binding_state == "not_restorable"
+
+
+@pytest.mark.parametrize("settled_approved", [True, False])
+@pytest.mark.parametrize("requested_approved", [True, False])
+@pytest.mark.parametrize("clear_pending", [True, False])
+def test_control_terminal_approval_replay_reports_owner_fact_without_mutation(
+  tmp_path, settled_approved, requested_approved, clear_pending,
+) -> None:
+  app, store, policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    approval, queue = _install_pending_approval(
+      app=app, store=store, chat_payload=chat, user_id="alice",
+    )
+    _link_sdk_root_approval(store, approval)
+    path = f"/api/control/runs/{chat['session_id']}/approvals/{approval.approval_id}"
+    settled = client.post(path, headers=_headers(control), json={"approved": settled_approved})
+    assert settled.status_code == 200, settled.text
+    assert queue.get_nowait()["approved"] is settled_approved
+    stored = _run(store.get(approval.approval_id))
+    if clear_pending:
+      session = _session(app, chat)
+      session.pending_tools.clear()
+      session.approval_queues.clear()
+
+    continuations: list[RootContinueRequest | ChildContinueRequest] = []
+    if requested_approved != settled_approved:
+      async def unexpected_continuation(request: RootContinueRequest | ChildContinueRequest) -> None:
+        continuations.append(request)
+        raise AssertionError("A conflicting replay must not reach continuation")
+
+      app.state.root_continue_hook = unexpected_continuation
+      app.state.child_continue_hook = unexpected_continuation
+
+    replay = client.post(
+      path, headers=_headers(control),
+      json={"approved": requested_approved, "reason": "must not overwrite the first vote"},
+    )
+    assert replay.status_code == 200, replay.text
+    result = replay.json()
+    assert result["outcome"] == (
+      "already_decided" if requested_approved == settled_approved else "conflict"
+    )
+    assert result["requested_act"] == ("approve" if requested_approved else "deny")
+    assert result["state_unchanged"] is True
+    assert result["approval"] == settled.json()["approval"]
+    assert result["next_call"] == {
+      "method": "GET", "path": f"/api/control/approvals/{approval.approval_id}",
+    }
+    if requested_approved != settled_approved:
+      assert continuations == []
+      assert "continuation" not in result
+    assert _run(store.get(approval.approval_id)) == stored
+    assert policy.resolved == [approval.approval_id]
+    assert queue.empty()
+
+
+@pytest.mark.parametrize("winner_approved", [True, False])
+@pytest.mark.parametrize("requested_approved", [True, False])
+def test_concurrent_vote_loser_uses_terminal_replay_owner(
+  tmp_path, monkeypatch, winner_approved, requested_approved,
+) -> None:
+  app, store, policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    chat = _chat_session(client, "alice")
+    approval, queue = _install_pending_approval(
+      app=app, store=store, chat_payload=chat, user_id="alice",
+    )
+    original_record_vote = store.record_vote
+    winners = []
+
+    async def record_after_winner(approval_id, vote):
+      winner = await original_record_vote(
+        approval_id,
+        ApprovalVote(
+          vote_id="winning-vote", approval_id=approval_id, decider_id="first-decider",
+          decider_role="owner", decision="approved" if winner_approved else "denied",
+          decision_reason="first vote wins",
+          decided_at=datetime.fromisoformat("2026-10-30T00:00:00+00:00"),
+        ),
+      )
+      winners.append(winner)
+      return await original_record_vote(approval_id, vote)
+
+    monkeypatch.setattr(store, "record_vote", record_after_winner)
+    result = _run(_record_vote_and_unblock(
+      target_session=_session(app, chat), pending_entry=None,
+      tool_call_id=approval.tool_call_id, nonce=None,
+      decider_id="later-decider", decider_role="owner",
+      approved=requested_approved, allow_tool_type=False, reason="later vote",
+      app_state=app.state, durable_request=approval,
+    ))
+    assert result["outcome"] == (
+      "already_decided" if requested_approved == winner_approved else "conflict"
+    )
+    assert result["state_unchanged"] is True
+    assert result["approval"]["decider_id"] == "first-decider"
+    assert _run(store.get(approval.approval_id)) == winners[0]
+    assert policy.resolved == []
+    assert queue.empty()
+
+
+def test_terminal_replay_retains_pending_card_nonce_boundary(tmp_path) -> None:
+  app, store, _policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    chat = _chat_session(client, "alice")
+    approval, queue = _install_pending_approval(
+      app=app, store=store, chat_payload=chat, user_id="alice", state="denied",
+    )
+    session = _session(app, chat)
+    with pytest.raises(ApprovalActionError) as error:
+      _run(_record_vote_and_unblock(
+        target_session=session, pending_entry=session.pending_tools[approval.tool_call_id],
+        tool_call_id=approval.tool_call_id, nonce="wrong-card",
+        decider_id="alice", decider_role="owner", approved=False,
+        allow_tool_type=False, reason=None, app_state=app.state,
+      ))
+    assert error.value.status_code == 409
+    assert error.value.payload["error"] == "Nonce mismatch"
+    assert _run(store.get(approval.approval_id)) == approval
+    assert queue.empty()
 
 
 def test_ended_sdk_approval_accepts_durable_vote_without_fabricating_native_call(tmp_path) -> None:
@@ -2376,6 +2834,51 @@ def test_child_hook_consumes_committed_vote_and_reports_failure_without_retry(tm
     assert policy.resolved == [approval.approval_id for approval in approvals]
 
 
+def test_child_vote_response_carries_the_outcome_detail_beside_the_status(tmp_path) -> None:
+  app, store, _policy, _writer = _make_app(tmp_path)
+  reason = (
+    "Run bg_662 cannot continue its approved call: its park predates the "
+    "approval-settings pin, so no launch policy was recorded. Re-run it from the start."
+  )
+
+  async def classify_root(request: RootContinueRequest) -> RootContinueOutcome:
+    _ = request
+    return RootContinueOutcome(status="not_root")
+
+  async def refuse_child(request: ChildContinueRequest) -> ChildContinueOutcome:
+    located = await store._locate_request_for_decision(
+      approval_id=request.approval_id,
+      tenant_storage_id=request.tenant_storage_id,
+    )
+    assert located is not None
+    _decision, locator, _nonce = located
+    return ChildContinueOutcome(
+      "not_restorable", locator.job_id, locator.tool_call_id, detail=reason,
+    )
+
+  with TestClient(app) as client:
+    app.state.root_continue_hook = classify_root
+    app.state.child_continue_hook = refuse_child
+    control = _with_role(app, _control_session(client, "alice"), "owner")
+    chat = _chat_session(client, "alice")
+    approval, _nonce = _install_captured_approval(
+      store=store, chat_payload=chat, user_id="alice",
+    )
+    response = client.post(
+      f"/api/control/runs/not-the-owning-address/approvals/{approval.approval_id}",
+      headers=_headers(control),
+      json={"approved": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["continuation"] == {
+      "status": "not_restorable",
+      "job_id": f"child-{approval.approval_id}",
+      "tool_call_id": approval.tool_call_id,
+      "detail": reason,
+    }
+
+
 def test_unrestricted_autonomous_launch_row_is_listed_and_votable_from_web(
   monkeypatch,
   tmp_path,
@@ -2445,3 +2948,36 @@ def test_unrestricted_autonomous_launch_row_is_listed_and_votable_from_web(
     ))
     assert delivery is not None
     assert delivery["approved"] is True
+
+
+def test_root_continuation_caller_abort_returns_typed_cancellation(tmp_path) -> None:
+  app, store, policy, _writer = _make_app(tmp_path)
+  with TestClient(app) as client:
+    chat = _with_role(app, _control_session(client, "alice"), "owner")
+    approval, _nonce = _install_captured_approval(
+      store=store,
+      chat_payload=chat,
+      user_id="alice",
+    )
+    session = _session(app, chat)
+    session.owner_user_id = "alice"
+    _link_sdk_root_approval(store, approval)
+
+    async def cancel_connected_approval(request: RootContinueRequest) -> RootContinueOutcome:
+      task = asyncio.current_task()
+      assert task is not None
+      task.cancel("caller_aborted")
+      await asyncio.sleep(0)
+      raise AssertionError("task.cancel did not interrupt the continuation")
+
+    app.state.root_continue_hook = cancel_connected_approval
+    response = client.post(
+      f"/api/control/runs/{chat['session_id']}/approvals/{approval.approval_id}",
+      headers=_headers(chat),
+      json={"approved": True, "reason": "caller abort witness"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["continuation"] == {
+      "status": "cancelled",
+      "reason": "caller_aborted",
+    }

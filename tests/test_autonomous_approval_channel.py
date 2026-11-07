@@ -32,7 +32,8 @@ from agent_gateway import AgentRunner, EventLog, SessionContextBuilder, ToolDisp
 from agent_gateway.admission import capture_job_context, root_context
 from agent_gateway.agent_session_log import AgentSessionLog
 from agent_gateway.approval_policy import ApprovalVote, RunContext
-from agent_gateway.approval_route import ParentDelegatedApprovalRoute
+from agent_gateway.registry_scope import NoRegistryScope, RegistryScope
+from agent_gateway.approval_route import ParentDelegatedApprovalRoute, child_approval_route
 from agent_gateway.approval_store import ApprovalExecutableBindingError, SQLiteApprovalStore
 from agent_gateway.autonomous_claim_broker import AutonomousClaimBroker
 from agent_gateway.autonomous_launch_envelope import (
@@ -71,11 +72,6 @@ from gateway_test_support.capability_execution_test_support import (
 )
 from gateway_test_support.host_policy import owner_session_host_policy  # noqa: F401
 
-import sys
-
-TESTS_DIR = Path(__file__).resolve().parent
-if str(TESTS_DIR) not in sys.path:
-  sys.path.insert(0, str(TESTS_DIR))
 
 from control_plane.manifest_helpers import write_v6_manifest  # noqa: E402
 
@@ -501,6 +497,7 @@ def _park_approval_process(connection: Any, session_authority: Any, log_path: st
           executable_capture=ExecutableCapture(
             prepared_call=original,
             dispatch_context={
+              "registry_scope": {"scope_type": "run", "scope_id": "run-7", "store_dir": root},
               "call_index": 7,
               "advertised_tool_names": None,
               "skill_run_id": None,
@@ -517,6 +514,7 @@ def _park_approval_process(connection: Any, session_authority: Any, log_path: st
           tool_input=original.materialize_input(), qualifier="", reason="Place the order",
           allow_persistent=False,
           resolve_run_context_fn=lambda: RunContext(
+            registry_scope=RegistryScope("run", "run-7", root),
             user_id="42", request_id="run-7", session_id="bg_7",
             profile="analyst", channel="cli", decider_role="owner",
           ),
@@ -674,6 +672,82 @@ def parked_detached_approval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     broker.close()
 
 
+def test_in_process_child_of_a_detached_run_sends_no_private_capture_for_its_own_job(
+  tmp_path: Path,
+) -> None:
+  """An in-process child of a detached run sends no private capture for its own job.
+
+  The asking call is a live order (the class every ask rides on); the ask
+  must fire, and the child must not send the run's capture for its own job.
+  The parent admits a capture only for the run's job, so a child capture killed
+  the whole run with ``call_identity_mismatch`` before any human could decide.
+  """
+  captures: list[dict[str, Any]] = []
+  asks: list[Any] = []
+
+  async def capture(payload: dict[str, Any]) -> None:
+    captures.append(payload)
+
+  async def ask(request: Any, decision: Any, **kwargs: Any) -> dict[str, Any]:
+    asks.append(kwargs.get("park"))
+    return {"approved": True, "approval_id": request.approval_id}
+
+  async def scenario() -> dict[str, Any]:
+    execution = stub_bound_capability_execution(
+      provider=_ContinuationProvider(), model="claude-test", effort="none",
+      run_mode="autonomous", credential_ref="autonomous-service:test-handle",
+    )
+    session = _ordinary_session_authority(bind=execution.bind).to_gateway_session()
+    session.agent_session_log = AgentSessionLog(path=tmp_path / "journal.jsonl")
+    pair = create_autonomous_approval_channel(authority=_authority())
+    try:
+      run_route = ParentDelegatedApprovalRoute(
+        pair.child, session, private_capture_writer=capture,
+      )
+      child_route = child_approval_route(run_route)
+      original = PreparedToolCall({"code": "print(1)"})
+      return await run_approval_lifecycle(
+        route=child_route, session=session, producer_session=session,
+        executable_capture=ExecutableCapture(
+          prepared_call=original,
+          dispatch_context={
+            "registry_scope": {"scope_type": "none"},
+            "call_index": 0,
+            "advertised_tool_names": None,
+            "skill_run_id": None,
+            "step_id": None,
+            "workspace_dir": None,
+            "batch_id": None,
+            "capture_readable_resource_snapshot": False,
+            "allow_uncertain_mcp_replay": False,
+          },
+          job_id="child-task-1", tenant_storage_id="42",
+          credential_generation_ref=None, root_turn=None,
+        ),
+        tool_call_id="call-child", tool_name="execute_trade",
+        tool_input=original.materialize_input(), qualifier="", reason="Run code",
+        allow_persistent=False,
+        resolve_run_context_fn=lambda: RunContext(
+          registry_scope=NoRegistryScope(),
+          user_id="42", request_id="run-7", session_id="bg_7",
+          profile="analyst", channel="cli", decider_role="owner",
+        ),
+        current_skill_admission_fn=lambda: None,
+        redact_for_approval_request_fn=lambda *_args: ({"code": "print(1)"}, "args-hash"),
+        resolve_tool_class_fn=lambda _name: "irreversible",
+        effective_trade_approval_decision_fn=lambda _name, _args, decision: decision,
+        await_user_approval_via_pending_tools_fn=ask,
+      )
+    finally:
+      pair.close()
+
+  lifecycle = asyncio.run(scenario())
+
+  assert lifecycle["approved"] is True
+  assert captures == []
+  assert asks == [None]
+
+
 def test_human_ask_parks_with_durable_binding_and_releases_original_process(
   parked_detached_approval: Any,
 ) -> None:
@@ -689,6 +763,7 @@ def test_human_ask_parks_with_durable_binding_and_releases_original_process(
     assert binding.prepared_input == {"units": 7, "account": "private-original-account"}
     assert binding.exact_backend == "original-order-backend"
     assert binding.dispatch_context == {
+      "registry_scope": {"scope_type": "run", "scope_id": "run-7", "store_dir": str(parked.root)},
       "call_index": 7,
       "advertised_tool_names": None,
       "skill_run_id": None,
@@ -785,13 +860,14 @@ def test_detached_decision_resumes_captured_call_without_replaying_preceding_eff
     )
     resumed_channel.close()
     capture_job_context(resumed_session, replace(
-      root_context(resumed_session, withheld_tools=frozenset(), research_file_id=None),
+      root_context(resumed_session, withheld_tools=frozenset(), research_file_id=None, selection_provenance=None),
       job_id="bg_7",
     ))
     executions: list[dict[str, Any]] = []
     replays: list[dict[str, Any]] = []
 
-    async def execute_original(tool_input: dict[str, Any], **_kwargs: Any):
+    async def execute_original(tool_input: dict[str, Any], *, tool_ctx: Any, **_kwargs: Any):
+      assert tool_ctx.registry_scope == RegistryScope("run", "run-7", str(parked.root))
       executions.append(dict(tool_input))
       units = tool_input["units"]
       (parked.root / "order-effect.txt").write_text(str(units), encoding="utf-8")
@@ -807,7 +883,10 @@ def test_detached_decision_resumes_captured_call_without_replaying_preceding_eff
       local_tool_handlers={"native_write": execute_original, "record_note": reject_preceding_replay},
       needs_approval=lambda *_args: True, session=resumed_session, role="owner",
       approval_route=resumed_session.approval_route,
-      run_context=RunContext(user_id="42", request_id="run-successor"),
+      run_context=RunContext(
+        registry_scope=RegistryScope("run", "run-successor", str(parked.root / "successor")),
+        user_id="42", request_id="run-successor",
+      ),
     )
     assert dispatcher._approval_store is None
     runner = AgentRunner(
@@ -927,6 +1006,50 @@ def test_signed_continuation_round_trip_authenticates_decided_call_and_journal(
         _CONTINUATION_SECRET,
         json.dumps(payload, separators=(",", ":"), sort_keys=True),
       )
+
+
+def test_pre_pin_park_is_refused_by_name_and_stays_awaiting_approval(
+  parked_detached_approval: Any,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  """A park from before the approval-settings pin cannot continue; the approver is told why."""
+  parked = parked_detached_approval
+  assert parked.source.launch_approval_settings is None
+
+  async def scenario() -> None:
+    store = parked.store
+    parked.registry._claim_signing_authority = GatewayClaimSigningAuthority(
+      _CONTINUATION_SECRET,
+    )
+    parked.registry._approval_store = store
+    await store.record_vote_with_autonomous_delivery(
+      parked.parked["approval_id"],
+      ApprovalVote(
+        vote_id="owner-decision", approval_id=parked.parked["approval_id"],
+        decider_id="42", decider_role="owner",
+        decision="approved", decision_reason="Reviewed original call",
+        decided_at=datetime.now(UTC),
+      ),
+      delivery=autonomous_approval_delivery_context(
+        parked.source, tool_call_id="call-original", nonce=parked.parked["nonce"],
+      ),
+    )
+    with caplog.at_level("ERROR", logger="agent_gateway.autonomous_runner"):
+      outcome = await parked.registry.continue_approval(
+        approval_id=parked.parked["approval_id"], tenant_storage_id="42",
+      )
+
+    assert outcome is not None
+    assert outcome.status == "not_restorable"
+    assert outcome.detail is not None
+    assert parked.source.control_run_id in outcome.detail
+    assert "predates the approval-settings pin" in outcome.detail
+    assert "Re-run it from the start" in outcome.detail
+    assert outcome.detail in caplog.text
+    assert parked.source.state == "awaiting_approval"
+    assert parked.source.resumed_as == []
+
+  asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("approved", [True, False], ids=["approve", "deny"])
@@ -1147,7 +1270,7 @@ async def _resume_signed_call(
   )
   resumed_channel.close()
   capture_job_context(resumed_session, replace(
-    root_context(resumed_session, withheld_tools=frozenset(), research_file_id=None),
+    root_context(resumed_session, withheld_tools=frozenset(), research_file_id=None, selection_provenance=None),
     job_id="bg_7",
   ))
 
@@ -1159,7 +1282,10 @@ async def _resume_signed_call(
     local_tool_handlers={"native_write": handler, "record_note": reject_replay},
     needs_approval=lambda *_args: True, session=resumed_session, role="owner",
     approval_route=resumed_session.approval_route,
-    run_context=RunContext(user_id="42", request_id="run-successor"),
+    run_context=RunContext(
+      registry_scope=RegistryScope("run", "run-successor", str(parked.root / "successor")),
+      user_id="42", request_id="run-successor",
+    ),
   )
   runner = AgentRunner(
     capability_execution=parked.execution, dispatcher=dispatcher, event_log=EventLog(),
@@ -1241,6 +1367,35 @@ def test_successor_outcome_that_is_not_a_known_result_is_never_recorded_as_compl
     with pytest.raises(ApprovalExecutableBindingError) as unknown:
       await parked.store._read_completed_executable_result_for_executor(binding=binding)
     assert unknown.value.code == "execution_outcome_unknown"
+
+  asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("scope", [None, {}, {"scope_type": "run"}, {"scope_type": "none", "scope_id": "other"}])
+def test_successor_refuses_missing_or_malformed_original_registry_scope(
+  parked_detached_approval: Any,
+  owner_session_host_policy: Any,
+  scope: Any,
+) -> None:
+  parked = parked_detached_approval
+
+  async def scenario() -> None:
+    _binding, signed = await _approved_claimed_continuation(parked)
+    signed = copy.deepcopy(signed)
+    if scope is None:
+      del signed["dispatch_context"]["registry_scope"]
+    else:
+      signed["dispatch_context"]["registry_scope"] = scope
+    executions: list[dict[str, Any]] = []
+
+    async def handler(tool_input: dict[str, Any], **_kwargs: Any):
+      executions.append(dict(tool_input))
+      return {"executed": True}, None
+
+    seen = await _resume_signed_call(parked, signed, handler)
+    assert executions == []
+    assert seen.returned == []
+    assert seen.result["is_error"] is True
 
   asyncio.run(scenario())
 

@@ -14,8 +14,8 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable, Iterator, Literal, Mapping, Protocol
-from urllib.error import URLError
+from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, Sequence
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
@@ -24,6 +24,8 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from hank_contracts.user_claims import derive_user_claim_key
 
+from .artifact_paths import user_desk_root
+from .user_identity_mapping import parse_storage_identity
 from hank_model_transport.user_runtime_credentials import (
   DeskReplica,
   USER_RUNTIME_CREDENTIALS_FILE_ENV,
@@ -42,6 +44,97 @@ RuntimeState = Literal["starting", "ready", "stopped", "replaced"]
 
 DESK_LEASE_SECONDS = 90.0
 LEASE_REFUSED_EXIT = 3
+LOCAL_RUNTIME_READY_TIMEOUT_SECONDS = 60.0
+
+
+RuntimeReadinessReason = Literal["ready", "unreachable", "http_status"]
+RuntimeStartupReason = Literal[
+  "process_exited", "readiness_timeout",
+  "missing_approvals_egress_url", "invalid_approvals_egress_url",
+]
+
+
+@dataclass(frozen=True)
+class RuntimeReadiness:
+  """Secret-free health evidence retained when a local runtime cannot start."""
+
+  ready: bool
+  reason: RuntimeReadinessReason
+  endpoint: str
+  status: int | None = None
+
+  @property
+  def diagnostic_code(self) -> str:
+    if self.reason == "http_status":
+      return f"health_http_{self.status}"
+    return "ready" if self.ready else "health_unreachable"
+
+  def as_dict(self) -> dict[str, Any]:
+    body: dict[str, Any] = {
+      "reason": self.reason,
+      "diagnostic_code": self.diagnostic_code,
+      "endpoint": self.endpoint,
+    }
+    if self.status is not None:
+      body["status"] = self.status
+    return body
+
+
+class RuntimeStartupError(RuntimeError):
+  """A safe, typed startup failure; private process output stays in runtime_log."""
+
+  def __init__(
+    self, reason: RuntimeStartupReason, *,
+    runtime_log: Path | None = None,
+    timeout_seconds: float | None = None,
+    readiness: RuntimeReadiness | None = None,
+    variable: str | None = None,
+    exit_code: int | None = None,
+  ) -> None:
+    self.reason = reason
+    self.runtime_log = runtime_log
+    self.timeout_seconds = timeout_seconds
+    self.readiness = readiness
+    self.variable = variable
+    self.exit_code = exit_code
+    if reason == "process_exited":
+      message = f"user runtime process exited before readiness (exit_code={exit_code})"
+    elif reason == "readiness_timeout":
+      diagnostic = "no health response" if readiness is None else readiness.diagnostic_code
+      message = f"user runtime did not become ready within {timeout_seconds:g} seconds ({diagnostic})"
+    elif reason == "missing_approvals_egress_url":
+      message = f"{variable} is required for local placement"
+    else:
+      message = f"{variable} must be an explicit absolute http(s) URL without query or fragment"
+    super().__init__(message)
+
+  @property
+  def next_call(self) -> str:
+    if self.variable is not None:
+      return (
+        f"set {self.variable} to the edge's absolute http(s) /egress/approvals URL, "
+        "then retry placement initialization"
+      )
+    if self.reason == "process_exited":
+      return "inspect the private runtime_log, correct the runtime startup failure, then retry POST /api/chat/init"
+    return (
+      "inspect the private runtime_log and readiness endpoint, correct the health/startup failure, "
+      "then retry POST /api/chat/init"
+    )
+
+  def as_dict(self) -> dict[str, Any]:
+    body: dict[str, Any] = {"reason": self.reason, "next_call": self.next_call}
+    if self.runtime_log is not None:
+      body["runtime_log"] = str(self.runtime_log)
+    if self.timeout_seconds is not None:
+      body["timeout_seconds"] = self.timeout_seconds
+    if self.readiness is not None:
+      body["readiness"] = self.readiness.as_dict()
+    if self.variable is not None:
+      body["variable"] = self.variable
+    if self.exit_code is not None:
+      body["exit_code"] = self.exit_code
+    return body
 
 
 class RestoreEpoch(BaseModel):
@@ -177,12 +270,8 @@ _RUNTIME_STATE_PATHS: Mapping[str, str] = {
 # root must be absent for investment_tools state_paths to initialise it.
 _DESK_STATE_PATHS: Mapping[str, str] = {
   "AGENT_SESSION_LOG_BASE_DIR": "agent-sessions",
+  "EXCEL_MCP_RELAY_STATE_DIR": "excel_mcp/relay",
 }
-
-
-def desk_root(user_data_dir: Path, storage_id: str) -> Path:
-  """The one directory a user's desk replicates: ``USER_DATA_DIR/users/<storage_id>``."""
-  return user_data_dir / "users" / storage_id
 
 
 def investment_state_dir(user_data_dir: Path, storage_id: str) -> Path:
@@ -191,25 +280,26 @@ def investment_state_dir(user_data_dir: Path, storage_id: str) -> Path:
   The placement owns this layout and hands it to the runtime and its children as an
   explicit ``INVESTMENT_TOOLS_STATE_DIR``. It is a locator only: nothing here creates it.
   """
-  return desk_root(user_data_dir, storage_id) / "investment-tools"
+  return user_desk_root(user_data_dir, storage_id) / "investment-tools"
 
 
 def runtime_state_environment(user_data_dir: Path, storage_id: str) -> dict[str, str]:
   """Every writable state root of one placed runtime, created and as env values.
 
   Everything is the runtime's own: an inherited shared-tier path would put two
-  users' logs or telemetry in one place. User data (session
-  journals) sits under the desk root, the rest under the placement root, the
-  parent of ``user_data_dir``. The storage id is exported too, and the
+  users' logs or telemetry in one place. User data (session journals and Excel
+  relay records) sits under the replicated desk root, the rest under the placement
+  root, the parent of ``user_data_dir``. The storage id is exported too, and the
   Investment private-state root as ``INVESTMENT_TOOLS_STATE_DIR`` (the desk's
   ``investment-tools``, see ``investment_state_dir``): that locator is the only
   way investment_tools places its state, in this runtime and in every child
   that inherits it. Investment state is the one root not created here;
   investment_tools initialises it on first use.
   """
+  storage_id = parse_storage_identity(storage_id).storage_id
   runtime_root = user_data_dir.parent
   paths = {name: runtime_root / relative for name, relative in _RUNTIME_STATE_PATHS.items()}
-  desk = desk_root(user_data_dir, storage_id)
+  desk = user_desk_root(user_data_dir, storage_id)
   paths.update({name: desk / relative for name, relative in _DESK_STATE_PATHS.items()})
   environ: dict[str, str] = {
     USER_STORAGE_ID_ENV: storage_id,
@@ -314,6 +404,16 @@ class RuntimePlacementStore:
         # token (and under rule 7 a deploy drains live work before restart),
         # so their handle_birth stays NULL (unverified) and stop never signals them.
         connection.execute("ALTER TABLE runtime_placements ADD COLUMN handle_birth TEXT")
+      connection.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_shutdown_sessions (
+          handle TEXT PRIMARY KEY, storage_id TEXT NOT NULL, generation INTEGER
+        )
+      """)
+      shutdown_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(runtime_shutdown_sessions)").fetchall()
+      }
+      if "generation" not in shutdown_columns:
+        connection.execute("ALTER TABLE runtime_shutdown_sessions ADD COLUMN generation INTEGER")
   @contextmanager
   def _connection(self) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(self.path, timeout=30)
@@ -366,6 +466,30 @@ class RuntimePlacementStore:
       rows = connection.execute("SELECT * FROM runtime_placements ORDER BY storage_id").fetchall()
     return [RuntimePlacement(**dict(row)) for row in rows]
 
+  def retain_shutdown_sessions(self, targets: list[tuple[str, str, int | None]]) -> None:
+    """Atomically retain handles and epochs until compute stop and writer proof complete."""
+    with self._connection() as connection:
+      connection.executemany(
+        "INSERT OR REPLACE INTO runtime_shutdown_sessions (storage_id, handle, generation) VALUES (?, ?, ?)",
+        targets,
+      )
+
+  def retain_shutdown_session(
+    self, storage_id: str, handle: str, generation: int | None = None,
+  ) -> None:
+    self.retain_shutdown_sessions([(storage_id, handle, generation)])
+
+  def list_shutdown_sessions(self) -> list[tuple[str, str, int | None]]:
+    with self._connection() as connection:
+      rows = connection.execute(
+        "SELECT handle, storage_id, generation FROM runtime_shutdown_sessions ORDER BY handle",
+      ).fetchall()
+    return [(row["handle"], row["storage_id"], row["generation"]) for row in rows]
+
+  def complete_shutdown_session(self, handle: str) -> None:
+    with self._connection() as connection:
+      connection.execute("DELETE FROM runtime_shutdown_sessions WHERE handle = ?", (handle,))
+
 
 class RuntimeBackend(Protocol):
   """Blocking placement operations; ASGI callers offload these to a worker thread."""
@@ -382,17 +506,24 @@ class RuntimeBackend(Protocol):
 
   def health(self, placement: RuntimePlacement) -> bool: ...
 
+  def shutdown(self) -> None: ...
+
   def transport(self, placement: RuntimePlacement) -> httpx.AsyncBaseTransport: ...
+
+  # A placed runtime starts work by itself (schedule ticks, approval resumes)
+  # under its product's restart lock. While the deploy holds the host lock the
+  # edge closes it: the storage ids returned have acknowledged, so their counts
+  # hold everything they admitted. Open reverses it once the host lock is free.
+  def close_self_admission(self, placements: Sequence[RuntimePlacement]) -> frozenset[str]: ...
+
+  def open_self_admission(self) -> None: ...
 
 
 def _storage_id(storage_id: str) -> str:
-  # This path is a private data boundary, not a product admission policy.
-  if (
-    not isinstance(storage_id, str) or not storage_id.isascii()
-    or not storage_id.isdigit() or storage_id.startswith("0")
-  ):
+  identity = parse_storage_identity(storage_id)
+  if identity.form != "numeric":
     raise ValueError("storage_id must be a canonical positive numeric identity")
-  return storage_id
+  return identity.storage_id
 
 
 def _fsync_directory(path: Path) -> None:
@@ -500,7 +631,7 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
     environ["MEMORY_STARTUP_USER_ID"] = storage_id
     approval_url = environ.get(APPROVALS_EGRESS_URL_ENV)
     if not approval_url:
-      raise ValueError(f"{APPROVALS_EGRESS_URL_ENV} is required for local placement")
+      raise RuntimeStartupError("missing_approvals_egress_url", variable=APPROVALS_EGRESS_URL_ENV)
     try:
       parsed = urlsplit(approval_url)
       if (
@@ -510,9 +641,7 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
       ):
         raise ValueError("invalid approval egress URL")
     except ValueError as exc:
-      raise ValueError(
-        f"{APPROVALS_EGRESS_URL_ENV} must be an explicit absolute http(s) URL without query or fragment"
-      ) from exc
+      raise RuntimeStartupError("invalid_approvals_egress_url", variable=APPROVALS_EGRESS_URL_ENV) from exc
     environ[APPROVALS_EGRESS_URL_ENV] = approval_url
     environ["HANK_APPROVAL_TRANSPORT"] = "local"
 
@@ -571,25 +700,47 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
         environ[names[0]] = str(source)
 
   @staticmethod
-  def _probe(url: str) -> bool:
+  def _runtime_log_path(environ: Mapping[str, str]) -> Path:
+    return Path(environ["GATEWAY_LOG_DIR"]).parent / "runtime.log"
+
+  @staticmethod
+  def _probe(url: str) -> RuntimeReadiness:
+    failure: RuntimeReadiness | None = None
     for path in ("/api/health", "/health"):
+      endpoint = url + path
       try:
-        with urlopen(url + path, timeout=1) as response:
+        with urlopen(endpoint, timeout=1) as response:
           if response.status == 200:
-            return True
-      except (OSError, URLError):
-        pass
-    return False
+            return RuntimeReadiness(True, "ready", endpoint, response.status)
+          outcome = RuntimeReadiness(False, "http_status", endpoint, response.status)
+      except HTTPError as exc:
+        # Status and endpoint are safe diagnostics; the response body is private.
+        outcome = RuntimeReadiness(False, "http_status", endpoint, exc.code)
+      except (OSError, URLError, TimeoutError):
+        outcome = RuntimeReadiness(False, "unreachable", endpoint)
+      if failure is None or (failure.reason == "unreachable" and outcome.reason == "http_status"):
+        failure = outcome
+    assert failure is not None
+    return failure
 
   def health(self, placement: RuntimePlacement) -> bool:
     _storage_id(placement.storage_id)
     process = self._processes.get(placement.storage_id)
     if process is not None and placement.handle == str(process.pid) and process.poll() is not None:
       return False
-    return placement.state == "ready" and self._probe(placement.url)
+    return placement.state == "ready" and self._probe(placement.url).ready
 
   def transport(self, placement: RuntimePlacement) -> httpx.AsyncBaseTransport:
     return httpx.AsyncHTTPTransport()
+
+  def close_self_admission(self, placements: Sequence[RuntimePlacement]) -> frozenset[str]:
+    # A local runtime's environment is this edge's (`_environment`), so its
+    # product leases the same host restart lock the deploy already holds.
+    return frozenset(placement.storage_id for placement in placements)
+
+  def open_self_admission(self) -> None:
+    # The host lock's release reopens local runtimes; nothing is held here.
+    return None
 
   def start(
     self, storage_id: str, identity: UserRuntimeIdentity, desk: DeskReplica,
@@ -613,7 +764,7 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
       user_root = self.placement_root / storage_id
       user_root.mkdir(parents=True, exist_ok=True, mode=0o700)
       user_data_dir = user_root / "user-data"
-      desk_root(user_data_dir, storage_id).mkdir(parents=True, exist_ok=True, mode=0o700)
+      user_desk_root(user_data_dir, storage_id).mkdir(parents=True, exist_ok=True, mode=0o700)
       environ = self._environment(user_data_dir, storage_id)
       self._seed_org_credentials(user_data_dir, environ, storage_id)
       if desk.aws_access_key_id is not None:
@@ -672,6 +823,7 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
       from .gateway_address import GATEWAY_BASE_URL_ENV
 
       environ[GATEWAY_BASE_URL_ENV] = placement.url
+      runtime_log = self._runtime_log_path(environ)
       try:
         boot_command = [
           self._python, str(self._scripts / "user_runtime_boot.py"),
@@ -696,14 +848,22 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
         birth = pid_birth_token(process.pid) or None
         placement = replace(placement, handle=str(process.pid), handle_birth=birth, updated_at=_now())
         self.store.upsert(placement)
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + LOCAL_RUNTIME_READY_TIMEOUT_SECONDS
+        readiness: RuntimeReadiness | None = None
         while time.monotonic() < deadline:
-          if process.poll() is not None:
-            raise RuntimeError("user runtime process exited before readiness")
-          if self._probe(placement.url):
+          exit_code = process.poll()
+          if exit_code is not None:
+            raise RuntimeStartupError(
+              "process_exited", runtime_log=runtime_log, readiness=readiness, exit_code=exit_code,
+            )
+          readiness = self._probe(placement.url)
+          if readiness.ready:
             return self.store.upsert(replace(placement, state="ready", updated_at=_now()))
           time.sleep(0.1)
-        raise RuntimeError("user runtime did not become ready within 60 seconds")
+        raise RuntimeStartupError(
+          "readiness_timeout", runtime_log=runtime_log,
+          timeout_seconds=LOCAL_RUNTIME_READY_TIMEOUT_SECONDS, readiness=readiness,
+        )
       except BaseException:
         self.stop(placement)
         self.store.upsert(
@@ -722,7 +882,7 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
   ) -> subprocess.Popen[bytes]:
     # User apps may print credentials: their output goes to the runtime's own
     # log beside its desk, never into the edge's logs.
-    log_path = Path(environ["GATEWAY_LOG_DIR"]).parent / "runtime.log"
+    log_path = self._runtime_log_path(environ)
     lifeline_read, lifeline_write = os.pipe()
     try:
       descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -747,24 +907,21 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
     expected_birth: str | None = None,
   ) -> bool:
     if process is None or process.poll() is None:
-      signum = signal.SIGTERM
       if expected_birth is not None:
         current_birth = pid_birth_token(pid)
         if current_birth and current_birth != expected_birth:
           return False
         if not current_birth:
-          # An unavailable birth token cannot authorize a signal. The existing
-          # group lookup can still prove that the recorded group is gone.
-          signum = 0
+          # An unavailable birth token cannot authorize a signal. Wait only for
+          # the recorded group to disappear, including descendants still draining.
+          return self._wait_for_group_exit(pid, process)
       try:
-        os.killpg(pid, signum)
+        os.killpg(pid, signal.SIGTERM)
       except ProcessLookupError:
         if process is not None:
           process.wait()
         return True
       except PermissionError:
-        return False
-      if signum == 0:
         return False
       if process is not None:
         try:
@@ -797,6 +954,11 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
       # macOS may deny a signal for a group whose leader has exited. Only the
       # group lookup below, never leader disappearance, can confirm the stop.
       pass
+    return self._wait_for_group_exit(pid, process)
+
+  def _wait_for_group_exit(
+    self, pid: int, process: subprocess.Popen[bytes] | None = None,
+  ) -> bool:
     deadline = time.monotonic() + 5
     while True:
       if process is not None:
@@ -853,6 +1015,12 @@ class LocalProcessRuntimeBackend(RuntimePlacementAuthority):
       return self.store.upsert(
         replace(placement, state="stopped", handle=None, handle_birth=None, updated_at=_now()),
       )
+
+  def shutdown(self) -> None:
+    """Stop retained local handles after the edge has drained its requests."""
+    for placement in self.store.list():
+      if placement.handle is not None:
+        self.stop(placement)
 
   def replace(self, placement: RuntimePlacement) -> RuntimePlacement:
     storage_id = placement.storage_id

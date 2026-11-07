@@ -17,6 +17,7 @@ from hank_model_transport.providers.api_key_store import upsert_api_key_record
 from hank_model_transport.providers.credential_pool import (
   ProviderCredentialPool,
   get_provider_credential_pool,
+  select_pool_candidate,
   store_write_lock,
 )
 from hank_model_transport.providers.kimi_code import KimiCodeProvider
@@ -30,6 +31,9 @@ from hank_model_transport.providers.kimi_code_oauth import (
 )
 from model_authority.thinking import ThinkingLevel
 
+# The hop's stamp on the Kimi pool config (`kimi_code_oauth`), spelled out so
+# these tests run against the pre-fix owner and fail on behavior, not import.
+_HOP_STAMP = "metered_api_key_admitted"
 _ENV_TOKEN_NAMES = (
   "KIMI_CODE_AUTH_TOKEN",
   "KIMI_CODE_API_KEY",
@@ -405,6 +409,81 @@ def test_pool_candidates_keep_both_stores_when_config_auth_store_is_oauth(kimi_e
   }
 
 
+def _enroll_every_kimi_source(kimi_env: Path) -> tuple[dict[str, Path], dict[str, str]]:
+  stores = {
+    "user_oauth": kimi_env / "users" / "42" / "kimi_code" / "oauth.json",
+    "user_api": kimi_env / "users" / "42" / "kimi_code" / "credentials.json",
+    "org_oauth": kimi_env / "kimi_code" / "oauth.json",
+    "org_api": kimi_env / "kimi_code" / "credentials.json",
+  }
+  save_kimi_code_token_record(stores["user_oauth"], _seat("user-oauth@example.com"))
+  upsert_api_key_record(
+    stores["user_api"], {"identity": "user-api", "api_key": "sk-user-api"}, family="kimi_code"
+  )
+  save_kimi_code_token_record(stores["org_oauth"], _seat("org-oauth@example.com"))
+  upsert_api_key_record(
+    stores["org_api"], {"identity": "org-api", "api_key": "sk-org-api"}, family="kimi_code"
+  )
+  environ = {
+    "USER_DATA_DIR": str(kimi_env),
+    "KIMI_CODE_AUTH_TOKEN": "env-oauth-token",
+    "KIMI_CODE_API_KEY": "env-code-api-key",
+    "KIMI_API_KEY": "env-kimi-api-key",
+  }
+  return stores, environ
+
+
+def test_hop_stamped_pool_keeps_oauth_seats_only(kimi_env: Path) -> None:
+  """A metered key reached through a fallback hop is PAYG nobody chose (C1 06a4b3ba)."""
+  stores, environ = _enroll_every_kimi_source(kimi_env)
+
+  candidates, _refresh = resolve_kimi_code_pool_candidates(
+    {_HOP_STAMP: False}, user_scope="42", environ=environ,
+  )
+
+  assert [(c.auth_mode, c.store_path, c.token) for c in candidates] == [
+    ("oauth", stores["user_oauth"], _seat("user-oauth@example.com")["access_token"]),
+    ("oauth", stores["org_oauth"], _seat("org-oauth@example.com")["access_token"]),
+    ("oauth", None, "env-oauth-token"),
+  ]
+
+
+@pytest.mark.parametrize(
+  "stamp",
+  [{}, {_HOP_STAMP: True}],
+  ids=["unstamped-named-selection", "explicitly-admitted"],
+)
+def test_named_selection_still_selects_its_metered_key(
+  kimi_env: Path, stamp: dict[str, bool],
+) -> None:
+  stores, environ = _enroll_every_kimi_source(kimi_env)
+  pool = get_provider_credential_pool("kimi_code")
+  candidates, refresh = resolve_kimi_code_pool_candidates(stamp, user_scope="42", environ=environ)
+  for candidate in candidates:
+    if candidate.auth_mode == "oauth":
+      pool.block(candidate.key, until=time.time() + 600)
+
+  selected = select_pool_candidate(
+    candidates, pool=pool, refresh_fn=refresh, user_scope="42", environ=environ,
+  )
+
+  assert selected is not None
+  assert (selected.auth_mode, selected.store_path, selected.token) == (
+    "api", stores["user_api"], "sk-user-api",
+  )
+
+
+@pytest.mark.parametrize("malformed", ["false", 0, 1, "no"])
+def test_malformed_metered_stamp_refuses_instead_of_choosing_a_lane(
+  kimi_env: Path, malformed: object,
+) -> None:
+  with pytest.raises(ValueError, match=_HOP_STAMP):
+    resolve_kimi_code_pool_candidates(
+      {_HOP_STAMP: malformed},
+      environ={"USER_DATA_DIR": str(kimi_env)},
+    )
+
+
 def test_adapter_route_support_declares_kimi_code_route() -> None:
   support = KimiCodeProvider.adapter_route_support()
   assert support is not None
@@ -518,6 +597,53 @@ def test_next_credential_rotates_to_seat_two_and_parks_seat_one(
   assert pool.blocked_until("second@example.com") == reset_at
 
 
+def _seat_with_metered_sibling(kimi_env: Path) -> dict[str, Any]:
+  user_store = kimi_env / "users" / "42" / "kimi_code"
+  seat = _seat("seat@example.com")
+  save_kimi_code_token_record(user_store / "oauth.json", seat)
+  upsert_api_key_record(
+    user_store / "credentials.json", {"identity": "user-api", "api_key": "sk-user-api"},
+    family="kimi_code",
+  )
+  return {
+    "provider": "kimi_code",
+    "auth_mode": "oauth",
+    "auth_token": seat["access_token"],
+    "api_key": "",
+    "account_identity": "seat@example.com",
+    "auth_user_scope": "42",
+  }
+
+
+def test_rotation_after_a_hop_never_lands_on_a_metered_key(kimi_env: Path) -> None:
+  config = {
+    **_seat_with_metered_sibling(kimi_env),
+    _HOP_STAMP: False,
+  }
+  reset_at = time.time() + 600
+  failure = ProviderCredentialFailure(
+    provider="kimi_code", kind="rate_limit", status_code=429, reset_at=reset_at,
+  )
+
+  assert KimiCodeProvider().next_credential(config, failure) is None
+  assert get_provider_credential_pool("kimi_code").blocked_until("seat@example.com") == reset_at
+
+
+def test_rotation_on_a_named_kimi_selection_still_reaches_its_metered_key(kimi_env: Path) -> None:
+  config = _seat_with_metered_sibling(kimi_env)
+  failure = ProviderCredentialFailure(
+    provider="kimi_code", kind="rate_limit", status_code=429, reset_at=time.time() + 600,
+  )
+
+  rotated = KimiCodeProvider().next_credential(config, failure)
+
+  assert rotated is not None
+  assert (rotated["auth_mode"], rotated["api_key"], rotated["auth_token"]) == (
+    "api", "sk-user-api", "",
+  )
+  assert _HOP_STAMP not in rotated
+
+
 def test_next_credential_does_not_rotate_oauth_seat_on_billing_failure(
   kimi_env: Path, owner_scope: str,
 ) -> None:
@@ -559,7 +685,7 @@ def test_next_credential_never_rotates_onto_org_oauth_seat_for_non_owner(
 
 @pytest.mark.parametrize(
   ("status", "body", "kind"),
-  [(401, "unauthorized", "auth"), (402, "payment required", "billing")],
+  [(401, "unauthorized", "auth"), (402, "payment required", "billing"), (403, "forbidden", "billing")],
 )
 def test_classify_credential_failure_maps_auth_and_billing_statuses(
   status: int, body: str, kind: str,
@@ -573,6 +699,104 @@ def test_classify_credential_failure_maps_auth_and_billing_statuses(
   assert failure.provider == "kimi_code"
   assert failure.kind == kind
   assert failure.status_code == status
+
+
+@pytest.fixture
+def kimi_monthly_limit_detail() -> str:
+  fixture = Path(__file__).parent / "fixtures" / "kimi-code-monthly-usage-limit-sse.json"
+  capture = json.loads(fixture.read_text(encoding="utf-8"))
+  return capture["envelope"]["event"]["primary_failure"]["detail"]
+
+
+@pytest.mark.parametrize(
+  ("retry_after", "expected_reset"),
+  [(None, None), ("Tue, 01 Jan 2030 00:00:00 GMT", 1893456000.0)],
+)
+def test_classify_code_less_monthly_429_from_retained_sse(
+  kimi_monthly_limit_detail: str, retry_after: str | None, expected_reset: float | None,
+) -> None:
+  request = httpx.Request("POST", "https://api.kimi.com/coding/v1/chat/completions")
+  # The SSE retained the formatted exception, not its upstream body/headers.
+  # An empty response is the constructed no-code case, not a captured raw body.
+  response = httpx.Response(
+    429, request=request, headers={} if retry_after is None else {"retry-after": retry_after},
+  )
+  exc = httpx.HTTPStatusError(kimi_monthly_limit_detail, request=request, response=response)
+
+  failure = KimiCodeProvider().classify_credential_failure(exc)
+
+  assert failure is not None
+  assert failure.provider == "kimi_code"
+  assert failure.kind == "rate_limit"
+  assert failure.status_code == 429
+  assert failure.error_code is None
+  assert failure.reset_at == expected_reset
+  assert kimi_monthly_limit_detail in failure.message
+
+
+@pytest.mark.parametrize("source", ["code", "error_code", "type", "response.code", "response.type"])
+@pytest.mark.parametrize(
+  ("code", "expected_kind"),
+  [
+    ("usage_limit", "rate_limit"),
+    ("quota_exceeded", "rate_limit"),
+    ("rate_limit_error", "rate_limit"),
+    ("invalid_api_key", "billing"),
+    ("unknown_provider_code", "billing"),
+  ],
+)
+def test_monthly_text_does_not_override_structured_code_classification(
+  kimi_monthly_limit_detail: str, source: str, code: str, expected_kind: str,
+) -> None:
+  request = httpx.Request("POST", "https://api.kimi.com/coding/v1/chat/completions")
+  # These declarations are synthetic precedence cases, not upstream capture data.
+  if source.startswith("response."):
+    field = source.split(".")[1]
+    response = httpx.Response(429, request=request, json={"error": {field: code}})
+  else:
+    response = httpx.Response(429, request=request)
+  exc = httpx.HTTPStatusError(kimi_monthly_limit_detail, request=request, response=response)
+  if not source.startswith("response."):
+    setattr(exc, source, code)
+
+  failure = KimiCodeProvider().classify_credential_failure(exc)
+
+  assert failure is not None
+  # Existing generic billing prose still applies to non-exhaustion codes; only
+  # the established exhaustion vocabulary takes the rate-limit override.
+  assert failure.kind == expected_kind
+  assert failure.error_code == code
+  assert failure.reset_at is None
+
+
+@pytest.mark.parametrize(("status", "expected_kind"), [(400, "billing"), (401, "auth"), (403, "billing")])
+def test_monthly_text_does_not_change_other_http_status_classification(
+  kimi_monthly_limit_detail: str, status: int, expected_kind: str,
+) -> None:
+  request = httpx.Request("POST", "https://api.kimi.com/coding/v1/chat/completions")
+  exc = httpx.HTTPStatusError(
+    kimi_monthly_limit_detail, request=request, response=httpx.Response(status, request=request),
+  )
+
+  failure = KimiCodeProvider().classify_credential_failure(exc)
+
+  assert failure is not None
+  assert failure.kind == expected_kind
+  assert failure.status_code == status
+  assert failure.reset_at is None
+
+
+def test_other_usage_limit_wording_keeps_existing_billing_classification() -> None:
+  request = httpx.Request("POST", "https://api.kimi.com/coding/v1/chat/completions")
+  exc = httpx.HTTPStatusError(
+    "API usage limit exceeded", request=request, response=httpx.Response(429, request=request),
+  )
+
+  failure = KimiCodeProvider().classify_credential_failure(exc)
+
+  assert failure is not None
+  assert failure.kind == "billing"
+  assert failure.reset_at is None
 
 
 def _kimi_sse(reasoning_key: str) -> bytes:

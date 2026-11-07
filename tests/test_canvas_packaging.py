@@ -22,6 +22,9 @@ def test_canvas_resources_resolve_from_installed_wheel(tmp_path: Path) -> None:
   wheel_dir = tmp_path / "wheel"
   wheel_dir.mkdir()
   build_env = os.environ.copy()
+  build_env.pop("PYTHONPATH", None)
+  build_env["PIP_NO_INDEX"] = "1"
+  build_env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
   build_env["PIP_CACHE_DIR"] = str(tmp_path / "pip-cache")
   subprocess.run(
     [
@@ -30,6 +33,7 @@ def test_canvas_resources_resolve_from_installed_wheel(tmp_path: Path) -> None:
       "pip",
       "wheel",
       "--no-deps",
+      "--no-build-isolation",
       "--wheel-dir",
       str(wheel_dir),
       str(package_root),

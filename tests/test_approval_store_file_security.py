@@ -1,4 +1,5 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -6,8 +7,11 @@ from dataclasses import replace
 from datetime import timedelta
 import fcntl
 import json
+import multiprocessing
+from multiprocessing.synchronize import Barrier as ProcessBarrier
 import os
 from pathlib import Path
+import sqlite3
 import stat
 from threading import Barrier, Event, get_ident
 from typing import Any
@@ -144,6 +148,7 @@ def _binding_arguments(
     "tool_name": request.tool_name,
     "prepared_call": prepared,
     "dispatch_context": {
+      "registry_scope": {"scope_type": "run", "scope_id": "test-run", "store_dir": "/tmp/test-store"},
       "skill_run_id": "skill-original",
       "step_id": "step-original",
       "workspace_dir": "/workspace/original",
@@ -181,6 +186,7 @@ async def _persist_binding(
       session_id="session-original",
       run_id="run-original",
       tenant_id="tenant-public-id",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
     state="pending_user",
   )
@@ -403,7 +409,14 @@ def test_private_binding_checks_scope_before_decoding_operands(
       "operand_mismatch",
     ),
     ("credential_generation_ref", "grant-generation-other", "operand_mismatch"),
-    ("dispatch_context", {"step_id": "step-other"}, "operand_mismatch"),
+    (
+      "dispatch_context",
+      {
+        "step_id": "step-other",
+        "registry_scope": {"scope_type": "run", "scope_id": "test-run", "store_dir": "/tmp/test-store"},
+      },
+      "operand_mismatch",
+    ),
   ],
 )
 def test_private_binding_contradiction_does_not_replace_original(
@@ -440,7 +453,10 @@ def test_private_binding_contradiction_does_not_replace_original(
   ("column", "replacement"),
   [
     ("prepared_input_json", '{"token":"different-secret"}'),
-    ("dispatch_context_json", '{"step_id":"step-other"}'),
+    (
+      "dispatch_context_json",
+      '{"step_id":"step-other","registry_scope":{"scope_type":"run","scope_id":"test-run","store_dir":"/tmp/test-store"}}',
+    ),
     ("nonce", "nonce-corrupted"),
   ],
 )
@@ -593,7 +609,10 @@ def test_park_binding_moves_an_undecided_approval_to_the_pending_call(
       "job_id": job_id,
       "tool_call_id": tool_call_id,
       "nonce": "nonce-repark",
-      "dispatch_context": {"call_index": 5},
+      "dispatch_context": {
+        "call_index": 5,
+        "registry_scope": {"scope_type": "run", "scope_id": "test-run", "store_dir": "/tmp/test-store"},
+      },
     }
     assert await store.park_executable_binding(**arguments) == published_nonce
     assert _binding_identities(store) == [
@@ -610,7 +629,10 @@ def test_park_binding_moves_an_undecided_approval_to_the_pending_call(
       nonce=published_nonce,
       tenant_storage_id="alice",
     )
-    assert binding.dispatch_context == {"call_index": 5}
+    assert binding.dispatch_context == {
+      "call_index": 5,
+      "registry_scope": {"scope_type": "run", "scope_id": "test-run", "store_dir": "/tmp/test-store"},
+    }
     assert binding.prepared_input["token"] == "secret-original-operand"
     assert decision.approval_id == request.approval_id
     located = await store.locate_request(
@@ -1314,6 +1336,96 @@ async def _root_turn_arguments(
   }
 
 
+def _open_approval_store_at_schema_barrier(
+  path: str,
+  barrier: ProcessBarrier,
+) -> None:
+  real_connect = sqlite3.connect
+
+  class BarrierConnection(sqlite3.Connection):
+    _started_schema_transaction = False
+
+    def execute(
+      self,
+      sql: str,
+      parameters: Any = (),
+      /,
+    ) -> sqlite3.Cursor:
+      if sql == "BEGIN IMMEDIATE" and not self._started_schema_transaction:
+        self._started_schema_transaction = True
+        # Before the fix, both openers have already read the obsolete schema.
+        # With the fix, SQLite serializes their schema reads after this barrier.
+        barrier.wait(timeout=20)
+      return super().execute(sql, parameters)
+
+  def connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+    return real_connect(*args, factory=BarrierConnection, **kwargs)
+
+  with pytest.MonkeyPatch.context() as patch:
+    patch.setattr(sqlite3, "connect", connect)
+    SQLiteApprovalStore(Path(path))
+
+
+@pytest.mark.parametrize("schema", ["fresh", "pre-provenance", "released"])
+def test_concurrent_process_opens_serialize_root_turn_schema_migrations(
+  tmp_path: Path,
+  schema: str,
+) -> None:
+  path = tmp_path / "approvals.sqlite3"
+  if schema != "fresh":
+    store = SQLiteApprovalStore(path)
+    with store._connection() as conn:
+      conn.execute(
+        "ALTER TABLE approval_root_turns DROP COLUMN selection_provenance_json",
+      )
+      if schema == "released":
+        conn.execute(
+          "ALTER TABLE approval_root_turns "
+          "RENAME COLUMN grant_digest TO grant_routes_digest",
+        )
+        conn.execute(
+          "ALTER TABLE approval_root_turns "
+          "ADD COLUMN routes_json TEXT NOT NULL DEFAULT '{}'",
+        )
+  # This fcntl-backed store is POSIX-only. Fork also avoids pickling pytest's
+  # importlib-loaded test module; setup has closed its SQLite connection.
+  context = multiprocessing.get_context("fork")
+  barrier = context.Barrier(2)
+  workers = [
+    context.Process(
+      target=_open_approval_store_at_schema_barrier,
+      args=(str(path), barrier),
+    )
+    for _ in range(2)
+  ]
+  for worker in workers:
+    worker.start()
+  try:
+    for worker in workers:
+      worker.join(30)
+    assert [worker.exitcode for worker in workers] == [0, 0]
+  finally:
+    for worker in workers:
+      if worker.is_alive():
+        worker.terminate()
+      worker.join(10)
+
+  async def case() -> None:
+    reopened = SQLiteApprovalStore(path)
+    arguments = await _root_turn_arguments(reopened)
+    await reopened.record_root_turn(**arguments)
+    record = await reopened._read_root_turn_for_executor(
+      job_id=arguments["job_id"],
+      turn_id=arguments["turn_id"],
+      tenant_storage_id=arguments["tenant_storage_id"],
+    )
+    assert record is not None
+    assert json.loads(record.effective_grant_json) == arguments["effective_grant"]
+    assert record.selection_provenance_json == "null"
+
+  asyncio.run(case())
+
+
 @pytest.mark.parametrize(
   ("with_row", "tampered", "future_shape_digest"),
   [(False, False, False), (True, False, False), (True, True, False), (True, False, True)],
@@ -1412,6 +1524,7 @@ def test_released_root_turn_schema_migrates_and_accepts_new_records(
           new_shape["grant_digest"] = _root_turn_snapshot_digest({
             "effective_grant_json": new_shape["effective_grant_json"],
           })
+          new_shape["selection_provenance_json"] = "null"
           old_digest = _root_turn_snapshot_digest(new_shape)
           conn.execute("UPDATE approval_root_turns SET snapshot_digest = ?", (old_digest,))
       conn.commit()
@@ -1430,6 +1543,7 @@ def test_released_root_turn_schema_migrates_and_accepts_new_records(
       assert "routes_json" not in columns
       assert "grant_routes_digest" not in columns
       assert "grant_digest" in columns
+      assert "selection_provenance_json" in columns
       migrated = conn.execute("SELECT * FROM approval_root_turns").fetchone()
       expected = {
         key: value for key, value in old_snapshot.items()
@@ -1442,6 +1556,7 @@ def test_released_root_turn_schema_migrates_and_accepts_new_records(
       expected["grant_digest"] = _root_turn_snapshot_digest({
         "effective_grant_json": expected["effective_grant_json"],
       })
+      expected["selection_provenance_json"] = "null"
       if with_row:
         assert migrated is not None
         if unverified:
@@ -1460,6 +1575,7 @@ def test_released_root_turn_schema_migrates_and_accepts_new_records(
       assert record is not None
       assert json.loads(record.effective_grant_json) == arguments["effective_grant"]
       assert record.grant_digest == expected["grant_digest"]
+      assert record.selection_provenance_json == "null"
       assert record.executable_refs[0].tool_call_id == request.tool_call_id
       assert record.executable_refs[0].nonce == "nonce-original"
       assert await reopened._locate_root_turn_for_approval(
@@ -1976,6 +2092,7 @@ def test_approval_store_get_and_get_by_tool_call_id_are_owner_scoped(
         session_id="sess-1",
         run_id="run-1",
         tenant_id="tenant-1",
+        registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
       ),
       state="pending_user",
     )

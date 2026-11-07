@@ -12,8 +12,13 @@ import time
 
 import pytest
 
-from hank_model_transport.capability_execution import CapabilityExecutionResolver, MaterializedCredential
+from hank_model_transport.auth import ProviderCredentialFailure
+from hank_model_transport.capability_execution import (
+  CapabilityExecutionResolver, FallbackSkip, MaterializedCredential, ModelFallbackHop,
+  materialize_frozen_bind,
+)
 from hank_model_transport.providers import ModelProvider
+from hank_model_transport.providers.api_key_store import upsert_api_key_record
 from hank_model_transport.providers.credential_pool import (
   PoolAccountCandidate,
   ProviderCredentialPool,
@@ -33,6 +38,11 @@ from hank_model_transport.providers.google_antigravity_oauth import (
   resolve_antigravity_pool_candidates,
   save_antigravity_token_record,
 )
+from hank_model_transport.providers.kimi_code import KimiCodeProvider
+from hank_model_transport.providers.kimi_code_oauth import (
+  load_kimi_code_accounts,
+  save_kimi_code_token_record,
+)
 from hank_model_transport.providers.muse import MuseResponsesProvider
 from hank_model_transport.providers.muse_oauth import (
   _materialize_muse_candidate,
@@ -40,7 +50,7 @@ from hank_model_transport.providers.muse_oauth import (
   save_muse_token_record,
 )
 from agent_workflow_contracts.models import SelectionProvenance
-from model_authority.binding import CredentialHandle
+from model_authority.binding import CapabilityResolutionError, CredentialHandle, ModelSelectionIntent
 from model_authority.selection import (
   CapabilityDefault, FallbackEntry, TierModelsDefault, TierSelectionPolicy, capture_selection_snapshot,
 )
@@ -668,6 +678,397 @@ def test_fallback_hop_placement_follows_the_bound_credentials_entitlement(
     ]
 
 
+@pytest.fixture
+def kimi_metered_pool(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> Iterator[tuple[ProviderCredentialPool, Path]]:
+  """User 42's Kimi pool holding one metered API key; tests add an OAuth seat."""
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  for name in (
+    "KIMI_CODE_AUTH_TOKEN", "KIMI_CODE_API_KEY", "KIMI_API_KEY",
+    "KIMI_CODE_AUTH_STORE_PATH", "KIMI_AUTH_STORE_PATH", "KIMI_CODE_API_KEY_STORE_PATH",
+  ):
+    monkeypatch.delenv(name, raising=False)
+  pool = get_provider_credential_pool("kimi_code")
+  pool.clear()
+  user_store = tmp_path / "users" / "42" / "kimi_code"
+  upsert_api_key_record(
+    user_store / "credentials.json", {"identity": "metered", "api_key": "sk-kimi-metered"},
+    family="kimi_code",
+  )
+  try:
+    yield pool, user_store
+  finally:
+    pool.clear()
+
+
+def _enroll_kimi_seat(user_store: Path) -> dict[str, Any]:
+  save_kimi_code_token_record(user_store / "oauth.json", {
+    "email": "seat@example.com",
+    "access_token": "kimi-seat-token",
+    "refresh_token": "kimi-seat-refresh",
+    "expires_at": time.time() + 3600,
+    "source": "subscription",
+  })
+  return load_kimi_code_accounts(user_store / "oauth.json")[0]
+
+
+def _kimi_resolver(
+  user_store: Path, *, with_backup: bool = True,
+) -> tuple[CapabilityExecutionResolver, str, str]:
+  """A `deep` chain from a primary onto `kimi_code` (then a backup).
+
+  The Kimi credential every bind materializes is the metered key, as a named
+  selection's materializer picks it when no OAuth seat serves.
+  """
+  resolver = stub_capability_execution_resolver(
+    default_provider="openai", default_model="gpt-primary", default_effort="none",
+    extra_models=(("kimi_code", "kimi-k3"), ("openai", "gpt-backup")),
+  )
+  models = resolver.registry.models
+  primary_key = next(key for key, entry in models.items() if entry.upstream_model == "gpt-primary")
+  kimi_key = next(key for key, entry in models.items() if entry.upstream_model == "kimi-k3")
+  backup_key = next(key for key, entry in models.items() if entry.upstream_model == "gpt-backup")
+  old_materializer = resolver.credential_materializer
+  metered_config = {
+    "provider": "kimi_code", "auth_mode": "api", "api_key": "sk-kimi-metered", "auth_token": "",
+    "account_identity": "metered", "api_key_store_path": str(user_store / "credentials.json"),
+    "auth_user_scope": "42",
+  }
+
+  def materialize(handle: CredentialHandle) -> MaterializedCredential:
+    if handle.provider == "kimi_code":
+      return MaterializedCredential(handle=handle, auth_config=metered_config)
+    return old_materializer(handle)
+
+  slot = resolver.selection_policy.capabilities["session.driver"]
+  fallback = (FallbackEntry(model=kimi_key),) + ((FallbackEntry(model=backup_key),) if with_backup else ())
+  policy = replace(
+    resolver.selection_policy,
+    capabilities={
+      **resolver.selection_policy.capabilities,
+      "session.driver": replace(slot, default=CapabilityDefault(kind="tier", tier="deep")),
+      # Compaction inherits the turn's model, as the shipped policy declares.
+      "session.compact": replace(
+        resolver.selection_policy.capabilities["session.compact"],
+        default=CapabilityDefault(kind="inherit_parent"),
+      ),
+    },
+    tiers={
+      "deep": TierSelectionPolicy(
+        default=TierModelsDefault((primary_key,), "none"),
+        allowed_model_keys=frozenset({primary_key, kimi_key, backup_key}),
+        fallback=fallback,
+      ),
+    },
+  )
+  return (
+    replace(resolver, selection_policy=policy, credential_materializer=materialize),
+    kimi_key,
+    backup_key,
+  )
+
+
+def _kimi_fallback_hop(
+  user_store: Path, *, with_backup: bool = True, skipped_out: list[FallbackSkip] | None = None,
+) -> tuple[ModelFallbackHop | None, str, str]:
+  """Hop from the primary onto `kimi_code` in `_kimi_resolver`'s chain."""
+  resolver, kimi_key, backup_key = _kimi_resolver(user_store, with_backup=with_backup)
+  hop = CapabilityExecutionResolver.rebind_model_fallback(
+    resolver.resolve("session.driver"), capture_selection_snapshot(resolver.selection_policy),
+    selection_provenance=SelectionProvenance(role=None, role_source=None, effort_source=None, preset=None),
+    history_fits=lambda _execution: True,
+    skipped_out=skipped_out,
+  )
+  return hop, kimi_key, backup_key
+
+
+def test_kimi_fallback_hop_binds_the_oauth_seat_and_its_rotations_stay_off_the_metered_key(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path],
+) -> None:
+  """C1 06a4b3ba: a hop admits Kimi OAuth/plan seats only, for its rotations too."""
+  _pool, user_store = kimi_metered_pool
+  _enroll_kimi_seat(user_store)
+
+  hop, kimi_key, _backup_key = _kimi_fallback_hop(user_store)
+
+  assert hop is not None
+  assert hop.execution.bind.model_key == kimi_key
+  config = dict(hop.execution.auth_config)
+  assert (config["auth_mode"], config["auth_token"], config["api_key"]) == (
+    "oauth", "kimi-seat-token", "",
+  )
+  failure = ProviderCredentialFailure(
+    provider="kimi_code", kind="rate_limit", status_code=429, reset_at=time.time() + 600,
+  )
+  assert KimiCodeProvider().next_credential(config, failure) is None
+
+
+def test_kimi_fallback_hop_skips_a_parked_seat_instead_of_reaching_the_metered_key(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path],
+) -> None:
+  pool, user_store = kimi_metered_pool
+  seat = _enroll_kimi_seat(user_store)
+  pool.block(seat["identity"], until=time.time() + 600)
+
+  hop, kimi_key, backup_key = _kimi_fallback_hop(user_store)
+
+  assert hop is not None
+  assert hop.execution.bind.model_key == backup_key
+  assert [(skip.model_key, skip.code) for skip in hop.skipped] == [
+    (kimi_key, "credential_pool_parked"),
+  ]
+
+
+@pytest.mark.parametrize("with_backup", [True, False], ids=["backup-serves", "chain-exhausted"])
+def test_kimi_fallback_hop_with_only_a_metered_key_refuses_typed(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path], with_backup: bool,
+) -> None:
+  _pool, user_store = kimi_metered_pool
+  skipped_out: list[FallbackSkip] = []
+
+  hop, kimi_key, backup_key = _kimi_fallback_hop(
+    user_store, with_backup=with_backup, skipped_out=skipped_out,
+  )
+
+  expected = [(kimi_key, "metered_credential_not_selected")]
+  if with_backup:
+    assert hop is not None
+    assert hop.execution.bind.model_key == backup_key
+    assert [(skip.model_key, skip.code) for skip in hop.skipped] == expected
+  else:
+    assert hop is None
+    assert [(skip.model_key, skip.code) for skip in skipped_out] == expected
+
+
+def test_a_child_inheriting_a_kimi_fallback_hop_stays_on_its_oauth_seat(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path],
+) -> None:
+  """The child inherits the hop's spending decision; rematerializing it regains no metered key."""
+  _pool, user_store = kimi_metered_pool
+  _enroll_kimi_seat(user_store)
+  hop, kimi_key, _backup_key = _kimi_fallback_hop(user_store)
+  assert hop is not None and hop.execution.resolver is not None
+
+  child = hop.execution.resolver.resolve("session.compact", parent_bind=hop.execution.bind)
+
+  assert (child.bind.model_key, child.bind.selection_source) == (kimi_key, "parent_binding")
+  assert (child.auth_config["auth_mode"], child.auth_config["auth_token"], child.auth_config["api_key"]) == (
+    "oauth", "kimi-seat-token", "",
+  )
+
+
+def test_a_child_inheriting_a_kimi_fallback_hop_refuses_typed_when_no_seat_serves(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path],
+) -> None:
+  pool, user_store = kimi_metered_pool
+  seat = _enroll_kimi_seat(user_store)
+  hop, _kimi_key, _backup_key = _kimi_fallback_hop(user_store)
+  assert hop is not None and hop.execution.resolver is not None
+  pool.block(seat["identity"], until=time.time() + 600)
+
+  with pytest.raises(CapabilityResolutionError) as refused:
+    hop.execution.resolver.resolve("session.compact", parent_bind=hop.execution.bind)
+
+  assert refused.value.code == "credential_unavailable"
+
+
+def test_a_named_kimi_selection_beside_a_hop_keeps_its_metered_key(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path],
+) -> None:
+  """Only an inherited bind carries the hop's decision; an explicit pick is outside the ruling."""
+  _pool, user_store = kimi_metered_pool
+  _enroll_kimi_seat(user_store)
+  hop, kimi_key, _backup_key = _kimi_fallback_hop(user_store)
+  assert hop is not None and hop.execution.resolver is not None
+
+  named = hop.execution.resolver.resolve(
+    "session.driver",
+    explicit_intent=ModelSelectionIntent(model_key=kimi_key, effort=None, source="explicit_user"),
+  )
+
+  assert (named.bind.model_key, named.bind.selection_source) == (kimi_key, "explicit_user")
+  assert (named.auth_config["auth_mode"], named.auth_config["api_key"]) == ("api", "sk-kimi-metered")
+
+
+def test_a_child_of_a_named_kimi_pick_beside_a_hop_keeps_the_metered_key(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path],
+) -> None:
+  """A named pick's descendants inherit its choice; the hop's siblings stay plan-only."""
+  _pool, user_store = kimi_metered_pool
+  _enroll_kimi_seat(user_store)
+  hop, kimi_key, _backup_key = _kimi_fallback_hop(user_store)
+  assert hop is not None and hop.execution.resolver is not None
+  named = hop.execution.resolver.resolve(
+    "session.driver",
+    explicit_intent=ModelSelectionIntent(model_key=kimi_key, effort=None, source="explicit_user"),
+  )
+  assert named.resolver is not None
+
+  named_child = named.resolver.resolve("session.compact", parent_bind=named.bind)
+  hop_child = hop.execution.resolver.resolve("session.compact", parent_bind=hop.execution.bind)
+
+  assert (named_child.bind.selection_source, named_child.auth_config["auth_mode"]) == (
+    "parent_binding", "api",
+  )
+  assert named_child.auth_config["api_key"] == "sk-kimi-metered"
+  assert (hop_child.auth_config["auth_mode"], hop_child.auth_config["auth_token"]) == (
+    "oauth", "kimi-seat-token",
+  )
+
+
+def test_a_revived_child_inheriting_kimi_with_no_recorded_lane_stays_plan_only(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path],
+) -> None:
+  """C1 ee450375: a record from before the lane revives as unknown, plan seats only.
+
+  The parent here even picked Kimi explicitly, and the restoring session holds
+  that explicit lane, but nothing persisted with the child says so. The
+  explicit parent's own durable bind keeps its metered key.
+  """
+  _pool, user_store = kimi_metered_pool
+  _enroll_kimi_seat(user_store)
+  resolver, kimi_key, _backup_key = _kimi_resolver(user_store)
+  parent = resolver.resolve(
+    "session.driver",
+    explicit_intent=ModelSelectionIntent(model_key=kimi_key, effort=None, source="explicit_user"),
+  )
+  assert parent.resolver is not None
+  child = parent.resolver.select_bind("session.compact", parent_bind=parent.bind)
+  assert (child.model_key, child.selection_source) == (kimi_key, "parent_binding")
+
+  revived_parent = materialize_frozen_bind(
+    resolver, parent.bind, selection_lane=None, user_scope="42", base_config={},
+  )
+  revived_child = materialize_frozen_bind(
+    parent.resolver, child, selection_lane=None, user_scope="42", base_config={},
+  )
+
+  assert (revived_parent.auth_config["auth_mode"], revived_parent.auth_config["api_key"]) == (
+    "api", "sk-kimi-metered",
+  )
+  assert (
+    revived_child.auth_config["auth_mode"],
+    revived_child.auth_config["auth_token"],
+    revived_child.auth_config["api_key"],
+  ) == ("oauth", "kimi-seat-token", "")
+
+
+def test_the_resolver_names_each_selected_binds_lane_and_a_child_carries_its_parents(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path],
+) -> None:
+  """Admission's lane: authored primary, explicit pick, hop, and the parent's for a child."""
+  _pool, user_store = kimi_metered_pool
+  _enroll_kimi_seat(user_store)
+  hop, kimi_key, _backup_key = _kimi_fallback_hop(user_store)
+  assert hop is not None and hop.execution.resolver is not None
+  resolver = hop.execution.resolver
+  authored = resolver.select_bind("session.driver")
+  named = resolver.resolve(
+    "session.driver",
+    explicit_intent=ModelSelectionIntent(model_key=kimi_key, effort=None, source="explicit_user"),
+  )
+  assert named.resolver is not None
+  hop_child = resolver.select_bind("session.compact", parent_bind=hop.execution.bind)
+  named_child = named.resolver.select_bind("session.compact", parent_bind=named.bind)
+  restarted, _kimi_key, _backup = _kimi_resolver(user_store)
+
+  assert resolver.selection_lane(authored) == "authored_primary"
+  assert resolver.selection_lane(named.bind) == "explicit_selection"
+  assert resolver.selection_lane(hop_child) == "fallback_hop"
+  assert named.resolver.selection_lane(named_child) == "explicit_selection"
+  # A resolver that holds no parent execution cannot name an inherited lane.
+  assert restarted.selection_lane(hop_child) is None
+
+
+def test_a_persisted_fallback_hop_child_revives_plan_only_through_its_lane(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path],
+) -> None:
+  """The persisted lane, not the restoring session, decides a revived hop child's pool."""
+  _pool, user_store = kimi_metered_pool
+  _enroll_kimi_seat(user_store)
+  hop, kimi_key, _backup_key = _kimi_fallback_hop(user_store)
+  assert hop is not None and hop.execution.resolver is not None
+  child = hop.execution.resolver.select_bind("session.compact", parent_bind=hop.execution.bind)
+  lane = hop.execution.resolver.selection_lane(child)
+  # The restarting session itself runs an explicit Kimi pick, metered key and all.
+  restarted, _kimi_key, _backup = _kimi_resolver(user_store)
+  restoring = restarted.resolve(
+    "session.driver",
+    explicit_intent=ModelSelectionIntent(model_key=kimi_key, effort=None, source="explicit_user"),
+  )
+  assert restoring.resolver is not None
+  assert restoring.auth_config["api_key"] == "sk-kimi-metered"
+
+  revived = materialize_frozen_bind(
+    restoring.resolver, child, selection_lane=lane, user_scope="42", base_config={},
+  )
+
+  assert lane == "fallback_hop"
+  assert (revived.auth_config["auth_mode"], revived.auth_config["auth_token"], revived.auth_config["api_key"]) == (
+    "oauth", "kimi-seat-token", "",
+  )
+
+
+def test_a_persisted_explicit_selection_child_keeps_its_metered_key(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path],
+) -> None:
+  """A child inheriting a named Kimi pick revives with that pick's full pool."""
+  _pool, user_store = kimi_metered_pool
+  _enroll_kimi_seat(user_store)
+  resolver, kimi_key, _backup_key = _kimi_resolver(user_store)
+  named = resolver.resolve(
+    "session.driver",
+    explicit_intent=ModelSelectionIntent(model_key=kimi_key, effort=None, source="explicit_user"),
+  )
+  assert named.resolver is not None
+  child = named.resolver.select_bind("session.compact", parent_bind=named.bind)
+  lane = named.resolver.selection_lane(child)
+  restarted, _kimi_key, _backup = _kimi_resolver(user_store)
+
+  revived = materialize_frozen_bind(
+    restarted, child, selection_lane=lane, user_scope="42", base_config={},
+  )
+
+  assert (lane, child.selection_source) == ("explicit_selection", "parent_binding")
+  assert (revived.auth_config["auth_mode"], revived.auth_config["api_key"]) == (
+    "api", "sk-kimi-metered",
+  )
+
+
+def test_a_child_selected_onto_a_kimi_hop_is_served_plan_only_and_revives_so(
+  kimi_metered_pool: tuple[ProviderCredentialPool, Path],
+) -> None:
+  """After the primary fails, a fresh selection resumes on the hop: same rule as the hop.
+
+  The bind keeps the primary's selection source, so only the recorded lane
+  tells it from an authored Kimi primary.
+  """
+  _pool, user_store = kimi_metered_pool
+  _enroll_kimi_seat(user_store)
+  resolver, kimi_key, _backup_key = _kimi_resolver(user_store)
+  snapshot = capture_selection_snapshot(resolver.selection_policy)
+  primary = resolver.resolve("session.driver", selection_snapshot=snapshot)
+  resolver._record_model_fallback_failure(
+    primary, snapshot,
+    selection_provenance=SelectionProvenance(role=None, role_source=None, effort_source=None, preset=None),
+    previous=None, reason="usage_limit", reset_at=time.time() + 600,
+  )
+
+  selected = resolver.select_bind("session.driver", selection_snapshot=snapshot)
+  lane = resolver.selection_lane(selected)
+  in_process = resolver.materialize_bind(selected)
+  restarted, _kimi_key, _backup = _kimi_resolver(user_store)
+  revived = materialize_frozen_bind(
+    restarted, selected, selection_lane=lane, user_scope="42", base_config={},
+  )
+
+  assert (selected.model_key, selected.selection_source) == (kimi_key, primary.bind.selection_source)
+  assert lane == "fallback_hop"
+  for execution in (in_process, revived):
+    assert (execution.auth_config["auth_mode"], execution.auth_config["api_key"]) == ("oauth", "")
+
+
 
 def test_two_xai_device_code_logins_preserve_both_seats(
   tmp_path: Path,
@@ -1127,3 +1528,19 @@ def test_seed_org_credential_stores_owner_copies_personal_seats_verbatim(tmp_pat
     [source], target, **_owner_kwargs(),
   ) == ("google/oauth.json",)
   assert (target / "google" / "oauth.json").read_bytes() == seat.read_bytes()
+
+
+def test_a_replay_store_record_is_a_model_replay_candidate_billed_as_replay() -> None:
+  candidate = PoolAccountCandidate(
+    provider="ollama_cloud",
+    key="model-replay",
+    record={"identity": "model-replay", "api_key": "replay-synthetic", "source": "model_replay"},
+    auth_mode="api",
+  )
+
+  assert candidate.auth_mechanism == "api_key"
+  assert candidate.entitlement_kind == "model_replay"
+  ordinary = PoolAccountCandidate(
+    provider="ollama_cloud", key="org", record={"identity": "org", "api_key": "k"}, auth_mode="api",
+  )
+  assert ordinary.entitlement_kind == "org_commercial"

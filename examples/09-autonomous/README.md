@@ -28,7 +28,7 @@ Then run:
 python agent.py
 ```
 
-The script writes state to `examples/09-autonomous/state/state.json` and prints the final response to stdout.
+The script writes `state.json` (the `state_file` default of `run_autonomous()`) into its `state/` directory (`STATE_DIR` in `agent.py`, created at run time) and prints the final response to stdout.
 
 ## Heartbeat Mode
 

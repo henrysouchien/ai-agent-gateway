@@ -31,7 +31,7 @@ from agent_workflow_contracts import (
 from .admission import current_parent_context
 from hank_model_transport.capability_execution import BoundCapabilityExecution
 from .event_log import EventLog
-from hank_model_transport.providers.anthropic import _is_cacheable_message_block
+from hank_model_transport.message_prefix import is_cacheable_message_block
 from .runner_introspection import derive_sub_agent_id as _derive_sub_agent_id
 from .runner_session_lifecycle import _runner_attr
 from .runner_cleanup import cleanup_failure_notes
@@ -820,7 +820,7 @@ class RunnerSubAgentMixin:
           else content if isinstance(content, list) else []
         ]
         for block_index in range(len(blocks) - 1, -1, -1)
-        if _is_cacheable_message_block(blocks[block_index])
+        if is_cacheable_message_block(blocks[block_index])
       )
     _bind_child_registry(
       sub_runner,
@@ -833,7 +833,7 @@ class RunnerSubAgentMixin:
     )
     if approved_call is not None:
       sub_runner.bind_resume_approved_call(
-        approved_call, dispatcher.execute_approved_binding,
+        approved_call, dispatcher,
       )
     if bind_research_file_activity_lease_func is not None:
       bind_research_file_activity_lease_func(sub_runner)

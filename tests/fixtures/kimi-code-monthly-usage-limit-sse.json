@@ -1,0 +1,9 @@
+{
+  "provenance": {
+    "source": "~/.local/state/hank/evidence/isolated-gateways/20261102T003155Z-p8791-ai8490b5d00b75/control/kimi-only-turn-events.jsonl",
+    "source_line": 1,
+    "capture_kind": "Gateway SSE envelope, retained verbatim below",
+    "limitations": "Only formatted HTTPStatusError text was retained, not the upstream HTTP response body or headers. The text reports status=429 and an explicit monthly usage limit. Absence of an upstream structured error code/type cannot be established from this capture; reset_at=null is the gateway projection, not proof of absent upstream reset headers. Regression tests separately construct the no-structured-code case."
+  },
+  "envelope": {"event": {"from": {"effort": "high", "label": "Kimi Code K3", "model_key": "kimi_code.k3", "provider": "kimi_code", "upstream_model": "k3"}, "outcome": "exhausted", "primary_failure": {"code": "credential_denied", "detail": "HTTPStatusError: HTTPStatusError(\"ollama API error (status=429): You've reached your monthly usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\")", "model_key": "kimi_code.k3", "reset_at": null}, "product_id": "hank-dev", "reason": "credential_denied", "reset_at": null, "skipped": [], "to": null, "type": "model_fallback"}, "schema_version": 1, "seq": 2, "session_id": "sess_2a2096d1e95b46ca8d74b3785739b594"}
+}

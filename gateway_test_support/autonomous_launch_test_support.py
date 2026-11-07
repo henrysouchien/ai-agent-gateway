@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 from agent_gateway.autonomous_launch_envelope import (
   AUTONOMOUS_CAPABILITY_ENVELOPE_AUDIENCE,
   AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION,
@@ -20,6 +20,12 @@ from agent_gateway.skill_limits import SkillExecutionLimits
 from agent_gateway.agent_session_log_layout import (
   AutonomousSessionLogAuthority,
 )
+
+# A launch always carries the parent's approval settings snapshot.
+_DEFAULT_APPROVAL_SETTINGS: dict[str, Any] = {
+  "approval_policy": "approve_all",
+  "approve_live_orders": False,
+}
 
 def _control_authority(
   *,
@@ -59,6 +65,7 @@ def _workload(
   dev_mode: bool = False,
   deliver: bool = True,
   admitted_skill_execution_limits: SkillExecutionLimits | None = None,
+  approval_settings: dict[str, Any] | None = None,
 ) -> AutonomousLaunchWorkload:
   if mode == "skill" and admitted_skill_execution_limits is None:
     admitted_skill_execution_limits = SkillExecutionLimits()
@@ -74,6 +81,10 @@ def _workload(
     dev_mode=dev_mode,
     deliver=deliver,
     admitted_skill_execution_limits=admitted_skill_execution_limits,
+    approval_settings=(
+      dict(_DEFAULT_APPROVAL_SETTINGS)
+      if approval_settings is None else approval_settings
+    ),
     session_log_authority=AutonomousSessionLogAuthority(
       layout="v1",
       provider_session_epoch=None,

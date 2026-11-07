@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import io
@@ -243,6 +245,7 @@ def _make_dispatcher(event_log: EventLog | None = None, *, capability_bind = TES
     local_tool_handlers={},
     event_log=event_log or EventLog(),
     session_id="sess-auth",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
@@ -1557,6 +1560,7 @@ def test_frozen_generation_bind_fails_typed_with_no_sibling_fallback(
   bind = execution.bind
   with pytest.raises(CapabilityResolutionError) as refused:
     materialize_frozen_bind(
-      resolver, bind, user_scope=7, base_config={"max_tokens": 512},
+      resolver, bind, selection_lane="authored_primary", user_scope=7,
+      base_config={"max_tokens": 512},
     )
   assert refused.value.code == "credential_unavailable"

@@ -6,7 +6,7 @@ import logging
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Literal, Optional, Protocol, runtime_checkable
 from uuid import UUID
@@ -15,6 +15,7 @@ from agent_workflow_contracts.models import SelectionPresetProvenance, Selection
 from fastapi import FastAPI, HTTPException
 
 
+from .admission import root_preset_layer
 from .agent_session_log import _atomic_write_sidecar
 from .approval_subsystem import build_runtime_approval_subsystem
 from model_authority.binding import (
@@ -32,6 +33,11 @@ from model_authority.binding import (
 from model_authority.capabilities import CAPABILITY_IDS, SESSION_DRIVER_CAPABILITY
 from model_authority.current import RATE_TABLES
 from hank_model_transport.capability_execution import CapabilityExecutionResolver, preset_role_map
+from hank_model_transport.user_provider_keys import (
+  ResolveContext, USER_KEY_PROVIDERS, UserKeyMissing, UserProviderKeyError, installed_user_key_pools,
+  parse_user_key_handle_id, user_key_handle_id,
+)
+from .commercial_work_start import MeteredSeat
 from .control_run_lifecycle import coerce_control_run_state
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from model_authority.registry import ProductModelRegistry
@@ -88,7 +94,7 @@ from .server_models import (
   _STREAM_SUBSCRIBER_KEEPALIVE_SECONDS,
   _STREAM_SUBSCRIBER_QUEUE_MAX,
   _build_runner_with_started_at,
-  _call_build_chat_runtime,
+  call_build_chat_runtime,
   _resolve_chat_profile_name,
   log,
 )
@@ -311,7 +317,7 @@ def _clear_active_turn(session: GatewaySession, active_turn: SessionStream) -> N
   session.last_completed_turn = active_turn
 
 
-def _active_turn_is_running(active_turn: SessionStream | None) -> bool:
+def active_turn_is_running(active_turn: SessionStream | None) -> bool:
   return active_turn is not None and active_turn.is_running
 
 
@@ -578,9 +584,10 @@ async def _stream_subscriber_sse(
 def _legacy_request_approval(session: GatewaySession, event_log: EventLog) -> RequestApproval:
   async def request_approval(payload: ApprovalRequest) -> ApprovalDecision:
     approval_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+    requested_at = time.time()
     session.pending_tools[payload.tool_call_id] = {
       "nonce": payload.nonce,
-      "requested_at": int(time.time()),
+      "requested_at": int(requested_at),
       "status": "approval_pending",
       "tool_name": payload.tool_name,
       "resolved_qualifier": payload.resolved_qualifier,
@@ -591,6 +598,8 @@ def _legacy_request_approval(session: GatewaySession, event_log: EventLog) -> Re
       {
         "type": "tool_approval_request",
         "tool_call_id": payload.tool_call_id,
+        "approval_id": payload.approval_id,
+        "ts": requested_at,
         "nonce": payload.nonce,
         "tool_name": payload.tool_name,
         "tool_input": _redact_tool_input_for_event(payload.tool_name, payload.tool_input),
@@ -839,6 +848,66 @@ def _root_preset_for_session(
   return preset
 
 
+class KeyServiceUnavailable(CapabilityResolutionError):
+  """An unavailable enrollment check, distinct from an absent user key."""
+
+  reason: Literal["key_service_unavailable"] = "key_service_unavailable"
+
+  def __init__(self, capability_id: str, notice: CapabilityChoiceNotice) -> None:
+    super().__init__(
+      "credential_unavailable", notice.message,
+      capability_id=capability_id, model_key=notice.model_key,
+    )
+
+  def to_error(self) -> dict[str, Any]:
+    return {**super().to_error(), "reason": self.reason}
+
+
+class MeteredPendingTurnRefused(CapabilityResolutionError):
+  """A metered-pending session's turn without a verified metered V4 seat."""
+
+  reason: Literal["user_key_missing"] = "user_key_missing"
+
+  def __init__(self, session: GatewaySession, provider: str) -> None:
+    missing = UserKeyMissing(provider, session.risk_user_id)
+    super().__init__(
+      "credential_unavailable", missing.user_message,
+      capability_id=SESSION_DRIVER_CAPABILITY, provider=provider,
+    )
+
+  def to_error(self) -> dict[str, Any]:
+    return {**super().to_error(), "reason": self.reason}
+
+
+def user_key_service_unavailable_notice(
+  session: GatewaySession,
+  resolver: CapabilityExecutionResolver,
+  capability_id: str,
+  model_key: str | None,
+) -> CapabilityChoiceNotice | None:
+  """Use the choice notice vocabulary for a model whose key enrollment is unknown."""
+  entry = resolver.registry.models.get(model_key or "")
+  policy = resolver.selection_policy.capabilities.get(capability_id)
+  if (
+    entry is None or policy is None
+    or entry.provider not in session.unavailable_user_key_providers
+    or entry.lifecycle != "active"
+    or entry.key not in policy.allowed_model_keys
+    or entry.key not in resolver.auth_context.entitled_model_keys
+    or capability_id not in resolver.auth_context.entitled_capabilities
+    or not (
+      entry.capabilities.get(capability_id) == "user_selectable"
+      or entry.capabilities.get(capability_id) == "internal" and policy.allow_authenticated_run_override
+    )
+  ):
+    return None
+  return CapabilityChoiceNotice(
+    code="key_service_unavailable", reason="key_service_unavailable",
+    model_key=entry.key,
+    message=f"{entry.label} is unavailable because the API key service is unavailable; try again shortly.",
+  )
+
+
 def build_capability_choices(
   *,
   session: GatewaySession,
@@ -913,7 +982,20 @@ def build_capability_choices(
         role_map_source=preset.source,
       )
     ]
-    notices: list[CapabilityChoiceNotice] = []
+    notices = [
+      notice
+      for key in sorted(policy.allowed_model_keys)
+      if (notice := user_key_service_unavailable_notice(session, resolver, capability_id, key)) is not None
+    ]
+    roles = [
+      CapabilityRoleChoice.model_validate({
+        **role.model_dump(), "unavailable": notice.code, "detail": notice.message,
+      })
+      if role.unavailable is not None and (
+        notice := user_key_service_unavailable_notice(session, resolver, capability_id, role.model_key)
+      ) is not None else role
+      for role in roles
+    ]
     selected: CapabilityChoiceSelection | None = None
     if policy.default.kind == "inherit_parent":
       notices.append(CapabilityChoiceNotice(
@@ -965,6 +1047,7 @@ def build_capability_choices(
             policy=policy,
             auth=resolver.auth_context,
             trusted_channel=resolver.trusted_channel,
+            run_route=policy_artifact.run_route,
           )
           detail = _SAVED_PREFERENCE_NOT_APPLIED_DETAILS.get(
             reason or "",
@@ -993,20 +1076,54 @@ def build_capability_choices(
   return responses
 
 
+def _session_user_key_handles(
+  session: GatewaySession, *, tenant_id: str,
+) -> dict[str, CredentialHandle]:
+  if not session.risk_user_id:
+    return {}
+  actor_id = str(session.owner_user_id or session.user_id or "").strip()
+  return {
+    provider: CredentialHandle(
+      handle_id=user_key_handle_id(risk_user_id=session.risk_user_id, provider=provider),
+      provider=provider, principal="user", tenant_id=tenant_id, actor_id=actor_id,
+    )
+    for provider in USER_KEY_PROVIDERS
+  }
+
+
 def _session_driver_auth_context(
   *,
   session: GatewaySession,
   tenant_id: str,
   service_provider_handles: dict[str, CredentialHandle],
+  metered_seat: MeteredSeat | None = None,
 ) -> AuthContext:
   session_handle = session.session_credential_handle
-  user_handles: dict[str, CredentialHandle] = {}
+  user_handles = {
+    provider: handle
+    for provider, handle in _session_user_key_handles(session, tenant_id=tenant_id).items()
+    if provider in session.enrolled_user_key_providers
+  }
   service_handles = dict(service_provider_handles)
   if session_handle is not None:
+    # The session's selected seat precedes its same-provider user-key hop target.
+    user_handles.pop(session_handle.provider, None)
     if session_handle.principal == "user":
-      user_handles[session_handle.provider] = session_handle
+      if (
+        parse_user_key_handle_id(session_handle.handle_id) is None
+        or session_handle.provider in session.enrolled_user_key_providers
+        or session_handle.provider == session.metered_pending_provider
+      ):
+        user_handles[session_handle.provider] = session_handle
     else:
       service_handles[session_handle.provider] = session_handle
+  allow_service_for_interactive = session.allow_service_for_interactive
+  if metered_seat is not None:
+    # Admitted by the verified metered V4 alone (credential_admission.admit_metered):
+    # the turn's only handle for the authorized provider is its paid seat.
+    user_handles.pop(metered_seat.provider, None)
+    service_handles = {metered_seat.provider: metered_seat.handle}
+    allow_service_for_interactive = True
 
   actor_id = str(session.owner_user_id or session.user_id or "").strip()
   return AuthContext(
@@ -1017,7 +1134,7 @@ def _session_driver_auth_context(
     service_provider_handles=service_handles,
     entitled_capabilities=session.model_entitled_capabilities,
     entitled_model_keys=session.model_entitled_keys,
-    allow_service_for_interactive=session.allow_service_for_interactive,
+    allow_service_for_interactive=allow_service_for_interactive,
   )
 
 
@@ -1026,7 +1143,27 @@ def _materialize_credential(
   session: GatewaySession,
   handle: CredentialHandle,
   service_auth_config_resolver: ServiceAuthConfigResolver | None,
+  metered_seat: MeteredSeat | None = None,
 ) -> MaterializedCredential:
+  if metered_seat is not None and handle == metered_seat.handle:
+    return metered_seat.materialize()
+  user_key = parse_user_key_handle_id(handle.handle_id)
+  if user_key is not None:
+    risk_user_id, provider = user_key
+    try:
+      lease = installed_user_key_pools(provider).lease(
+        risk_user_id=risk_user_id, provider=provider,
+        context=ResolveContext(
+          consumer_key_hash=session.api_key_hash[:16], channel=session.channel,
+          session_id=session.session_id,
+        ),
+      )
+    except UserProviderKeyError as exc:
+      raise CapabilityResolutionError(
+        "credential_unavailable", exc.user_message,
+        capability_id=SESSION_DRIVER_CAPABILITY, provider=provider,
+      ) from exc
+    return MaterializedCredential(handle=handle, auth_config=lease.auth_config())
   if handle is session.session_credential_handle:
     if session.auth_config is None:
       raise RuntimeError(
@@ -1060,6 +1197,7 @@ def _capability_execution_resolver_for_session(
   session: GatewaySession,
   build_chat_runtime: BuildChatRuntime,
   run_overrides: dict[CapabilityId, ModelSelectionIntent] | None = None,
+  metered_seat: MeteredSeat | None = None,
 ) -> CapabilityExecutionResolver:
   registry: ProductModelRegistry | None = getattr(
     build_chat_runtime,
@@ -1104,6 +1242,7 @@ def _capability_execution_resolver_for_session(
     session=session,
     tenant_id=tenant_id,
     service_provider_handles=service_handles,
+    metered_seat=metered_seat,
   )
   adapter_resolver = getattr(
     build_chat_runtime,
@@ -1116,6 +1255,12 @@ def _capability_execution_resolver_for_session(
     registry=registry,
     selection_policy=selection_policy,
     auth_context=auth,
+    # Failover-only handles for every user-key provider of this user, not the session-start
+    # enrollment snapshot: a key enrolled mid-session is eligible at the next authorized
+    # failover, and the credential owner (UserKeyPools.enrolled / materialization) decides
+    # enrollment and key status there (docs/design/user-key-failover-enrollment-2026-11-05.md).
+    user_key_handles=_session_user_key_handles(session, tenant_id=tenant_id),
+    risk_user_id=session.risk_user_id or None,
     credential_materializer=lambda handle: _materialize_credential(
       session=session,
       handle=handle,
@@ -1124,6 +1269,7 @@ def _capability_execution_resolver_for_session(
         "_gateway_service_auth_config_resolver",
         None,
       ),
+      metered_seat=metered_seat,
     ),
     adapter_resolver=adapter_resolver,
     trusted_channel=session.channel,
@@ -1174,6 +1320,11 @@ def bind_init_capability_selections(
     run_overrides=run_overrides,
   )
   for capability_id in sorted(normalized):
+    notice = user_key_service_unavailable_notice(
+      session, resolver, capability_id, normalized[capability_id].model_key,
+    )
+    if notice is not None:
+      raise KeyServiceUnavailable(capability_id, notice)
     resolver.resolve(capability_id)
   if model_preset is not None:
     preset_role_map(resolver.selection_policy, model_preset)
@@ -1190,12 +1341,21 @@ def prepare_session_driver_turn(
   *,
   build_chat_runtime: BuildChatRuntime,
   commercial_account_id: UUID | None = None,
+  metered_seat: MeteredSeat | None = None,
 ) -> PreparedChatTurn:
   """Build and bind one trusted chat request before any billable side effect.
 
   ``commercial_account_id`` comes only from a verified commercial claim; it
-  selects the firm preset layer.
+  selects the firm preset layer. ``metered_seat`` comes only from the
+  commercial gate's verified metered V4 for this request; a metered-pending
+  session binds nothing else.
   """
+
+  pending_provider = session.metered_pending_provider
+  if pending_provider is not None and (
+    metered_seat is None or metered_seat.provider != pending_provider
+  ):
+    raise MeteredPendingTurnRefused(session, pending_provider)
 
   request_id = (
     inputs.request_id.strip()
@@ -1235,6 +1395,7 @@ def prepare_session_driver_turn(
     attachments=tuple(inputs.attachments),
     investment_artifact_selection=inputs.investment_artifact_selection,
   )
+  request._claims_turn = inputs.claims_turn
 
   raw_channel = context.get("channel")
   claimed_channel = (
@@ -1269,7 +1430,27 @@ def prepare_session_driver_turn(
   capability_execution_resolver = _capability_execution_resolver_for_session(
     session=session,
     build_chat_runtime=build_chat_runtime,
+    metered_seat=metered_seat,
   )
+  requested_entry = capability_execution_resolver.registry.models.get(request.model_key or "")
+  notice = (
+    None
+    if metered_seat is not None
+    and requested_entry is not None
+    and requested_entry.provider == metered_seat.provider
+    else user_key_service_unavailable_notice(
+      session, capability_execution_resolver, SESSION_DRIVER_CAPABILITY, request.model_key,
+    )
+  )
+  # An enrollment outage is not enrolled. A deployment handle the session may
+  # use is the pre-unit path, not a refusal.
+  deployment_serves = (
+    requested_entry is not None
+    and capability_execution_resolver.auth_context.allow_service_for_interactive
+    and requested_entry.provider in capability_execution_resolver.auth_context.service_provider_handles
+  )
+  if notice is not None and not deployment_serves:
+    raise KeyServiceUnavailable(SESSION_DRIVER_CAPABILITY, notice)
   preference_store = getattr(
     build_chat_runtime,
     "_gateway_model_preference_store",
@@ -1317,6 +1498,10 @@ def prepare_session_driver_turn(
       )
       if preset.name is not None and preset.scope is not None
       else None
+    ),
+    preset_layer=root_preset_layer(
+      capability_execution_resolver.selection_policy,
+      chosen_by_session=preset.name is not None,
     ),
   )
   explicit_intent = (
@@ -1430,14 +1615,15 @@ async def _dispatch_chat_turn_body(
     )
   # One session admits one active turn: its transcript, runner and event log
   # take one writer, and a second concurrent turn would interleave writes.
-  if _active_turn_is_running(session.active_turn):
+  if active_turn_is_running(session.active_turn):
     raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
   if session.active_turn is not None:
     _clear_active_turn(session, session.active_turn)
   if session.stream_active:
     raise HTTPException(status_code=409, detail="A turn is already running; subscribe via /chat/subscribe")
 
-  prepared = prepared_turn or prepare_session_driver_turn(
+  prepared = prepared_turn or await asyncio.to_thread(
+    prepare_session_driver_turn,
     session,
     inputs,
     build_chat_runtime=build_chat_runtime,
@@ -1449,6 +1635,16 @@ async def _dispatch_chat_turn_body(
   context = dict(request.context or {})
   request_metadata = dict(request.metadata or {})
   request._bind_commercial_work_start(inputs.commercial_work_start)
+  if inputs.commercial_work_start is not None and request.capability_execution_resolver is not None:
+    request._capability_execution_resolver = replace(
+      request.capability_execution_resolver,
+      commercial_work_authorization=inputs.commercial_work_start.authorization,
+    )
+    if request.capability_execution is not None:
+      request._capability_execution = replace(
+        request.capability_execution,
+        resolver=request.capability_execution_resolver,
+      )
   ui_blocks_run = UiBlocksRunContext(
     capability=request.ui_blocks_contract,
     turn_key=uuid.uuid4().hex,
@@ -1589,7 +1785,7 @@ async def _dispatch_chat_turn_body(
         },
         sid,
       )
-      runtime = await _call_build_chat_runtime(
+      runtime = await call_build_chat_runtime(
         build_chat_runtime,
         session=session,
         request=request,
@@ -1662,6 +1858,12 @@ async def _dispatch_chat_turn_body(
         )
       bind_selected_content_activity(selected_content_activity_lease)
       selected_content_activity_transferred = True
+
+    bind_analyst_content = getattr(runner, "bind_analyst_content", None)
+    if callable(bind_analyst_content) and any(
+      message.get("role") == "user" for message in messages
+    ):
+      bind_analyst_content(last_user)
 
     turn_context_msg = getattr(runtime, "turn_context_message", None)
     if turn_context_msg:

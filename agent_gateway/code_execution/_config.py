@@ -39,7 +39,12 @@ class CodeExecutionConfig:
   # Recorded beside the measured host wait on a result; never armed as a wait,
   # interrupt or refusal. `default_timeout_ms` bounds compute only.
   default_host_wait_ms: int | None = None
-  max_timeout_ms: int = 120_000
+  # Bounds the interpreter's boot: the cell frame's write to the runner's
+  # `started` frame, outside `default_timeout_ms`. A session's first cell waits
+  # on the interpreter importing; on a host at load ~90 that took 1.3-6.2 s
+  # (median 3.8 s), so 60 s is ~10x the worst observed. A boot that outlasts it
+  # fails as `kernel_boot_failed`, not as a timeout.
+  kernel_boot_timeout_ms: int = 60_000
 
   # Tool schema
   tool_description_suffix: str = ""

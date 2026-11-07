@@ -304,11 +304,11 @@ def test_enrolling_an_account_does_not_mutate_an_existing_gateway_session_config
   assert after["auth_token"] == "sk-ant-oat01-existing"
 
 
-def test_openai_login_fails_without_changing_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_login_without_identity_does_not_change_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
   monkeypatch.setenv("OPENAI_API_KEY", "existing-key")
   stderr = io.StringIO()
-  assert agent_cli.main(["auth", "login", "openai"], stderr=stderr) == 2
-  assert "does not provide ChatGPT subscription OAuth" in stderr.getvalue()
+  assert agent_cli.main(["auth", "login", "openai"], stderr=stderr) == 1
+  assert "identity_unresolved" in stderr.getvalue()
   assert "existing-key" == os.environ["OPENAI_API_KEY"]
 
 
@@ -736,18 +736,16 @@ def test_same_account_reconsent_supersedes_original_generation_in_its_pool_slot(
   assert original.refresh_token not in path.read_text()
 
 
-@pytest.mark.parametrize("source", ["env:ANTHROPIC_API_KEY", "request:anthropic:api_key"])
 def test_static_api_key_reobservation_and_replacement_have_exact_source_generations(
-  tmp_path: Path, source: str,
+  tmp_path: Path,
 ) -> None:
+  source = "env:ANTHROPIC_API_KEY"
   env = {"USER_DATA_DIR": str(tmp_path), "ANTHROPIC_API_KEY": "fixture-api-key-first"}
   original = register_anthropic_static_credential(
     env["ANTHROPIC_API_KEY"], source=source, environ=env, user_scope=7,
   )
   assert original is not None and original.record is not None
-  path = resolve_anthropic_auth_store_path(
-    environ=env, user_scope="" if source.startswith("env:") else 7,
-  )
+  path = resolve_anthropic_auth_store_path(environ=env)
   assert original.store_path == path
   assert original.account_identity == "api-key-" + hashlib.sha256(original.token.encode()).hexdigest()[:16]
   assert original.grant_hash == hashlib.sha256(original.token.encode()).hexdigest()
@@ -757,14 +755,8 @@ def test_static_api_key_reobservation_and_replacement_have_exact_source_generati
   assert repeated is not None
   assert repeated.source_metadata() == original.source_metadata()
   assert load_anthropic_oauth_store(path) == ()
-  # A user's own request API key is a member of that user's pool (private
-  # tier); the deployment's environment key is never an ambient member.
-  members = resolve_anthropic_credentials(environ=env, user_scope=7).credentials
-  if source.startswith("env:"):
-    assert members == ()
-  else:
-    assert [member.generation_id for member in members] == [original.generation_id]
-    assert members[0].private
+  # Deployment keys are never ambient members of a user's subscription pool.
+  assert resolve_anthropic_credentials(environ=env, user_scope=7).credentials == ()
 
   env["ANTHROPIC_API_KEY"] = "fixture-api-key-replacement"
   replacement = register_anthropic_static_credential(
@@ -773,15 +765,9 @@ def test_static_api_key_reobservation_and_replacement_have_exact_source_generati
   assert replacement is not None
   assert replacement.generation_id != original.generation_id
   assert load_anthropic_oauth_store(path) == ()
-  if not source.startswith("env:"):
-    assert [
-      member.generation_id
-      for member in resolve_anthropic_credentials(environ=env, user_scope=7).credentials
-    ] == [replacement.generation_id]
   assert original.token not in path.read_text()
   assert stat.S_IMODE(path.stat().st_mode) == 0o600
-  if source.startswith("env:"):
-    assert not resolve_anthropic_auth_store_path(environ=env, user_scope=7).exists()
+  assert not resolve_anthropic_auth_store_path(environ=env, user_scope=7).exists()
 
 
 def test_empty_static_source_does_not_invent_a_generation_and_removal_discards_material(
@@ -792,11 +778,11 @@ def test_empty_static_source_does_not_invent_a_generation_and_removal_discards_m
   path = resolve_anthropic_auth_store_path(environ=env)
   assert not path.exists()
   key = register_anthropic_static_credential(
-    "fixture-request-key", source="request:anthropic:api_key", environ=env, user_scope=1,
+    "fixture-deployment-key", environ=env,
   )
   assert key is not None
   assert register_anthropic_static_credential(
-    "", source="request:anthropic:api_key", environ=env, user_scope=1,
+    "", environ=env,
   ) is None
   assert key.store_path is not None
   saved = json.loads(key.store_path.read_text())
@@ -1309,18 +1295,17 @@ def test_environment_array_subset_or_empty_never_retires_unobserved_generations(
 
 
 
-@pytest.mark.parametrize("credential_kind", ["api_key", "auth_token"])
 def test_generation_auth_config_materializes_exact_source_and_rejects_retirement(
-  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credential_kind: str,
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
   frozen = register_anthropic_static_credential(
-    "frozen-material", credential_kind=credential_kind,
+    "frozen-material", credential_kind="auth_token",
     source="request:test:frozen", user_scope=7,
   )
   assert frozen is not None
   register_anthropic_static_credential(
-    "other-material", credential_kind=credential_kind,
+    "other-material", credential_kind="auth_token",
     source="request:test:other", user_scope=7,
   )
   config = anthropic_oauth.anthropic_generation_auth_config(
@@ -1330,10 +1315,10 @@ def test_generation_auth_config_materializes_exact_source_and_rejects_retirement
   assert config["max_tokens"] == 123
   assert config["credential_source"] == frozen.source_metadata()
   assert config["auth_user_scope"] == "7"
-  assert config["api_key"] == ("frozen-material" if credential_kind == "api_key" else "")
-  assert config["auth_token"] == ("frozen-material" if credential_kind == "auth_token" else "")
+  assert config["api_key"] == ""
+  assert config["auth_token"] == "frozen-material"
   register_anthropic_static_credential(
-    "replacement", credential_kind=credential_kind,
+    "replacement", credential_kind="auth_token",
     source="request:test:frozen", user_scope=7,
   )
   with pytest.raises(AnthropicSourceError):
@@ -1342,20 +1327,19 @@ def test_generation_auth_config_materializes_exact_source_and_rejects_retirement
     )
 
 
-@pytest.mark.parametrize("credential_kind", ["api_key", "auth_token"])
 def test_request_enrollment_without_material_preserves_existing_generation(
-  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credential_kind: str,
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
   existing = register_anthropic_static_credential(
-    "existing-material", credential_kind=credential_kind,
-    source=f"request:anthropic:{credential_kind}", user_scope=7,
+    "existing-material", credential_kind="auth_token",
+    source="request:anthropic:auth_token", user_scope=7,
   )
   assert existing is not None
   path = resolve_anthropic_auth_store_path(user_scope=7)
   before = path.read_bytes()
-  assert anthropic_oauth.enroll_request_anthropic_credential(
-    "  ", credential_kind=credential_kind, user_scope=7,
+  assert anthropic_oauth.enroll_request_anthropic_token(
+    "  ", user_scope=7,
   ) is None
   assert path.read_bytes() == before
   config = anthropic_oauth.anthropic_generation_auth_config(
@@ -1379,14 +1363,14 @@ def test_enroll_request_token_owned_by_the_org_is_refused_for_a_non_owner(
   assert org is not None
 
   with pytest.raises(AnthropicSourceError) as refused:
-    anthropic_oauth.enroll_request_anthropic_credential(
-      record.access_token, credential_kind="auth_token", user_scope=2,
+    anthropic_oauth.enroll_request_anthropic_token(
+      record.access_token, user_scope=2,
     )
   assert refused.value.reason == "unobservable"
   assert not resolve_anthropic_auth_store_path(user_scope=2).exists()
 
-  enrolled = anthropic_oauth.enroll_request_anthropic_credential(
-    record.access_token, credential_kind="auth_token", user_scope=1,
+  enrolled = anthropic_oauth.enroll_request_anthropic_token(
+    record.access_token, user_scope=1,
   )
   assert enrolled is not None and enrolled.record is not None
   assert enrolled.generation_ref == org.generation_ref
@@ -1406,8 +1390,8 @@ def test_request_enrollment_retains_oauth_account_refresh_authority(
   upsert_anthropic_oauth_record(path, record)
   owned = resolve_anthropic_credentials(user_scope=7).by_token(record.access_token)
   assert owned is not None and owned.record is not None
-  entered = anthropic_oauth.enroll_request_anthropic_credential(
-    record.access_token, credential_kind="auth_token", user_scope=7,
+  entered = anthropic_oauth.enroll_request_anthropic_token(
+    record.access_token, user_scope=7,
   )
   assert entered is not None and entered.record is not None
   assert entered.generation_ref == owned.generation_ref
@@ -1466,28 +1450,24 @@ def test_bare_bound_tokens_of_different_requests_never_retire_each_other(
     assert resolved.generation_ref == ref
 
 
-@pytest.mark.parametrize("credential_kind", ["api_key", "auth_token"])
 @pytest.mark.parametrize("user_scope", [None, 7])
 def test_request_enrollment_of_different_material_keeps_every_generation(
   tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-  credential_kind: str, user_scope: int | None,
+  user_scope: int | None,
 ) -> None:
   monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
   first, second, again = (
-    anthropic_oauth.enroll_request_anthropic_credential(
-      material, credential_kind=credential_kind, user_scope=user_scope,
+    anthropic_oauth.enroll_request_anthropic_token(
+      material, user_scope=user_scope,
     )
     for material in ("first-session-material", "second-session-material", "first-session-material")
   )
   if user_scope is None:
     # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: no unscoped request is enrolled.
-    if credential_kind == "auth_token":
-      assert first is not None and second is not None and again is not None
-      assert first.token == again.token == "first-session-material"
-      assert second.token == "second-session-material"
-      assert again.generation_ref == first.generation_ref != second.generation_ref
-    else:
-      assert first is None and second is None and again is None
+    assert first is not None and second is not None and again is not None
+    assert first.token == again.token == "first-session-material"
+    assert second.token == "second-session-material"
+    assert again.generation_ref == first.generation_ref != second.generation_ref
     assert not resolve_anthropic_auth_store_path().exists()
     return
   assert first is not None and second is not None and again is not None
@@ -1497,6 +1477,46 @@ def test_request_enrollment_of_different_material_keeps_every_generation(
       enrolled.generation_ref, user_scope=user_scope, base_config={},
     )
     assert config["credential_source"] == enrolled.source_metadata()
+
+
+@pytest.mark.parametrize("source", ["request:anthropic:api_key", "user:7"])
+def test_user_api_key_registration_is_not_a_file_store_route(tmp_path: Path, source: str) -> None:
+  with pytest.raises(AnthropicOAuthError, match="enrolled in Risk"):
+    register_anthropic_static_credential(
+      "legacy-user-key", source=source, user_scope=7,
+      environ={"USER_DATA_DIR": str(tmp_path)},
+    )
+  assert not (tmp_path / "users").exists()
+
+
+def test_legacy_private_store_api_key_resolves_with_user_and_owner_seats(tmp_path: Path) -> None:
+  env = {
+    "USER_DATA_DIR": str(tmp_path),
+    "GATEWAY_USER_KEYS": '[{"slug":"owner","risk_user_id":7,"role":"owner"}]',
+  }
+  user_path = resolve_anthropic_auth_store_path(environ=env, user_scope=7)
+  org_path = resolve_anthropic_auth_store_path(environ=env)
+  user_seat = _record("user-seat")
+  owner_seat = _record("owner-seat")
+  legacy_key = AnthropicOAuthRecord(
+    identity="legacy-key", access_token="legacy-api-key", credential_kind="api_key",
+    source="request:anthropic:api_key",
+  )
+  upsert_anthropic_oauth_record(user_path, user_seat)
+  upsert_anthropic_oauth_record(user_path, legacy_key)
+  upsert_anthropic_oauth_record(org_path, owner_seat)
+  sources = resolve_anthropic_credentials(environ=env, user_scope=7)
+  assert sources.tokens == (user_seat.access_token, "legacy-api-key", owner_seat.access_token)
+  assert [credential.tier for credential in sources.credentials] == ["private", "private", "org"]
+  saved = json.loads(user_path.read_text())
+  assert saved["static_credentials"][0]["access_token"] == "legacy-api-key"
+  exact = resolve_anthropic_credentials(
+    {"credential_source": {"generation_ref": "anthropic-generation-" + saved["static_credentials"][0]["generation_id"]}},
+    environ=env, user_scope=7,
+  )
+  assert exact.credentials[0].token == "legacy-api-key"
+  assert exact.credentials[0].private is True
+  assert exact.credentials[0].generation_ref.endswith(saved["static_credentials"][0]["generation_id"])
 
 
 def test_exact_lookup_and_read_paths_never_write_a_read_only_store(

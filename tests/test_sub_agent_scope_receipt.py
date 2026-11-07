@@ -387,3 +387,96 @@ def test_resolved_authority_projects_into_pure_persisted_route_scopes() -> None:
   assert all_tools == frozenset({"file_read", "web_search"})
   assert local_tools == frozenset({"file_read"})
   assert mcp_scope == {"web": {"web_search"}}
+
+
+def _essential_write_profile() -> SkillProfile:
+  return SkillProfile(
+    execution_class="node.implement",
+    name="study-runner",
+    system_prompt="Run one study through its own door.",
+    agent_callable=True,
+    mutation_mode="model_writer",
+    metadata={
+      "semantic_metadata": {
+        "allowed_effects": ["read", "state_write"],
+        "tool_refs": [
+          {"kind": "local", "tool_id": "file_read"},
+          {
+            "kind": "mcp",
+            "server_id": "records",
+            "tool_id": "propose_record",
+          },
+          {
+            "kind": "mcp",
+            "server_id": "records",
+            "tool_id": "write_record",
+            "essential": True,
+          },
+        ],
+        "capability_requirements": [
+          {
+            "name": "corpus.read/v1",
+            "required": True,
+            "binding_modes": ["live_tool"],
+          },
+          {
+            "name": "state.mutate/v1",
+            "required": True,
+            "binding_modes": ["live_tool"],
+          },
+        ],
+      },
+    },
+  )
+
+
+def test_a_declared_essential_route_is_required_at_admission() -> None:
+  """A sibling write serves state.mutate/v1; the operation's own door is a route."""
+
+  operation = compile_agent_operation(_essential_write_profile())
+  assert operation.essential_routes == ("mcp__records__write_record",)
+
+  def admit(held: tuple[str, ...]):
+    return admit_operation_tools(
+      operation,
+      grant_id="grant:study-runner",
+      operation_tool_ids=held,
+      definitions=tuple({"name": name} for name in held),
+      local_tool_handlers={"file_read": object()},
+      mcp_client=_Mcp(),
+      effect_resolver=lambda tool_id, server, local: (
+        "write" if tool_id in {"write_record", "propose_record"}
+        else _effect(tool_id, server, local)
+      ),
+      exposed_route_ids={"mcp__records__write_record": "write_record"},
+    )
+
+  held_without_door = admit(("file_read", "propose_record"))
+  with_door = admit(("file_read", "propose_record", "write_record"))
+
+  assert isinstance(held_without_door, OperationUnavailable)
+  assert held_without_door.missing_routes == ("write_record",)
+  assert isinstance(with_door, ResolvedAuthority)
+  assert "write_record" in granted_tool_ids(with_door)
+
+
+def test_essential_route_ids_follow_the_callers_exposed_names() -> None:
+  """Canonical ``mcp__server__tool`` declarations meet exposed dispatcher names."""
+
+  operation = compile_agent_operation(_essential_write_profile())
+
+  authority = admit_operation_tools(
+    operation,
+    grant_id="grant:study-runner-exposed",
+    operation_tool_ids=("file_read", "write_record"),
+    definitions=({"name": "file_read"}, {"name": "write_record"}),
+    local_tool_handlers={"file_read": object()},
+    mcp_client=_Mcp(),
+    effect_resolver=lambda tool_id, server, local: (
+      "write" if tool_id == "write_record" else _effect(tool_id, server, local)
+    ),
+    exposed_route_ids={"mcp__records__write_record": "write_record"},
+  )
+
+  assert isinstance(authority, ResolvedAuthority)
+  assert granted_tool_ids(authority) == frozenset({"file_read", "write_record"})

@@ -147,7 +147,7 @@ if TYPE_CHECKING:
     validate_run_identity,
   )
   from .containment_settings import ContainmentSettings
-  from .runner import AgentRunner, SubAgentConfig, ToolResultContext, _derive_sub_agent_id
+  from .runner import AgentRunner, FinalAnswerVerdict, SubAgentConfig, ToolResultContext, _derive_sub_agent_id
   from .runner_background_tasks import WorkflowTaskMetadata
   from .sdk_runner import AgentSDKRunner
   from .session import (
@@ -353,6 +353,7 @@ _EXPORTS = {
   "validate_run_identity": ("agent_gateway.run_identity", "validate_run_identity"),
   "ContainmentSettings": ("agent_gateway.containment_settings", "ContainmentSettings"),
   "AgentRunner": ("agent_gateway.runner", "AgentRunner"),
+  "FinalAnswerVerdict": ("agent_gateway.runner_state", "FinalAnswerVerdict"),
   "SubAgentConfig": ("agent_gateway.runner", "SubAgentConfig"),
   "ToolResultContext": ("agent_gateway.runner", "ToolResultContext"),
   "_derive_sub_agent_id": ("agent_gateway.runner", "_derive_sub_agent_id"),
@@ -451,6 +452,7 @@ __all__ = [
   "RetentionSweepReport",
   "RetentionSweeper",
   "AgentRunner",
+  "FinalAnswerVerdict",
   "AgentSDKRunner",
   "AgentSessionLog",
   "IdempotentEventConflictError",

@@ -9,6 +9,7 @@ OWNER_GATEWAY_SESSION = GatewaySession(
   created_at=1,
   expires_at=2,
   user_id="tool-catalog-test-owner",
+  owner_user_id="tool-catalog-test-owner",
   role="owner",
 )
 

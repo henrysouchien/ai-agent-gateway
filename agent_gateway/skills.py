@@ -24,6 +24,7 @@ from .canonical_json_target_lock import (
   read_locked_canonical_json_target,
   write_locked_canonical_json_target,
 )
+from .operation_catalog import SEMANTIC_SCOPES
 from .operation_snapshot import (
   OPERATION_LISTING_DESCRIPTION_MAX_CHARS,
   build_agent_operation_snapshot,
@@ -290,6 +291,7 @@ def compile_agent_operation(
     resumable=profile.resumable,
     terminal_on_persist=profile.terminal_on_persist,
     result_requires_persist=profile.result_requires_persist,
+    essential_routes=operation_essential_route_ids(profile),
     children=profile.children,
   )
 
@@ -331,8 +333,8 @@ def generic_explore_profile() -> "SkillProfile":
   )
 
 
-def operation_tool_ids(profile: "SkillProfile") -> frozenset[str]:
-  """Return the operation's private declared route ceiling, never a grant."""
+def _semantic_tool_refs(profile: "SkillProfile") -> tuple[dict[str, Any], ...] | None:
+  """The profile's declared ``tool_refs`` mappings, or ``None`` when it has none."""
 
   metadata = getattr(profile, "metadata", None)
   semantic = (
@@ -342,20 +344,49 @@ def operation_tool_ids(profile: "SkillProfile") -> frozenset[str]:
   )
   raw_refs = semantic.get("tool_refs") if isinstance(semantic, dict) else None
   if raw_refs is None:
-    if getattr(profile, "name", None) == GENERIC_EXPLORE_OPERATION_NAME:
-      return GENERIC_EXPLORE_TOOL_IDS
-    return frozenset()
+    return None
   if isinstance(raw_refs, (str, bytes)) or not isinstance(raw_refs, (list, tuple)):
     raise ValueError("semantic tool_refs must be a list")
-  tool_ids: set[str] = set()
+  refs: list[dict[str, Any]] = []
   for raw in raw_refs:
     if not isinstance(raw, dict):
       raise ValueError("semantic tool_refs entries must be mappings")
     tool_id = raw.get("tool_id")
     if type(tool_id) is not str or not tool_id or tool_id != tool_id.strip():
       raise ValueError("semantic tool_refs require canonical tool_id")
-    tool_ids.add(tool_id)
-  return frozenset(tool_ids)
+    refs.append(raw)
+  return tuple(refs)
+
+
+def operation_tool_ids(profile: "SkillProfile") -> frozenset[str]:
+  """Return the operation's private declared route ceiling, never a grant."""
+
+  refs = _semantic_tool_refs(profile)
+  if refs is None:
+    if getattr(profile, "name", None) == GENERIC_EXPLORE_OPERATION_NAME:
+      return GENERIC_EXPLORE_TOOL_IDS
+    return frozenset()
+  return frozenset(raw["tool_id"] for raw in refs)
+
+
+def operation_essential_route_ids(profile: "SkillProfile") -> tuple[str, ...]:
+  """The declared routes the operation cannot run without, in canonical-id form.
+
+  A tool ref marks one with ``essential: true``. MCP routes retain their server
+  identity; admission maps canonical ids to the current exposed route names.
+  """
+
+  refs = _semantic_tool_refs(profile) or ()
+  for raw in refs:
+    if type(raw.get("essential", False)) is not bool:
+      raise ValueError("semantic tool_refs essential must be a boolean")
+  return tuple(sorted({
+    f"mcp__{raw['server_id']}__{raw['tool_id']}"
+    if raw["kind"] == "mcp"
+    else raw["tool_id"]
+    for raw in refs
+    if raw.get("essential", False)
+  }))
 
 
 @dataclass
@@ -504,9 +535,9 @@ def _coerce_optional_scope(value: Any, *, field_name: str, path: Path) -> str | 
   text = _clean_string(value)
   if text is None:
     return None
-  if text not in {"ticker", "portfolio", "industry"}:
+  if text not in SEMANTIC_SCOPES:
     raise ValueError(
-      f"{path}: Invalid scope '{text}': must be 'ticker', 'portfolio', or 'industry'"
+      f"{path}: Invalid scope '{text}': must be 'global', 'ticker', 'portfolio', or 'industry'"
     )
   return text
 

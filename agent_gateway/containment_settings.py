@@ -136,6 +136,18 @@ class ContainmentSettings:
     """A configured compaction trigger is raised to this percent of a larger
     window (``effective_compaction_trigger``)."""
   )
+  tool_result_aging_after_replies = _Setting[int | None](
+    """L4. A large data tool result leaves the model-visible history for its
+    stub once this many assistant replies follow it (stepped by
+    ``tool_result_aging_step_replies``); ``None`` leaves aging off."""
+  )
+  tool_result_aging_min_chars = _Setting[int](
+    """L4. Only a tool result longer than this many characters ages."""
+  )
+  tool_result_aging_step_replies = _Setting[int](
+    """L4. The aging boundary advances once per this many replies, so the
+    provider prefix cache breaks at most that often."""
+  )
 
   def soft_turn_threshold(self, kind: str) -> int | None:
     """One run kind's steer threshold in requests; ``None`` means no ladder."""

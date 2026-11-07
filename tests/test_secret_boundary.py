@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 import json
 import pickle
@@ -180,6 +182,23 @@ def test_typed_event_policy_projects_authored_text_and_returned_tool_payloads() 
   }
   assert leaked_projection["content"][1] == leaked["content"][1]
   assert canary in json.dumps(leaked)
+
+
+@pytest.mark.parametrize("content", [
+  "Analyst-authored prose is not a tool payload.",
+  [
+    {"type": "text", "text": "Analyst-authored text"},
+    {
+      "type": "tool_result", "tool_use_id": "tool-1",
+      "content": "sk-ant-api03-CODEX-WAVE0-CANARY-DO-NOT-USE-8f21d7",
+    },
+  ],
+])
+def test_analyst_content_uses_the_user_content_sanitizer_projection(content: Any) -> None:
+  event = {"type": "user_message", "content": content, "analyst_content": content}
+  projected = sanitize_tool_event(event, sink="durable_event")
+  assert projected["analyst_content"] == projected["content"]
+  assert event["analyst_content"] == content
 
 
 @pytest.mark.parametrize("sink", ["durable_event", "stream_event"])
@@ -659,6 +678,7 @@ def test_payg_bound_auth_config_preserves_public_credential_ref_in_skill_result_
     cast(Any, None),
     event_log=raw_log,
     capability_bind=CapabilityBind.from_json(bind_dict),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   dispatcher.bind_secret_boundary(boundary)
   tool_ctx = SimpleNamespace(

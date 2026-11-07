@@ -29,6 +29,57 @@ class UnknownRegisteredMcpToolDescriptorError(LookupError):
   """An exposed live MCP name has no compiled exact descriptor."""
 
 
+UNREGISTERED_ROUTE_REASON = "live MCP route has no exact static registration"
+UNREGISTERED_ROUTE_ERROR_CODE = "mcp_tool_not_registered"
+
+
+@dataclass(frozen=True, slots=True)
+class RefusedMcpRoute:
+  """One live MCP route refused because it has no exact static registration.
+
+  The route stays out of the model-visible surface; this record is what
+  readiness and the typed call error report.
+  """
+
+  logical_server_id: str
+  logical_name: str
+  exposed_name: str
+  transport_server_id: str
+  route_kind: str
+  reason: str
+
+  def call_error(self) -> dict[str, str]:
+    """Return the typed error a call to this refused tool receives."""
+
+    return {
+      "code": UNREGISTERED_ROUTE_ERROR_CODE,
+      "message": (
+        f"Tool '{self.exposed_name}' on server '{self.logical_server_id}' "
+        f"is refused: {self.reason}."
+      ),
+    }
+
+  def as_readiness(self) -> dict[str, str]:
+    """Return the route as listed in gateway readiness."""
+
+    return {
+      "logical_server_id": self.logical_server_id,
+      "logical_name": self.logical_name,
+      "exposed_name": self.exposed_name,
+      "transport_server_id": self.transport_server_id,
+      "route_kind": self.route_kind,
+      "reason": self.reason,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredMcpToolCompilation:
+  """Descriptors for registered live routes and the routes refused for lack of one."""
+
+  descriptors: tuple["RegisteredMcpToolDescriptor", ...]
+  refused: tuple[RefusedMcpRoute, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class RegisteredMcpToolDescriptor:
   """One exact static MCP registration joined to one exact live route."""
@@ -97,13 +148,18 @@ def _identity_order(
 def compile_registered_mcp_tool_descriptors(
   tool_registration_catalog: ToolRegistrationCatalog,
   manager_route_bindings: tuple[LiveToolRouteBinding, ...],
-) -> tuple[RegisteredMcpToolDescriptor, ...]:
+) -> RegisteredMcpToolCompilation:
   """Join static registrations to the manager's exact immutable route tuple.
 
   ``manager_route_bindings`` is the tuple returned by
   ``McpClientManager.get_server_tool_route_bindings``. This pure join
   revalidates its value shape and its coherence with the static catalog; it
   does not reconstruct or attest the manager topology that produced it.
+
+  A route with no exact static registration is contained per route: it is
+  returned in ``refused`` and every other route still compiles. Any other
+  incoherence (duplicate identity, a registration that disagrees with its
+  route) still raises ``RegisteredMcpToolCompilationError``.
   """
 
   catalog = validate_tool_registration_catalog(tool_registration_catalog)
@@ -111,6 +167,7 @@ def compile_registered_mcp_tool_descriptors(
     raise TypeError("manager_route_bindings must be an exact tuple")
 
   descriptors: list[RegisteredMcpToolDescriptor] = []
+  refused: list[RefusedMcpRoute] = []
   identities: set[RegisteredToolIdentity] = set()
   registration_keys: set[str] = set()
   exposed_names: set[str] = set()
@@ -124,10 +181,16 @@ def compile_registered_mcp_tool_descriptors(
     try:
       declaration = catalog.by_identity(identity)
       server = catalog.server(binding.logical_server_id)
-    except UnknownToolRegistrationError as exc:
-      raise RegisteredMcpToolCompilationError(
-        "live MCP route has no exact static registration"
-      ) from exc
+    except UnknownToolRegistrationError:
+      refused.append(RefusedMcpRoute(
+        logical_server_id=binding.logical_server_id,
+        logical_name=binding.logical_name,
+        exposed_name=binding.exposed_name,
+        transport_server_id=binding.transport_server_id,
+        route_kind=binding.route_kind,
+        reason=UNREGISTERED_ROUTE_REASON,
+      ))
+      continue
     descriptor = RegisteredMcpToolDescriptor(
       declaration=declaration,
       server=server,
@@ -151,12 +214,17 @@ def compile_registered_mcp_tool_descriptors(
     descriptors.append(descriptor)
 
   descriptors.sort(key=_identity_order)
-  return tuple(descriptors)
+  refused.sort(key=lambda route: (route.logical_server_id, route.logical_name))
+  return RegisteredMcpToolCompilation(tuple(descriptors), tuple(refused))
 
 
 __all__ = [
+  "RefusedMcpRoute",
+  "RegisteredMcpToolCompilation",
   "RegisteredMcpToolCompilationError",
   "RegisteredMcpToolDescriptor",
+  "UNREGISTERED_ROUTE_ERROR_CODE",
+  "UNREGISTERED_ROUTE_REASON",
   "UnknownRegisteredMcpToolDescriptorError",
   "compile_registered_mcp_tool_descriptors",
 ]

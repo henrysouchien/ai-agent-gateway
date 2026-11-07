@@ -1,4 +1,4 @@
-"""Run-and-loop diagnostic bounds: packaged defaults under one operator file.
+"""Run-and-loop diagnostic bounds and approval policy under one operator file.
 
 Owner doc: ``docs/reference/agent-run-containment.md``. The bounds are the soft-turn ladder
 thresholds per session kind, its final factor and grace turns, the child silence timeout,
@@ -7,14 +7,15 @@ limit, and the plan-author attempt count. This module is the only reader of the 
 path override ``HANK_RUN_SETTINGS_PATH``) and the only writer of it (``set_operator_setting``,
 reached by ``scripts/hank_settings.py set``). Every ``load_run_settings()`` re-stats the file
 (``operator_settings.StampCache``), so a change is in force at the next read of a running
-process. Operator config inside the trust boundary is observed, never refused
-(``docs/engineering/fail-closed-local-guards.md``; ruled 2026-10-10): a file that is not a JSON
-object, an unknown key or an out-of-range value logs one warning per file change and that
-setting's packaged default applies, while every valid key in the same file still applies. Only
-the writer (``set_operator_setting``) and the fixed form (``pinned_run_settings``: packaged
-defaults plus overrides, never the file) raise ``RunSettingsError``. The file machinery is
-``model_authority.operator_settings``, shared with ``spend_settings``; a bound here is a
-measurement an operator sets, never a refusal of an artifact.
+process. Invalid diagnostic settings are observed with a warning and their packaged
+defaults apply, while valid keys in the same file still apply. The approval keys are
+money authority rather than diagnostics: ``approval_policy`` accepts only
+``approve_all`` and ``ask_all``, ``approve_live_orders`` only a boolean, and invalid
+values raise ``RunSettingsError`` at load, pinned construction,
+and writes without coercion or fallback. The writer (``set_operator_setting``) and
+fixed form (``pinned_run_settings``: packaged defaults plus overrides, never the file)
+also reject invalid diagnostics. The file machinery is ``model_authority.operator_settings``,
+shared with ``spend_settings``.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, Mapping
+from typing import Any, Final, Literal, Mapping
 
 from model_authority import operator_settings
 
@@ -37,6 +38,8 @@ SETTINGS_PATH_ENV: Final = "HANK_RUN_SETTINGS_PATH"
 DEFAULT_SETTINGS_PATH: Final = "~/.config/hank/run-settings.json"
 _DEFAULTS_PATH: Final = Path(__file__).resolve().parent / "run_settings.defaults.json"
 _LABEL: Final = "run settings"
+
+ApprovalPolicyMode = Literal["approve_all", "ask_all"]
 
 
 @dataclass(frozen=True)
@@ -63,13 +66,40 @@ _SPECS: Final = MappingProxyType(
     "context_pressure_reminder_pct": _Spec(integer=True, minimum=1, maximum=100),
     "context_pressure_reminder_step_pct": _Spec(integer=True, minimum=1),
     "compaction_trigger_pct": _Spec(integer=True, minimum=1, maximum=100),
+    "tool_result_aging_after_replies": _Spec(integer=True, minimum=1, nullable=True),
+    "tool_result_aging_min_chars": _Spec(integer=True, minimum=1),
+    "tool_result_aging_step_replies": _Spec(integer=True, minimum=1),
   }
 )
-_KEYS: Final = frozenset(_SPECS)
+_APPROVAL_KEYS: Final = frozenset({"approval_policy", "approve_live_orders"})
+_KEYS: Final = frozenset(_SPECS) | _APPROVAL_KEYS
 
 
 class RunSettingsError(ValueError):
   """The settings (packaged defaults or operator file) are unreadable or invalid."""
+
+
+class _ApprovalPolicyError(RunSettingsError):
+  """Invalid money authority must not use diagnostic-setting fallback."""
+
+
+def _approval_policy(value: object) -> ApprovalPolicyMode:
+  if isinstance(value, str):
+    if value == "approve_all":
+      return "approve_all"
+    if value == "ask_all":
+      return "ask_all"
+  raise _ApprovalPolicyError(
+    f"approval_policy must be 'approve_all' or 'ask_all', got {value!r}"
+  )
+
+
+def _approve_live_orders(value: object) -> bool:
+  if type(value) is bool:
+    return value
+  raise _ApprovalPolicyError(
+    f"approve_live_orders must be true or false, got {value!r}"
+  )
 
 
 @dataclass(frozen=True)
@@ -88,6 +118,11 @@ class RunSettings:
   context_pressure_reminder_pct: int
   context_pressure_reminder_step_pct: int
   compaction_trigger_pct: int
+  tool_result_aging_after_replies: int | None
+  tool_result_aging_min_chars: int
+  tool_result_aging_step_replies: int
+  approval_policy: ApprovalPolicyMode
+  approve_live_orders: bool
 
   def to_dict(self) -> dict[str, Any]:
     return asdict(self)
@@ -136,6 +171,8 @@ def _parse(raw: object) -> RunSettings:
   if unknown or missing:
     raise RunSettingsError(f"run settings keys: unknown {sorted(unknown)}, missing {sorted(missing)}")
   values: dict[str, Any] = {key: _check(key, raw[key]) for key in _SPECS}
+  values["approval_policy"] = _approval_policy(raw["approval_policy"])
+  values["approve_live_orders"] = _approve_live_orders(raw["approve_live_orders"])
   return RunSettings(**values)
 
 
@@ -192,10 +229,13 @@ def _merged_settings(overrides: dict[str, Any], path: Path) -> RunSettings:
 
 
 def _observed_settings(overrides: dict[str, Any], path: Path) -> RunSettings:
-  """The file's valid keys over the packaged defaults; each invalid one is warned about and dropped."""
+  """Observe invalid diagnostics, but reject invalid approval authority."""
 
   kept: dict[str, Any] = {}
   for key, value in overrides.items():
+    if key in _APPROVAL_KEYS:
+      kept[key] = value
+      continue
     if key not in _SPECS:
       logger.warning("run settings file %s: unknown key %s ignored", path, key)
       continue
@@ -211,14 +251,16 @@ def _observed_settings(overrides: dict[str, Any], path: Path) -> RunSettings:
 def load_run_settings() -> RunSettings:
   """Packaged defaults under the operator file's valid keys; re-stat'ed (mtime_ns + size) every call.
 
-  Never raises for the file's content: an unreadable file or one that is not a JSON object is
-  warned about once per change and the packaged defaults apply until it is repaired.
+  Unreadable files or non-object content warn once per change and use defaults.
+  Invalid approval values raise; invalid numeric diagnostics use their defaults.
   """
 
   global _warned
   path = settings_path()
   try:
     settings = _cache.load(path, lambda raw: _observed_settings(raw, path), error=RunSettingsError, label=_LABEL)
+  except _ApprovalPolicyError:
+    raise
   except RunSettingsError as exc:
     _warn_once(path, f"{exc}; the packaged defaults apply")
     return _parse(_packaged_defaults())
@@ -254,14 +296,16 @@ def set_operator_setting(key: str, value: object) -> RunSettings:
 
   A ``str`` value is the CLI form: ``"null"`` / ``"none"`` write ``null`` (an override
   that clears a nullable bound; ``null`` on a bound that forbids it is rejected), anything
-  else is parsed as a JSON scalar, and text that is not JSON stays text and fails
-  validation. The merged result is validated before the in-place write (the file keeps
+  else is parsed as a JSON scalar, and text that is not JSON stays text. The approval
+  policy accepts only its literal modes without CLI conversion; ``approve_live_orders``
+  takes the JSON booleans and refuses everything else. The merged result is
+  validated before the in-place write (the file keeps
   its inode); invalid input leaves the file's bytes unchanged.
   """
 
   if key not in _KEYS:
     raise RunSettingsError(f"unknown run setting {key!r}; known {sorted(_KEYS)}")
-  if isinstance(value, str):
+  if key != "approval_policy" and isinstance(value, str):
     value = _cli_value(value)
   path = settings_path()
   with operator_settings.settings_lock(path):
@@ -274,6 +318,7 @@ def set_operator_setting(key: str, value: object) -> RunSettings:
 
 
 __all__ = [
+  "ApprovalPolicyMode",
   "DEFAULT_SETTINGS_PATH",
   "RunSettings",
   "RunSettingsError",

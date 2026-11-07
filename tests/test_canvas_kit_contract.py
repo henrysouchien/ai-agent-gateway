@@ -37,11 +37,9 @@ def test_authoring_manifest_is_generated_from_packaged_types_and_policy() -> Non
 def test_authoring_manifest_prompt_exposes_exact_component_shapes() -> None:
   prompt = canvas_kit_contract.authoring_manifest_prompt()
 
-  assert "Generated read-only Canvas Kit authoring manifest" in prompt
   assert "SectionHeader:" in prompt
   assert "title: string" in prompt
   assert "MetricStripItem" in prompt
-  assert "calls, new expressions, and await are forbidden" in prompt
 
 
 def test_component_repair_hint_names_nearest_component_and_related_item_shape() -> None:

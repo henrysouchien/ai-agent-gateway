@@ -18,6 +18,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from .approval_store import CONVERSATION_CLOSED_REASON
 from .approval_continuation import RootContinueOutcome
 from .session import AuthManager, GatewaySession, session_owner_user_id
 
@@ -290,7 +291,7 @@ async def cancel_parked_approvals(
       await store.fence_persistent_grants_for_cancellation(request.approval_id, **identity)
       updated, transitioned, _ = await store.terminalize_pending_for_cancellation(
         request.approval_id, **identity,
-        decider_id=tenant_storage_id, decision_reason="conversation_closed",
+        decider_id=tenant_storage_id, decision_reason=CONVERSATION_CLOSED_REASON,
       )
       await store.revoke_persistent_grants_for_approval(request.approval_id)
       if transitioned and policy is not None:

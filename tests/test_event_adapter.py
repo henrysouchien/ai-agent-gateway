@@ -14,7 +14,7 @@ from agent_gateway.runner_session_events import REFUSAL_GUIDANCE, build_refusal_
 
 
 def test_v1_wire_projection_covers_every_v1_type() -> None:
-  assert len(V1_WIRE_EVENT_TYPES) == 46
+  assert len(V1_WIRE_EVENT_TYPES) == 49
   assert V1_WIRE_EVENT_TYPES
   assert set(V1_FIELD_PROJECTION) == set(V1_WIRE_EVENT_TYPES)
   assert all("type" in fields for fields in V1_FIELD_PROJECTION.values())
@@ -86,7 +86,18 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
     {"type": "tool_output_chunk", "tool_call_id": "toolu_1", "tool_name": "code_execute", "stream": "stdout", "text": "line", "seq": 1},
     {"type": "tool_execute_request", "tool_call_id": "toolu_1", "nonce": "nonce", "expires_at": 123, "tool_name": "persist_workbook_update", "tool_input": {}},
     {"type": "interceptor_decision", "tool_call_id": "toolu_1", "tool_name": "bash", "action": "deny", "code": "blocked", "message": "blocked"},
-    {"type": "stream_retry", "attempt": 1, "error": "retry"},
+    {
+      "type": "stream_retry",
+      "attempt": 1,
+      "error": "retry",
+      "settlement": "preserve_partial",
+      "resumed_text_chars": 0,
+      "resumed_reasoning_chars": 0,
+      "discarded_text_chars": 0,
+      "discarded_reasoning_chars": 0,
+      "retained_text_chars": 120,
+      "retained_reasoning_chars": 64,
+    },
     {"type": "credential_refreshed", "provider": "anthropic", "kind": "auth", "status_code": 401},
     {
       "type": "model_fallback",
@@ -116,12 +127,19 @@ def test_v1_projection_covers_current_emitter_fixture_shapes() -> None:
     {"type": "soft_budget_final", "kind": "cost", "observed": 1.5, "threshold": 1.0},
     {"type": "runtime_guard", "guard": "final_answer", "message": "continue"},
     {"type": "operator_pause", "reason": "operator_pause", "safe_boundary": "before_turn"},
+    {"type": "citation_check_started", "turn": 1, "mode": "hold"},
+    {
+      "type": "answer_revision_started", "turn": 1,
+      "mode": "hold", "violation_count": 2,
+    },
+    {"type": "citation_hold_active", "mode": "hold"},
     {
       "type": "citation_validation",
       "schema_version": 1,
       "turn": 1,
       "violations": [],
       "violation_count": 0,
+      "revised": True,
       "warning_codes": [],
       "registry_scope": "session",
     },
@@ -374,6 +392,29 @@ def test_v1_adapter_preserves_artifact_ready_origin() -> None:
 
   assert adapted["origin"] == "readback"
   assert "future_only" not in adapted
+
+
+def test_citation_validation_projection_carries_content_findings() -> None:
+  # The ruling's finding is surfaced to the analyst: a jsonl row is not that.
+  findings = [{
+    "code": "stored_state_contradiction", "figure": "185.93", "span_start": 40, "span_end": 46,
+    "cited": ["S3"], "matched_rows": ["record:price_target.low=209.13"],
+  }]
+  event = {"type": "citation_validation", "turn": 2, "violations": [], "violation_count": 0, "content_findings": findings}
+  adapted = adapt_event(event, 1)
+  assert adapted is not None and adapted["content_findings"] == findings
+
+
+@pytest.mark.parametrize("revised", [False, True])
+def test_citation_validation_projection_preserves_revision_status(revised: bool) -> None:
+  event = {
+    "type": "citation_validation",
+    "turn": 1,
+    "violations": [],
+    "violation_count": 0,
+    "revised": revised,
+  }
+  assert adapt_event(event, 1) == event
 
 
 def test_adapt_event_keeps_tool_calls_planned_turn_and_calls() -> None:

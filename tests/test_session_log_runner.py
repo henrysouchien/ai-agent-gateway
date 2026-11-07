@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import dataclasses
@@ -272,6 +274,7 @@ def _make_dispatcher(
     # invite and denies the synthetic local tools these logging tests execute.
     role="owner",
     get_tool_definitions=lambda: list(tool_definitions),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
@@ -447,6 +450,7 @@ def test_gateway_session_attach_records_the_log_owner(tmp_path: Path) -> None:
     created_at=1,
     expires_at=2,
     user_id="alice",
+    owner_user_id="alice",
     channel="cli",
     auth_config={"api_key": "k"},
   )
@@ -795,6 +799,13 @@ def test_named_skill_repeated_cancellation_drains_interruption_and_detach(
     assert entries[-1].event["type"] == "detach"
     assert entries[-1].event["reason"] == "cancelled"
     assert runner._write_lease_file is None
+    completion = runner.session_completion_read()
+    assert completion["required_skill"]["result_committed"] is True
+    assert completion["required_skill"]["result_projected"] is True
+    assert completion["required_skill"]["settlement_complete"] is True
+    assert completion["required_skill"]["settlement_error"] is None
+    assert completion["detach_committed"] is True
+    assert completion["detach"]["event"]["reason"] == "cancelled"
 
   _run(case())
 
@@ -986,14 +997,14 @@ def test_semantic_tool_error_without_detail_warns_model_context(tmp_path: Path) 
     "sub_code": "empty_error_detail",
   }
   final_content = json.loads(complete["final_tool_result_blocks"][0]["content"])
-  assert final_content == {
-    "status": "error",
-    "error": "",
-    "_runner_warning": (
-      "Tool get_skill_artifact returned status=error without error detail; "
-      "do not retry unchanged input unless required context changed or there is new evidence the failure was transient."
-    ),
-  }
+  assert final_content["status"] == "error"
+  assert final_content["error"] == ""
+  assert final_content["type"] == "operational_failure"
+  assert final_content["next_call"] is None
+  assert final_content["_runner_warning"] == (
+    "Tool get_skill_artifact returned status=error without error detail; "
+    "do not retry unchanged input unless required context changed or there is new evidence the failure was transient."
+  )
   assert complete["final_tool_result_blocks"][0]["is_error"] is True
 
 
@@ -1601,7 +1612,10 @@ def test_credential_rotation_on_the_last_attempt_records_no_backoff(
     billing_mode="byok",
     rate_table_version="unknown",
   )
-  monkeypatch.setattr(runner, "_apply_refreshed_auth_config", lambda config, refreshed: True)
+  monkeypatch.setattr(
+    runner, "_apply_refreshed_auth_config",
+    lambda config, refreshed, failure=None: True,
+  )
 
   _run(runner.run(messages=[{"role": "user", "content": "review allocation"}]))
 
@@ -2628,9 +2642,10 @@ def test_sub_agent_events_are_written_to_parent_log(tmp_path: Path) -> None:
     created_at=1,
     expires_at=2,
     user_id="alice",
+    owner_user_id="alice",
     auth_config={"api_key": "k"},
   )
-  root_context(sub_session, withheld_tools=frozenset(), research_file_id=None)
+  root_context(sub_session, withheld_tools=frozenset(), research_file_id=None, selection_provenance=None)
   logical_task, attempt, result_requirement, result_provenance = (
     _subagent_result_identity(
       delegation_id="test-sub-agent-events",
@@ -3628,3 +3643,281 @@ def test_task_callback_fanout_runs_every_member_then_raises_first_failure() -> N
     assert observed == ["bad", "later_bad", "host"]
 
   _run(_case())
+
+
+def test_completion_read_closed_journal_has_no_manufactured_terminal(
+  tmp_path: Path,
+) -> None:
+  event_log = EventLog(first_seq=41)
+  durable_log = AgentSessionLog(tmp_path / "closed-without-receipt.jsonl")
+  assert event_log.completion_read() == {
+    "closed": False, "cursor": 40, "next_seq": 41,
+    "terminal": None, "revision": 0,
+  }
+  event_log.close_without_terminal()
+  journal = event_log.completion_read()
+  durable = durable_log.completion_read(runner_id="runner_missing")
+  assert journal == {
+    "closed": True, "cursor": 40, "next_seq": 41,
+    "terminal": None, "revision": 1,
+  }
+  assert durable["status"] == "missing"
+  assert durable["cursor"] == durable["revision"] == 0
+  assert durable["receipts"] == []
+  assert durable["detach"] is None
+  assert durable_log.completion_read(runner_id="")["status"] == "no_target"
+
+
+def test_completion_read_copies_terminal_and_retains_absolute_cursor() -> None:
+  event_log = EventLog(first_seq=41, defer_terminal_close=True)
+  event_log.append({
+    "type": "stream_complete", "usage": {"input_tokens": 12},
+  })
+  event_log.append({"type": "session_recap", "summary": "recorded later"})
+  facts = event_log.completion_read()
+  assert facts["closed"] is False
+  assert facts["cursor"] == 42
+  assert facts["next_seq"] == 43
+  assert facts["revision"] == 2
+  assert facts["terminal"] == {
+    "seq": 41,
+    "event": {"type": "stream_complete", "usage": {"input_tokens": 12}},
+  }
+  facts["terminal"]["event"]["usage"]["input_tokens"] = 999
+  assert event_log.completion_read()["terminal"]["event"]["usage"]["input_tokens"] == 12
+
+
+def test_durable_completion_read_uses_exact_runner_and_root_scope(
+  tmp_path: Path,
+) -> None:
+  log = AgentSessionLog(tmp_path / "root-completion.jsonl")
+  log.append_sync({"type": "attach", "runner_id": "root"})
+  receipt_types = [
+    "task_completed", "skill_result_captured", "workflow_output_attached",
+    "stream_complete", "error", "session_recap",
+  ]
+  expected = [
+    log.append_sync({
+      "type": event_type, "runner_id": "root", "details": {"index": index},
+    })
+    for index, event_type in enumerate(receipt_types)
+  ]
+  log.append_sync({
+    "type": "skill_result_captured", "runner_id": "root",
+    "sub_agent_id": "sub0:root",
+  })
+  detach = log.append_sync({
+    "type": "detach", "runner_id": "root", "reason": "completed",
+  })
+  other = log.append_sync({
+    "type": "session_recap", "runner_id": "other",
+  })
+  facts = log.completion_read(runner_id="root")
+  assert facts["status"] == "observed"
+  assert facts["cursor"] == facts["revision"] == other.seq
+  assert facts["receipts"] == [
+    {"seq": entry.seq, "event": entry.event} for entry in expected
+  ]
+  assert facts["detach"] == {"seq": detach.seq, "event": detach.event}
+  assert facts["terminal"]["event"]["type"] == "error"
+  facts["receipts"][0]["event"]["details"]["index"] = 999
+  assert log.completion_read(runner_id="root")["receipts"][0]["event"]["details"]["index"] == 0
+
+
+def test_durable_completion_read_keeps_child_runner_own_scope(tmp_path: Path) -> None:
+  log = AgentSessionLog(tmp_path / "child-completion.jsonl")
+  log.append_sync({
+    "type": "attach", "runner_id": "child", "sub_agent_id": "sub0:parent",
+  })
+  receipt = log.append_sync({
+    "type": "skill_result_captured", "runner_id": "child",
+    "sub_agent_id": "sub0:parent",
+  })
+  log.append_sync({
+    "type": "skill_result_captured", "runner_id": "child",
+    "sub_agent_id": "sub1:parent",
+  })
+  assert log.completion_read(runner_id="child")["receipts"] == [
+    {"seq": receipt.seq, "event": receipt.event},
+  ]
+
+
+def test_durable_completion_read_honors_current_projection_cutoff(
+  tmp_path: Path,
+) -> None:
+  from agent_gateway.research_file_current_projection import (
+    build_current_projection_unavailable_event,
+  )
+
+  log = AgentSessionLog(tmp_path / "erased-completion.jsonl")
+  log.append_sync({"type": "attach", "runner_id": "root"})
+  receipt = log.append_sync({
+    "type": "workflow_output_attached", "runner_id": "root",
+  })
+  marker = log.append_sync(build_current_projection_unavailable_event(
+    invalidated_through_seq=receipt.seq,
+    research_file_ids=[1],
+    document_id="doc:11111111111111111111111111111111",
+    document_generation="11111111-1111-4111-8111-111111111111",
+  ))
+  facts = log.completion_read(runner_id="root")
+  assert facts["status"] == "missing"
+  assert facts["cursor"] == marker.seq
+  assert facts["attach"] is None
+  assert facts["receipts"] == []
+  assert facts["detach"] is None
+
+
+def test_durable_completion_read_exposes_unknown_strict_source(
+  tmp_path: Path,
+) -> None:
+  log = AgentSessionLog(tmp_path / "unknown-completion.jsonl")
+  log.append_sync({"type": "detach", "runner_id": "root"})
+  with log.path.open("ab") as handle:
+    handle.write(b'{"seq":')
+  facts = log.completion_read(runner_id="root")
+  assert facts["status"] == "unknown"
+  assert facts["error"]["type"] == "AgentSessionLogCurrentIntegrityError"
+  assert facts["cursor"] is None
+  assert facts["receipts"] == []
+  assert facts["detach"] is None
+  json.dumps(facts, allow_nan=False)
+
+
+def test_durable_completion_read_reports_pending_append_without_a_receipt(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  async def case() -> None:
+    log = AgentSessionLog(tmp_path / "pending-completion.jsonl")
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    append_sync = log._append_sync
+
+    def paused_append(event: dict[str, Any]):
+      loop.call_soon_threadsafe(started.set)
+      release.wait(timeout=5.0)
+      return append_sync(event)
+
+    monkeypatch.setattr(log, "_append_sync", paused_append)
+    append = asyncio.create_task(log.append({
+      "type": "workflow_output_attached", "runner_id": "root",
+    }))
+    try:
+      await asyncio.wait_for(started.wait(), timeout=5.0)
+      facts = log.completion_read(runner_id="root")
+      assert facts["pending_appends"] == 1
+      assert facts["receipts"] == []
+      assert facts["status"] == "missing"
+    finally:
+      release.set()
+      await append
+    assert log.completion_read(runner_id="root")["pending_appends"] == 0
+    assert len(log.completion_read(runner_id="root")["receipts"]) == 1
+
+  _run(case())
+
+
+def test_session_completion_read_distinguishes_staging_detach_and_receipt(
+  tmp_path: Path,
+) -> None:
+  log = AgentSessionLog(tmp_path / "staged-completion.jsonl")
+  runner = _a_m8_runner(log)
+  _run(runner._emit_attach_event())
+  runner._terminal_closure_receipts = [{
+    "type": "workflow_output_attached", "details": {"path": "report.md"},
+  }]
+  runner._terminal_closure_event = {"type": "stream_complete"}
+  runner._log.append({"type": "stream_complete"})
+  facts = runner.session_completion_read()
+  assert runner._log.completion_read()["closed"] is True
+  assert facts["attach_committed"] is True
+  assert facts["detach_committed"] is False
+  assert facts["closure"]["receipts_staged"][0]["type"] == "workflow_output_attached"
+  assert log.completion_read(runner_id="runner_new")["receipts"] == []
+  facts["closure"]["receipts_staged"][0]["details"]["path"] = "changed"
+  assert runner.session_completion_read()["closure"]["receipts_staged"][0]["details"]["path"] == "report.md"
+  runner._emit_detach_event_sync("completed")
+  detached = runner.session_completion_read()
+  assert detached["detach_committed"] is True
+  assert detached["detach_status"] == "observed"
+  assert log.completion_read(runner_id="runner_new")["receipts"] == []
+  assert detached["required_skill"]["result_committed"] is False
+  assert _a_m8_runner(None).session_completion_read()["status"] == "no_target"
+
+
+@pytest.mark.parametrize("write_first", [False, True])
+def test_session_completion_read_retains_receipt_append_uncertainty(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  write_first: bool,
+) -> None:
+  log = AgentSessionLog(tmp_path / "receipt-uncertainty.jsonl")
+  runner = _a_m8_runner(log)
+  _run(runner._emit_attach_event())
+  append_sync = log.append_sync
+
+  def failing_receipt(event: dict[str, Any]):
+    if event["type"] == "workflow_output_attached":
+      if write_first:
+        append_sync(event)
+      raise OSError("receipt acknowledgement unavailable")
+    return append_sync(event)
+
+  monkeypatch.setattr(log, "append_sync", failing_receipt)
+  runner._terminal_closure_event = {"type": "stream_complete"}
+  runner._terminal_closure_receipts = [{"type": "workflow_output_attached"}]
+  assert _run(runner._settle_run_closure(
+    clean_detach_reason="completed", run_error=None,
+  )) is False
+  facts = runner.session_completion_read()
+  assert facts["receipt_persistence_error"] == {
+    "type": "OSError", "message": "receipt acknowledgement unavailable",
+  }
+  assert facts["receipt_persistence_uncertain"] is True
+  assert facts["detach_committed"] is True
+  assert facts["closure"]["terminal"]["type"] == "error"
+  durable = log.completion_read(runner_id="runner_new")
+  observed = [
+    entry for entry in durable["receipts"]
+    if entry["event"]["type"] == "workflow_output_attached"
+  ]
+  assert bool(observed) is write_first
+  assert durable["detach"]["event"]["reason"] == "error"
+  json.dumps(facts, allow_nan=False)
+
+
+def test_session_completion_read_distinguishes_detach_ack_from_durable_bytes(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  log = AgentSessionLog(tmp_path / "detach-uncertainty.jsonl")
+  runner = _a_m8_runner(log)
+  _run(runner._emit_attach_event())
+  append_sync = log.append_sync
+
+  def unacknowledged_detach(event: dict[str, Any]):
+    entry = append_sync(event)
+    if event["type"] == "detach":
+      raise OSError("detach acknowledgement unavailable")
+    return entry
+
+  monkeypatch.setattr(log, "append_sync", unacknowledged_detach)
+  with pytest.raises(OSError, match="detach acknowledgement unavailable"):
+    runner._emit_detach_event_sync("completed")
+  facts = runner.session_completion_read()
+  assert facts["detach_committed"] is False
+  assert facts["detach_status"] == "unknown"
+  assert facts["detach_persistence_uncertain"] is True
+  assert facts["detach_persistence_error"]["type"] == "OSError"
+  durable = log.completion_read(runner_id="runner_new")
+  assert durable["detach"]["event"]["type"] == "detach"
+  assert durable["receipts"] == []
+  monkeypatch.setattr(log, "append_sync", append_sync)
+  runner._emit_detach_event_sync("completed")
+  assert runner.session_completion_read()["detach_status"] == "observed"
+  assert runner.session_completion_read()["detach_persistence_uncertain"] is False
+  runner._runner_id = "another-runner"
+  assert runner.session_completion_read()["detach_status"] == "missing"
+  assert runner.session_completion_read()["detach_persistence_error"] is None

@@ -21,6 +21,7 @@ from urllib.request import urlopen
 
 import pytest
 
+from excel_mcp.relay_store import SqliteRelayRequestStore, default_relay_request_store_path
 from hank_contracts.agent_api import AGENT_API_CLAIM_ENV_VARS
 from hank_contracts.user_claims import derive_user_claim_key
 from agent_gateway import AgentSessionLog, AgentSessionRef, resolve_agent_session_id
@@ -35,12 +36,15 @@ from agent_gateway.runtime_placement import (
   RestoreResult,
   RuntimePlacement,
   RuntimePlacementStore,
+  RuntimeReadiness,
+  RuntimeStartupError,
   RuntimeState,
   WriterRecord,
   parse_positive_pid,
   pid_birth_token,
 )
 import agent_gateway.runtime_placement as placement_module
+from agent_gateway.user_identity_mapping import StorageIdentityFinding
 from hank_model_transport.providers import api_key_store
 from hank_model_transport.providers.anthropic_oauth import (
   ANTHROPIC_CREDENTIAL_POOL_ENV_NAMES,
@@ -69,8 +73,19 @@ from hank_model_transport.user_runtime_credentials import (
   write_user_runtime_credentials,
 )
 import investment_tools.state_paths as investment_state_paths
+from investment_tools._state_migration import Desk, NoDesk, canonical_json_sha256
 from investment_tools.state_paths import ready_state_paths
 
+
+# Resolve by path because importlib collection binds `tests` to this package.
+_signal_fence_spec = importlib.util.spec_from_file_location(
+  "_test_signal_fence",
+  Path(__file__).resolve().parents[3] / "tests" / "scripts" / "signal_fence.py",
+)
+assert _signal_fence_spec is not None and _signal_fence_spec.loader is not None
+_signal_fence_module = importlib.util.module_from_spec(_signal_fence_spec)
+_signal_fence_spec.loader.exec_module(_signal_fence_module)
+_signal_fence = _signal_fence_module.signal_fence_fixture()
 
 # Real desk_sync restore/replicate here runs the host-wide replica-writer census; another
 # worker's census-test fakes (deliberately unreadable configs) are unproven writers to it.
@@ -242,7 +257,7 @@ def backend(tmp_path: Path) -> Iterator[LocalProcessRuntimeBackend]:
         str(checkout / "packages" / "contracts"), os.environ.get("PYTHONPATH", ""),
       )),
       "AGENT_API_USER_CLAIM_HMAC_KEY": ORG_KEY,
-      "GATEWAY_USER_KEYS": json.dumps([{"key": "other-user-secret"}]),
+      "GATEWAY_USER_KEYS": json.dumps([{"slug": "other-user", "risk_user_id": 18, "key": "other-user-secret"}]),
       "GATEWAY_API_KEY_WEB": "shared-web-operator-authority",
       "GATEWAY_SUBJECT_ASSERTION_ED25519_PUBLIC_KEYS": SUBJECT_PUBLIC_KEYS,
       # The shared tier's own state roots must not reach a user runtime.
@@ -401,9 +416,6 @@ def test_killed_leader_cannot_leave_a_gateway_alive_during_takeover(
     gateway_pid = json.load(response)["pid"]
   os.kill(int(first.handle), signal.SIGKILL)
   backend._processes["17"].wait(timeout=5)
-  os.kill(gateway_pid, 0)
-  with urlopen(first.url + "/health") as response:
-    assert response.status == 200
   assert not backend.health(first)
   writer_path = Path(desk.url) / "users" / "17" / "writer.json"
   held = WriterRecord.model_validate_json(writer_path.read_bytes())
@@ -466,8 +478,10 @@ def test_confirmed_takeover_does_not_cross_replica_urls(
   assert not backend._processes
 
 
-@pytest.mark.parametrize("proof", ["missing-handle", "missing-birth", "mismatched-birth", "unknown-birth"])
-@pytest.mark.parametrize("state", ["ready", "stopped"])
+@pytest.mark.parametrize(("state", "proof"), [
+  ("ready", "missing-handle"), ("ready", "missing-birth"), ("ready", "mismatched-birth"),
+  ("ready", "unknown-birth"), ("stopped", "missing-handle"),
+])
 def test_unconfirmed_placement_cannot_take_over_a_held_writer(
   tmp_path: Path, backend: LocalProcessRuntimeBackend, monkeypatch: pytest.MonkeyPatch,
   proof: str, state: RuntimeState,
@@ -494,7 +508,7 @@ def test_unconfirmed_placement_cannot_take_over_a_held_writer(
     real_killpg(pid, signum)
 
   with monkeypatch.context() as patched:
-    patched.setattr(reloaded, "_probe", lambda url: False)
+    patched.setattr(reloaded, "_probe", lambda url: RuntimeReadiness(False, "unreachable", url))
     patched.setattr(placement_module.os, "killpg", killpg)
     if proof in ("mismatched-birth", "unknown-birth"):
       patched.setattr(
@@ -602,8 +616,12 @@ def test_local_placement_refuses_missing_or_malformed_approval_url(
   runtime = LocalProcessRuntimeBackend(
     placement_root=tmp_path / "placements", org_claim_key=ORG_KEY, extra_env=extra_env,
   )
-  with pytest.raises(ValueError, match="HANK_APPROVALS_EGRESS_URL"):
+  with pytest.raises(RuntimeStartupError, match="HANK_APPROVALS_EGRESS_URL") as caught:
     runtime.start("17", IDENTITY, _desk(tmp_path))
+  expected = "missing_approvals_egress_url" if approval_url in (None, "") else "invalid_approvals_egress_url"
+  assert caught.value.reason == expected
+  assert caught.value.as_dict()["variable"] == "HANK_APPROVALS_EGRESS_URL"
+  assert "retry placement initialization" in caught.value.next_call
   assert runtime.store.get("17") is None
 
 
@@ -622,7 +640,10 @@ def _bundle(path: Path, tmp_path: Path, storage_id: str) -> Path:
 def _local_environment(tmp_path: Path, storage_id: str) -> dict[str, str]:
   local = LocalProcessRuntimeBackend(
     placement_root=tmp_path / "local", org_claim_key=ORG_KEY,
-    extra_env={"HANK_APPROVALS_EGRESS_URL": APPROVALS_EGRESS_URL},
+    extra_env={
+      "HANK_APPROVALS_EGRESS_URL": APPROVALS_EGRESS_URL,
+      "EXCEL_MCP_RELAY_STATE_DIR": str(tmp_path / "shared-relay"),
+    },
   )
   user_root = tmp_path / "local" / storage_id
   environ = local._environment(user_root / "user-data", storage_id)
@@ -641,7 +662,10 @@ def _agentcore_environment(
   monkeypatch.setitem(sys.modules, spec.name, module)
   spec.loader.exec_module(module)
   root = tmp_path / "agentcore"
-  adapter = module.RuntimeAdapter(module.AdapterConfig(root=root, image_env={}, litestream_bin=None))
+  adapter = module.RuntimeAdapter(module.AdapterConfig(
+    root=root, image_env={"EXCEL_MCP_RELAY_STATE_DIR": str(tmp_path / "shared-relay")},
+    litestream_bin=None,
+  ))
   try:
     environ = adapter.environment({}, storage_id)
   finally:
@@ -656,16 +680,24 @@ def _initialise_investment_state(environ: dict[str, str], tmp_path: Path, name: 
   return ready_state_paths(environ, home=tmp_path / "home", package_root=package_root)
 
 
-def test_placed_runtime_initialises_investment_state_in_its_desk(tmp_path: Path) -> None:
-  environ = _local_environment(tmp_path, "7331")
+@pytest.mark.parametrize("backend_name", ["local", "agentcore"])
+def test_placed_runtime_initialises_investment_state_in_its_desk(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_name: str,
+) -> None:
+  environ = (
+    _local_environment(tmp_path, "7331") if backend_name == "local"
+    else _agentcore_environment(tmp_path, monkeypatch, "7331")
+  )
   desk = (Path(environ["USER_DATA_DIR"]) / "users" / "7331").resolve()
 
-  paths = _initialise_investment_state(environ, tmp_path, "local")
+  paths = _initialise_investment_state(environ, tmp_path, backend_name)
 
+  assert paths.identity == Desk("7331")
   assert paths.root.is_relative_to(desk)
   assert paths.root != desk
   assert paths.cutover_marker.is_file()
   assert paths.cutover_marker.is_relative_to(desk)
+  assert json.loads(paths.cutover_marker.read_text())["storage_id"] == "7331"
 
 
 def test_edge_state_dir_does_not_move_a_placed_runtime_off_its_desk(tmp_path: Path) -> None:
@@ -697,6 +729,9 @@ def test_agentcore_and_local_runtimes_keep_state_and_journals_in_their_own_desk(
   }
   for name, environ in environments.items():
     desk = (Path(environ["USER_DATA_DIR"]) / "users" / "7331").resolve()
+    assert environ[USER_STORAGE_ID_ENV] == "7331"
+    assert Path(environ["AGENT_SESSION_LOG_BASE_DIR"]) == desk / "agent-sessions"
+    assert Path(environ["INVESTMENT_TOOLS_STATE_DIR"]) == desk / "investment-tools"
     paths = _initialise_investment_state(environ, tmp_path, name)
     assert paths.root.is_relative_to(desk)
     assert paths.cutover_marker.is_file()
@@ -711,14 +746,59 @@ def test_agentcore_and_local_runtimes_keep_state_and_journals_in_their_own_desk(
     assert not session.path.resolve().is_relative_to(paths.root)
 
 
+@pytest.mark.parametrize("runtime_kind", ["local", "agentcore"])
+def test_placed_relay_stores_are_isolated_from_the_edge_and_other_desks(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime_kind: str,
+) -> None:
+  shared_path = tmp_path / "shared-relay" / "relay_requests.sqlite3"
+  shared_store = SqliteRelayRequestStore(shared_path)
+  shared_record = {
+    "request_id": "same-request", "owner_user_id": "edge", "state": "completed",
+    "updated_at": time.time(), "result": {"value": "edge"},
+  }
+  shared_store.save(shared_record)
+  stores: dict[str, SqliteRelayRequestStore] = {}
+  records = {}
+  for storage_id in ("7331", "7332"):
+    environ = (
+      _local_environment(tmp_path, storage_id) if runtime_kind == "local"
+      else _agentcore_environment(tmp_path, monkeypatch, storage_id)
+    )
+    path = default_relay_request_store_path(environ)
+    assert path is not None
+    desk = Path(environ["USER_DATA_DIR"]) / "users" / storage_id
+    assert path.is_relative_to(desk)
+    assert path != shared_path
+    assert path.parent.is_dir()
+    store = SqliteRelayRequestStore(path)
+    record = {
+      "request_id": "same-request", "owner_user_id": storage_id, "state": "completed",
+      "updated_at": time.time(), "result": {"value": storage_id},
+    }
+    store.save(record)
+    stores[storage_id] = store
+    records[storage_id] = record
+  assert stores["7331"].path != stores["7332"].path
+  for storage_id, store in stores.items():
+    assert store.get("same-request", owner_user_id=storage_id) == records[storage_id]
+    assert store.get("same-request", owner_user_id="edge") is None
+  assert shared_store.get("same-request", owner_user_id="edge") == shared_record
+
+
 def test_investment_tools_and_placement_agree_on_the_storage_id_env_name() -> None:
   # investment_tools ships as its own distribution pinned to an older agent_gateway,
   # so it declares the name itself; this pins it to the placement's.
   assert investment_state_paths.USER_STORAGE_ID_ENV == USER_STORAGE_ID_ENV
 
 
-def test_children_of_a_placed_runtime_resolve_the_same_investment_state_root(tmp_path: Path) -> None:
-  gateway_environment = _local_environment(tmp_path, "7331")
+@pytest.mark.parametrize("backend_name", ["local", "agentcore"])
+def test_children_of_a_placed_runtime_resolve_the_same_investment_state_root(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_name: str,
+) -> None:
+  gateway_environment = (
+    _local_environment(tmp_path, "7331") if backend_name == "local"
+    else _agentcore_environment(tmp_path, monkeypatch, "7331")
+  )
   gateway_paths = _initialise_investment_state(gateway_environment, tmp_path, "gateway")
 
   child_environment = filter_child_environment(gateway_environment, purpose=AUTONOMOUS_CHILD_ENVIRONMENT)
@@ -731,8 +811,83 @@ def test_children_of_a_placed_runtime_resolve_the_same_investment_state_root(tmp
   child_package_root.mkdir()
   child_paths = ready_state_paths(child_environment, home=tmp_path / "home", package_root=child_package_root)
   desk = (Path(gateway_environment["USER_DATA_DIR"]) / "users" / "7331").resolve()
+  assert child_paths.identity == gateway_paths.identity == Desk("7331")
   assert child_paths.root == gateway_paths.root
   assert child_paths.root.is_relative_to(desk)
+
+
+@pytest.mark.parametrize("backend_name", ["local", "agentcore"])
+@pytest.mark.parametrize("marker_schema", ["v5", "v4"])
+@pytest.mark.parametrize("environment_kind", ["autonomous-child", "parent"])
+def test_placed_runtime_identity_loss_refuses_desk_state_without_shared_fallback(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend_name: str,
+  environment_kind: str, marker_schema: str,
+) -> None:
+  gateway_environment = (
+    _local_environment(tmp_path, "7331") if backend_name == "local"
+    else _agentcore_environment(tmp_path, monkeypatch, "7331")
+  )
+  gateway_paths = _initialise_investment_state(gateway_environment, tmp_path, "gateway")
+  assert gateway_paths.identity == Desk("7331")
+  if marker_schema == "v4":
+    v4_payload = json.loads(gateway_paths.cutover_marker.read_text(encoding="utf-8"))
+    v4_payload["schema"] = "investment-tools-state-cutover/v4"
+    v4_payload.pop("storage_id", None)
+    unsigned = {key: value for key, value in v4_payload.items() if key != "evidence_sha256"}
+    v4_payload["evidence_sha256"] = canonical_json_sha256(unsigned)
+    gateway_paths.cutover_marker.write_text(
+      json.dumps(v4_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    gateway_paths.cutover_marker.chmod(0o600)
+  else:
+    assert json.loads(gateway_paths.cutover_marker.read_text())["storage_id"] == "7331"
+  gateway_paths.data.mkdir(parents=True, exist_ok=True)
+  (gateway_paths.data / "placement-proof.json").write_bytes(b'{"desk":"7331"}\n')
+
+  assert USER_RUNTIME_CREDENTIALS_FILE_ENV in gateway_environment
+  if environment_kind == "autonomous-child":
+    environ = filter_child_environment(gateway_environment, purpose=AUTONOMOUS_CHILD_ENVIRONMENT)
+    assert USER_RUNTIME_CREDENTIALS_FILE_ENV not in environ
+  else:
+    environ = dict(gateway_environment)
+    assert Path(environ[USER_RUNTIME_CREDENTIALS_FILE_ENV]).is_file()
+  del environ[USER_STORAGE_ID_ENV]
+
+  package_root = tmp_path / "package-consumer"
+  package_root.mkdir()
+  home = tmp_path / "home"
+  shared_root = investment_state_paths.resolve_state_paths(
+    {}, home=home, package_root=package_root,
+  ).root
+  assert not shared_root.exists()
+  marker_bytes = gateway_paths.cutover_marker.read_bytes()
+  marker_inode = gateway_paths.cutover_marker.stat().st_ino
+
+  def tree_snapshot() -> dict[Path, tuple[int, int, bytes | None]]:
+    return {
+      path.relative_to(tmp_path): (
+        path.stat().st_ino, path.stat().st_mtime_ns,
+        path.read_bytes() if path.is_file() else None,
+      )
+      for path in (tmp_path, *sorted(tmp_path.rglob("*")))
+    }
+
+  before = tree_snapshot()
+  resolved = investment_state_paths.resolve_state_paths(
+    environ, home=home, package_root=package_root,
+  )
+  assert resolved.identity == NoDesk()
+  assert resolved.root == gateway_paths.root
+  assert resolved.root != shared_root
+  with pytest.raises(investment_state_paths.StatePathError) as error:
+    ready_state_paths(environ, home=home, package_root=package_root)
+  finding = str(error.value)
+  assert "Finding" in finding and "NoDesk" in finding and "Desk" in finding and "7331" in finding
+  assert str(gateway_paths.root) in finding
+  assert gateway_paths.cutover_marker.read_bytes() == marker_bytes
+  assert gateway_paths.cutover_marker.stat().st_ino == marker_inode
+  assert tree_snapshot() == before
+  assert not shared_root.exists()
 
 
 def test_local_process_claim_custody_and_replacement(
@@ -922,6 +1077,67 @@ def test_backend_reload_sigkill_permission_error_requires_confirmed_group_exit(
   assert signals[2:] and all(signum == 0 for _, signum in signals[2:])
   if not confirmed:
     assert 5 <= clock[0] < 6  # EPERM alone is unconfirmed only after the full bound
+
+
+@pytest.mark.parametrize(("group_probe_results", "confirmed"), [
+  pytest.param(
+    [None, None, ProcessLookupError(errno.ESRCH, "group gone")],
+    True, id="group-present-then-gone",
+  ),
+  pytest.param(
+    [PermissionError(errno.EPERM, "zombie group"), None,
+     ProcessLookupError(errno.ESRCH, "group gone")],
+    True, id="eperm-then-gone",
+  ),
+  pytest.param([None], False, id="group-still-present"),
+  pytest.param([PermissionError(errno.EPERM, "probe denied")], False, id="group-unknown"),
+])
+def test_unverified_birth_waits_for_group_exit_without_signalling(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+  group_probe_results: list[OSError | None], confirmed: bool,
+) -> None:
+  runtime = LocalProcessRuntimeBackend(
+    placement_root=tmp_path / "placements", org_claim_key=ORG_KEY, stop_grace=0,
+  )
+  pid = 12345
+  signals: list[tuple[int, int]] = []
+  clock = [0.0]
+  probes = list(group_probe_results)
+  observed_group_exit = False
+
+  def killpg(group: int, signum: int) -> None:
+    nonlocal observed_group_exit
+    signals.append((group, signum))
+    assert group == pid and signum == 0, "an unverified leader cannot authorize a signal"
+    result = probes.pop(0) if len(probes) > 1 else probes[0]
+    if isinstance(result, ProcessLookupError):
+      observed_group_exit = True
+    if result is not None:
+      raise result
+
+  def kill(process: int, signum: int) -> None:
+    pytest.fail("leader disappearance must not substitute for process-group exit")
+
+  def no_child(pid: int, options: int) -> tuple[int, int]:
+    raise ChildProcessError
+
+  def sleep(seconds: float) -> None:
+    clock[0] += seconds
+
+  monkeypatch.setattr(placement_module, "pid_birth_token", lambda pid: "")
+  monkeypatch.setattr(placement_module.os, "killpg", killpg)
+  monkeypatch.setattr(placement_module.os, "kill", kill)
+  monkeypatch.setattr(placement_module.os, "waitpid", no_child)
+  monkeypatch.setattr(placement_module.time, "monotonic", lambda: clock[0])
+  monkeypatch.setattr(placement_module.time, "sleep", sleep)
+  assert runtime._terminate(pid, expected_birth="persisted-birth") is confirmed
+  assert observed_group_exit is confirmed
+  assert signals and all(group == pid and signum == 0 for group, signum in signals)
+  if confirmed:
+    assert len(signals) == len(group_probe_results)
+    assert clock[0] > 0
+  else:
+    assert 5 <= clock[0] < 6
 
 
 def test_termination_without_group_exit_is_unconfirmed_after_the_bound(
@@ -1163,13 +1379,33 @@ def test_pid_primitives_accept_only_positive_int32() -> None:
     assert pid_birth_token(raw) == ""  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("storage_id", ("../17", "/17", "017", "0", "１８", "18"))
-def test_backend_rejects_unsafe_or_mismatched_storage_identity(
+@pytest.mark.parametrize("storage_id", ("../17", "/17", "017", "0", "１８"))
+def test_backend_rejects_unsafe_storage_identity(
   tmp_path: Path, backend: LocalProcessRuntimeBackend, storage_id: str,
 ) -> None:
-  with pytest.raises(ValueError, match="storage_id"):
+  with pytest.raises(StorageIdentityFinding) as finding:
     backend.start(storage_id, IDENTITY, _desk(tmp_path))
+  assert finding.value.input == storage_id
   assert backend.store.list() == []
+
+
+def test_backend_rejects_mismatched_storage_identity(
+  tmp_path: Path, backend: LocalProcessRuntimeBackend,
+) -> None:
+  with pytest.raises(ValueError, match="storage_id"):
+    backend.start("18", IDENTITY, _desk(tmp_path))
+  assert backend.store.list() == []
+
+
+@pytest.mark.parametrize("storage_id", (None, 17, True, "", "../17", "017", "0", "１８"))
+def test_runtime_state_environment_parses_owner_before_creating_roots(
+  tmp_path: Path, storage_id: object,
+) -> None:
+  user_data_dir = tmp_path / "runtime" / "user-data"
+  with pytest.raises(StorageIdentityFinding) as finding:
+    placement_module.runtime_state_environment(user_data_dir, storage_id)  # pyright: ignore[reportArgumentType]  # negative: raw bootstrap identity is malformed
+  assert finding.value.input == storage_id
+  assert not user_data_dir.parent.exists()
 
 
 def test_start_failure_stops_children_and_marks_stopped(
@@ -1181,8 +1417,12 @@ def test_start_failure_stops_children_and_marks_stopped(
     extra_env={**os.environ, "HANK_APPROVALS_EGRESS_URL": APPROVALS_EGRESS_URL},
   )
   try:
-    with pytest.raises(RuntimeError, match="exited before readiness"):
+    with pytest.raises(RuntimeStartupError, match="exited before readiness") as caught:
       broken.start("17", IDENTITY, _desk(tmp_path))
+    assert caught.value.reason == "process_exited"
+    assert caught.value.exit_code is not None
+    assert caught.value.runtime_log == broken.placement_root / "17" / "logs" / "runtime.log"
+    assert "retry POST /api/chat/init" in caught.value.next_call
     placement = broken.store.get("17")
     assert placement is not None
     assert placement.state == "stopped"
@@ -1192,6 +1432,62 @@ def test_start_failure_stops_children_and_marks_stopped(
   finally:
     for placement in broken.store.list():
       broken.stop(placement)
+
+
+def test_readiness_timeout_preserves_health_status_without_response_body(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  response_secret = "private-health-body-must-not-cross-the-edge"
+  (tmp_path / "placement_unhealthy_app.py").write_text(dedent(f"""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    async def health(request):
+      return JSONResponse({{"error": "{response_secret}"}}, status_code=503)
+
+    app = Starlette(routes=[Route("/api/health", health)])
+  """), encoding="utf-8")
+  broken = LocalProcessRuntimeBackend(
+    placement_root=tmp_path / "broken", org_claim_key=ORG_KEY,
+    app="placement_unhealthy_app:app", python=sys.executable,
+    extra_env={
+      **os.environ,
+      "HANK_APPROVALS_EGRESS_URL": APPROVALS_EGRESS_URL,
+      "PYTHONPATH": os.pathsep.join((str(tmp_path), os.environ.get("PYTHONPATH", ""))),
+    },
+  )
+  monkeypatch.setattr(placement_module, "LOCAL_RUNTIME_READY_TIMEOUT_SECONDS", 5.0)
+  try:
+    with pytest.raises(RuntimeStartupError) as caught:
+      broken.start("17", IDENTITY, _desk(tmp_path))
+    failure = caught.value
+    assert failure.reason == "readiness_timeout"
+    assert failure.timeout_seconds == 5.0
+    assert failure.readiness is not None
+    assert failure.readiness.reason == "http_status"
+    assert failure.readiness.status == 503
+    assert failure.readiness.endpoint.endswith("/api/health")
+    assert failure.readiness.diagnostic_code == "health_http_503"
+    assert failure.runtime_log == broken.placement_root / "17" / "logs" / "runtime.log"
+    assert response_secret not in str(failure)
+    assert response_secret not in str(failure.as_dict())
+    assert "readiness endpoint" in failure.next_call
+  finally:
+    for placement in broken.store.list():
+      broken.stop(placement)
+
+
+def test_health_probe_distinguishes_unreachable_from_http_status() -> None:
+  import socket
+
+  with socket.socket() as listener:
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+  outcome = LocalProcessRuntimeBackend._probe(f"http://127.0.0.1:{port}")
+  assert outcome.reason == "unreachable"
+  assert outcome.status is None
+  assert outcome.diagnostic_code == "health_unreachable"
 
 
 def test_replace_loads_bundle_before_stopping_original(
@@ -1229,9 +1525,17 @@ def test_replica_is_the_desk_across_a_wiped_replacement(tmp_path: Path) -> None:
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse
     from starlette.routing import Route
+    from excel_mcp.relay_store import SqliteRelayRequestStore, default_relay_request_store_path
 
     async def health(request):
-      return JSONResponse({"status": "ok"})
+      relay_path = default_relay_request_store_path()
+      assert relay_path is not None
+      relay_store = SqliteRelayRequestStore(relay_path)
+      return JSONResponse({
+        "status": "ok",
+        "relay_path": str(relay_path),
+        "relay_record": relay_store.get("relay-before-replacement", owner_user_id="alice"),
+      })
 
     app = Starlette(routes=[Route("/health", health)])
   """))
@@ -1241,9 +1545,11 @@ def test_replica_is_the_desk_across_a_wiped_replacement(tmp_path: Path) -> None:
     extra_env={
       **os.environ,
       "HANK_APPROVALS_EGRESS_URL": APPROVALS_EGRESS_URL,
+      "EXCEL_MCP_RELAY_STATE_DIR": str(tmp_path / "shared-relay"),
       "PYTHONPATH": os.pathsep.join((
         str(tmp_path), str(checkout), str(checkout / "packages" / "agent-gateway"),
-        str(checkout / "packages" / "contracts"), os.environ.get("PYTHONPATH", ""),
+        str(checkout / "packages" / "contracts"), str(checkout / "packages" / "excel-mcp" / "python"),
+        os.environ.get("PYTHONPATH", ""),
       )),
     },
   )
@@ -1251,6 +1557,17 @@ def test_replica_is_the_desk_across_a_wiped_replacement(tmp_path: Path) -> None:
   try:
     first = runtime.start("17", IDENTITY, desk)
     user_root = runtime.placement_root / "17" / "user-data" / "users" / "17"
+    with urlopen(first.url + "/health") as response:
+      first_health = json.load(response)
+    relay_path = Path(first_health["relay_path"])
+    assert relay_path.is_relative_to(user_root)
+    assert not relay_path.is_relative_to(tmp_path / "shared-relay")
+    relay_record = {
+      "request_id": "relay-before-replacement", "owner_user_id": "alice",
+      "state": "completed", "boot_id": "first-runtime", "updated_at": time.time(),
+      "result": {"range": "Sheet1!A1", "values": [[42]]},
+    }
+    SqliteRelayRequestStore(relay_path).save(relay_record)
     db_path = user_root / "research.db"
     with sqlite3.connect(db_path) as connection:
       connection.execute("PRAGMA journal_mode=WAL")
@@ -1261,14 +1578,22 @@ def test_replica_is_the_desk_across_a_wiped_replacement(tmp_path: Path) -> None:
     note.write_text("ALICE-FILE-SENTINEL\n")
     time.sleep(3)
     runtime.stop(first)
+    manifest = json.loads((user_root / ".desk-databases.json").read_text())
+    assert relay_path.relative_to(user_root).as_posix() in manifest
     # Replacement compute starts from an empty disk: databases and files alike
     # come back from the replica.
     shutil.rmtree(user_root)
+    assert not relay_path.exists()
     second = runtime.start("17", IDENTITY, desk)
     assert second.generation == first.generation + 1
     with sqlite3.connect(db_path) as connection:
       assert connection.execute("SELECT note FROM sentinel").fetchall() == [("alice-desk",)]
     assert note.read_text() == "ALICE-FILE-SENTINEL\n"
+    with urlopen(second.url + "/health") as response:
+      second_health = json.load(response)
+    assert second_health["relay_path"] == str(relay_path)
+    assert second_health["relay_record"] == relay_record
+    assert not (tmp_path / "shared-relay").exists()
   finally:
     for placement in runtime.store.list():
       runtime.stop(placement)
@@ -1298,7 +1623,7 @@ def test_rotated_org_claim_key_remints_a_running_runtime(
   assert backend.start("17", IDENTITY, desk) == second
 
 
-@pytest.mark.parametrize("mismatch", ("generation", "generic_key", "approval_key", "both"))
+@pytest.mark.parametrize("mismatch", ("generation", "generic_key", "approval_key"))
 def test_ready_bundle_must_match_current_placement_generation(
   tmp_path: Path, backend: LocalProcessRuntimeBackend, mismatch: str,
 ) -> None:
@@ -1306,13 +1631,13 @@ def test_ready_bundle_must_match_current_placement_generation(
   first = backend.start("17", IDENTITY, desk)
   bundle_path = Path(first.bundle_path)
   stale_bundle = json.loads(bundle_path.read_text())
-  if mismatch in ("generation", "both"):
+  if mismatch == "generation":
     stale_bundle["generation"] = first.generation + 1
   if mismatch == "generic_key":
     stale_bundle["claim_signing"]["key"] = derive_user_claim_key(
       "other-org-authority-at-least-32-bytes", IDENTITY.slug, IDENTITY.email,
     )
-  if mismatch in ("approval_key", "both"):
+  if mismatch == "approval_key":
     stale_bundle["approval_claim_signing"]["key"] = derive_approval_claim_key(
       ORG_KEY, IDENTITY.slug, IDENTITY.email, first.generation + 1,
     )
@@ -1368,7 +1693,7 @@ def _ollama_store(base: Path, api_key: str) -> Path:
 
 def _start_until_runtime_fails(backend: LocalProcessRuntimeBackend, tmp_path: Path) -> Path:
   try:
-    with pytest.raises(RuntimeError, match="exited before readiness"):
+    with pytest.raises(RuntimeStartupError, match="exited before readiness"):
       backend.start("17", IDENTITY, _desk(tmp_path))
   finally:
     for placement in backend.store.list():

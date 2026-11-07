@@ -617,6 +617,7 @@ _ENTITLEMENT_KINDS = (
   "operator_personal_subscription",
   "platform_metered",
   "local_unauthenticated",
+  "model_replay",
 )
 _HOSTED_REJECTED_ROUTES = (
   ("ollama", "ollama.local"),

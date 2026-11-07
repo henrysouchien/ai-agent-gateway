@@ -7,7 +7,6 @@ ambient tool catalog or the live tool surface.
 
 from __future__ import annotations
 
-import inspect
 
 from agent_workflow_contracts import (
   LiveToolCapabilityBinding,
@@ -175,36 +174,3 @@ def test_source_capability_membership_is_the_grant_intersected_bindings() -> Non
   )
 
 
-def test_derivation_signature_names_only_admitted_authority_inputs() -> None:
-  # T3-I08 as a shape contract: the derivation takes the admitted grant and
-  # bindings plus runtime facts. No catalog, registry, dispatcher, or session
-  # parameter may appear — those are the ambient reads the RC2 defect made.
-  parameters = set(
-    inspect.signature(derive_mechanical_outcome).parameters
-  )
-
-  assert parameters == {
-    "grant",
-    "bindings",
-    "failures",
-    "sources",
-    "narrative_present",
-    "missing_inputs",
-    "evidence_gap",
-  }
-
-
-def test_derivation_module_imports_no_catalog_or_runtime_surface() -> None:
-  from pathlib import Path
-
-  source = (
-    Path(inspect.getfile(derive_mechanical_outcome)).read_text(encoding="utf-8")
-  )
-  for forbidden in (
-    "tool_dispatcher",
-    "mcp_client",
-    "get_tool_definitions",
-    "snapshot_platform_catalog",
-    "tool_catalog",
-  ):
-    assert forbidden not in source

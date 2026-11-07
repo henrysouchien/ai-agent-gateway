@@ -10,6 +10,8 @@ construction funnel.
 
 from __future__ import annotations
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
+from agent_gateway.registry_scope import NoRegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 import asyncio
 import dataclasses
@@ -199,6 +201,7 @@ def test_gateway_construction_funnel_has_one_route_writer(
       capability_bind=TEST_CAPABILITY_BIND,
       principal=principal,
       profile=profile,
+      run_context=run_context_for_test(registry_scope=NoRegistryScope()),
       event_log=None,
       session_id=session.session_id,
       request_approval=None,

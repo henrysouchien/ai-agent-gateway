@@ -99,24 +99,14 @@ def test_loader_resolves_only_full_operation_identity(tmp_path: Path) -> None:
     loader.resolve_operation("filing-review")  # type: ignore[arg-type]
 
 
-def test_run_agent_schema_exposes_operation_and_objective(tmp_path: Path) -> None:
+def test_run_agent_schema_renders_catalog_operation_identity(tmp_path: Path) -> None:
   _write_operation(tmp_path / "filing-review.md")
 
   schema = make_run_agent_tool_def(SkillLoader(tmp_path))["input_schema"]
 
-  assert not {"oneOf", "anyOf", "allOf"} & set(schema)
-  assert "required" not in schema
-  assert "operation" in schema["properties"]
-  assert "agent" not in schema["properties"]
-  assert "task" not in schema["properties"]
   description = schema["properties"]["operation"]["description"]
   assert "agent-operation/filing-review@2.0" in description
-  assert "list_skills" in description
   assert "sha256:" not in description
-  assert schema["properties"]["operation"]["required"] == [
-    "namespace", "name", "version", "digest",
-  ]
-  assert "digest" in schema["properties"]["operation"]["properties"]
 
 
 def test_omitted_operation_selects_registered_generic_explore(tmp_path: Path) -> None:

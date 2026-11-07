@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 from pathlib import Path
 from typing import Any, cast
@@ -115,6 +117,7 @@ def _preset_app(tmp_path: Path) -> tuple[Any, ModelPreferenceStore]:
         ToolDispatcher(
           capability_bind=execution.bind,
           mcp_client=McpClientManager(config_path=None),
+          run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
         ),
         session_id, capability_execution=execution, started_at=started_at,
       )

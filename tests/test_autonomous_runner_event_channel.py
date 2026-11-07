@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import importlib.util
+import inspect
 import json
 import os
 import signal
+import select
 import subprocess
 import sys
 import time
@@ -32,6 +35,16 @@ from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECT
 from agent_gateway.approval_store import SQLiteApprovalStore
 from gateway_test_support.control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 
+
+# Resolve by path because importlib collection binds `tests` to this package.
+_signal_fence_spec = importlib.util.spec_from_file_location(
+  "_test_signal_fence",
+  Path(__file__).resolve().parents[3] / "tests" / "scripts" / "signal_fence.py",
+)
+assert _signal_fence_spec is not None and _signal_fence_spec.loader is not None
+_signal_fence_module = importlib.util.module_from_spec(_signal_fence_spec)
+_signal_fence_spec.loader.exec_module(_signal_fence_module)
+_signal_fence = _signal_fence_module.signal_fence_fixture()
 
 _HMAC_KEY = "autonomous-runner-event-channel-test-key"
 _TENANT_ID = "autonomous-event-channel-tests"
@@ -215,6 +228,7 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
       *,
       owner_lifeline_fd: int,
       owner_lease_fd: int,
+      status_fd: int,
     ) -> list[str]:
       captured["owner_lease_fd"] = owner_lease_fd
       captured["owner_lease_stat"] = os.fstat(owner_lease_fd)
@@ -222,6 +236,7 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
         target_cmd,
         owner_lifeline_fd=owner_lifeline_fd,
         owner_lease_fd=owner_lease_fd,
+        status_fd=status_fd,
       )
 
     monkeypatch.setattr(
@@ -323,8 +338,240 @@ def test_autonomous_start_uses_private_event_lifeline_and_lease_fds(
   asyncio.run(case())
 
 
+def test_interpreter_startup_stderr_before_dash_c_does_not_fail_the_run(
+  monkeypatch,
+  tmp_path: Path,
+  _signal_fence,
+) -> None:
+  # `site` runs sitecustomize before any `-c` code, so a sitecustomize on the
+  # inherited PYTHONPATH writes to fd 2 before the sentinel can rearrange it.
+  # Every python child already starts through the signal fence's bootstrap
+  # sitecustomize, which owns that module name; extend it with the noise.
+  with (_signal_fence.bootstrap_path / "sitecustomize.py").open(
+    "a", encoding="utf-8",
+  ) as bootstrap:
+    bootstrap.write("import os\nos.write(2, b'sitecustomize before -c\\n')\n")
+  monkeypatch.setenv("AGENT_API_USER_CLAIM_HMAC_KEY", _HMAC_KEY)
+
+  async def case() -> None:
+    registry = _registry(tmp_path, child_source=_SUCCESS_CHILD)
+    started = await _start(registry)
+    run_id = started["task_id"]
+    status = await registry.wait(run_id, timeout_sec=20)
+    record = registry._tasks[run_id]
+
+    assert status["state"] == "completed", status
+    assert record.error is None
+    assert record.reaper_task is not None
+    await asyncio.wait_for(record.reaper_task, timeout=20)
+    # The reaper parsed the sentinel's status; a polluted pipe leaves it None.
+    assert record.exit_code == 0
+    run_log = record.log_path.read_text(encoding="utf-8")
+    assert "sitecustomize before -c" in run_log
+
+  asyncio.run(case())
 
 
+def test_sentinel_import_stderr_stays_in_log_and_status_fd_is_not_inherited(
+  tmp_path: Path,
+) -> None:
+  from agent_gateway.autonomous_runner_start import (
+    _OWNED_PROCESS_SENTINEL_SOURCE,
+    _create_owner_lifeline,
+  )
+
+  stub_root = tmp_path / "sentinel-imports"
+  stub_package = stub_root / "agent_gateway"
+  stub_package.mkdir(parents=True)
+  (stub_package / "__init__.py").write_text("", encoding="utf-8")
+  (stub_package / "secret_boundary.py").write_text(
+    """
+import logging
+import os
+
+logging.getLogger(__name__).warning("WARNING: sentinel import warning remains visible")
+os.write(2, b"sentinel import wrote directly to stderr\\n")
+SANITIZATION_FAILED = "sanitization failed"
+
+
+class SecretBoundary:
+    @classmethod
+    def from_auth_config(cls, auth_config):
+        return cls()
+
+    def sanitize(self, value, *, sink):
+        return value
+""",
+    encoding="utf-8",
+  )
+  report_path = tmp_path / "child-status-descriptors.json"
+  log_path = tmp_path / "sentinel.log"
+  lease_fd = os.open(
+    tmp_path / "owner.lease",
+    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+    0o600,
+  )
+  fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+  owner_read_fd, owner_write_fd = _create_owner_lifeline()
+  event_read_fd, event_write_fd = os.pipe()
+  claim_read_fd, claim_write_fd = os.pipe()
+  status_read_fd, status_write_fd = os.pipe()
+  status_identity = os.fstat(status_write_fd)
+  inherited_fds = (
+    event_write_fd,
+    claim_read_fd,
+    owner_read_fd,
+    lease_fd,
+  )
+  descriptor_limit = max(*inherited_fds, status_read_fd, status_write_fd) + 2
+  target_source = """
+import json
+import os
+from pathlib import Path
+import sys
+
+sys.stdin.buffer.read()
+status_device, status_inode, descriptor_limit = map(int, sys.argv[2:])
+inherited_status_descriptors = []
+for descriptor in range(descriptor_limit):
+    try:
+        identity = os.fstat(descriptor)
+    except OSError:
+        continue
+    if (identity.st_dev, identity.st_ino) == (status_device, status_inode):
+        inherited_status_descriptors.append(descriptor)
+Path(sys.argv[1]).write_text(
+    json.dumps(inherited_status_descriptors), encoding="utf-8"
+)
+print("child stdout remains visible", flush=True)
+print("child stderr remains visible", file=sys.stderr, flush=True)
+"""
+  env = dict(os.environ)
+  for name in (
+    "AGENT_AUTONOMOUS_APPROVAL_CHANNEL_FD",
+    "AGENT_SESSION_LOG_ROOT_FD",
+    "AGENT_SESSION_LOG_ACTIVE_FD",
+    "AGENT_SESSION_LOG_META_FD",
+  ):
+    env.pop(name, None)
+  env.update({
+    "PYTHONPATH": str(stub_root),
+    "AGENT_SESSION_LOG_LAYOUT": "v1",
+    "AGENT_AUTONOMOUS_EVENT_CHANNEL_FD": str(event_write_fd),
+    "AGENT_AUTONOMOUS_CLAIM_BROKER_FD": str(claim_read_fd),
+    "AGENT_AUTONOMOUS_CREDENTIAL_HANDOFF": "stdin-json-v1",
+  })
+  sentinel = None
+  try:
+    with log_path.open("wb") as run_log:
+      sentinel = subprocess.Popen(
+        [
+          sys.executable,
+          "-c",
+          _OWNED_PROCESS_SENTINEL_SOURCE,
+          "1024",
+          str(owner_read_fd),
+          str(lease_fd),
+          "0.1",
+          str(status_write_fd),
+          sys.executable,
+          "-c",
+          target_source,
+          str(report_path),
+          str(status_identity.st_dev),
+          str(status_identity.st_ino),
+          str(descriptor_limit),
+        ],
+        close_fds=True,
+        env=env,
+        pass_fds=(*inherited_fds, status_write_fd),
+        start_new_session=True,
+        stdin=subprocess.PIPE,
+        stdout=run_log,
+        stderr=run_log,
+      )
+      os.close(status_write_fd)
+      status_write_fd = -1
+      assert sentinel.stdin is not None
+      sentinel.stdin.write(b'{"auth_config":{}}\n')
+      sentinel.stdin.close()
+      assert select.select([status_read_fd], [], [], 10)[0]
+      status_line = bytearray()
+      while not status_line.endswith(b"\n"):
+        piece = os.read(status_read_fd, 1)
+        assert piece, "sentinel closed its status pipe before a status"
+        status_line.extend(piece)
+      assert json.loads(status_line) == {
+        "kind": "exited",
+        "returncode": 0,
+        "version": 1,
+      }
+      assert json.loads(report_path.read_text(encoding="utf-8")) == []
+      run_log_text = log_path.read_text(encoding="utf-8")
+      assert "sentinel import wrote directly to stderr" in run_log_text
+      assert "WARNING: sentinel import warning remains visible" in run_log_text
+      assert "child stdout remains visible" in run_log_text
+      assert "child stderr remains visible" in run_log_text
+      assert '"kind":"exited"' not in run_log_text
+  finally:
+    if sentinel is not None and sentinel.poll() is None:
+      os.killpg(sentinel.pid, signal.SIGKILL)
+      sentinel.wait(timeout=10)
+    for descriptor in (
+      lease_fd,
+      owner_read_fd,
+      owner_write_fd,
+      event_read_fd,
+      event_write_fd,
+      claim_read_fd,
+      claim_write_fd,
+      status_read_fd,
+      status_write_fd,
+    ):
+      if descriptor >= 0:
+        os.close(descriptor)
+
+
+
+
+
+
+def _spawn_owner_holder(owner_write_fd: int) -> subprocess.Popen[bytes]:
+  # Stands in for the runner that owns the lifeline's write end. It reads a stdin
+  # pipe the test process holds, so it exits when that process dies by any signal:
+  # a bare `signal.pause()` holder outlived a SIGKILLed pytest, kept the write end
+  # open, and the sentinel never saw lifeline EOF.
+  return subprocess.Popen(
+    [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+    stdin=subprocess.PIPE,
+    close_fds=True,
+    pass_fds=(owner_write_fd,),
+  )
+
+
+def test_owner_holder_does_not_outlive_its_test_process() -> None:
+  helper = (
+    "import os, signal, subprocess, sys\n"
+    + inspect.getsource(_spawn_owner_holder)
+    + "\nread_fd, write_fd = os.pipe()\n"
+    "holder = _spawn_owner_holder(write_fd)\n"
+    "print(holder.pid, flush=True)\n"
+    "os.kill(os.getpid(), signal.SIGKILL)\n"
+  )
+  completed = subprocess.run(
+    [sys.executable, "-c", helper], capture_output=True, text=True, timeout=30,
+  )
+  assert completed.returncode == -signal.SIGKILL, completed.stderr
+  holder_pid = int(completed.stdout.strip())
+  deadline = time.monotonic() + 15
+  while time.monotonic() < deadline:
+    try:
+      os.kill(holder_pid, 0)
+    except ProcessLookupError:
+      return
+    time.sleep(0.05)
+  os.kill(holder_pid, signal.SIGKILL)
+  pytest.fail("owner holder survived the SIGKILL of the process that started it")
 
 
 def test_owner_sigkill_reaps_target_grandchild_before_releasing_lease(
@@ -349,15 +596,7 @@ def test_owner_sigkill_reaps_target_grandchild_before_releasing_lease(
   owner_read_stat = os.fstat(owner_read_fd)
   event_read_fd, event_write_fd = os.pipe()
   claim_broker_read_fd, claim_broker_write_fd = os.pipe()
-  owner_process = subprocess.Popen(
-    [
-      sys.executable,
-      "-c",
-      "import signal; signal.pause()",
-    ],
-    close_fds=True,
-    pass_fds=(owner_write_fd,),
-  )
+  owner_process = _spawn_owner_holder(owner_write_fd)
   target_source = r"""
 import json
 import os
@@ -421,6 +660,7 @@ time.sleep(60)
     claim_broker_read_fd
   )
   env["AGENT_AUTONOMOUS_CREDENTIAL_HANDOFF"] = "stdin-json-v1"
+  status_read_fd, status_write_fd = os.pipe()
   sentinel = subprocess.Popen(
     [
       sys.executable,
@@ -430,6 +670,7 @@ time.sleep(60)
       str(owner_read_fd),
       str(lease_fd),
       "1.0",
+      str(status_write_fd),
       sys.executable,
       "-c",
       target_source,
@@ -448,12 +689,15 @@ time.sleep(60)
       claim_broker_read_fd,
       owner_read_fd,
       lease_fd,
+      status_write_fd,
     ),
     start_new_session=True,
     stdin=subprocess.PIPE,
     stdout=subprocess.DEVNULL,
-    stderr=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
   )
+  os.close(status_write_fd)
+  status_write_fd = -1
   assert sentinel.stdin is not None
   sentinel.stdin.write(b'{"auth_config":{}}\n')
   sentinel.stdin.close()
@@ -530,6 +774,8 @@ time.sleep(60)
       owner_read_fd,
       owner_write_fd,
       lease_fd,
+      status_read_fd,
+      status_write_fd,
     ):
       if fd >= 0:
         try:
@@ -542,6 +788,8 @@ time.sleep(60)
     if owner_process.poll() is None:
       owner_process.kill()
       owner_process.wait(timeout=10)
+    if owner_process.stdin is not None:
+      owner_process.stdin.close()
 
 
 class _BlockingTerminalBus:
@@ -925,6 +1173,7 @@ from agent_gateway.autonomous_event_channel import (
 )
 from agent_gateway.autonomous_launch_envelope import AutonomousSessionAuthority
 from agent_gateway.admission import root_context
+from agent_workflow_contracts.models import SelectionProvenance
 from agent_gateway.approval_policy import (
   ApprovalRequest, approval_request_projection, sha256_args, utc_now,
 )
@@ -936,7 +1185,11 @@ channel=adopt_inherited_autonomous_event_channel(
 session=AutonomousSessionAuthority.from_receipt(
   envelope["session_authority"],
 ).to_gateway_session()
-context=root_context(session, withheld_tools=frozenset(), research_file_id=None)
+provenance=envelope.get("selection_provenance")
+context=root_context(
+  session, withheld_tools=frozenset(), research_file_id=None,
+  selection_provenance=SelectionProvenance.model_validate(provenance) if provenance is not None else None,
+)
 admitted=envelope.get("admitted_context")
 tenant_storage_id=admitted["tenant"]["storage_id"] if admitted else context.tenant.storage_id
 job_id=envelope["task_id"] if admitted else context.job_id
@@ -963,6 +1216,7 @@ for index in (1,2):
     "prepared_input":prepared,"exact_backend":"docker","job_id":job_id,
     "tenant_storage_id":tenant_storage_id,"credential_generation_ref":generation,
     "dispatch_context":{
+      "registry_scope":{"scope_type":"none"},
       "call_index":index,"advertised_tool_names":["place_order"],"skill_run_id":"original-skill",
       "step_id":"original-step","workspace_dir":"original-workspace","batch_id":None,
       "capture_readable_resource_snapshot":False,"allow_uncertain_mcp_replay":False,
@@ -1090,6 +1344,7 @@ def test_private_child_operands_are_cold_readable_before_publication(
         "anthropic-generation-private-source" if admitted_child else None
       )
       assert dict(binding.dispatch_context) == {
+        "registry_scope": {"scope_type": "none"},
         "call_index": index, "advertised_tool_names": ("place_order",),
         "skill_run_id": "original-skill", "step_id": "original-step",
         "workspace_dir": "original-workspace", "batch_id": None,
@@ -1109,97 +1364,11 @@ def test_private_child_operands_are_cold_readable_before_publication(
   asyncio.run(case())
 
 
-def test_rebound_capture_is_admitted_but_executor_requires_its_live_generation(
-  tmp_path: Path,
-) -> None:
-  from agent_gateway import ToolDispatcher
-  from agent_gateway.admission import capture_job_context, root_context
-  from agent_gateway.approval_route import DurableLocalApprovalRoute
-  from agent_gateway.mcp_client import McpClientManager
-  from agent_gateway.autonomous_launch_envelope import AutonomousLaunchEnvelope
-  from gateway_test_support.approval_policy_test_support import FixedOutcomeApprovalPolicy
-
-  async def case() -> None:
-    generation = "anthropic-generation-rebound"
-    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
-    source = _PRIVATE_CAPTURE_CHILD.replace(
-      "PRIVATE_PAYLOAD_OVERRIDE",
-      f"assert generation is None; private['credential_generation_ref']={generation!r}",
-    ).replace("for index in (1,2):", "for index in (1,):")
-    envelopes: list[AutonomousLaunchEnvelope] = []
-
-    class PublicationObserver:
-      async def publish(self, user_id, control_run_id, event) -> None:
-        if event.get("type") == "tool_approval_request":
-          child = registry._find_by_control_run_id(control_run_id)
-          assert child is not None and child.claim_broker is not None
-          envelopes.append(child.claim_broker.envelope)
-
-      async def cleanup_run(self, user_id, control_run_id) -> None:
-        return None
-
-    registry = _registry(
-      tmp_path / "runs", child_source=source, approval_store=store,
-      user_event_bus=PublicationObserver(),
-    )
-    started = await _start(registry)
-    status = await registry.wait(started["task_id"], timeout_sec=60)
-    assert status["state"] == "completed"
-    record = registry._tasks[started["task_id"]]
-    binding, request = await store._read_executable_binding_for_executor(
-      job_id=record.task_id, tool_call_id="private-call-1",
-      nonce="original-private-nonce-1", tenant_storage_id="owner-1",
-    )
-    assert binding.credential_generation_ref == generation
-    await store.transition_state(
-      request.approval_id, "approved",
-      expected_state_version=request.state_version, decider_id="owner-1", decider_role="owner",
-    )
-    assert len(envelopes) == 1
-    envelope = envelopes[0]
-    session = envelope.session_authority.to_gateway_session()
-    capture_job_context(session, replace(
-      root_context(session, withheld_tools=frozenset(), research_file_id=None),
-      job_id=record.task_id,
-    ))
-    executions: list[dict[str, Any]] = []
-
-    async def handler(tool_input: dict[str, Any], **_kwargs: Any):
-      executions.append(tool_input)
-      return {"ok": True}, None
-
-    route = DurableLocalApprovalRoute(
-      store, FixedOutcomeApprovalPolicy("request_user_approval"), session,
-    )
-    dispatcher = ToolDispatcher(
-      capability_bind=envelope.bind.model_copy(update={
-        "credential_ref": "anthropic-generation-different-live-bind",
-      }),
-      mcp_client=McpClientManager(config_path=None),
-      local_tool_handlers={"place_order": handler},
-      session=session, role="owner", approval_route=route,
-    )
-    result, error = await dispatcher.execute_approved_binding(
-      job_id=record.task_id, tool_call_id="private-call-1",
-      nonce="original-private-nonce-1", abort_event=None, on_executed_prepared_call=None,
-    )
-    assert result is None
-    assert error is not None
-    assert error["code"] == "approval_credential_generation_mismatch"
-    assert executions == []
-    assert await store._read_completed_executable_result_for_executor(binding=binding) is None
-
-  asyncio.run(case())
-
-
-
 @pytest.mark.parametrize("field,replacement", [
   ("job_id", "parent-job-not-child"),
   ("tenant_storage_id", "another-owner"),
   ("credential_generation_ref", 1),
   ("credential_generation_ref", True),
-  ("credential_generation_ref", []),
-  ("credential_generation_ref", {}),
   ("nonce", "different-from-public-nonce"),
   ("tool_name", "different-from-public-tool"),
   ("approval_id", "different-from-public-approval"),

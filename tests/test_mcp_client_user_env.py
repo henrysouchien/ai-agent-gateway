@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
@@ -90,6 +92,7 @@ def test_dispatcher_preserves_meta_and_authenticated_session_for_user_server(mon
       channel="cli",
       role="owner",
       mcp_meta_inject_servers=frozenset({SERVER}),
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     result, error = await dispatcher.dispatch(
       "call-1",

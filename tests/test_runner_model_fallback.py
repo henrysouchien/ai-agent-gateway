@@ -2,13 +2,16 @@
 to the next entry of the role's frozen chain (model-roles design §6.5, W7b)."""
 
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 import asyncio
 import copy
 import json
+import hashlib
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -22,7 +25,7 @@ from hank_model_transport.providers import ModelInfo, ModelProvider
 import agent_gateway.runner as gateway_runner
 import agent_gateway.runner_stream_turn as runner_stream_turn
 import hank_model_transport.capability_execution as capability_execution
-from agent_gateway.admission import root_context
+from agent_gateway.admission import default_root_provenance, root_context
 from hank_model_transport.auth import ProviderCredentialFailure
 from hank_model_transport.providers.codex import CodexCredentialExpired, CodexProvider
 from agent_gateway.execution_identity import DispatchIdentity
@@ -35,6 +38,7 @@ from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
   MaterializedCredential,
+  execute_leaf_model_call,
 )
 from hank_model_transport.providers import StreamEvent
 from hank_contracts.commercial_work import WorkStartSpendLedger
@@ -48,6 +52,7 @@ from agent_gateway.runner_sub_agents import _build_child_event_log, _ChildActivi
 from agent_gateway.session import GatewaySession
 from agent_gateway.tool_dispatcher_helpers import ToolResult
 from gateway_test_support.model_defaults import compat_for_profile
+from gateway_test_support.transport_runtime import TEST_SEND_PROMPT_RUNTIME
 from agent_workflow_contracts.models import SelectionProvenance
 from model_authority.bind import CapabilityBind
 from model_authority.binding import AuthContext, CredentialHandle, ModelSelectionIntent
@@ -75,13 +80,15 @@ SOL = "test.codex.sol"
 MUSE = "test.muse.muse"
 OPENAI = "test.openai.sol"
 GROK = "test.xai.grok"
+DEEPSEEK = "test.ollama_cloud.deepseek"
 _UPSTREAM = {
   OPUS: "claude-opus-test", SONNET: "claude-sonnet-test", SONNET_SDK: "claude-sonnet-sdk-test",
   SOL: "gpt-sol-test", MUSE: "muse-test", OPENAI: "gpt-openai-test", GROK: "grok-test",
+  DEEPSEEK: "deepseek-v4.1-flash",
 }
 _PROVIDER = {
   OPUS: "anthropic", SONNET: "anthropic", SONNET_SDK: "anthropic", SOL: "codex",
-  MUSE: "muse", OPENAI: "openai", GROK: "xai",
+  MUSE: "muse", OPENAI: "openai", GROK: "xai", DEEPSEEK: "ollama_cloud",
 }
 _TOKEN_A = "sk-ant-oat01-fallback-account-a-000000000000"
 _TOKEN_B = "sk-ant-oat01-fallback-account-b-000000000000"
@@ -89,6 +96,7 @@ _CODEX_KEY = "codex-account"
 _MUSE_KEY = "muse-account"
 _OPENAI_KEY = "sk-openai-fallback"
 _GROK_KEY = "sk-xai-fallback"
+_OLLAMA_KEY = "ollama-cloud-account"
 
 
 class _Limited(RuntimeError):
@@ -126,6 +134,8 @@ class _World:
     self.windows: dict[str, int] = {}
     self.calls: list[tuple[str, str, str]] = []
     self.requests: list[dict[str, Any]] = []
+    # Set by a test that wants the bound provider to report a KeyPool.
+    self.key_pool: Any = None
     # Accounts whose organisation refuses OAuth, as a parked account did live.
     self.refusing_tokens: set[str] = set()
     # (provider that closed it, the client's token), in order.
@@ -231,6 +241,26 @@ class _ScriptedProvider(ModelProvider):
       assert member is not None
       rotated["credential_source"] = member.source_metadata()
     return rotated
+
+  def credential_key_pool(self, config: Mapping[str, Any]) -> Any:
+    _ = config
+    return self._world.key_pool
+
+  async def prepare_credential(
+    self,
+    config: Mapping[str, Any],
+    *,
+    model: str,
+    session_id: str | None,
+  ) -> dict[str, Any] | None:
+    _ = model, session_id
+    if not self._world.rotation_generation_metadata or self.name != "anthropic":
+      return None
+    token = str(config.get("auth_token") or "")
+    member = resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True}).by_token(token)
+    if member is None:
+      return None
+    return {"auth_token": token, "credential_source": member.source_metadata()}
 
   def is_retryable_error(self, exc: Exception) -> bool:
     return isinstance(exc, (_Limited, _Outage))
@@ -343,7 +373,7 @@ def _resolver(
         allowed_model_keys=frozenset({
           SONNET, *(entry.model for entry in fast_fallback if entry.model is not None),
         }),
-        **({"fallback": fast_fallback} if fast_fallback else {}),
+        fallback=fast_fallback or None,
       ),
       "plan": TierSelectionPolicy(
         default=TierAliasDefault("deep"), allowed_model_keys=keys, fallback=plan_fallback,
@@ -363,6 +393,7 @@ def _resolver(
     "muse": {"auth_mode": "api", "api_key": _MUSE_KEY, "provider": "muse"},
     "openai": {"auth_mode": "api", "api_key": _OPENAI_KEY, "provider": "openai"},
     "xai": {"auth_mode": "api", "api_key": _GROK_KEY, "provider": "xai"},
+    "ollama_cloud": {"auth_mode": "api", "api_key": _OLLAMA_KEY, "provider": "ollama_cloud"},
   }
   adapters = {
     "test.anthropic": _ScriptedProvider("anthropic", world),
@@ -370,6 +401,7 @@ def _resolver(
     "test.muse": _ScriptedProvider("muse", world),
     "test.openai": _ScriptedProvider("openai", world),
     "test.xai": _ScriptedProvider("xai", world),
+    "test.ollama_cloud": _ScriptedProvider("ollama_cloud", world),
   }
   return CapabilityExecutionResolver(
     registry=registry,
@@ -405,6 +437,7 @@ class _Turn:
     event_log: EventLog | None = None,
   ) -> None:
     self.snapshot = snapshot or capture_selection_snapshot(resolver.selection_policy)
+    provenance = default_root_provenance(resolver.selection_policy)
     self.primary = resolver.resolve(
       "session.driver",
       explicit_intent=(
@@ -435,8 +468,10 @@ class _Turn:
       identity=DispatchIdentity(
         context=root_context(
           None, withheld_tools=frozenset(), research_file_id=None, selection_snapshot=self.snapshot,
+          selection_provenance=provenance,
         ),
       ),
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     self.runner = AgentRunner(
       event_log=self.event_log,
@@ -568,7 +603,10 @@ def test_refused_entries_are_skipped_and_an_exhausted_chain_fails_as_today() -> 
 
   events = turn.run()
 
-  [hop] = _of_type(events, "model_fallback")
+  [hop, exhausted] = _of_type(events, "model_fallback")
+  assert exhausted["outcome"] == "exhausted"
+  assert exhausted["from"]["model_key"] == SONNET
+  assert exhausted["to"] is None
   assert hop["to"]["model_key"] == SONNET
   assert hop["chain_index"] == 1
   assert [skip["model_key"] for skip in hop["skipped"]] == [SOL]
@@ -585,12 +623,33 @@ def test_refused_entries_are_skipped_and_an_exhausted_chain_fails_as_today() -> 
 def test_fallback_rebind_failure_logs_evaluated_candidates_and_refusal_codes(caplog: pytest.LogCaptureFixture) -> None:
   world = _World()
   world.limited_models = {_UPSTREAM[OPUS], _UPSTREAM[SONNET]}
-  turn = _Turn(_resolver(world, chain=(FallbackEntry(model=SOL),), providers_with_credentials=frozenset({"anthropic"})))
+  turn = _Turn(_resolver(
+    world, chain=(FallbackEntry(model=SOL), FallbackEntry(model=MUSE)),
+    providers_with_credentials=frozenset({"anthropic"}),
+  ))
 
   with caplog.at_level(logging.WARNING, logger="agent_gateway.runner"):
     events = turn.run()
 
-  assert not _of_type(events, "model_fallback")
+  [exhausted] = _of_type(events, "model_fallback")
+  assert exhausted["outcome"] == "exhausted"
+  assert exhausted["from"]["model_key"] == OPUS
+  assert exhausted["to"] is None
+  assert exhausted["reason"] == "usage_limit"
+  assert exhausted["reset_at"] == world.reset_at
+  [error] = _of_type(events, "error")
+  assert exhausted["primary_failure"] == {
+    "model_key": OPUS, "code": "provider_exhausted",
+    "detail": error["error"], "reset_at": world.reset_at,
+  }
+  assert [(skip["model_key"], skip["code"]) for skip in exhausted["skipped"]] == [
+    (SOL, "default_not_eligible"),
+    (MUSE, "default_not_eligible"),
+  ]
+  assert all(skip["detail"] and skip["reset_at"] is None for skip in exhausted["skipped"])
+  assert world.calls == [("anthropic", _UPSTREAM[OPUS], _TOKEN_A)] * (1 + _FAST_RETRIES)
+  assert "usage limit reached" in error["error"]
+  assert events.index(exhausted) < events.index(error)
   assert any(
     "with no eligible fallback chain entry (evaluated candidates:" in record.getMessage()
     and f"{SOL}: default_not_eligible" in record.getMessage()
@@ -607,7 +666,11 @@ def test_entry_whose_context_cannot_hold_the_transcript_is_skipped() -> None:
 
   [hop] = _of_type(events, "model_fallback")
   assert hop["to"]["model_key"] == SONNET
-  assert hop["skipped"] == [{"model_key": SOL, "code": "context_window_exceeded"}]
+  assert hop["skipped"] == [{
+    "model_key": SOL, "code": "context_window_exceeded",
+    "detail": "The current transcript does not fit the fallback model's context window.",
+    "reset_at": None,
+  }]
   assert not _of_type(events, "error")
 
 
@@ -636,8 +699,17 @@ def test_outage_with_no_chain_takes_todays_failure_path() -> None:
   events = turn.run()
 
   assert len(world.calls) == 1 + _FAST_RETRIES
-  assert not _of_type(events, "model_fallback")
-  assert len(_of_type(events, "error")) == 1
+  [exhausted] = _of_type(events, "model_fallback")
+  assert exhausted["outcome"] == "exhausted"
+  assert exhausted["to"] is None
+  assert exhausted["reason"] == "provider_outage"
+  [error] = _of_type(events, "error")
+  assert exhausted["primary_failure"] == {
+    "model_key": OPUS, "code": "provider_outage",
+    "detail": error["error"], "reset_at": None,
+  }
+  assert exhausted["skipped"] == []
+  assert events.index(exhausted) < events.index(error)
   assert turn.runner.capability_execution is turn.primary
 
 
@@ -673,7 +745,10 @@ def test_stall_with_no_chain_takes_todays_failure_path() -> None:
   events = turn.run(timeout=30)
 
   assert len(world.calls) == 1 + _FAST_RETRIES
-  assert not _of_type(events, "model_fallback")
+  [exhausted] = _of_type(events, "model_fallback")
+  assert exhausted["outcome"] == "exhausted"
+  assert exhausted["to"] is None
+  assert exhausted["reason"] == "provider_outage"
   [error] = _of_type(events, "error")
   assert "Stream watchdog" in str(error.get("error"))
 
@@ -1074,6 +1149,117 @@ def test_unchanged_frozen_credential_does_not_revive_failed_primary() -> None:
   assert second.runner.capability_execution.bind.model_key == SOL
 
 
+@pytest.mark.parametrize(
+  ("session_id", "durable_id", "credential_id"),
+  [
+    ("sess-leaf-one", "conversation-one", "conversation-one"),
+    ("sess-leaf-two", "conversation-two", "conversation-two"),
+    ("sub1:sess-leaf-one", "conversation-one", "sub1:sess-leaf-one"),
+    ("", None, None),
+  ],
+)
+def test_leaf_credential_selection_matches_the_turn_and_direct_door(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+  session_id: str, durable_id: str | None, credential_id: str | None,
+) -> None:
+  world = _World()
+  resolver = _resolver(world)
+  provider = resolver.adapter_resolver("test.anthropic")
+  sessions: list[str | None] = []
+
+  async def prepare(
+    config: Mapping[str, Any], *, model: str, session_id: str | None,
+  ) -> dict[str, Any]:
+    sessions.append(session_id)
+    generation = "anthropic-generation-" + hashlib.sha256(
+      json.dumps(session_id).encode(),
+    ).hexdigest()
+    return {"auth_token": _TOKEN_A, "credential_source": {"generation_ref": generation}}
+
+  monkeypatch.setattr(provider, "prepare_credential", prepare)
+  session = GatewaySession(
+    session_id=session_id, api_key_hash="hash", created_at=1, expires_at=2,
+    user_id="alice", owner_user_id="alice",
+    resume_log_path=tmp_path / f"{durable_id}.jsonl",
+  )
+  execution = resolver.resolve("session.driver")
+  event_log = EventLog()
+  runner = AgentRunner(
+    event_log=event_log,
+    dispatcher=ToolDispatcher(
+      capability_bind=execution.bind, mcp_client=_NullMcpClient(), event_log=event_log,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
+    ),
+    session_id=session_id, gateway_session=session, capability_execution=execution,
+    user_id="alice", billing_mode="byok", rate_table_version="unknown",
+  )
+
+  async def run() -> tuple[dict[str, Any], dict[str, Any]]:
+    assert await runner._prepare_credential(dict(runner._auth_config))
+    direct = await execute_leaf_model_call(
+      "verification", runtime=TEST_SEND_PROMPT_RUNTIME,
+      resolver=resolver, session_id=credential_id, state="same material", questions={},
+    )
+    launched = await execute_leaf_model_call(
+      "verification", runtime=TEST_SEND_PROMPT_RUNTIME,
+      runner=runner, state="same material", questions={}, wait=True,
+    )
+    entry = runner._task_registry.get(launched["task_id"])
+    assert entry is not None and entry.result is not None
+    assert direct["bind"] == launched["bind"] == entry.capability_bind_receipt
+    return direct, entry.result
+
+  direct, leaf = asyncio.run(run())
+  # Selection depends on the identity, not a double that always returns one
+  # generation. Roots resume on the durable log; children keep their full id;
+  # stateless calls never acquire a shared "model-call" affinity row.
+  assert sessions == [credential_id, credential_id, credential_id]
+  assert direct["selection_provenance"] == leaf["selection_provenance"]
+  assert direct["usage"] == leaf["usage"]
+  assert direct["bind"]["credential_ref"] == runner.capability_execution.bind.credential_ref
+
+
+@pytest.mark.parametrize("rotated", [False, True], ids=["same-generation", "new-generation"])
+def test_leaf_preparation_revives_parked_models_only_for_a_changed_generation(
+  monkeypatch: pytest.MonkeyPatch, rotated: bool,
+) -> None:
+  world = _World()
+  resolver = _resolver(world)
+  provider = resolver.adapter_resolver("test.anthropic")
+  selected_token = _TOKEN_A
+
+  async def prepare(
+    config: Mapping[str, Any], *, model: str, session_id: str | None,
+  ) -> dict[str, Any]:
+    member = resolve_anthropic_credentials({
+      ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
+    }).by_token(selected_token)
+    assert member is not None
+    return {
+      "auth_token": selected_token, "credential_source": member.source_metadata(),
+      "credential_affinity_key": session_id,
+    }
+
+  monkeypatch.setattr(provider, "prepare_credential", prepare)
+  world.limited_models = {_UPSTREAM[OPUS]}
+  turn = _Turn(resolver)
+  events = turn.run()
+  [hop] = _of_type(events, "model_fallback")
+  assert hop["reason"] == "usage_limit"
+  assert turn.runner.capability_execution.bind.model_key == SOL
+
+  # A mid-turn leaf succeeds on the same account (or genuinely rotates).
+  # Neither result is evidence that the primary's recorded reset expired.
+  selected_token = _TOKEN_B if rotated else _TOKEN_A
+  world.limited_models.clear()
+  asyncio.run(execute_leaf_model_call(
+    "verification", runtime=TEST_SEND_PROMPT_RUNTIME,
+    runner=turn.runner, state="leaf after fallback", questions={}, wait=True,
+  ))
+
+  assert _Turn(resolver).primary.bind.model_key == (OPUS if rotated else SOL)
+
+
 def test_changed_frozen_credential_revives_only_its_providers_failed_entries() -> None:
   world = _World()
   world.limited_models = {_UPSTREAM[OPUS]}
@@ -1290,6 +1476,7 @@ def test_a_chain_naming_a_model_twice_hops_once_per_entry_and_ends() -> None:
 
   assert [
     (hop["to"]["model_key"], hop["chain_index"]) for hop in _of_type(events, "model_fallback")
+    if hop.get("outcome") != "exhausted"
   ] == [(SOL, 0), (SOL, 1)]
   assert len(_of_type(events, "error")) == 1
 
@@ -1386,7 +1573,9 @@ def test_a_captured_role_the_live_policy_no_longer_has_takes_todays_failure_path
 
   events = turn.run()
 
-  assert not _of_type(events, "model_fallback")
+  [exhausted] = _of_type(events, "model_fallback")
+  assert exhausted["outcome"] == "exhausted"
+  assert exhausted["to"] is None
   [error] = _of_type(events, "error")
   assert "usage limit reached" in error["error"]
   assert turn.runner.capability_execution is turn.primary
@@ -1416,7 +1605,10 @@ def test_entry_whose_whole_account_pool_is_parked_is_skipped_and_recorded() -> N
   events = turn.run()
 
   [hop] = _of_type(events, "model_fallback")
-  assert hop["skipped"] == [{"model_key": SONNET, "code": "credential_pool_parked"}]
+  [skip] = hop["skipped"]
+  assert (skip["model_key"], skip["code"]) == (SONNET, "provider_exhausted")
+  assert skip["detail"]
+  assert skip["reset_at"] == world.reset_at
   assert hop["to"]["model_key"] == SOL
   assert "claude-sonnet-test" not in [model for _, model, _ in world.calls]
   assert not _of_type(events, "error")
@@ -1432,9 +1624,20 @@ def test_a_chain_of_parked_entries_exhausts_and_fails_as_today() -> None:
 
   events = turn.run()
 
-  assert not _of_type(events, "model_fallback")
-  assert {model for _, model, _ in world.calls} == {"claude-opus-test"}
+  [exhausted] = _of_type(events, "model_fallback")
+  assert exhausted["outcome"] == "exhausted"
+  assert exhausted["from"]["model_key"] == OPUS
+  assert exhausted["to"] is None
   [error] = _of_type(events, "error")
+  assert exhausted["primary_failure"] == {
+    "model_key": OPUS, "code": "provider_exhausted",
+    "detail": error["error"], "reset_at": world.reset_at,
+  }
+  assert [(skip["model_key"], skip["code"], skip["reset_at"]) for skip in exhausted["skipped"]] == [
+    (SONNET, "provider_exhausted", world.reset_at),
+  ]
+  assert all(skip["detail"] for skip in exhausted["skipped"])
+  assert {model for _, model, _ in world.calls} == {"claude-opus-test"}
   assert "usage limit reached" in error["error"]
   assert turn.runner.capability_execution is turn.primary
 
@@ -1545,10 +1748,18 @@ def test_denied_chain_exhausts_and_fails_as_today() -> None:
 
   events = turn.run()
 
-  hops = _of_type(events, "model_fallback")
+  notices = _of_type(events, "model_fallback")
+  hops = [event for event in notices if event.get("outcome") != "exhausted"]
+  [exhausted] = [event for event in notices if event.get("outcome") == "exhausted"]
+  assert exhausted["from"]["model_key"] == OPENAI
+  assert exhausted["to"] is None
+  [error] = _of_type(events, "error")
+  assert exhausted["primary_failure"] == {
+    "model_key": OPENAI, "code": "credential_denied",
+    "detail": error["error"], "reset_at": None,
+  }
   assert [hop["to"]["model_key"] for hop in hops] == [SOL, OPENAI]
   assert all(hop["reason"] == "credential_denied" for hop in hops)
-  [error] = _of_type(events, "error")
   assert "access denied" in error["error"]
   assert turn.runner.capability_execution.bind.model_key == OPENAI
 
@@ -1586,7 +1797,10 @@ def test_expired_codex_with_no_chain_entry_names_model_and_remedy() -> None:
   events = turn.run()
 
   assert world.calls == [("codex", _UPSTREAM[SOL], _CODEX_KEY)]
-  assert not _of_type(events, "model_fallback")
+  [exhausted] = _of_type(events, "model_fallback")
+  assert exhausted["outcome"] == "exhausted"
+  assert exhausted["from"]["model_key"] == SOL
+  assert exhausted["to"] is None
   [error] = _of_type(events, "error")
   assert error["error"] == (
     "CodexCredentialExpired: codex gpt-sol-test (test.codex.sol) "
@@ -1683,3 +1897,431 @@ def test_credential_rotation_and_model_fallback_hops_do_not_compound_retry_backo
   assert retry_sleeps == [3.0, 0.0, 0.0, 0.0]
   assert not _of_type(events, "error")
   assert turn.runner.capability_execution.bind.model_key == GROK
+
+
+def test_park_under_fallback_relaunch_executes_approved_call_and_rotated_generation_refuses(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.admission import capture_job_context
+  from agent_gateway.agent_session_log import AgentSessionLog
+  from agent_gateway.agent_session_log_records import AgentSessionRef, resolve_agent_session_id
+  from agent_gateway.approval_route import DurableLocalApprovalRoute
+  from agent_gateway.approval_store import SQLiteApprovalStore
+  from agent_gateway.context_builder import SessionContextBuilder
+  from agent_gateway.sub_agent import ApprovedCallRef
+  from gateway_test_support.approval_policy_test_support import FixedOutcomeApprovalPolicy
+
+  async def _case() -> None:
+    monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "user-data"))
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _TOKEN_A)
+    world = _World()
+    world.rotation_generation_metadata = True
+    world.limited_models = {_UPSTREAM[OPUS]}
+    world.turns[_UPSTREAM[SOL]] = [
+      _tool_use_turn("call-fallback-1", "code_execute"),
+      _text_turn("completed on fallback"),
+    ]
+    store = SQLiteApprovalStore(tmp_path / "approvals.sqlite3")
+    policy = FixedOutcomeApprovalPolicy("request_user_approval")
+    log_path = AgentSessionLog.path_for_session(
+      tmp_path / "logs",
+      AgentSessionRef(
+        user_id="test-actor",
+        agent_id="fallback",
+        agent_session_id=resolve_agent_session_id("test-actor", "fallback"),
+      ),
+    )
+    session_log = AgentSessionLog(log_path)
+    executions: list[dict[str, Any]] = []
+
+    async def _place_order(tool_input: dict[str, Any], **_kwargs: Any) -> ToolResult:
+      executions.append(dict(tool_input))
+      return {"placed": True}, None
+
+    def _build_runner(resolver: CapabilityExecutionResolver, *, token: str = _TOKEN_A) -> tuple[AgentRunner, EventLog]:
+      snapshot = capture_selection_snapshot(resolver.selection_policy)
+      provenance = default_root_provenance(resolver.selection_policy)
+      primary = resolver.resolve("session.driver", selection_snapshot=snapshot)
+      session = GatewaySession(
+        session_id="sess-fallback",
+        user_id="test-actor",
+        owner_user_id="test-actor",
+        tenant_id="test-tenant",
+        role="owner",
+        api_key_hash="test-hash",
+        created_at=0,
+        expires_at=9999999999,
+        auth_config={"provider": "anthropic", "auth_mode": "oauth", "auth_token": token},
+      )
+      session.agent_session_log = session_log
+      ctx = replace(
+        root_context(
+          session,
+          withheld_tools=frozenset(),
+          research_file_id=None,
+          selection_snapshot=snapshot,
+          selection_provenance=provenance,
+        ),
+        job_id="sess-fallback",
+      )
+      capture_job_context(session, ctx)
+      route = DurableLocalApprovalRoute(store, policy, session)
+      session.approval_route = route
+      ev_log = EventLog()
+      dispatcher = ToolDispatcher(
+        capability_bind=primary.bind,
+        mcp_client=_NullMcpClient(),
+        local_tool_handlers={"code_execute": _place_order},
+        needs_approval=lambda name, *_a, **_kw: name == "code_execute",
+        event_log=ev_log,
+        session_id="sess-fallback",
+        role="owner",
+        approval_route=route,
+        identity=DispatchIdentity(context=ctx),
+        run_context=run_context_for_test(
+          user_id="test-actor",
+          session_id="sess-fallback",
+          registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
+        ),
+      )
+      runner = AgentRunner(
+        event_log=ev_log,
+        dispatcher=dispatcher,
+        session_id="sess-fallback",
+        gateway_session=session,
+        agent_session_log=session_log,
+        capability_execution=primary,
+        get_tool_definitions=lambda: [
+          {"name": "code_execute", "description": "", "input_schema": {"type": "object", "properties": {}}},
+        ],
+        user_id="test-actor",
+        billing_mode="byok",
+        rate_table_version="unknown",
+      )
+      return runner, ev_log
+
+    runner_1, ev_log_1 = _build_runner(_resolver(world))
+    await runner_1.run(messages=[{"role": "user", "content": "run fallback ask"}])
+    events_1 = [entry.event for entry in ev_log_1.entries]
+    assert events_1[-1]["type"] == "stream_complete"
+    assert events_1[-1]["terminal_disposition"] == "awaiting_approval"
+    assert executions == []
+
+    request = await store.get_by_tool_call_id("call-fallback-1")
+    assert request is not None
+    located_1 = await store._locate_request_for_decision(
+      tenant_storage_id="test-actor", approval_id=request.approval_id,
+    )
+    assert located_1 is not None and located_1[2] is not None
+    binding, _ = await store._read_executable_binding_for_executor(
+      job_id="sess-fallback",
+      tool_call_id="call-fallback-1",
+      nonce=located_1[2],
+      tenant_storage_id="test-actor",
+    )
+    assert binding.credential_generation_ref is None
+    await store.transition_state(
+      request.approval_id,
+      "approved",
+      expected_state_version=request.state_version,
+      decider_id="test-actor",
+      decider_role="owner",
+    )
+
+    # Fresh resolver (as on a relaunched subprocess): no in-memory _fallback_progress.
+    resumed_messages = await SessionContextBuilder(agent_session_log=session_log).build()
+    runner_2, ev_log_2 = _build_runner(_resolver(world))
+    runner_2.bind_resume_approved_call(
+      ApprovedCallRef(
+        job_id="sess-fallback",
+        tool_call_id="call-fallback-1",
+        nonce=binding.nonce,
+      ),
+      runner_2._dispatcher,
+    )
+    await runner_2.run(messages=[], resume_initial_messages=resumed_messages)
+    events_2 = [entry.event for entry in ev_log_2.entries]
+    tool_complete = [e for e in events_2 if e.get("type") == "tool_call_complete"]
+    assert len(tool_complete) == 1
+    assert tool_complete[0].get("is_error") is False
+    assert executions == [{}]
+    assert runner_2.capability_execution.bind.model_key == SOL
+    assert world.calls == [
+      ("anthropic", _UPSTREAM[OPUS], _TOKEN_A),
+      ("codex", _UPSTREAM[SOL], _CODEX_KEY),
+      ("codex", _UPSTREAM[SOL], _CODEX_KEY),
+    ]
+
+    # Part 2: a genuinely rotated Anthropic generation still refuses.
+    world.limited_models.clear()
+    world.turns[_UPSTREAM[OPUS]] = [
+      _tool_use_turn("call-anthropic-1", "code_execute"),
+      _text_turn("after rotated refusal"),
+    ]
+    log_path_rot = AgentSessionLog.path_for_session(
+      tmp_path / "logs",
+      AgentSessionRef(
+        user_id="test-actor",
+        agent_id="rot",
+        agent_session_id=resolve_agent_session_id("test-actor", "rot"),
+      ),
+    )
+    session_log = AgentSessionLog(log_path_rot)
+    executions.clear()
+    runner_3, _ = _build_runner(_resolver(world))
+    await runner_3.run(messages=[{"role": "user", "content": "run anthropic ask"}])
+    request_rot = await store.get_by_tool_call_id("call-anthropic-1")
+    assert request_rot is not None
+    located_rot = await store._locate_request_for_decision(
+      tenant_storage_id="test-actor", approval_id=request_rot.approval_id,
+    )
+    assert located_rot is not None and located_rot[2] is not None
+    binding_rot, _ = await store._read_executable_binding_for_executor(
+      job_id="sess-fallback",
+      tool_call_id="call-anthropic-1",
+      nonce=located_rot[2],
+      tenant_storage_id="test-actor",
+    )
+    assert binding_rot.credential_generation_ref is not None
+    await store.transition_state(
+      request_rot.approval_id,
+      "approved",
+      expected_state_version=request_rot.state_version,
+      decider_id="test-actor",
+      decider_role="owner",
+    )
+    # Genuine rotation: retire _TOKEN_A and replace the pool with _TOKEN_B.
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", _TOKEN_B)
+    resolve_anthropic_credentials({ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True})
+    world_rot = _World()
+    world_rot.rotation_generation_metadata = True
+    world_rot.turns[_UPSTREAM[OPUS]] = [_text_turn("after rotated refusal")]
+    resumed_rot_messages = await SessionContextBuilder(agent_session_log=session_log).build()
+    resolver_rot = _resolver(world_rot)
+    # Materializer now serves _TOKEN_B for anthropic.
+    orig_mat = resolver_rot.credential_materializer
+    resolver_rot = replace(
+      resolver_rot,
+      credential_materializer=lambda handle: (
+        MaterializedCredential(
+          handle=handle,
+          auth_config={
+            "auth_mode": "oauth",
+            "auth_token": _TOKEN_B,
+            "provider": "anthropic",
+            ANTHROPIC_OPERATOR_SEATS_ADMITTED_FIELD: True,
+          },
+        )
+        if handle.provider == "anthropic"
+        else orig_mat(handle)
+      ),
+    )
+    runner_4, ev_log_4 = _build_runner(resolver_rot, token=_TOKEN_B)
+    runner_4.bind_resume_approved_call(
+      ApprovedCallRef(
+        job_id="sess-fallback",
+        tool_call_id="call-anthropic-1",
+        nonce=binding_rot.nonce,
+      ),
+      runner_4._dispatcher,
+    )
+    await runner_4.run(messages=[], resume_initial_messages=resumed_rot_messages)
+    events_4 = [entry.event for entry in ev_log_4.entries]
+    tool_complete_rot = [e for e in events_4 if e.get("type") == "tool_call_complete"]
+    assert len(tool_complete_rot) == 1
+    assert tool_complete_rot[0].get("is_error") is True
+    assert tool_complete_rot[0]["error"]["code"] == "approval_credential_generation_mismatch"
+    assert executions == []
+
+  asyncio.run(_case())
+
+
+
+def test_classified_429_keeps_the_preset_fallback_and_does_not_lease() -> None:
+  """A 429 with no sibling is the pre-unit hop, enrolled or not.
+
+  Hop handles are present, including the evidence shape where a Risk outage
+  would otherwise be leased. The chain still serves the next preset entry.
+  """
+  from hank_model_transport.user_provider_keys import (
+    ResolvedKey, ResolvedUserKeys, UserKeyPools, UserKeyResolverUnavailable,
+    install_user_key_pools,
+  )
+
+  class Probe:
+    def __init__(self, *, outage: bool) -> None:
+      self.outage = outage
+
+    def resolve(self, *, risk_user_id, provider, context):
+      if self.outage:
+        raise UserKeyResolverUnavailable(provider, "resolver_response_invalid")
+      key = "sk-ant-user-fixture"
+      digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+      return ResolvedUserKeys(provider, risk_user_id, (ResolvedKey(digest, "mine", key),))
+
+    def report(self, **kwargs):
+      raise AssertionError("preset fallback must not report a user-key failure")
+
+  for probe in (None, Probe(outage=True), Probe(outage=False)):
+    world = _World()
+    world.limited_models = {_UPSTREAM[OPUS]}
+    leases: list[str] = []
+    base = _resolver(world)
+    original = base.credential_materializer
+
+    def materialize(handle, _original=original, _leases=leases):
+      if str(handle.handle_id).startswith("user-key:"):
+        _leases.append(handle.handle_id)
+      return _original(handle)
+
+    user = CredentialHandle(
+      "user-key:101:anthropic", "anthropic", "user", "test-tenant", "test-actor",
+    )
+    resolver = replace(
+      base, credential_materializer=materialize,
+      user_key_handles={"anthropic": user}, risk_user_id=101,
+    )
+    if probe is None:
+      events = _Turn(resolver).run()
+    else:
+      install_user_key_pools(UserKeyPools(probe))
+      try:
+        events = _Turn(resolver).run()
+      finally:
+        install_user_key_pools(None)
+    assert leases == []
+    hops = _of_type(events, "model_fallback")
+    assert hops and hops[0]["reason"] == "usage_limit"
+    assert hops[0]["to"]["model_key"] == SOL
+    assert not _of_type(events, "error")
+
+
+def _exhausted_seat_pool() -> Any:
+  from model_authority.key_pool import KeyPool, PooledKey
+
+  key = PooledKey(key="sk-ant-seat-pool", fingerprint="abcdef12")
+  pool = KeyPool("anthropic", (key,), state_path=None, repo="ai-excel-addin")
+  pool.mark_exhausted(key.fingerprint, "out_of_credit")
+  return pool
+
+
+class _ChildUserKeyPost:
+  """The autonomous child's parent route. A call is the R19 POST."""
+
+  def __init__(self, *, outage: bool) -> None:
+    self.outage = outage
+    self.calls: list[str] = []
+
+  def __call__(self, url: str, *, json: dict[str, Any], headers: dict[str, str]) -> Any:
+    _ = json, headers
+    self.calls.append(url)
+    if self.outage:
+      import httpx
+      raise httpx.RequestError("parent down")
+    from hank_contracts.user_provider_keys import ResolveCredentialRefusal
+
+    class _Missing:
+      status_code = 404
+
+      def json(self) -> dict[str, Any]:
+        return ResolveCredentialRefusal(
+          "user_key_missing", provider="anthropic", risk_user_id=101,
+          message="connect your Anthropic API key",
+        ).to_wire()
+
+    return _Missing()
+
+
+@pytest.mark.parametrize("state", ["unenrolled", "parent_outage"])
+def test_autonomous_child_exhausted_seat_walks_fallback_without_user_key_post(
+  state: str,
+) -> None:
+  """R19: an autonomous child whose seat pool is out of credit must not POST.
+
+  The child source is the parent ``/internal/autonomous/user-provider-keys``
+  route. Unenrolled and a Risk/parent outage are the shapes entry builds with
+  no hop handles. Either way the declared chain is walked and nothing leases.
+  """
+  from agent_gateway.autonomous_user_keys import (
+    AUTONOMOUS_USER_KEYS_PATH, AutonomousUserKeySource,
+  )
+  from hank_model_transport.user_provider_keys import (
+    NO_API_KEY_CONSUMER, ResolveContext, UserKeyPools, install_user_key_pools,
+    installed_user_key_pools,
+  )
+
+  world = _World()
+  world.limited_models = {_UPSTREAM[OPUS]}
+  world.key_pool = _exhausted_seat_pool()
+  post = _ChildUserKeyPost(outage=state == "parent_outage")
+  now = int(time.time())
+  source = AutonomousUserKeySource(
+    session=GatewaySession(
+      session_id="child-1", api_key_hash="run:autonomous",
+      created_at=now, expires_at=now + 3600, user_id="test-actor",
+      risk_user_id=101, role="owner", tenant_id="test-tenant",
+      session_token="child-token",
+    ),
+    base_url="http://parent.test",
+    post=post,
+  )
+  leases: list[str] = []
+  base = _resolver(
+    world,
+    chain=(FallbackEntry(model=DEEPSEEK),),
+    providers_with_credentials=frozenset({"anthropic", "ollama_cloud"}),
+  )
+  original = base.credential_materializer
+
+  def materialize(handle, _original=original, _leases=leases):
+    if str(handle.handle_id).startswith("user-key:"):
+      _leases.append(handle.handle_id)
+      lease = installed_user_key_pools().lease(
+        risk_user_id=101,
+        provider=handle.provider,
+        context=ResolveContext(
+          consumer_key_hash=NO_API_KEY_CONSUMER, channel="autonomous",
+        ),
+      )
+      return MaterializedCredential(handle=handle, auth_config=lease.auth_config())
+    return _original(handle)
+
+  service_handles = {
+    provider: CredentialHandle(
+      handle_id=f"service:test:{provider}", provider=provider, principal="service",
+      tenant_id="test-tenant", actor_id=None,
+    )
+    for provider in ("anthropic", "ollama_cloud")
+  }
+  resolver = replace(
+    base,
+    auth_context=AuthContext(
+      run_mode="autonomous",
+      actor_id="test-actor",
+      tenant_id="test-tenant",
+      user_provider_handles={},
+      service_provider_handles=service_handles,
+      entitled_capabilities=base.auth_context.entitled_capabilities,
+      entitled_model_keys=base.auth_context.entitled_model_keys,
+    ),
+    credential_materializer=materialize,
+    user_key_handles={},
+    risk_user_id=101,
+  )
+  install_user_key_pools(UserKeyPools(source))
+  try:
+    events = _Turn(resolver).run()
+  finally:
+    install_user_key_pools(None)
+
+  assert post.calls == []
+  assert leases == []
+  hops = _of_type(events, "model_fallback")
+  assert hops and hops[0]["reason"] == "usage_limit"
+  assert hops[0]["to"]["model_key"] == DEEPSEEK
+  assert hops[0]["to"]["provider"] == "ollama_cloud"
+  assert _UPSTREAM[DEEPSEEK] in {model for _provider, model, _token in world.calls}
+  assert not _of_type(events, "error")
+  assert AUTONOMOUS_USER_KEYS_PATH not in "".join(post.calls)
+

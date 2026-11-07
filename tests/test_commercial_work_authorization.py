@@ -183,6 +183,29 @@ def test_verifier_rejects_request_path_drift(changes, expected) -> None:
     _verify(_verifier(public), _token(private), **changes)
 
 
+def test_token_verification_binds_request_and_session_but_not_bind_facts() -> None:
+  private, public = _keypair()
+  verifier = _verifier(public)
+  token = _token(private, _payload(schema_version=4, credential_principal="service",
+                                   credential_route="server_managed", credential_owner_kind="hank"))
+  verified = verifier.verify_token(
+    token, execution_claim=_claim(), request_id="request-1", session_id="session-1",
+  )
+  assert verified == _verify(verifier, token, credential_principal="service")
+  for changes, expected in (
+    ({"request_id": "request-2"}, "request_mismatch"),
+    ({"session_id": "session-2"}, "session_mismatch"),
+  ):
+    facts = {"request_id": "request-1", "session_id": "session-1", **changes}
+    with pytest.raises(WorkAuthorizationError, match=expected):
+      verifier.verify_token(token, execution_claim=_claim(), **facts)
+  with pytest.raises(WorkAuthorizationError, match="invalid_signature_or_registered_claim"):
+    verifier.verify_token(
+      _token(_keypair()[0], _payload()), execution_claim=_claim(),
+      request_id="request-1", session_id="session-1",
+    )
+
+
 def test_verifier_accepts_v3_ticket_without_comparing_provider() -> None:
   private, public = _keypair()
   verified = _verify(
@@ -210,6 +233,62 @@ def test_verifier_accepts_byok_ticket_with_null_budget() -> None:
   )
   assert verified.billing_mode == "byok"
   assert verified.reserved_spend_microusd is None
+  assert verified.schema_version == 3
+  assert verified.credential_route is None
+  assert verified.credential_owner_kind is None
+
+
+@pytest.mark.parametrize("version,route,owner,admitted", [
+  (3, None, None, False),
+  (4, "server_managed", "hank", True),
+  (4, "customer_byok", "hank", False),
+  (4, "server_managed", "flat_subscription", False),
+  (4, "server_managed", "customer", False),
+])
+def test_verified_funding_route_controls_metered_admission(version, route, owner, admitted):
+  from api.credential_admission import admit_metered
+
+  private, public = _keypair()
+  payload = _payload(schema_version=version, credential_principal="service")
+  if version == 4:
+    payload.update(credential_route=route, credential_owner_kind=owner)
+  verified = _verify(
+    _verifier(public), _token(private, payload), credential_principal="service",
+  )
+  assert verified.credential_route == route
+  assert verified.credential_owner_kind == owner
+  assert admit_metered(verified) is admitted
+
+
+@pytest.mark.parametrize("changes,expected", [
+  ({"unknown_v4_field": True}, "unknown_or_missing_claim"),
+  ({"credential_route": None}, "invalid_credential_route"),
+  ({"credential_route": 7}, "invalid_credential_route"),
+  ({"credential_route": "Invalid Route"}, "invalid_credential_route"),
+  ({"credential_owner_kind": None}, "invalid_credential_owner_kind"),
+  ({"credential_owner_kind": 7}, "invalid_credential_owner_kind"),
+  ({"credential_owner_kind": []}, "invalid_credential_owner_kind"),
+  ({"credential_owner_kind": "unknown"}, "invalid_credential_owner_kind"),
+])
+def test_v4_refuses_unknown_or_malformed_route_claims(changes, expected):
+  private, public = _keypair()
+  payload = _payload(
+    schema_version=4, credential_route="server_managed", credential_owner_kind="hank",
+  )
+  payload.update(changes)
+  with pytest.raises(WorkAuthorizationError, match=expected):
+    _verify(_verifier(public), _token(private, payload))
+
+
+@pytest.mark.parametrize("missing", ["credential_route", "credential_owner_kind"])
+def test_v4_requires_both_route_claims(missing):
+  private, public = _keypair()
+  payload = _payload(
+    schema_version=4, credential_route="server_managed", credential_owner_kind="hank",
+  )
+  del payload[missing]
+  with pytest.raises(WorkAuthorizationError, match="unknown_or_missing_claim"):
+    _verify(_verifier(public), _token(private, payload))
 
 
 @pytest.mark.parametrize("version", (1, 2))

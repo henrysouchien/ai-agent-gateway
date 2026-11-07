@@ -16,11 +16,12 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from hank_model_transport.capability_execution import BoundCapabilityExecution
+from hank_model_transport.auth import ProviderCredentialFailure
 from hank_model_transport.multi_user.billing import UsageEvent
 from agent_gateway.provider_summarize import ProviderSummarizeResult, provider_summarize
 from hank_model_transport.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
 from hank_model_transport.rate_limit import AnthropicTokenBucket
-from agent_gateway import runner_streaming
+from hank_model_transport import streaming as runner_streaming
 from hank_model_transport.send_prompt import send_prompt
 from model_authority.binding import CapabilityEffort
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
@@ -46,7 +47,6 @@ class _DirectStreamProvider(ModelProvider):
     self.bucket = AnthropicTokenBucket(
       rpm=2000 if scenario == "queued_then_delayed" else 300,
     )
-    self.bucket._rpm_tokens = 0.0
     self.waited_seconds = 0.0
 
   def has_active_credential(self, config: dict[str, Any]) -> bool:
@@ -86,6 +86,10 @@ class _DirectStreamProvider(ModelProvider):
     started_at = time.monotonic()
     try:
       if self.scenario in {"queued", "queued_then_silent", "queued_then_delayed"}:
+        # Request preparation can outlast a refill; queue from dispatch rather
+        # than letting fixture construction consume the wait under test.
+        self.bucket._rpm_tokens = 0.0
+        self.bucket._last_refill = time.monotonic()
         self.waited_seconds = await self.bucket.acquire()
         if self.scenario == "queued_then_silent":
           await asyncio.Event().wait()
@@ -109,6 +113,10 @@ class _DirectStreamProvider(ModelProvider):
         provider_wait_ms=17,
         provider_reported_model=params["model"],
       )
+      if self.scenario == "thinking":
+        while True:
+          await asyncio.sleep(0.005)
+          yield StreamEvent(type="thinking_delta", thinking_text="still reasoning")
       if self.scenario in {"heartbeats", "ready_heartbeats"}:
         while True:
           if self.scenario == "heartbeats":
@@ -208,9 +216,7 @@ def test_direct_stream_sustained_progress_has_no_total_duration_cap(
   liveness: list[dict[str, Any]] = []
 
   async def run() -> ProviderSummarizeResult | str:
-    return await asyncio.wait_for(
-      _call_direct(consumer, execution, usage_events, liveness), timeout=0.4,
-    )
+    return await _call_direct(consumer, execution, usage_events, liveness)
 
   result = asyncio.run(run())
 
@@ -276,6 +282,24 @@ def test_direct_stream_heartbeats_after_start_do_not_reset_progress(
     assert usage_events[0].input_tokens == 10
     assert usage_events[0].output_tokens == 0
 
+
+@pytest.mark.parametrize("consumer", ["summary", "prompt"])
+def test_direct_stream_thinking_deltas_do_not_reset_progress(
+  consumer: str,
+  small_stall_timeouts: None,
+) -> None:
+  provider = _DirectStreamProvider("thinking")
+
+  async def run() -> None:
+    with pytest.raises(runner_streaming.StreamStallError) as caught:
+      await asyncio.wait_for(
+        _call_direct(consumer, _execution(provider), [], []), timeout=0.4,
+      )
+    assert "stall" in str(caught.value).lower()
+
+  asyncio.run(run())
+
+  assert provider.closed_clients == [provider.client]
 
 @pytest.mark.parametrize("consumer", ["summary", "prompt"])
 def test_direct_stream_preserves_provider_timeout_error(
@@ -351,3 +375,61 @@ def test_direct_stream_peer_silence_counts_only_after_local_queue(
   assert provider.waited_seconds + 0.04 > runner_streaming.STREAM_STALL_TIMEOUT
   text = result.text if isinstance(result, ProviderSummarizeResult) else result
   assert text == "abcdefghij"
+
+
+class _RotatingProvider(_DirectStreamProvider):
+  """First client's stream stalls; the sibling credential's stream completes."""
+
+  def __init__(self) -> None:
+    super().__init__("silent")
+    self.clients: list[Any] = []
+
+  def create_client(
+    self, config: dict[str, Any], *, timeout: float | None = None,
+  ) -> object:
+    client = {"api_key": config["api_key"]}
+    self.clients.append(client)
+    return client
+
+  def classify_credential_failure(self, exc: Exception) -> ProviderCredentialFailure | None:
+    if isinstance(exc, runner_streaming.StreamStallError):
+      return ProviderCredentialFailure(provider=self.name, kind="transport")
+    return None
+
+  def next_credential(
+    self, config: Any, failure: ProviderCredentialFailure,
+  ) -> dict[str, Any] | None:
+    if config["api_key"] == "key-1":
+      return {**config, "api_key": "key-2"}
+    return None
+
+  async def stream(self, client: Any, params: dict[str, Any]) -> AsyncIterator[StreamEvent]:
+    self.scenario = "silent" if client is self.clients[0] else "ok"
+    async for event in super().stream(client, params):
+      yield event
+
+
+@pytest.mark.parametrize("consumer", ["summary", "prompt"])
+def test_direct_stream_stall_rotates_to_sibling_credential(
+  consumer: str,
+  small_stall_timeouts: None,
+) -> None:
+  provider = _RotatingProvider()
+  execution = stub_bound_capability_execution(
+    provider=provider,
+    model="claude-opus-5",
+    effort="none",
+    auth_config={"max_tokens": 4096, "api_key": "key-1"},
+  )
+
+  async def run() -> ProviderSummarizeResult | str:
+    return await asyncio.wait_for(
+      _call_direct(consumer, execution, [], []), timeout=1.0,
+    )
+
+  result = asyncio.run(run())
+
+  text = result.text if isinstance(result, ProviderSummarizeResult) else result
+  assert text == "abcdefghij"
+  assert [client["api_key"] for client in provider.clients] == ["key-1", "key-2"]
+  assert provider.closed_clients == provider.clients

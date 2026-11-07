@@ -55,8 +55,8 @@ CODE_EXECUTION_DELEGATION_TOOL_DEFS: tuple[Dict[str, Any], ...] = (
   {
     "name": "completion",
     "description": (
-      "Submit a leaf model completion under a registered model-call operation; "
-      "returns its task_id at once. Wait on it with hank.wait."
+      "Unsupported: no gateway-executed completion capability is defined. "
+      "Raises unsupported_operation with no next_call; no model call is launched."
     ),
     "input_schema": {
       "type": "object",
@@ -141,10 +141,10 @@ def _bridge_operation_names() -> str:
   )
 
 def _model_call_operation_names() -> str:
-  """Registered leaf model-call operations."""
+  """Registered leaf judgment operations supported by the kernel."""
   from hank_model_transport.capability_execution import list_model_call_operations
 
-  return ", ".join(op.name for op in list_model_call_operations())
+  return ", ".join(op.name for op in list_model_call_operations(kind="judgment"))
 
 
 def _placement_description(config: CodeExecutionConfig) -> str:
@@ -202,7 +202,8 @@ def make_code_execute_tool_def(config: CodeExecutionConfig) -> Dict[str, Any]:
       "unknown). A cell cannot recurse into code_execute itself, and money/irreversible trade "
       "execution still goes through the human-approval door. "
       f"To delegate from a cell, {_bridge_operation_names()}. "
-      f"Registered leaf model-call operations for completion and judge: {_model_call_operation_names()}. "
+      f"Registered leaf judgment operations for hank.judge: {_model_call_operation_names()}. "
+      "hank.completion is unsupported: no gateway-executed completion capability is defined. "
       "Full parsed dict/list results arrive in kernel memory untruncated: retain fetched data "
       "in Python locals across cells, filter and compute in Python, and print only compact "
       "summaries so only the printed summary enters the transcript. "

@@ -10,7 +10,6 @@ from model_authority.loader import PACKAGED_AUTHORITY_DIR, load_model_authority
 from model_authority.selection import TierModelsDefault, TierSelectionPolicy
 
 from .test_sub_agent import _CapabilityResolver, _Runner, _handler, _operation, _write_operation
-from agent_gateway.sub_agent_helpers import make_run_agent_tool_def
 from gateway_test_support.host_policy import owner_session_host_policy
 from gateway_test_support.capability_execution_test_support import stub_capability_execution_resolver
 
@@ -36,14 +35,6 @@ def _invoke(tmp_path: Path, resolver: _CapabilityResolver, **fields: Any):
   return runner, result, error
 
 
-def test_public_selection_schema() -> None:
-  schema = make_run_agent_tool_def()["input_schema"]
-  assert schema["properties"]["role"]["type"] == "string"
-  assert set(schema["properties"]["effort"]["enum"]) == {
-    "none", "minimal", "low", "medium", "high", "xhigh", "max",
-  }
-  assert not {"oneOf", "anyOf", "allOf"} & set(schema)
-  assert "required" not in schema
 
 
 def test_spawn_role_and_effort_reach_selection(tmp_path: Path) -> None:

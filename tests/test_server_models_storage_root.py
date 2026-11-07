@@ -7,7 +7,7 @@ from typing import Any
 
 import agent_gateway.server as server_module
 from agent_gateway.sdk_runner import AgentSDKRunner
-from agent_gateway.server_models import _call_build_chat_runtime
+from agent_gateway.server_models import call_build_chat_runtime
 
 
 def _call(
@@ -16,7 +16,7 @@ def _call(
   storage_root: Path | None,
 ) -> Any:
   return asyncio.run(
-    _call_build_chat_runtime(
+    call_build_chat_runtime(
       builder,
       session="session",  # type: ignore[arg-type]
       request="request",  # type: ignore[arg-type]
@@ -91,7 +91,7 @@ def test_gateway_request_builder_passes_app_state_storage_root(
 
   monkeypatch.setattr(
     server_module,
-    "_call_build_chat_runtime",
+    "call_build_chat_runtime",
     fake_call,
   )
   session = SimpleNamespace(purpose="chat", fork_source_log_path=None)

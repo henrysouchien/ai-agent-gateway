@@ -44,13 +44,6 @@ WORKSPACE_WRITE = "workspace.write/v1"
 ARTIFACT_PROPOSE = "artifact.propose/v1"
 STATE_MUTATE = "state.mutate/v1"
 
-#: The dataset-shaped requirement the autonomous prefetch hook reads.  It
-#: binds no live tool (its registry spec declares no compatible effect); it
-#: exists so a methodology can declare *which datasets it needs warmed*
-#: without the deleted ``data_requirements`` block (D-B8-2).
-MARKET_DATA_HISTORY = "market-data.history/v1"
-
-
 #: A read route whose owner declares no capability still gets one: an
 #: unplaceable route must never fall back to "satisfies anything", which is
 #: exactly the vacuous admission B-8 removes.
@@ -144,7 +137,6 @@ __all__ = [
   "COMPUTATION_EXECUTE",
   "CORPUS_READ",
   "FILINGS_READ",
-  "MARKET_DATA_HISTORY",
   "MARKET_DATA_READ",
   "STATE_MUTATE",
   "SEMANTIC_CAPABILITY_CORRECTIONS_BY_EFFECT",

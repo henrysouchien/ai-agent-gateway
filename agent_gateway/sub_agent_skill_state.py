@@ -118,9 +118,13 @@ def declared_context_doors_from_grant(grant: ToolGrant | None) -> frozenset[str]
 def _door_refused(result: Any) -> bool:
   if not isinstance(result, Mapping):
     return False
+  status = str(result.get("status") or "").strip().lower()
   return (
-    str(result.get("gate_code") or "").strip() == "STOP"
-    or str(result.get("status") or "").strip().lower() in _FAILURE_FMS_STATUSES
+    (
+      str(result.get("gate_code") or "").strip() == "STOP"
+      and status not in _TERMINAL_SUCCESS_STATUSES - {"staged"}
+    )
+    or status in _FAILURE_FMS_STATUSES
   )
 
 
@@ -131,10 +135,11 @@ def latest_declared_door_refusal(
   """Return the child's last declared-door answer, verbatim, when it refused.
 
   The doors are the grant's terminal and context doors. When the last of them
-  the child called answered ``STOP`` or an error status, that answer — with
-  its own ``next_call`` — is what the child settles on and the parent reads.
-  A later accepted call supersedes an earlier refusal, and a transport
-  failure carries no door answer.
+  the child called answered an unsuccessful ``STOP`` or an error status, that
+  answer — with its own ``next_call`` — is what the child settles on and the
+  parent reads. A committed ``applied`` result is not a refusal. A later
+  accepted call supersedes an earlier refusal, and a transport failure carries
+  no door answer.
   """
 
   doors = frozenset(declared_doors)
@@ -237,7 +242,10 @@ def terminal_fms_result_disposition(
       "subcommand" in result and "mutation_mode" in result
     )
     return "failure" if is_fms_envelope and not recoverable else None
-  if str(result.get("gate_code") or "").strip() == "STOP":
+  if (
+    str(result.get("gate_code") or "").strip() == "STOP"
+    and status not in _TERMINAL_SUCCESS_STATUSES - {"staged"}
+  ):
     return "failure"
   if result.get("success") is False:
     return None

@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 # ruff: noqa: E402
 
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
@@ -104,6 +106,7 @@ def test_local_tool_schema_validation_rejects_missing_required_before_handler() 
     event_log=event_log,
     get_tool_definitions=_tool_defs,
     role="owner",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(dispatcher.dispatch("call-1", "structured_write", {}))
@@ -146,6 +149,7 @@ def test_local_tool_schema_validation_preserves_dispatcher_override_seam() -> No
       return {"code": "custom_schema_gate", "message": "blocked by override"}
 
   dispatcher = _OverrideDispatcher(
+    run_context=run_context_for_test(registry_scope=RegistryScope("run", "test-run", "/tmp/test-store")),
     capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _handler},
@@ -177,6 +181,7 @@ def test_local_tool_schema_validation_preserves_type_match_override_seam() -> No
       return True
 
   dispatcher = _LenientTypeDispatcher(
+    run_context=run_context_for_test(registry_scope=RegistryScope("run", "test-run", "/tmp/test-store")),
     capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"structured_write": _handler},
@@ -200,6 +205,7 @@ def test_local_tool_schema_validation_rejects_unknown_top_level_field() -> None:
     local_tool_handlers={"structured_write": _unexpected_handler},
     get_tool_definitions=_tool_defs,
     role="owner",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
@@ -219,6 +225,7 @@ def test_local_tool_schema_validation_rejects_top_level_type_mismatch() -> None:
     local_tool_handlers={"structured_write": _unexpected_handler},
     get_tool_definitions=_tool_defs,
     role="owner",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
@@ -240,6 +247,7 @@ def test_local_tool_schema_validation_allows_valid_input() -> None:
     local_tool_handlers={"structured_write": _ok_handler},
     get_tool_definitions=_tool_defs,
     role="owner",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
@@ -264,6 +272,7 @@ def test_local_handler_declaring_authoritative_validation_receives_schema_invali
     local_tool_handlers={"structured_write": owning_handler},
     get_tool_definitions=_tool_defs,
     role="owner",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   for tool_input in (
@@ -302,6 +311,7 @@ def test_unmarked_local_handler_stays_schema_gated_beside_a_marked_one() -> None
     },
     get_tool_definitions=two_tool_defs,
     role="owner",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
@@ -331,6 +341,7 @@ def test_snapshot_admitted_local_tool_requires_live_schema_for_input_validation(
     local_tool_handlers={"hidden_write": _unexpected_handler},
     get_tool_definitions=lambda: list(live_definitions),
     role="owner",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   live_definitions.clear()
 
@@ -365,6 +376,7 @@ def test_snapshot_admitted_local_tool_requires_schema_in_live_definition() -> No
     local_tool_handlers={"hidden_write": _unexpected_handler},
     get_tool_definitions=lambda: [{"name": "hidden_write"}],
     role="owner",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
@@ -391,6 +403,7 @@ def test_catalog_free_local_caller_remains_supported_without_request_snapshot() 
     mcp_client=_NullMcpClient(),
     local_tool_handlers={"package_read": _ok_handler},
     role="owner",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = _run(
@@ -431,6 +444,7 @@ def test_local_tool_schema_validation_rechecks_approval_modified_args(tmp_path: 
       session_id=session.session_id,
       channel="cli",
       policy_bundle_hash="modified-args-test-policy",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
     get_tool_definitions=_tool_defs,
   )
@@ -468,6 +482,7 @@ def test_deferred_local_tool_missing_schema_names_pack_and_load_tools_next_call(
         request_id="deferred-hint-request",
         channel="web",
         profile_name="researcher",
+        registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
       ),
       session=SimpleNamespace(channel="web"),
       get_tool_definitions=lambda: [],

@@ -32,6 +32,7 @@ from agent_gateway.tool_definition import (
   OriginatedToolDefinition,
 )
 from agent_gateway.tool_registration import (
+  RefusedMcpRoute,
   RegisteredMcpToolCompilationError,
   RegisteredMcpToolDescriptor,
   UnknownRegisteredMcpToolDescriptorError,
@@ -174,7 +175,7 @@ def test_compiler_joins_physical_and_logical_routes_exactly() -> None:
   descriptors = compile_registered_mcp_tool_descriptors(
     catalog,
     (physical, logical),
-  )
+  ).descriptors
 
   assert tuple(descriptor.identity for descriptor in descriptors) == (
     logical_declaration.identity,
@@ -212,7 +213,7 @@ def test_same_bare_name_on_distinct_servers_is_identity_preserving() -> None:
       (_server("b-mcp"), _server("a-mcp")),
     ),
     (binding_b, binding_a),
-  )
+  ).descriptors
 
   assert tuple(
     (descriptor.identity.logical_server_id, descriptor.identity.logical_name)
@@ -240,7 +241,7 @@ def test_declared_but_offline_routes_remain_valid_and_unbound() -> None:
     provider_original_name="online_tool",
   )
 
-  descriptors = compile_registered_mcp_tool_descriptors(catalog, (binding,))
+  descriptors = compile_registered_mcp_tool_descriptors(catalog, (binding,)).descriptors
 
   assert tuple(descriptor.identity for descriptor in descriptors) == (
     online.identity,
@@ -248,7 +249,9 @@ def test_declared_but_offline_routes_remain_valid_and_unbound() -> None:
   assert catalog.resolve_mcp("offline-mcp", "offline_tool").identity == (
     offline.identity
   )
-  assert compile_registered_mcp_tool_descriptors(catalog, ()) == ()
+  empty = compile_registered_mcp_tool_descriptors(catalog, ())
+  assert empty.descriptors == ()
+  assert empty.refused == ()
 
 
 class _CatalogMcpSession(McpClientSession):
@@ -481,7 +484,7 @@ def test_manager_resolves_sdk_alias_and_same_bare_names_to_exact_descriptors() -
 
 
 
-def test_manager_rejects_an_unknown_live_route_during_topology_compile() -> None:
+def test_manager_refuses_an_unknown_live_route_during_topology_compile() -> None:
   manager = McpClientManager(
     config_path=None,
     allowed_servers={"research-mcp"},
@@ -496,13 +499,14 @@ def test_manager_rejects_an_unknown_live_route_during_topology_compile() -> None
     tool_name="undeclared_tool",
   )
 
-  with pytest.raises(
-    RegisteredMcpToolCompilationError,
-    match="no exact static registration",
-  ):
-    manager._apply_collision_filtering(
-      policy_server_for_tool=lambda _name: "research-mcp"
-    )
+  manager._apply_collision_filtering(
+    policy_server_for_tool=lambda _name: "research-mcp"
+  )
+
+  (refused,) = manager.get_refused_mcp_routes()
+  assert (refused.logical_server_id, refused.logical_name) == (
+    "research-mcp", "undeclared_tool",
+  )
 
 
 def test_manager_uses_registered_per_tool_expectation() -> None:
@@ -746,7 +750,7 @@ def test_compiler_detaches_every_input_and_materializes_fresh_definitions() -> N
   descriptor = compile_registered_mcp_tool_descriptors(
     catalog,
     (binding,),
-  )[0]
+  ).descriptors[0]
 
   assert descriptor.declaration is not catalog.declarations[0]
   assert descriptor.server is not catalog.servers[0]
@@ -791,7 +795,7 @@ def test_compiler_detaches_hostile_mapping_proxy_backing() -> None:
     MappingProxyType(definition_backing),
   )
 
-  descriptor = compile_registered_mcp_tool_descriptors(catalog, (binding,))[0]
+  descriptor = compile_registered_mcp_tool_descriptors(catalog, (binding,)).descriptors[0]
   definition_backing["name"] = "mutated"
   schema_backing["type"] = "array"
 
@@ -810,7 +814,7 @@ def test_compiler_requires_an_exact_binding_tuple(bindings: object) -> None:
     )
 
 
-def test_compiler_rejects_unknown_or_non_mcp_static_routes() -> None:
+def test_compiler_refuses_a_route_whose_static_registration_is_not_mcp() -> None:
   binding = _binding(
     server_id="research-mcp",
     exposed_name="filings_read",
@@ -830,11 +834,56 @@ def test_compiler_rejects_unknown_or_non_mcp_static_routes() -> None:
     (_server("research-mcp"),),
   )
 
-  with pytest.raises(
-    RegisteredMcpToolCompilationError,
-    match="no exact static registration",
-  ):
-    compile_registered_mcp_tool_descriptors(catalog, (binding,))
+  compilation = compile_registered_mcp_tool_descriptors(catalog, (binding,))
+
+  assert compilation.descriptors == ()
+  (refused,) = compilation.refused
+  assert refused.logical_server_id == "research-mcp"
+  assert refused.logical_name == "filings_read"
+
+
+def test_unregistered_live_route_is_refused_while_other_routes_compile() -> None:
+  registered = _binding(
+    server_id="research-mcp",
+    exposed_name="declared_tool",
+    logical_name="declared_tool",
+    transport_server_id="research-mcp",
+    provider_original_name="declared_tool",
+  )
+  unregistered = _binding(
+    server_id="edgar-parser-mcp",
+    exposed_name="get_restatements",
+    logical_name="get_restatements",
+    transport_server_id="edgar-parser-mcp",
+    provider_original_name="get_restatements",
+  )
+  catalog = _catalog(
+    (_declaration("research-mcp", "declared_tool"),),
+    (_server("research-mcp"), _server("edgar-parser-mcp")),
+  )
+
+  compilation = compile_registered_mcp_tool_descriptors(
+    catalog, (registered, unregistered)
+  )
+
+  assert tuple(
+    descriptor.exposed_name for descriptor in compilation.descriptors
+  ) == ("declared_tool",)
+  (refused,) = compilation.refused
+  assert refused == RefusedMcpRoute(
+    logical_server_id="edgar-parser-mcp",
+    logical_name="get_restatements",
+    exposed_name="get_restatements",
+    transport_server_id="edgar-parser-mcp",
+    route_kind=unregistered.route_kind,
+    reason="live MCP route has no exact static registration",
+  )
+  error = refused.call_error()
+  assert error["code"] == "mcp_tool_not_registered"
+  assert "edgar-parser-mcp" in error["message"]
+  assert "get_restatements" in error["message"]
+  assert "declared_tool" not in error["message"]
+  assert "research-mcp" not in error["message"]
 
 
 def test_descriptor_rejects_non_mcp_static_identity() -> None:
@@ -913,7 +962,7 @@ def test_compiler_accepts_manager_same_server_physical_and_logical_routes() -> N
   descriptors = compile_registered_mcp_tool_descriptors(
     catalog,
     manager_bindings,
-  )
+  ).descriptors
 
   assert tuple(descriptor.identity.logical_name for descriptor in descriptors) == (
     "alias_tool",
@@ -1064,3 +1113,113 @@ def test_compiler_requires_an_exact_detachable_static_catalog() -> None:
   object.__setattr__(catalog, "declarations", [declaration])
   with pytest.raises(TypeError, match="exact tuple"):
     compile_registered_mcp_tool_descriptors(catalog, ())
+
+
+def _install_advertised_tool(
+  manager: McpClientManager,
+  *,
+  server_id: str,
+  tool_name: str,
+  properties: dict[str, object],
+) -> None:
+  manager._servers = {
+    **manager._servers,
+    server_id: _ServerState(
+      name=server_id,
+      session=_CatalogMcpSession(),
+      exit_contexts=[],
+      tool_definitions=[{
+        "name": tool_name,
+        "description": "Advertised by the provider.",
+        "input_schema": {"type": "object", "properties": properties, "required": list(properties)},
+      }],
+      tool_names={tool_name},
+      config={"type": "stdio", "command": server_id},
+    ),
+  }
+
+
+def test_collision_preserving_records_describe_the_published_surface_when_registered() -> None:
+  # `filings_read` carries publication guidance and `user_id` is stripped from every
+  # advertised schema: the raw advertised definition is not the registered surface.
+  manager = McpClientManager(
+    config_path=None,
+    allowed_servers={"corpus-mcp"},
+    strip_input_fields={"user_id"},
+    tool_registration_catalog=_catalog(
+      (_declaration("corpus-mcp", "filings_read"),), (_server("corpus-mcp"),),
+    ),
+  )
+  _install_advertised_tool(
+    manager, server_id="corpus-mcp", tool_name="filings_read",
+    properties={"document_id": {"type": "string"}, "user_id": {"type": "string"}},
+  )
+  manager._apply_collision_filtering(policy_server_for_tool=lambda _name: "corpus-mcp")
+
+  records = manager.get_collision_preserving_server_tool_definition_records({"corpus-mcp"})
+
+  assert records == manager.get_server_tool_definition_records({"corpus-mcp"})
+  assert "user_id" not in records[0].definition["input_schema"]["properties"]
+
+
+def test_collision_preserving_records_keep_the_unregistered_loser_copy() -> None:
+  manager = McpClientManager(
+    config_path=None,
+    allowed_servers={"first-mcp", "second-mcp"},
+    tool_registration_catalog=_catalog(
+      (_declaration("first-mcp", "shared_tool"), _declaration("second-mcp", "shared_tool")),
+      (_server("first-mcp"), _server("second-mcp")),
+    ),
+  )
+  for server_id in ("first-mcp", "second-mcp"):
+    _install_advertised_tool(
+      manager, server_id=server_id, tool_name="shared_tool", properties={"ticker": {"type": "string"}},
+    )
+  manager._apply_collision_filtering(policy_server_for_tool=lambda _name: "first-mcp")
+
+  records = manager.get_collision_preserving_server_tool_definition_records(
+    {"first-mcp", "second-mcp"}
+  )
+
+  assert [(record.server_id, record.name) for record in records] == [
+    ("first-mcp", "shared_tool"), ("second-mcp", "shared_tool"),
+  ]
+  assert [record.server_id for record in manager.get_server_tool_definition_records(
+    {"first-mcp", "second-mcp"}
+  )] == ["first-mcp"]
+
+
+def test_unregistered_live_route_is_refused_without_taking_down_the_manager() -> None:
+  manager = McpClientManager(
+    config_path=None,
+    allowed_servers={"corpus-mcp", "edgar-mcp"},
+    tool_registration_catalog=_catalog(
+      (_declaration("corpus-mcp", "filings_read"),), (_server("corpus-mcp"),),
+    ),
+  )
+  for server_id, tool_name in (
+    ("corpus-mcp", "filings_read"), ("edgar-mcp", "get_restatements"),
+  ):
+    _install_advertised_tool(
+      manager, server_id=server_id, tool_name=tool_name, properties={"ticker": {"type": "string"}},
+    )
+  owners = {"filings_read": "corpus-mcp", "get_restatements": "edgar-mcp"}
+
+  manager._apply_collision_filtering(policy_server_for_tool=owners.get)
+
+  (refused,) = manager.get_refused_mcp_routes()
+  assert (refused.logical_server_id, refused.logical_name) == ("edgar-mcp", "get_restatements")
+  assert manager.is_mcp_tool("filings_read")
+  assert not manager.is_mcp_tool("get_restatements")
+  assert [definition["name"] for definition in manager.get_tool_definitions()] == ["filings_read"]
+  assert [
+    record.name
+    for record in manager.get_server_tool_definition_records({"corpus-mcp", "edgar-mcp"})
+  ] == ["filings_read"]
+  assert manager.get_server_catalog()["edgar-mcp"]["tools"] == []
+  result, error = asyncio.run(manager.call_tool("get_restatements", {}))
+  assert result is None
+  assert error is not None
+  assert error["code"] == "mcp_tool_not_registered"
+  assert "get_restatements" in error["message"]
+  assert "edgar-mcp" in error["message"]

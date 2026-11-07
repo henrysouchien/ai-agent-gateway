@@ -14,6 +14,7 @@ from agent_gateway.fork_ledger import ForkLedger
 from agent_gateway.event_log import EventLog
 from agent_gateway.fork_task_registry import ForkTaskRegistry
 from agent_gateway.learning_fork_trigger import (
+  _owner,
   claim_learning_receipts,
   evaluate_learning_fork_trigger,
   owner_operated_interactive_analyst,
@@ -48,6 +49,18 @@ def _ledger(tmp_path: Path) -> ForkLedger:
     process_instance_id="test-process",
     clock_ns=_clock,
   )
+
+
+@pytest.mark.parametrize("owner", ["1", "legacy-owner"])
+def test_learning_owner_uses_session_storage_owner(owner: str) -> None:
+  session = SimpleNamespace(owner_user_id=owner, user_id="henry")
+  assert _owner(session) == owner
+
+
+def test_learning_owner_without_desk_does_not_fall_back_to_login() -> None:
+  session = SimpleNamespace(owner_user_id=None, user_id="henry")
+  with pytest.raises(ValueError, match="learning fork owner is required"):
+    _owner(session)
 
 
 
@@ -165,8 +178,8 @@ def test_post_turn_launch_and_fork_counts_land_in_second_turn_recap(
     ledger = _ledger(tmp_path)
     config = SimpleNamespace(_pending_events={})
     session = SimpleNamespace(
-      session_id="session-1", role="owner", owner_user_id="owner-1",
-      user_id="owner-1", learning_fork_config=config,
+      session_id="session-1", role="owner", owner_user_id="1",
+      user_id="henry", learning_fork_config=config,
       learning_fork_ledger=ledger,
       learn_memory_nudge_turns=0, learn_skill_nudge_iters=0,
     )
@@ -184,8 +197,10 @@ def test_post_turn_launch_and_fork_counts_land_in_second_turn_recap(
       _dispatcher=SimpleNamespace(run_context=SimpleNamespace(profile="analyst")),
     )
     finished = asyncio.Event()
+    submitted_owners: list[tuple[str, str]] = []
 
     async def spawn(fork_id, work_item):
+      submitted_owners.append((work_item.owner, work_item.user_id))
       child_log = EventLog(session_id=fork_id)
       child_log.append({"type": "turn_complete"})
       child_log.append({"type": "turn_complete"})
@@ -214,6 +229,7 @@ def test_post_turn_launch_and_fork_counts_land_in_second_turn_recap(
     )
     assert launch is not None and launch.launched
     await finished.wait()
+    assert submitted_owners == [("1", "1")]
     assert first_log.has_terminal
     assert not any(
       entry.event["type"] in {"learning_fork_launched", "fork_measurements"}
@@ -247,6 +263,37 @@ def test_post_turn_launch_and_fork_counts_land_in_second_turn_recap(
     await registry.shutdown()
 
   asyncio.run(case())
+
+
+def test_decision_log_names_the_session_and_request_it_decided_for(
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  session = SimpleNamespace(
+    session_id="session-1", role="owner", owner_user_id="1", user_id="henry",
+    learning_fork_config=SimpleNamespace(_pending_events={}),
+    learn_memory_nudge_turns=0, learn_skill_nudge_iters=0,
+  )
+  runner = SimpleNamespace(
+    _gateway_session=session, _request_id="req-42", _billing_mode="platform",
+    _fork_mode=False,
+    _capability_execution=SimpleNamespace(bind=SimpleNamespace(
+      credential_principal="service", run_mode="interactive",
+    )),
+    _dispatcher=SimpleNamespace(run_context=SimpleNamespace(profile="analyst")),
+  )
+
+  with caplog.at_level("INFO", logger="agent_gateway.learning_fork_trigger"):
+    assert submit_learning_fork_after_turn(
+      runner, handoff=None, tool_calling_iters=1, foreground_memory_write=False,
+      completed=True, real_final_response=True,
+      errored=False, aborted=False, cancelled=False,
+    ) is None
+
+  [record] = [r for r in caplog.records if r.getMessage() == "learning fork decision"]
+  data = record.__dict__["data"]
+  assert data["event"] == "learning_fork_decision"
+  assert data["session_id"] == "session-1"
+  assert data["request_id"] == "req-42"
 
 
 def test_measurement_delivery_keeps_closed_logs_and_other_sessions_pending() -> None:

@@ -19,9 +19,6 @@ from agent_gateway.runner_streaming import (  # noqa: E402
 )
 
 
-def test_runner_reexports_streaming_constants() -> None:
-  assert gateway_runner.STREAM_STALL_TIMEOUT == STREAM_STALL_TIMEOUT
-  assert gateway_runner.STREAM_THINKING_STALL_TIMEOUT == STREAM_THINKING_STALL_TIMEOUT
 
 
 def test_thinking_level_maps_boolean_to_provider_enum() -> None:

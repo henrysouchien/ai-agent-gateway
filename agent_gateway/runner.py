@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from dataclasses import replace
 import fcntl  # noqa: F401 - compatibility alias for runner session lifecycle monkeypatches
 import inspect
 import json  # noqa: F401 - compatibility alias for runner tool execution monkeypatches
@@ -10,7 +11,7 @@ import socket  # noqa: F401 - compatibility alias for runner session lifecycle m
 import time
 import uuid
 from pathlib import Path
-from typing import AbstractSet, Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import AbstractSet, Any, Awaitable, Callable, Dict, List, Literal, Optional, Set, Tuple
 
 from agent_workflow_contracts import ResultRequirement
 
@@ -20,6 +21,7 @@ from .context_builder import SessionContextBuilder
 from .context_capture import ContextCapture
 from .event_log import EventLog
 from .mcp_activation import McpActivationFold
+from .registry_scope import NoRegistryScope, RegistryScope
 from .mcp_client import McpClientManager
 from hank_model_transport.multi_user.billing import (
   DEFAULT_USAGE_DLQ_PATH,
@@ -91,6 +93,7 @@ from .runner_tool_execution import (
 )
 from .workflow_output_attachment import WorkflowOutputAttachment
 from .runner_session_events import (
+  ANALYST_CONTENT_UNSET,
   build_attach_event as _build_attach_event,  # noqa: F401 - compatibility alias
   build_context_warning_log_data as _build_context_warning_log_data,  # noqa: F401 - compatibility alias
   build_orphan_tool_call_interrupted_events as _build_orphan_tool_call_interrupted_events,  # noqa: F401 - compatibility alias
@@ -109,6 +112,7 @@ from .runner_skill_gate import (
 from .runner_state import (
   BackgroundTask,
   CostAccumulator,
+  FinalAnswerVerdict as FinalAnswerVerdict,
   StreamTurnResult,  # noqa: F401 - compatibility alias
   SubAgentConfig,
   ToolResultContext,
@@ -266,6 +270,11 @@ class AgentRunner(
     on_session_summary: OnSessionSummary | None = None,
     on_late_usage_event: OnUsage | None = None,
     on_before_stream_complete: OnBeforeStreamComplete | None = None,
+    final_answer_check: Callable[
+      [str], Awaitable[FinalAnswerVerdict | None]
+    ] | None = None,
+    final_answer_check_mode: Literal["hold", "append", "off"] = "hold",
+    record_reminder: Callable[[], str] | None = None,
     on_tool_timing: OnToolTiming | None = None,
     user_id: str | None = None,
     request_id: str | None = None,
@@ -460,6 +469,7 @@ class AgentRunner(
     self._dispatcher = dispatcher
     self._selected_content_bindings: tuple[SelectedContentBinding, ...] = ()
     self._selected_content_bindings_bound = False
+    self._analyst_content: Any = ANALYST_CONTENT_UNSET
     self._gateway_session = gateway_session
     self._tool_prefix = (
       gateway_session.request_tool_prefix
@@ -520,6 +530,16 @@ class AgentRunner(
     self._on_session_summary = on_session_summary
     self._on_late_usage_event = on_late_usage_event
     self._on_before_stream_complete = on_before_stream_complete
+    if final_answer_check is None:
+      run_context = getattr(dispatcher, "run_context", None)
+      if run_context is not None:
+        final_answer_check = run_context.final_answer_check
+        final_answer_check_mode = run_context.final_answer_check_mode
+    self._final_answer_check = final_answer_check
+    self._final_answer_check_mode = final_answer_check_mode
+    # The run record's per-request reminder (api/agent's RunRecord.reminder_text):
+    # the runner carries a string, never research knowledge.
+    self._record_reminder = record_reminder
     self._on_tool_timing = on_tool_timing
     self._on_tool_timing_accepts_user_id = _detect_user_id_param(on_tool_timing)
     self._on_tool_timing_accepts_context_surfaces = _detect_keyword_param(on_tool_timing, "context_surfaces")
@@ -559,6 +579,11 @@ class AgentRunner(
     self._compaction_trigger = compaction_trigger
     self._compaction_instructions = compaction_instructions
     self._containment = containment
+    # tool_use_id -> the stub that replaces that result's content in requests
+    # once it ages (``tool_result_aging``). The receipt registers it; a rebuilt
+    # history repopulates it from the log (``_restore_tool_result_aging_stubs``).
+    self._tool_result_aging_stubs: dict[str, str] = {}
+    self._tool_result_aging_spill_failure_logged = False
     # The reminder cursor is seeded when the runner is built and reset to the
     # live setting at each compaction; the thresholds the decision compares
     # against (``runner_run_loop``) are read live each turn.
@@ -802,6 +827,13 @@ class AgentRunner(
       raise TypeError("selected content must be an immutable binding tuple")
     self._selected_content_bindings = bindings
     self._selected_content_bindings_bound = True
+
+  def bind_analyst_content(self, content: str | list[dict[str, Any]]) -> None:
+    if getattr(self, "_analyst_content", ANALYST_CONTENT_UNSET) is not ANALYST_CONTENT_UNSET:
+      raise RuntimeError("analyst content is already bound for this runner")
+    if not isinstance(content, (str, list)):
+      raise TypeError("analyst content must be text or a content block list")
+    self._analyst_content = content
 
   @property
   def committed_top_level_skill_result_event(
@@ -1059,6 +1091,17 @@ class AgentRunner(
       uuid_factory=uuid.uuid4,
     )
 
+  def tool_definitions(self) -> list[dict[str, Any]]:
+    return list(self._get_tool_definitions()) if callable(self._get_tool_definitions) else []
+
+  @property
+  def dispatcher(self) -> AgentRunnerDispatcher:
+    return self._dispatcher
+
+  @property
+  def workspace_dir(self) -> str | None:
+    return self._workspace_dir
+
   def _default_tool_definitions(self) -> List[Dict[str, Any]]:
     return _default_tool_definitions(self._get_tool_definitions, self._mcp_client)
 
@@ -1094,6 +1137,16 @@ class AgentRunner(
       self._skill_run_id = validate_run_identity(normalized)
     except RunIdentityCarrierError:
       return
+    run_context = self._dispatcher.run_context
+    match (run_context.registry_scope, self._workspace_dir):
+      case (RegistryScope(scope_type="session"), _):
+        pass
+      case (RegistryScope(scope_type="run") | NoRegistryScope(), str() as workspace_dir):
+        self._dispatcher.rebind_run_context(replace(
+          run_context,
+          run_id=self._skill_run_id,
+          registry_scope=RegistryScope("run", self._skill_run_id, workspace_dir),
+        ))
 
   def _newly_exposed_tool_names(
     self,

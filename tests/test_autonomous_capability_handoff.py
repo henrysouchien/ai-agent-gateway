@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+from contextlib import ExitStack
 import signal
 from itertools import count
 from pathlib import Path
@@ -12,9 +13,12 @@ import pytest
 from dataclasses import replace
 from agent_workflow_contracts import OperationUnavailable, ResolvedAuthority
 from agent_workflow_contracts.models import (
-  AdmittedContextWire, AdmittedLineage, AdmittedResearchBinding, AdmittedTenant, ToolGrant,
+  AdmittedContextWire, AdmittedLineage, AdmittedResearchBinding, AdmittedTenant,
+  SelectionPresetProvenance, SelectionProvenance, ToolGrant,
 )
-from agent_gateway.admission import AdmittedContext, Refusal, context_for_child
+from agent_gateway.admission import (
+  AdmittedContext, Refusal, context_for_child, root_context_from_identity,
+)
 from agent_gateway.approval_route import NoApprovalRoute
 from agent_gateway.child_environment import AUTONOMOUS_CHILD_ENVIRONMENT, filter_child_environment
 
@@ -41,6 +45,8 @@ from agent_gateway.autonomous_runner_start import (
   _positive_autonomous_child_env,
 )
 from model_authority.bind import CapabilityBind
+from model_authority.loader import PACKAGED_AUTHORITY_DIR, load_model_authority
+from model_authority.run_route import read_entry_run_route, serialize_run_route
 from model_authority.binding import CredentialHandle
 from hank_model_transport.capability_execution import MaterializedCredential
 from agent_gateway.skill_limits import (
@@ -255,6 +261,75 @@ async def _start(
   )
   await registry.wait(payload["task_id"], timeout_sec=1)
   return payload
+
+
+@pytest.mark.parametrize("schedule_id", [None, "schedule-replay"], ids=["detached", "scheduled"])
+@pytest.mark.parametrize("route_present", [True, False], ids=["frozen-route", "no-route"])
+def test_model_launch_and_cold_resume_preserve_loopback_routing_without_cloud_key(
+  monkeypatch, tmp_path: Path, schedule_id: str | None, route_present: bool,
+) -> None:
+  route_file = tmp_path / "run-route.json"
+  route_file.write_bytes(serialize_run_route({
+    "schema": "run-route/2", "preset": "kimi_dev", "pool": ["ollama_cloud", "ollama"],
+    "enforcement": "strict",
+    "set_by": "test", "set_at": "2026-11-05T18:00:00Z", "reason": "replay fixture",
+  }))
+  routing = {
+    "OLLAMA_CLOUD_BASE_URL": "http://127.0.0.1:18081",
+    "OLLAMA_BASE_URL": "http://127.0.0.1:18082",
+    "HANK_RUN_ROUTE_FILE": str(route_file) if route_present else "",
+  }
+  for name, value in routing.items():
+    monkeypatch.setenv(name, value)
+  if not route_present:
+    monkeypatch.delenv("HANK_RUN_ROUTE_FILE")
+  monkeypatch.setenv("OLLAMA_CLOUD_API_KEY", "production-key-must-not-travel")
+  requests: list[AutonomousCapabilityBindingRequest] = []
+  environments: list[dict[str, str]] = []
+  streams: list[_FakeStdin] = []
+
+  def resolver(request: AutonomousCapabilityBindingRequest) -> AutonomousCapabilityBinding:
+    requests.append(request)
+    return _binding_for_request(request)
+
+  async def fake_exec(*args, **kwargs):
+    stream = _FakeStdin()
+    streams.append(stream)
+    environments.append(dict(kwargs["env"]))
+    return _FakeProcess(stdin=stream)
+
+  async def run() -> None:
+    original = await _start(_registry(tmp_path, resolver), schedule_id=schedule_id)
+    restored = _registry(tmp_path, resolver)
+    await _start(restored, resumed_from=original["run_id"])
+
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+  asyncio.run(run())
+
+  assert [request.source for request in requests] == [
+    "schedule" if schedule_id else "start", "resume",
+  ]
+  assert len(environments) == len(streams) == 2
+  for request, environment, stream in zip(requests, environments, streams, strict=True):
+    assert {"OLLAMA_CLOUD_BASE_URL", "OLLAMA_BASE_URL"} <= request.env_names
+    assert "HANK_RUN_ROUTE_FILE" not in request.env_names
+    assert {name: environment[name] for name in routing} == routing
+    assert read_entry_run_route(environment) == read_entry_run_route(routing)
+    assert "OLLAMA_CLOUD_API_KEY" not in request.env_names
+    assert "OLLAMA_CLOUD_API_KEY" not in environment
+    envelope = verify_autonomous_launch_envelope(
+      _SECRET, Path(environment[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(),
+    )
+    credential = read_autonomous_credential_handoff(
+      expected_handle_id=envelope.bind.credential_ref,
+      expected_provider=envelope.bind.provider,
+      expected_principal=envelope.bind.credential_principal,
+      expected_tenant_id="test-product",
+      expected_actor_id=None,
+      stream=io.BytesIO(bytes(stream.buffer)),
+    )
+    assert credential.auth_config["api_key"] == "service-secret"
+    assert "service-secret" not in json.dumps(environment)
 
 
 def test_resolver_is_invoked_once_and_signed_exact_envelope_reaches_spawn(
@@ -598,7 +673,6 @@ def test_child_environment_is_uniform_across_profiles_and_secret_minimal() -> No
     "CORPUS_LOG_DIR": "/writable/live/corpus-logs",
     "CORPUS_STATE_DIR": "/writable/live/corpus",
     "EDGAR_UPDATER_ROOT": "/opt/hank/edgar-updater",
-    "LOCAL_GATEWAY_CONTROL_GENERATION": "/opt/hank/control/generation",
     "LOCAL_GATEWAY_CONTROL_GENERATION_ID": "generation-1",
     "LOCAL_GATEWAY_CONTROL_STATE_ROOT": "/opt/hank/control/state",
     "LOG_DIR": "/writable/live/logs",
@@ -644,7 +718,6 @@ def test_child_environment_is_uniform_across_profiles_and_secret_minimal() -> No
   assert analyst["CORPUS_LOG_DIR"] == "/writable/live/corpus-logs"
   assert analyst["CORPUS_STATE_DIR"] == "/writable/live/corpus"
   assert analyst["EDGAR_UPDATER_ROOT"] == "/opt/hank/edgar-updater"
-  assert analyst["LOCAL_GATEWAY_CONTROL_GENERATION"] == "/opt/hank/control/generation"
   assert analyst["LOCAL_GATEWAY_CONTROL_GENERATION_ID"] == "generation-1"
   assert analyst["LOCAL_GATEWAY_CONTROL_STATE_ROOT"] == "/opt/hank/control/state"
   assert analyst["LOG_DIR"] == "/writable/live/logs"
@@ -780,6 +853,7 @@ def test_pinned_autonomous_child_inherits_exact_runtime_import_roots(
     str(ai_root / "packages" / "agent-gateway"),
     str(ai_root / "packages" / "agent-workflow-contracts"),
     str(ai_root / "packages" / "model-authority"),
+    str(ai_root / "packages" / "model-transport"),
     str(ai_root / "packages" / "excel-mcp" / "python"),
     str(ai_root / "packages" / "ibkr-relay-client" / "python"),
     str(ai_root / "packages" / "sheets-finance-mcp"),
@@ -1009,6 +1083,144 @@ def test_manifest_persists_and_rehydrates_secret_free_exact_handoff(
   rehydrated = _registry(tmp_path)
   record = rehydrated._tasks[payload["task_id"]]
   assert record.capability_bind == _bind(run_mode="autonomous")
+  assert record.selection_provenance == SelectionProvenance(
+    role=None, role_source=None, effort_source=None, preset=None,
+  )
+
+
+@pytest.mark.parametrize("source", ["process_override", None])
+def test_parentless_root_persists_authority_layer_and_resume_keeps_it(
+  monkeypatch, tmp_path, source,
+) -> None:
+  policy = load_model_authority(PACKAGED_AUTHORITY_DIR).selection_policy
+  policy = replace(
+    policy, default_preset=next(iter(policy.presets)) if source is not None else None,
+    default_preset_source=source,
+  )
+
+  envelopes: list[str] = []
+
+  async def fake_exec(*args, **kwargs):
+    envelopes.append(
+      Path(kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8")
+    )
+    return _FakeProcess()
+
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+  registry = _registry(tmp_path, autonomous_selection_policy=policy)
+
+  async def run():
+    original = await _start(registry)
+    restored = _registry(tmp_path, autonomous_selection_policy=replace(
+      policy, default_preset=None, default_preset_source=None,
+    ))
+    resumed = await _start(restored, resumed_from=original["run_id"])
+    return original, resumed, restored
+
+  original, resumed, restored = asyncio.run(run())
+  provenance = SelectionProvenance(
+    role=None, role_source=None, effort_source=None, preset=None,
+    preset_layer=source or "policy_default",
+  )
+  for payload, raw_envelope in zip((original, resumed), envelopes, strict=True):
+    manifest = json.loads((tmp_path / f"{payload['task_id']}.task.json").read_text())
+    assert manifest["admitted_context"] is None
+    assert manifest["selection_provenance"] == provenance.model_dump(mode="json")
+    assert restored._tasks[payload["task_id"]].selection_provenance == provenance
+    envelope = verify_autonomous_launch_envelope(_SECRET, raw_envelope)
+    assert envelope.task_id == payload["task_id"]
+    assert envelope.selection_provenance == provenance
+  assert restored._tasks[resumed["task_id"]].capability_bind == registry._tasks[original["task_id"]].capability_bind
+
+
+def test_unadmitted_root_manifest_retains_captured_parent_provenance(monkeypatch, tmp_path) -> None:
+  provenance = SelectionProvenance(
+    role=None, role_source="spawn", effort_source="spawn", preset=None,
+    preset_layer="deployment_file",
+  )
+  parent = root_context_from_identity(
+    tenant=None, job_id="root-1", tool_ids=None, withheld_tools=frozenset(),
+    research_binding=AdmittedResearchBinding(), approval_route=NoApprovalRoute(),
+    selection_provenance=provenance,
+  )
+
+  envelopes: list[str] = []
+
+  async def fake_exec(*args, **kwargs):
+    envelopes.append(
+      Path(kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8")
+    )
+    return _FakeProcess()
+
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+  registry = _registry(tmp_path)
+
+  async def run():
+    payload = await registry.start(
+      role="owner", profile="analyst", mode="skill", skill="risk.scan",
+      user_id="42", user_email="owner@example.com", parent=parent,
+    )
+    await registry.wait(payload["task_id"], timeout_sec=1)
+    return payload
+
+  payload = asyncio.run(run())
+  manifest = json.loads((tmp_path / f"{payload['task_id']}.task.json").read_text())
+  assert manifest["admitted_context"] is None
+  assert manifest["selection_provenance"] == provenance.model_dump(mode="json")
+  assert _registry(tmp_path)._tasks[payload["task_id"]].selection_provenance == provenance
+  envelope = verify_autonomous_launch_envelope(_SECRET, envelopes[0])
+  assert envelope.selection_provenance == provenance
+
+
+@pytest.mark.parametrize("admitted_child", [False, True], ids=["root", "admitted-child"])
+def test_historical_manifest_resume_preserves_only_recorded_provenance(
+  monkeypatch, tmp_path, admitted_child,
+) -> None:
+  bind = _bind(run_mode="autonomous")
+  provenance = SelectionProvenance(
+    role="fast", role_source="spawn", effort_source=None, preset=None,
+  )
+  admitted = _admitted(bind)
+  admitted = replace(admitted, wire=admitted.wire.model_copy(update={
+    "selection_provenance": provenance,
+  }))
+
+  def resolver(request):
+    binding = _binding_for_request(request)
+    return replace(binding, admitted=admitted) if admitted_child and request.source != "resume" else binding
+
+  envelopes: list[str] = []
+
+  async def fake_exec(*args, **kwargs):
+    envelopes.append(
+      Path(kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8")
+    )
+    return _FakeProcess()
+
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+  original = asyncio.run(_start(_registry(tmp_path, resolver)))
+  path = tmp_path / f"{original['task_id']}.task.json"
+  manifest = json.loads(path.read_text())
+  del manifest["selection_provenance"]
+  path.write_text(json.dumps(manifest) + "\n")
+  policy = load_model_authority(PACKAGED_AUTHORITY_DIR).selection_policy
+  current_policy = replace(
+    policy, default_preset=next(iter(policy.presets)), default_preset_source="process_override",
+  )
+  restored = _registry(tmp_path, resolver, autonomous_selection_policy=current_policy)
+  expected = provenance if admitted_child else None
+  assert restored._tasks[original["task_id"]].selection_provenance == expected
+  resumed = asyncio.run(_start(restored, resumed_from=original["run_id"], model_preset="different"))
+  record = restored._tasks[resumed["task_id"]]
+  assert record.selection_provenance == expected
+  assert record.capability_bind == bind
+  persisted = json.loads((tmp_path / f"{resumed['task_id']}.task.json").read_text())
+  assert persisted["selection_provenance"] == (
+    provenance.model_dump(mode="json") if admitted_child else None
+  )
+  assert expected is None or "preset_layer" not in expected.model_dump(mode="json")
+  resumed_envelope = verify_autonomous_launch_envelope(_SECRET, envelopes[-1])
+  assert resumed_envelope.selection_provenance == expected
 
 
 def test_historical_and_tampered_manifests_are_rejected(
@@ -1474,9 +1686,35 @@ def _admitted(bind: CapabilityBind) -> AdmittedContext[ResolvedAuthority]:
   )
 
 
-def test_admitted_node_binding_signs_projects_persists_and_resumes(monkeypatch, tmp_path) -> None:
-  bind = _bind(run_mode="autonomous").model_copy(update={"capability_id": "node.explore"})
+@pytest.mark.parametrize("run_mode", ["autonomous", "cron"])
+def test_admitted_node_binding_signs_projects_persists_and_resumes(
+  monkeypatch, tmp_path, run_mode: str,
+) -> None:
+  bind = _bind(run_mode=run_mode).model_copy(update={"capability_id": "node.explore"})
   admitted = _admitted(bind)
+  # Persisted pre-routing admission snapshots must remain executable unchanged.
+  assert admitted.wire.env_projection == ("PATH",)
+  route_file = tmp_path / "run-route.json"
+  route_file.write_bytes(serialize_run_route({
+    "schema": "run-route/2", "preset": "kimi_dev", "pool": ["ollama_cloud", "ollama"],
+    "enforcement": "strict",
+    "set_by": "test", "set_at": "2026-11-05T18:00:00Z", "reason": "replay fixture",
+  }))
+  routing = {
+    "OLLAMA_CLOUD_BASE_URL": "http://127.0.0.1:18081",
+    "OLLAMA_BASE_URL": "http://127.0.0.1:18082",
+    "HANK_RUN_ROUTE_FILE": str(route_file),
+  }
+  for name, value in routing.items():
+    monkeypatch.setenv(name, value)
+  monkeypatch.setenv("OLLAMA_CLOUD_API_KEY", "production-key-must-not-travel")
+  provenance = SelectionProvenance(
+    role="fast", role_source="spawn", effort_source="operation", preset=None,
+    preset_layer="request",
+  )
+  admitted = replace(admitted, wire=admitted.wire.model_copy(update={
+    "selection_provenance": provenance,
+  }))
   parent = context_for_child(admitted, job_id="parent-7")
   requests = []
   environments = []
@@ -1499,12 +1737,16 @@ def test_admitted_node_binding_signs_projects_persists_and_resumes(monkeypatch, 
       role="owner", profile="analyst", mode="skill", skill="risk.scan",
       context="Investigate risk", ticker="MSFT", research_file_id=7,
       user_id="42", user_email="owner@example.com", parent=parent, model_preset="quick",
+      schedule_id="schedule-admitted-replay" if run_mode == "cron" else None,
     )
     await registry.wait(first["task_id"], timeout_sec=1)
     restored = _registry(tmp_path, resolver)
     record = restored._tasks[first["task_id"]]
     assert record.admitted_context == admitted.wire
     assert record.tool_authority == admitted.tool_authority
+    assert record.selection_provenance == provenance
+    manifest = json.loads((tmp_path / f"{first['task_id']}.task.json").read_text())
+    assert manifest["selection_provenance"] == provenance.model_dump(mode="json")
     resumed = await _start(restored, resumed_from=first["run_id"], model_preset="quick")
     return first, resumed, restored
 
@@ -1520,11 +1762,16 @@ def test_admitted_node_binding_signs_projects_persists_and_resumes(monkeypatch, 
   assert requests[1].parent is None
   assert requests[1].required_bind == bind
   assert requests[1].model_preset is None
+  assert len(environments) == 2
   for environment in environments:
     envelope = verify_autonomous_launch_envelope(_SECRET, Path(environment[AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8"))
     assert envelope.admitted == (admitted.wire, admitted.tool_authority)
     assert envelope.bind == bind
+    assert envelope.selection_provenance == provenance
     assert "FMP_API_KEY" not in environment
+    assert {name: environment[name] for name in routing} == routing
+    assert read_entry_run_route(environment) == read_entry_run_route(routing)
+    assert "OLLAMA_CLOUD_API_KEY" not in environment
     assert environment["PYTHONUNBUFFERED"] == "1"
     session_log_authority = envelope.workload.session_log_authority
     assert session_log_authority is not None
@@ -1534,6 +1781,7 @@ def test_admitted_node_binding_signs_projects_persists_and_resumes(monkeypatch, 
   assert record.capability_bind == bind
   assert record.admitted_context == admitted.wire
   assert record.tool_authority == admitted.tool_authority
+  assert record.selection_provenance == provenance
   assert record.autonomous_in_flight_at_start is not None
   assert record.credential_handoff_bytes is not None
   assert record.credential_handoff_bytes > 0
@@ -1646,3 +1894,184 @@ def test_launch_admission_refusal_owns_http_projection(reason, status) -> None:
   exception = AutonomousLaunchAdmissionRefused.from_refusal(Refusal(reason, "owner", "detail"))
   assert exception.http_status == status
   assert exception.payload() == {"reason": reason, "owner": "owner", "detail": "detail"}
+
+
+@pytest.mark.parametrize("invalid", ["", {"preset_layer": "unknown"}])
+def test_malformed_manifest_provenance_is_not_replaced_by_admitted_history(
+  monkeypatch, tmp_path, invalid,
+) -> None:
+  bind = _bind(run_mode="autonomous")
+  admitted = _admitted(bind)
+  admitted = replace(admitted, wire=admitted.wire.model_copy(update={
+    "selection_provenance": SelectionProvenance(
+      role=None, role_source=None, effort_source=None, preset=None,
+      preset_layer="deployment_file",
+    ),
+  }))
+
+  def resolver(request):
+    return replace(_binding_for_request(request), admitted=admitted)
+
+  async def fake_exec(*args, **kwargs):
+    return _FakeProcess()
+
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+  payload = asyncio.run(_start(_registry(tmp_path, resolver)))
+  path = tmp_path / f"{payload['task_id']}.task.json"
+  manifest = json.loads(path.read_text())
+  manifest["selection_provenance"] = invalid
+  path.write_text(json.dumps(manifest) + "\n")
+  assert payload["task_id"] not in _registry(tmp_path, resolver)._tasks
+
+
+@pytest.mark.parametrize("historical", [False, True], ids=["captured-request", "historical-unknown"])
+def test_registry_provenance_reaches_authenticated_root_on_resume(
+  monkeypatch, tmp_path, historical,
+) -> None:
+  root = Path(__file__).resolve().parents[3]
+  if not (root / "api" / "agent" / "autonomous" / "child_authentication.py").is_file():
+    pytest.skip("product child authentication is not included in the gateway wheel")
+  monkeypatch.syspath_prepend(str(root))
+  monkeypatch.syspath_prepend(str(root / "api"))
+  from api.agent.autonomous.child_authentication import authenticate_autonomous_child
+  from agent_gateway.admission import root_context
+
+  provenance = SelectionProvenance(
+    role=None, role_source=None, effort_source=None,
+    preset=SelectionPresetProvenance(
+      name="saved_user_preset", scope="user", policy_revision="recorded-policy",
+    ),
+    preset_layer="request",
+  )
+  parent = root_context_from_identity(
+    tenant=None, job_id="interactive-root", tool_ids=None, withheld_tools=frozenset(),
+    research_binding=AdmittedResearchBinding(), approval_route=NoApprovalRoute(),
+    selection_provenance=provenance,
+  )
+  authenticated = []
+
+  async def fake_exec(*args, **kwargs):
+    environ = dict(kwargs["env"])
+    # Unsigned process data is not the provenance authority.
+    environ["AUTONOMOUS_SELECTION_PROVENANCE"] = '{"preset_layer":"process_override"}'
+
+    def duplicate_optional(name):
+      return os.dup(int(environ[name])) if name in environ else None
+
+    admission = authenticate_autonomous_child(
+      os.dup(int(environ["AGENT_AUTONOMOUS_EVENT_CHANNEL_FD"])),
+      os.dup(int(environ["AGENT_AUTONOMOUS_CLAIM_BROKER_FD"])),
+      duplicate_optional("AGENT_AUTONOMOUS_APPROVAL_CHANNEL_FD"),
+      inherited_session_log_root_fd=duplicate_optional("AGENT_SESSION_LOG_ROOT_FD"),
+      inherited_session_log_active_fd=duplicate_optional("AGENT_SESSION_LOG_ACTIVE_FD"),
+      inherited_session_log_meta_fd=duplicate_optional("AGENT_SESSION_LOG_META_FD"),
+      environ=environ,
+    )
+    with ExitStack() as resources:
+      resources.callback(admission.event_channel.close)
+      resources.callback(admission.claim_signer.close)
+      resources.callback(admission.verified_session_log.close)
+      if admission.approval_channel is not None:
+        resources.callback(admission.approval_channel.close)
+      context = root_context(
+        admission.gateway_session, withheld_tools=frozenset(), research_file_id=None,
+        selection_provenance=admission.gateway_session.autonomous_selection_provenance,
+      )
+      authenticated.append((
+        admission.envelope.selection_provenance,
+        admission.gateway_session.autonomous_selection_provenance,
+        context.selection_provenance,
+      ))
+    return _FakeProcess()
+
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+  registry = _registry(tmp_path)
+
+  async def run():
+    original = await registry.start(
+      role="owner", profile="analyst", mode="skill", skill="risk.scan",
+      user_id="42", user_email="owner@example.com", parent=parent,
+    )
+    await registry.wait(original["task_id"], timeout_sec=1)
+    if historical:
+      path = tmp_path / f"{original['task_id']}.task.json"
+      manifest = json.loads(path.read_text())
+      del manifest["selection_provenance"]
+      path.write_text(json.dumps(manifest) + "\n")
+    policy = load_model_authority(PACKAGED_AUTHORITY_DIR).selection_policy
+    restored = _registry(tmp_path, autonomous_selection_policy=replace(
+      policy, default_preset=next(iter(policy.presets)), default_preset_source="process_override",
+    ))
+    resumed = await _start(restored, resumed_from=original["run_id"])
+    return restored._tasks[resumed["task_id"]]
+
+  resumed_record = asyncio.run(run())
+  expected = None if historical else provenance
+  assert authenticated == [
+    (provenance, provenance, provenance),
+    (expected, expected, expected),
+  ]
+  assert resumed_record.selection_provenance == expected
+
+
+def test_provenance_and_dispatch_watermark_rehydrate_and_resume_together(
+  monkeypatch, tmp_path,
+) -> None:
+  provenance = SelectionProvenance(
+    role=None, role_source=None, effort_source=None,
+    preset=SelectionPresetProvenance(
+      name="saved_user_preset", scope="user", policy_revision="recorded-policy",
+    ),
+    preset_layer="request",
+  )
+  parent = root_context_from_identity(
+    tenant=None, job_id="interactive-root", tool_ids=None, withheld_tools=frozenset(),
+    research_binding=AdmittedResearchBinding(), approval_route=NoApprovalRoute(),
+    selection_provenance=provenance,
+  )
+  envelopes: list[str] = []
+
+  async def fake_exec(*args, **kwargs):
+    envelopes.append(
+      Path(kwargs["env"][AUTONOMOUS_CAPABILITY_ENVELOPE_FILE_ENV]).read_text(encoding="utf-8")
+    )
+    return _FakeProcess()
+
+  monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+  registry = _registry(tmp_path)
+
+  async def run():
+    original = await registry.start(
+      role="owner", profile="analyst", mode="skill", skill="risk.scan",
+      user_id="42", user_email="owner@example.com", parent=parent,
+      dispatch_start_decision_id=277,
+    )
+    await registry.wait(original["task_id"], timeout_sec=1)
+    restored = _registry(tmp_path)
+    recorded = restored._tasks[original["task_id"]]
+    assert recorded.dispatch_start_decision_id == 277
+    assert recorded.selection_provenance == provenance
+    # The control-plane resume edge forwards the recovered decision watermark.
+    resumed = await restored.start(
+      role="owner", profile="analyst", mode="skill", skill="risk.scan",
+      user_id="42", user_email="owner@example.com",
+      resumed_from=original["run_id"],
+      dispatch_start_decision_id=recorded.dispatch_start_decision_id,
+    )
+    await restored.wait(resumed["task_id"], timeout_sec=1)
+    return original, resumed, restored
+
+  original, resumed, restored = asyncio.run(run())
+  for payload, raw_envelope in zip((original, resumed), envelopes, strict=True):
+    manifest = json.loads((tmp_path / f"{payload['task_id']}.task.json").read_text())
+    assert manifest["dispatch_start_decision_id"] == 277
+    assert manifest["selection_provenance"] == provenance.model_dump(mode="json")
+    assert manifest["admitted_context"] is None
+    envelope = verify_autonomous_launch_envelope(_SECRET, raw_envelope)
+    assert envelope.selection_provenance == provenance
+    record = restored._tasks[payload["task_id"]]
+    assert record.dispatch_start_decision_id == 277
+    assert record.selection_provenance == provenance
+  assert restored._tasks[resumed["task_id"]].capability_bind == (
+    restored._tasks[original["task_id"]].capability_bind
+  )

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import Any, Callable, Literal
+from dataclasses import dataclass
+from typing import Annotated, Any, Callable, Literal
 
 from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from agent_gateway.user_identity_mapping import StorageIdentityFinding
 
 from agent_gateway.auth import (
   CredentialsResolver,
@@ -15,6 +16,7 @@ from agent_gateway.auth import (
   CredentialsTimeoutError,
   MissingUserIdError,
 )
+from agent_gateway.subject_assertion import SubjectVerificationUnavailable
 from agent_gateway.approval_route import bind_session_approval_route
 from hank_model_transport.providers.anthropic_oauth import ANTHROPIC_USER_SCOPE_FIELD
 from agent_gateway.session import AuthManager
@@ -27,6 +29,7 @@ from agent_gateway.ttl_policy import (
 
 
 CONTROL_SESSION_TTL_SECONDS = 900
+McpAuthority = Annotated[int, Field(strict=True, gt=0)] | None
 
 
 class ControlSessionRequest(BaseModel):
@@ -39,7 +42,10 @@ class ControlSessionRequest(BaseModel):
 
 
 class ControlSessionIdentityResponse(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
   owner_user_id: str
+  mcp_authority: McpAuthority
   user_slug: str | None = None
   aliases: list[str] = Field(default_factory=list)
   identity_status: str
@@ -91,6 +97,9 @@ def _error_response(
       payload["user_id"] = user_id
     return JSONResponse(payload, status_code=401)
 
+  if isinstance(exc, SubjectVerificationUnavailable):
+    return JSONResponse(exc.error_body(user_id=user_id), status_code=exc.status_code)
+
   status_code = getattr(exc, "status_code", 500)
   payload = {
     "error": "auth_failed" if status_code < 500 else "credentials_unavailable",
@@ -132,6 +141,20 @@ def _resolver_contract_error(message: str, *, user_id: str | None) -> JSONRespon
 
 
 
+@dataclass(frozen=True)
+class _FallbackControlIdentity:
+  owner_user_id: str
+  mcp_authority: int | None
+  user_slug: str | None
+  risk_user_id: int
+  user_email: str | None
+  aliases: tuple[str, ...]
+  raw_user_id: str
+  role: str | None
+  channel: str | None
+  identity_status: str
+
+
 def _fallback_control_identity(
   *,
   user_id: str,
@@ -139,7 +162,7 @@ def _fallback_control_identity(
   user_email: str | None,
   role: str | None,
   channel: str | None,
-) -> Any:
+) -> _FallbackControlIdentity:
   owner_user_id = str(risk_user_id) if risk_user_id > 0 else user_id
   user_slug = user_id if risk_user_id > 0 and user_id != owner_user_id and not user_id.isdecimal() else None
   aliases = [owner_user_id]
@@ -147,8 +170,9 @@ def _fallback_control_identity(
     aliases.append(user_slug)
   if user_email:
     aliases.append(user_email.strip().lower())
-  return SimpleNamespace(
+  return _FallbackControlIdentity(
     owner_user_id=owner_user_id,
+    mcp_authority=None,
     user_slug=user_slug,
     risk_user_id=risk_user_id,
     user_email=user_email,
@@ -187,9 +211,14 @@ def _resolve_control_identity(
   )
 
 
-def _identity_response(identity: Any) -> ControlSessionIdentityResponse:
+def _identity_response(
+  identity: Any,
+  *,
+  mcp_authority: int | None,
+) -> ControlSessionIdentityResponse:
   return ControlSessionIdentityResponse(
     owner_user_id=str(identity.owner_user_id),
+    mcp_authority=mcp_authority,
     user_slug=identity.user_slug,
     aliases=[str(alias) for alias in identity.aliases],
     identity_status=str(identity.identity_status),
@@ -216,7 +245,11 @@ def build_session_router(
   ) -> ControlSessionResponse | JSONResponse:
     auth.validate_api_key(payload.api_key)
     try:
-      resolved_user_id = _normalize_user_id(payload.user_id)
+      resolved_user_id = (
+        payload.user_id
+        if credentials_resolver is None and identity_resolver is None
+        else _normalize_user_id(payload.user_id)
+      )
     except MissingUserIdError as exc:
       return _error_response(exc)
 
@@ -227,11 +260,14 @@ def build_session_router(
     resolved_auth_config: dict[str, Any] | None = None
     resolved_channel: str | None = None
     resolved_risk_user_id = 0
+    resolved_mcp_authority: int | None = None
     resolved_role: Literal["owner", "invite"] = "invite"
     resolved_capabilities: frozenset[str] = frozenset()
     resolved_model_entitled_capabilities: frozenset[str] = frozenset()
     resolved_unknown_model_entitled_capabilities: frozenset[str] = frozenset()
     resolved_model_entitled_keys: frozenset[str] = frozenset()
+    resolved_enrolled_user_key_providers: frozenset[str] = frozenset()
+    resolved_unavailable_user_key_providers: frozenset[str] = frozenset()
     resolved_credential_principal = None
     resolved_allow_service_for_interactive = (
       allow_service_credentials_for_interactive
@@ -261,6 +297,7 @@ def build_session_router(
           "credential resolver must return a positive risk_user_id.",
           user_id=resolved_user_id,
         )
+      resolved_mcp_authority = resolved_risk_user_id
       if result.role not in {"owner", "invite"}:
         return _resolver_contract_error(
           "credential resolver must return role='owner' or role='invite'.",
@@ -273,6 +310,8 @@ def build_session_router(
         result.unknown_model_entitled_capabilities
       )
       resolved_model_entitled_keys = result.model_entitled_keys
+      resolved_enrolled_user_key_providers = result.enrolled_user_key_providers
+      resolved_unavailable_user_key_providers = result.unavailable_user_key_providers
       resolved_auth_config = result.auth_config.to_dict()
       # Stamp the validated run owner's scope so anthropic_oauth seat admission keys on it even when the resolver omitted it.
       resolved_auth_config[ANTHROPIC_USER_SCOPE_FIELD] = str(resolved_risk_user_id)
@@ -309,31 +348,36 @@ def build_session_router(
     except (ValueError, SystemExit) as exc:
       return _resolver_contract_error(str(exc), user_id=resolved_user_id)
 
-    session = auth.session_store.create_session(
-      api_key_hash=AuthManager.hash_api_key(payload.api_key),
-      user_id=resolved_user_id,
-      user_email=identity.user_email,
-      risk_user_id=identity.risk_user_id,
-      role=resolved_role,
-      capabilities=resolved_capabilities,
-      model_entitled_capabilities=resolved_model_entitled_capabilities,
-      model_entitled_keys=resolved_model_entitled_keys,
-      kind="control",
-      auth_config=resolved_auth_config,
-      ttl_seconds=resolve_ttl_seconds(
-        ttl_resolver, resolved_user_id, CONTROL_SESSION_TTL, CONTROL_SESSION_TTL_SECONDS,
-      ),
-      owner_user_id=str(identity.owner_user_id),
-      raw_user_id=str(identity.raw_user_id),
-      user_slug=identity.user_slug,
-      user_aliases=tuple(str(alias) for alias in identity.aliases),
-      identity_status=str(identity.identity_status),
-      tenant_id=tenant_id,
-      credential_principal=(
-        resolved_credential_principal if tenant_id is not None else None
-      ),
-      allow_service_for_interactive=resolved_allow_service_for_interactive,
-    )
+    try:
+      session = auth.session_store.create_session(
+        api_key_hash=AuthManager.hash_api_key(payload.api_key),
+        user_id=resolved_user_id,
+        user_email=identity.user_email,
+        risk_user_id=identity.risk_user_id,
+        role=resolved_role,
+        capabilities=resolved_capabilities,
+        model_entitled_capabilities=resolved_model_entitled_capabilities,
+        model_entitled_keys=resolved_model_entitled_keys,
+        enrolled_user_key_providers=resolved_enrolled_user_key_providers,
+        unavailable_user_key_providers=resolved_unavailable_user_key_providers,
+        kind="control",
+        auth_config=resolved_auth_config,
+        ttl_seconds=resolve_ttl_seconds(
+          ttl_resolver, resolved_user_id, CONTROL_SESSION_TTL, CONTROL_SESSION_TTL_SECONDS,
+        ),
+        owner_user_id=identity.owner_user_id,
+        raw_user_id=identity.raw_user_id,
+        user_slug=identity.user_slug,
+        user_aliases=tuple(str(alias) for alias in identity.aliases),
+        identity_status=str(identity.identity_status),
+        tenant_id=tenant_id,
+        credential_principal=(
+          resolved_credential_principal if tenant_id is not None else None
+        ),
+        allow_service_for_interactive=resolved_allow_service_for_interactive,
+      )
+    except StorageIdentityFinding as exc:
+      return _resolver_contract_error(str(exc), user_id=resolved_user_id)
     session.channel = resolved_channel
     session.is_public = False
     bind_session_approval_route(session, approval_store, approval_policy)
@@ -352,7 +396,7 @@ def build_session_router(
       unknown_model_entitled_capabilities=sorted(
         resolved_unknown_model_entitled_capabilities
       ),
-      identity=_identity_response(identity),
+      identity=_identity_response(identity, mcp_authority=resolved_mcp_authority),
     )
 
   return router
@@ -363,5 +407,6 @@ __all__ = [
   "ControlSessionIdentityResponse",
   "ControlSessionRequest",
   "ControlSessionResponse",
+  "McpAuthority",
   "build_session_router",
 ]

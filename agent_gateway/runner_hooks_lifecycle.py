@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
+from pathlib import Path
 from typing import (
   TYPE_CHECKING,
   Any,
@@ -11,7 +13,16 @@ from typing import (
   List,
 )
 
-from hank_model_transport.capability_execution import BoundCapabilityExecution, CapabilityExecutionResolver
+from hank_model_transport.auth import ProviderCredentialFailure
+from hank_model_transport.capability_execution import (
+  BoundCapabilityExecution,
+  CapabilityExecutionResolver,
+  materialize_frozen_bind,
+)
+from hank_model_transport.providers.anthropic_oauth import is_anthropic_generation_ref
+from model_authority.bind import CapabilityBind
+from model_authority.binding import CapabilityResolutionError
+from model_authority.selection import project_fallback_chain
 from hank_model_transport.multi_user.billing import (
   BillingMode,
   SessionUsageSummary,
@@ -43,10 +54,8 @@ from .runner_usage import (
 )
 from .undo_token_lifetime import conversation_id
 
+from .agent_session_log import AgentSessionLog
 if TYPE_CHECKING:
-  from pathlib import Path
-
-  from .agent_session_log import AgentSessionLog
   from .session import GatewaySession
   from hank_model_transport.capability_execution import ModelFallbackHop
   from .event_log import EventLog
@@ -69,14 +78,19 @@ def prepare_session_id(full_session_id: str | None) -> str | None:
 def rebind_refreshed_credential(
   execution: BoundCapabilityExecution,
   active_config: Dict[str, Any],
-  refreshed: Dict[str, Any],
+  refreshed: Dict[str, Any] | None,
   *,
+  failure: ProviderCredentialFailure | None = None,
   merge: Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]] = _merge_refreshed_auth_config,
 ) -> BoundCapabilityExecution | None:
   """Merge refreshed credential material into `execution`; None when it cannot bind.
 
   The one owner of rotation, preparation and compaction rebinds.
   """
+  if refreshed is None:
+    if failure is None:
+      return None
+    return CapabilityExecutionResolver.rebind_after_exhausted_pool(execution, failure)
   merged = merge(active_config, refreshed)
   return CapabilityExecutionResolver.rebind_rotated_credential(
     execution,
@@ -84,6 +98,53 @@ def rebind_refreshed_credential(
     merged_auth_config=merged,
   )
 
+
+class _UnmaterializableParkedBindExecutor:
+  """Refuse an approved call when its parked capability bind cannot be materialized."""
+
+  def __init__(
+    self,
+    dispatcher: Any,
+    *,
+    executor: Any,
+    parked_bind: CapabilityBind,
+  ) -> None:
+    self._dispatcher = dispatcher
+    self._executor = executor
+    self._parked_bind = parked_bind
+
+  async def admit_approved_binding(
+    self,
+    *,
+    job_id: str,
+    tool_call_id: str,
+    nonce: str,
+  ) -> tuple[Any | None, dict[str, Any] | None]:
+    admitted, error = await self._executor.admit_approved_binding(
+      job_id=job_id,
+      tool_call_id=tool_call_id,
+      nonce=nonce,
+    )
+    if error is not None:
+      return None, error
+    request = getattr(admitted, "decision", None)
+    return None, self._dispatcher._approved_binding_error(
+      "approval_credential_generation_mismatch",
+      "Continue with the original bound credential generation before execution.",
+      request=request,
+    )
+
+  async def execute_admitted_binding(
+    self,
+    admitted: Any,
+    *,
+    abort_event: Any,
+    on_executed_prepared_call: Any,
+  ) -> Any:
+    _ = admitted, abort_event, on_executed_prepared_call
+    raise RuntimeError(
+      f"unmaterializable parked capability bind {self._parked_bind.model_key!r} cannot execute admitted binding"
+    )
 
 class RunnerHooksLifecycleMixin:
   if TYPE_CHECKING:
@@ -190,7 +251,13 @@ class RunnerHooksLifecycleMixin:
       logger=log,
     )
 
-  def _apply_refreshed_auth_config(self, config: Dict[str, Any], refreshed: Dict[str, Any]) -> bool:
+  def _apply_refreshed_auth_config(
+    self,
+    config: Dict[str, Any],
+    refreshed: Dict[str, Any] | None,
+    *,
+    failure: ProviderCredentialFailure | None = None,
+  ) -> bool:
     execution = getattr(self, "_capability_execution", None)
     if not isinstance(execution, BoundCapabilityExecution):
       raise RuntimeError(
@@ -207,6 +274,7 @@ class RunnerHooksLifecycleMixin:
       active_config,
       refreshed,
       merge=_merge_refreshed_auth_config,
+      failure=failure,
     )
     if refreshed_execution is None:
       return False
@@ -262,7 +330,11 @@ class RunnerHooksLifecycleMixin:
       upstream_model=execution.bind.upstream_model,
       effort=execution.bind.effort,
     )
-    self._dispatcher.replace_capability_bind(execution.bind)
+    self._dispatcher.replace_capability_bind(
+      execution
+      if execution.bind.credential_principal != self._capability_execution.bind.credential_principal
+      else execution.bind
+    )
     config.clear()
     config.update(run_config)
     self._auth_config.clear()
@@ -285,6 +357,148 @@ class RunnerHooksLifecycleMixin:
     if callable(bind_dispatcher_boundary):
       bind_dispatcher_boundary(self._secret_boundary)
 
+
+  async def _parked_capability_bind_from_log(
+    self,
+    tool_call_id: str,
+    *,
+    session_log: AgentSessionLog | None,
+  ) -> CapabilityBind | None:
+    if session_log is None:
+      return None
+    entries, _ = await session_log.query(
+      event_types={"assistant_message"},
+    )
+    for entry in reversed(entries):
+      ev = entry.event
+      blocks = ev.get("content_blocks")
+      if not isinstance(blocks, list) or not any(
+        isinstance(block, Mapping)
+        and block.get("type") == "tool_use"
+        and block.get("id") == tool_call_id
+        for block in blocks
+      ):
+        continue
+      raw_bind = (ev.get("usage") or {}).get("capability_bind")
+      if raw_bind is None:
+        return None
+      return CapabilityBind.from_json(raw_bind)
+    return None
+
+  async def _restore_resume_approved_capability_execution(self) -> None:
+    """Restore the parked capability execution before replaying an approved call."""
+    approved_call = getattr(self, "_resume_approved_call", None)
+    if approved_call is None:
+      return
+    initial_execution = getattr(self, "_capability_execution", None)
+    if not isinstance(initial_execution, BoundCapabilityExecution):
+      return
+    resolver = initial_execution.resolver
+    if resolver is None:
+      return
+    initial_bind = initial_execution.bind
+    executor = getattr(self, "_resume_approved_executor", None)
+    continuation = getattr(executor, "_continuation", None)
+    if isinstance(continuation, Mapping):
+      raw_log_path = continuation.get("session_log_path")
+      authoritative_log: AgentSessionLog | None = (
+        AgentSessionLog(
+          path=Path(raw_log_path.strip()),
+          _create_active_on_open=False,
+          _repair_manifest_on_open=False,
+        )
+        if isinstance(raw_log_path, str) and raw_log_path.strip()
+        else getattr(self, "_agent_session_log", None)
+      )
+    else:
+      authoritative_log = getattr(self, "_agent_session_log", None)
+
+    parked_bind = await self._parked_capability_bind_from_log(
+      approved_call.tool_call_id,
+      session_log=authoritative_log,
+    )
+    if parked_bind is None:
+      return
+    if (
+      parked_bind.capability_id != initial_bind.capability_id
+      or parked_bind.run_mode != initial_bind.run_mode
+      or parked_bind.credential_principal != initial_bind.credential_principal
+    ):
+      raise ValueError("resumed approved capability bind changes execution authority")
+    if (
+      parked_bind.provider == "anthropic"
+      and isinstance(continuation, Mapping)
+      and "credential_generation_ref" in continuation
+    ):
+      raw_gen = continuation.get("credential_generation_ref")
+      if isinstance(raw_gen, str) and is_anthropic_generation_ref(raw_gen):
+        parked_bind = parked_bind.model_copy(update={"credential_ref": raw_gen})
+    if parked_bind == initial_bind:
+      return
+    gateway_session = getattr(self, "_gateway_session", None)
+    user_scope = (
+      getattr(gateway_session, "risk_user_id", None)
+      or getattr(self, "_usage_user_id", None)
+    )
+    lane = (
+      "fallback_hop"
+      if parked_bind.model_key != initial_bind.model_key
+      else resolver.selection_lane(initial_bind)
+    )
+    try:
+      parked_execution = materialize_frozen_bind(
+        resolver,
+        parked_bind,
+        selection_lane=lane,
+        user_scope=user_scope,
+        base_config=self._auth_config,
+      )
+    except CapabilityResolutionError:
+      if executor is not None:
+        setattr(
+          self,
+          "_resume_approved_executor",
+          _UnmaterializableParkedBindExecutor(
+            self._dispatcher,
+            executor=executor,
+            parked_bind=parked_bind,
+          ),
+        )
+      return
+    self._install_capability_execution({}, parked_execution)
+    spawning_context = self._dispatcher.capture_spawning_turn().context
+    if (
+      parked_execution.bind.model_key != initial_bind.model_key
+      and spawning_context is not None
+      and spawning_context.selection_snapshot is not None
+    ):
+      role = resolver._fallback_role(
+        initial_bind,
+        spawning_context.selection_snapshot,
+        spawning_context.selection_provenance.role
+        if spawning_context.selection_provenance is not None
+        else None,
+      )
+      chain = project_fallback_chain(
+        resolver.registry,
+        resolver.selection_policy,
+        initial_bind.capability_id,
+        role,
+        selection_snapshot=spawning_context.selection_snapshot,
+      )
+      for idx, entry in enumerate(chain.entries):
+        if entry.model_key == parked_execution.bind.model_key:
+          progress = resolver._fallback_progress_for(
+            spawning_context.selection_snapshot,
+            initial_bind.capability_id,
+            role,
+            initial_bind.model_key,
+            initial_bind.selection_source,
+            create=True,
+          )
+          if progress is not None:
+            progress.positions[resolver._fallback_position(parked_execution.bind)] = idx
+          break
   @staticmethod
   def _usage_has_tokens(usage_totals: Dict[str, int]) -> bool:
     return _runner_module_attr("_usage_has_tokens", _usage_has_tokens)(usage_totals)

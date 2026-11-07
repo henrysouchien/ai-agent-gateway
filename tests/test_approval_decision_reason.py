@@ -1,4 +1,5 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
 
 import asyncio
 import json
@@ -70,7 +71,7 @@ def test_interactive_reason_reaches_audit_session_projection_and_tool_result(
       session=session,
       role="owner",
       approval_route=route,
-      run_context=RunContext(user_id="alice", request_id="request-1", session_id=session.session_id),
+      run_context=RunContext(user_id="alice", request_id="request-1", session_id=session.session_id, registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     dispatcher.bind_secret_boundary(SecretBoundary(()))
     runner = AgentRunner(

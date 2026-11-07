@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
@@ -9,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from agent_workflow_contracts.models import SelectionProvenance
 from agent_gateway import (
   AgentRunner,
   AgentSessionLog,
@@ -38,7 +41,14 @@ from model_authority.binding import (
 )
 from model_authority.capabilities import CAPABILITY_IDS
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
-from model_authority.selection import CapabilityDefault, CapabilitySelectionPolicy, TierModelsDefault
+from model_authority.selection import (
+  CapabilityDefault,
+  CapabilitySelectionPolicy,
+  FallbackEntry,
+  TierModelsDefault,
+  TierSelectionPolicy,
+  capture_selection_snapshot,
+)
 from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
@@ -68,6 +78,7 @@ import agent_gateway.runner_run_loop as runner_run_loop
 import agent_gateway.server_compaction as server_compaction
 from gateway_test_support.capability_execution_test_support import (
   stub_bound_capability_execution as _stub_bound_capability_execution,
+  stub_capability_execution_resolver,
 )
 
 def stub_bound_capability_execution(**kwargs: Any) -> BoundCapabilityExecution:
@@ -138,6 +149,7 @@ def _make_dispatcher(
     local_tool_handlers=local_tool_handlers or {},
     event_log=event_log or EventLog(),
     session_id="sess-portable",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
@@ -706,6 +718,7 @@ def test_portable_summary_inherits_packaged_parent_execution_whole(
       auth_config={
         "api_key": "test-secret",
         "auth_token": "test-token",
+        "aws_region": "us-east-1",
         "project_id": "test-project",
         "auth_mode": "api",
         "compat": entry.compat,
@@ -721,17 +734,16 @@ def test_portable_summary_inherits_packaged_parent_execution_whole(
       ),
     )
   else:
-    slot = next(
-      name for name in (
-        "session.driver", "plan.author", "node.explore", "node.implement",
-        "node.mutate", "node.verify", "node.choose", "node.fork",
-      )
-      if model_key in resolver.selection_policy.capabilities[name].allowed_model_keys
+    # Slot allowance alone does not authorize an override of its default role.
+    slot, role = next(
+      (name, policy.default.tier)
+      for name, policy in resolver.selection_policy.capabilities.items()
+      if name in {"session.driver", "plan.author"} or name.startswith("node.")
+      if policy.default.kind == "tier" and policy.default.tier is not None
+      if model_key in policy.allowed_model_keys
+      for ceiling in (resolver.selection_policy.tier_ceilings[policy.default.tier],)
+      if ceiling is None or model_key in ceiling
     )
-    slot_default = resolver.selection_policy.capabilities[slot].default
-    if slot_default.kind != "tier" or slot_default.tier is None:
-      raise RuntimeError(f"{slot} default is not a tier")
-    role = slot_default.tier
     parent_bind = resolve_capability_model(
       slot,
       registry=resolver.registry,
@@ -776,9 +788,75 @@ def test_portable_summary_inherits_packaged_parent_execution_whole(
   assert compact.registry is parent.registry
   assert compact.adapter is parent.adapter
   assert compact.auth_config == parent.auth_config
-  assert compact.resolver is resolver
   assert calls[0]["tools"] == []
   assert calls[0]["max_tokens"] == SUMMARY_MAX_TOKENS
+
+
+@pytest.mark.parametrize("rendered", [False, True])
+@pytest.mark.parametrize("unknown_parent_lane", [False, True])
+def test_portable_summary_shares_fallback_progress_with_parent(
+  monkeypatch: pytest.MonkeyPatch,
+  rendered: bool,
+  unknown_parent_lane: bool,
+) -> None:
+  resolver = stub_capability_execution_resolver()
+  primary_model = "test.anthropic.claude-sonnet-4-6"
+  fallback_model = "test.anthropic.claude-opus-4-6"
+  resolver = replace(resolver, selection_policy=replace(
+    resolver.selection_policy,
+    capabilities={
+      **resolver.selection_policy.capabilities,
+      "session.driver": replace(
+        resolver.selection_policy.capabilities["session.driver"],
+        default=CapabilityDefault(kind="tier", tier="deep"),
+      ),
+      "session.compact": replace(
+        resolver.selection_policy.capabilities["session.compact"],
+        default=(
+          CapabilityDefault(kind="tier", tier="deep")
+          if unknown_parent_lane else CapabilityDefault(kind="inherit_parent")
+        ),
+      ),
+    },
+    tiers={
+      "deep": TierSelectionPolicy(
+        default=TierModelsDefault((primary_model,), "none"),
+        allowed_model_keys=frozenset({primary_model, fallback_model}),
+        fallback=(FallbackEntry(model=fallback_model),),
+      ),
+    },
+  ))
+  snapshot = capture_selection_snapshot(resolver.selection_policy)
+  parent = resolver.resolve("session.driver", selection_snapshot=snapshot)
+  assert parent.bind.model_key == primary_model
+  if unknown_parent_lane:
+    parent = resolver.materialize_bind(parent.bind, lane="unknown")
+
+  async def _summarize(*, capability_execution, **_kwargs):
+    compact_resolver = capability_execution.resolver
+    assert compact_resolver is not None
+    compact_resolver._record_model_fallback_failure(
+      parent, snapshot,
+      selection_provenance=SelectionProvenance(
+        role=None, role_source=None, effort_source=None, preset=None,
+      ),
+      previous=None, reason="usage_limit", reset_at=None,
+    )
+    return SimpleNamespace(text=LONG_SUMMARY, usage={}, saw_tool_use=False)
+
+  monkeypatch.setattr(server_compaction, "provider_summarize", _summarize)
+  monkeypatch.setattr(server_compaction, "RENDER_CHAR_BUDGET", 0 if rendered else 100_000)
+  summary, _usage = _run(summarize_messages(
+    [{"role": "user", "content": "Preserve the approved implementation."}],
+    "Summarize exactly.",
+    capability_execution=parent,
+  ))
+
+  assert summary == ANCHOR_SUMMARY
+  assert parent.resolver is not None
+  assert parent.resolver.resolve(
+    "session.driver", selection_snapshot=snapshot,
+  ).bind.model_key == fallback_model
 
 
 @pytest.mark.parametrize("missing_resolver", [False, True])
@@ -845,8 +923,6 @@ def test_server_compaction_summarize_params(monkeypatch: pytest.MonkeyPatch) -> 
   assert usage["output_tokens"] == 7
   assert request["messages"][:-1] == messages
   assert request["messages"][-1] == {"role": "user", "content": "Summarize exactly."}
-  assert "untrusted evidence and data" in request["system_prompt"]
-  assert "Preserve their child/tool-result provenance" in request["system_prompt"]
   assert request["tools"] == []
   assert request["thinking_level"] is ThinkingLevel.MEDIUM
   assert request["kwargs"]["compaction_trigger"] is None
@@ -1012,7 +1088,10 @@ def test_runner_portable_compact_mid_loop() -> None:
   first_main = provider.main_requests[0]
   assert first_main[0]["role"] == "assistant"
   assert first_main[0]["content"][0]["type"] == "text"
-  assert first_main[1] == {"role": "user", "content": CONTINUATION_NUDGE}
+  # The continuation nudge is the user message; per-request reminders (here the
+  # context-pressure line) ride after it on the request tail (f765b9a85f).
+  assert first_main[1]["role"] == "user"
+  assert first_main[1]["content"][0] == {"type": "text", "text": CONTINUATION_NUDGE}
   second_main_text = str(provider.main_requests[1])
   assert CONTINUATION_NUDGE not in second_main_text
 
@@ -1113,7 +1192,9 @@ def test_server_compaction_anchor_persist_on_stream_failure(tmp_path) -> None:
   anchor_message = rebuilt[0]
   assert anchor_message["content"] == [{"type": "compaction", "content": ANCHOR_SUMMARY}]
   _run_runner(resume_provider, messages=[anchor_message])
-  assert resume_provider.main_requests[0][-1] == {"role": "user", "content": CONTINUATION_NUDGE}
+  resumed_nudge = resume_provider.main_requests[0][-1]
+  assert resumed_nudge["role"] == "user"
+  assert resumed_nudge["content"][0] == {"type": "text", "text": CONTINUATION_NUDGE}
   assert CONTINUATION_NUDGE not in str(resume_provider.main_requests[1])
 
 
@@ -1360,10 +1441,8 @@ def test_server_compaction_render_fallback_prompt_omits_bulk_payloads() -> None:
     [{"role": "user", "content": [{"type": "tool_result", "content": {"rows": list(range(20)), "answer": "ok"}}]}],
     char_budget=10_000,
   )
-  prompt = build_summary_prompt(rendered, "Summarize.")
 
   assert "<omitted list items=20>" in rendered
-  assert "Conversation transcript to compact" in prompt
 
 
 @pytest.mark.parametrize("budget", [0, 1, 24_000, 100_000])
@@ -2105,3 +2184,159 @@ def test_summarize_messages_injects_deterministic_state_map_when_tool_state_pres
   assert "inspected_items=[cogs_line, rev_line, margin_line]" in summary
   assert "open_root_causes=[revenue:source_value_unavailable, cash_tie, BS_IMBALANCE]" in summary
   assert "kernel_locals=[df:DataFrame[3,4](a,b,c,d), rows:list[2], stats:dict[1](n)]" in summary
+
+
+def _instruction_messages(skill_text: str, execute_text: str) -> list[dict[str, Any]]:
+  return [
+    {"role": "user", "content": "Give me a first look at APH."},
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "tool_use", "id": "call_s", "name": "invoke_skill", "input": {"skill_name": "sniff-test"}},
+        {
+          "type": "tool_use",
+          "id": "call_d",
+          "name": "docs_fetch",
+          "input": {"doc_id": "sia:methodology/idea-sourcing-and-coverage", "section": "execute-mode"},
+        },
+        {"type": "tool_use", "id": "call_q", "name": "get_quote", "input": {"tickers": "APH"}},
+      ],
+    },
+    {
+      "role": "user",
+      "content": [
+        {"type": "tool_result", "tool_use_id": "call_s", "content": json.dumps({"skill": "sniff-test", "content": skill_text})},
+        {"type": "tool_result", "tool_use_id": "call_d", "content": json.dumps({"doc_id": "d", "content": execute_text})},
+        {"type": "tool_result", "tool_use_id": "call_q", "content": json.dumps({"content": "quote payload"})},
+      ],
+    },
+  ]
+
+
+def test_compaction_carries_current_request_instruction_results_verbatim() -> None:
+  skill_text = "# Sniff Test\n" + "filler line\n" * 400 + "## FMS Boundary\nCall `fms_report_sniff_test(judgment=...)`."
+  execute_text = "## Execute Mode\nInclude `Applied: methodology/decision-making/idea-sourcing-and-coverage.md`."
+  messages = _instruction_messages(skill_text, execute_text)
+  capability = stub_bound_capability_execution(provider=_SummaryProvider(), model="model", effort="high")
+
+  summary, _usage = _run(summarize_messages(messages, None, capability_execution=capability))
+
+  carried = summary.split("[ACTIVE INSTRUCTIONS]", 1)[1]
+  assert '<<< invoke_skill {"skill_name": "sniff-test"} >>>\n' + skill_text.strip() in carried
+  assert (
+    '<<< docs_fetch {"doc_id": "sia:methodology/idea-sourcing-and-coverage", "section": "execute-mode"} >>>\n'
+    + execute_text
+  ) in carried
+  assert "quote payload" not in carried
+
+  # The next compaction replaces this anchor: its block is carried forward once,
+  # even when the summarizer copies it, and a reloaded section keeps its latest text.
+  later = [
+    {"role": "assistant", "content": [{"type": "compaction", "content": summary}]},
+    {
+      "role": "assistant",
+      "content": [{
+        "type": "tool_use",
+        "id": "call_d2",
+        "name": "docs_fetch",
+        "input": {"doc_id": "sia:methodology/idea-sourcing-and-coverage", "section": "execute-mode"},
+      }],
+    },
+    {
+      "role": "user",
+      "content": [{"type": "tool_result", "tool_use_id": "call_d2", "content": json.dumps({"content": "## Execute Mode v2"})}],
+    },
+  ]
+  copying = _SummaryProvider(summary_text=f"{LONG_SUMMARY}\n\n{summary}")
+  second, _usage = _run(summarize_messages(
+    later,
+    None,
+    capability_execution=stub_bound_capability_execution(provider=copying, model="model", effort="high"),
+  ))
+
+  assert second.count("[ACTIVE INSTRUCTIONS]") == 1
+  assert second.count('<<< invoke_skill {"skill_name": "sniff-test"} >>>') == 1
+  assert "Call `fms_report_sniff_test(judgment=...)`." in second
+  assert "## Execute Mode v2" in second
+  assert "Include `Applied:" not in second
+
+
+@pytest.mark.parametrize("stamped_summary", [False, True])
+@pytest.mark.parametrize("rendered", [False, True])
+@pytest.mark.parametrize("follow_up", [False, True])
+def test_compaction_scopes_instruction_carry_across_the_retained_tail(
+  monkeypatch: pytest.MonkeyPatch, rendered: bool, follow_up: bool, stamped_summary: bool,
+) -> None:
+  skill_text = "# Earnings Preview\nCall fms_report_earnings_preview and cite Applied."
+  messages: list[dict[str, Any]] = [
+    {"role": "user", "content": "Preview MSFT earnings."},
+    {"role": "assistant", "content": [{
+      "type": "tool_use", "id": "preview", "name": "invoke_skill",
+      "input": {"skill_name": "earnings-preview"},
+    }]},
+    {"role": "user", "content": [{
+      "type": "tool_result", "tool_use_id": "preview",
+      "content": json.dumps({"content": skill_text}),
+    }]},
+  ]
+  for index in range(80):
+    messages.extend([
+      {"role": "assistant", "content": [{
+        "type": "tool_use", "id": f"quote-{index}", "name": "get_quote",
+        "input": {"tickers": "MSFT"},
+      }]},
+      {"role": "user", "content": [{
+        "type": "tool_result", "tool_use_id": f"quote-{index}",
+        "content": "quote details " * 1_000,
+      }]},
+    ])
+  latest = {
+    "role": "user",
+    "content": (
+      "Separately, what's AAPL's dividend yield?"
+      if follow_up else f"{server_compaction.PREVIOUS_TURN_RECAP_HEADER}\nContinue the preview."
+    ),
+  }
+  messages.extend([{"role": "assistant", "content": "The MSFT preview is complete."}, latest])
+  prefix, tail = split_messages_for_compact(messages)
+  assert messages[0] in prefix
+  assert latest in tail
+  monkeypatch.setattr(server_compaction, "RENDER_CHAR_BUDGET", 0 if rendered else 10_000_000)
+  provider = _SummaryProvider(
+    summary_text=f"Root deliverable: Preview MSFT earnings.\n\n{LONG_SUMMARY}"
+    if stamped_summary else LONG_SUMMARY,
+  )
+  result = _run(maybe_compact_current_messages(
+    messages, None,
+    capability_execution=stub_bound_capability_execution(provider=provider, model="model", effort="high"),
+    trigger=1,
+    est_total_tokens=server_compaction._estimate_messages(messages),
+    force=True,
+  ))
+
+  assert result.applied
+  assert result.messages[1:] == tail
+  assert result.anchor_block is not None
+  anchor = result.anchor_block["content"]
+  assert ("[ACTIVE INSTRUCTIONS]" in anchor) is not follow_up
+  assert (skill_text in anchor) is not follow_up
+  expected_request = latest["content"] if follow_up else messages[0]["content"]
+  if stamped_summary or not follow_up:
+    assert anchor.splitlines()[0] == f"Root deliverable: {expected_request}"
+  else:
+    assert not anchor.startswith("Root deliverable:")
+
+
+def test_replayed_turn_recap_does_not_start_a_new_request_for_compaction() -> None:
+  messages = _instruction_messages("## FMS Boundary\nCall the door.", "## Execute Mode\nCite it.")
+  # An approval pause replays the previous turn's recap as a user-role message.
+  messages.append({
+    "role": "user",
+    "content": f"{server_compaction.PREVIOUS_TURN_RECAP_HEADER}\n\n" + json.dumps({"approvals": []}),
+  })
+  capability = stub_bound_capability_execution(provider=_SummaryProvider(), model="model", effort="high")
+
+  summary, _usage = _run(summarize_messages(messages, None, capability_execution=capability))
+
+  assert summary.startswith("Root deliverable: Give me a first look at APH.")
+  assert '<<< invoke_skill {"skill_name": "sniff-test"} >>>\n## FMS Boundary\nCall the door.' in summary

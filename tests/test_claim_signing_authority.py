@@ -7,12 +7,14 @@ import hashlib
 import hmac
 import os
 from pathlib import Path
+import subprocess
+import sys
 import threading
-from typing import cast
+from typing import Any, cast
 
 import httpx2
 import pytest
-from hank_contracts.agent_api import AGENT_API_CLAIM_HEADERS
+from hank_contracts.agent_api import AGENT_API_CLAIM_ENV_VARS, AGENT_API_CLAIM_HEADERS
 
 from agent_gateway import claim_signing_authority as authority_module
 from agent_gateway.autonomous_runner_claims import get_agent_api_claim_ttl_seconds
@@ -23,6 +25,7 @@ from agent_gateway.claim_signing_authority import (
   GatewayUserClaimSigner,
   UserClaimHttpAuth,
   LEGACY_CLAIM_HMAC_KEY_ENV,
+  agent_api_claim_http_headers,
   configured_gateway_claim_signing_authority,
   gateway_user_claim_signer_identity,
   install_gateway_claim_signing_authority,
@@ -395,7 +398,7 @@ class _CollectingLock:
     self._lock.release()
 
 
-def test_collection_inside_binding_section_does_not_wait_on_own_lock(
+def _assert_collection_inside_binding_section_does_not_wait_on_own_lock(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
   monkeypatch.setattr(
@@ -429,6 +432,31 @@ def test_collection_inside_binding_section_does_not_wait_on_own_lock(
 
   assert not worker.is_alive(), "binding thread waited on its own lock"
   assert bound == [("next", "next@example.test")]
+
+
+def test_collection_inside_binding_section_does_not_wait_on_own_lock() -> None:
+  # A full collection must exercise this lock, not finalizers and background
+  # activity accumulated by unrelated tests in the suite process.
+  completed = subprocess.run(
+    [
+      sys.executable,
+      "-c",
+      """
+import runpy
+import sys
+import pytest
+
+namespace = runpy.run_path(sys.argv[1])
+with pytest.MonkeyPatch.context() as monkeypatch:
+  namespace["_assert_collection_inside_binding_section_does_not_wait_on_own_lock"](monkeypatch)
+""",
+      str(Path(__file__).resolve()),
+    ],
+    capture_output=True,
+    text=True,
+    timeout=60,
+  )
+  assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 
@@ -705,4 +733,170 @@ def test_user_claim_http_auth_signs_each_request_with_a_fresh_claim() -> None:
   assert {(claim["user_id"], claim["user_email"]) for claim in verified if claim} == {
     ("42", "owner@example.test"),
   }
+  assert len({claim["nonce"] for claim in verified if claim}) == 2
+
+
+def test_user_claim_http_auth_refreshes_claim_after_initial_claim_expires(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway import autonomous_runner_claims
+
+  monkeypatch.delenv("AGENT_API_CLAIM_TTL_SECONDS", raising=False)
+  authority = GatewayClaimSigningAuthority(_SECRET)
+  signer = authority.bind_user(user_id="42", user_email="owner@example.test")
+  clock_times = iter((1_700_000_000, 1_700_000_301, 1_700_000_602))
+  monkeypatch.setattr(autonomous_runner_claims, "_time_time", lambda: float(next(clock_times)))
+  seen: list[httpx2.Request] = []
+
+  def respond(request: httpx2.Request) -> httpx2.Response:
+    seen.append(request)
+    return httpx2.Response(200)
+
+  async def scenario() -> None:
+    auth = UserClaimHttpAuth(lambda: sign_gateway_user_claim(signer))
+    async with httpx2.AsyncClient(
+      auth=auth, transport=httpx2.MockTransport(respond),
+    ) as client:
+      for _ in range(3):
+        await client.post("https://risk.example.test/api/mcp/x/")
+
+  asyncio.run(scenario())
+
+  claims = [
+    {
+      field: request.headers[header]
+      for field, header in AGENT_API_CLAIM_HEADERS.items()
+    }
+    for request in seen
+  ]
+  assert len({claim["nonce"] for claim in claims}) == 3
+  assert authority.verify_user_claim(claims[0], now=1_700_000_000) is not None
+  assert authority.verify_user_claim(claims[0], now=1_700_000_301) is None
+  assert authority.verify_user_claim(claims[1], now=1_700_000_301) is not None
+  assert authority.verify_user_claim(claims[1], now=1_700_000_602) is None
+  assert authority.verify_user_claim(claims[2], now=1_700_000_602) is not None
+
+
+def test_verify_user_claim_enforces_600_second_ttl_ceiling_at_boundary(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from types import SimpleNamespace
+  from fastapi import HTTPException
+  from starlette.datastructures import Headers
+  from agent_gateway.server_artifact_helpers import (
+    _AGENT_API_CLAIM_MAX_TTL_SECONDS,
+    _verify_agent_claim_headers,
+    _verify_signed_user_claim,
+  )
+
+  assert _AGENT_API_CLAIM_MAX_TTL_SECONDS == 600
+  authority = GatewayClaimSigningAuthority(_SECRET)
+
+  def _fields(claim: dict[str, str]) -> dict[str, str]:
+    return {
+      field: claim[env_name]
+      for field, env_name in AGENT_API_CLAIM_ENV_VARS.items()
+    }
+
+  at_ceiling = authority.sign_user_claim(
+    user_id="42", user_email="owner@example.test", ttl_seconds=600,
+  )
+  at_ceiling_fields = _fields(at_ceiling)
+  issued = int(at_ceiling_fields["issued_at"])
+  assert authority.verify_user_claim(at_ceiling_fields, now=issued) is not None
+  assert authority.verify_user_claim(at_ceiling_fields, now=issued + 600) is not None
+
+  over_ceiling = authority.sign_user_claim(
+    user_id="42", user_email="owner@example.test", ttl_seconds=601,
+  )
+  over_ceiling_fields = _fields(over_ceiling)
+  over_issued = int(over_ceiling_fields["issued_at"])
+  assert _claim_ttl(over_ceiling) == 601
+  assert authority.verify_user_claim(over_ceiling_fields, now=over_issued) is None
+  assert _verify_agent_claim_headers(
+    _SECRET.decode("utf-8"), over_ceiling_fields, now=over_issued,
+  ) is None
+
+  monkeypatch.setenv("AGENT_API_CLAIM_TTL_SECONDS", "601")
+  env_over = authority.sign_user_claim(user_id="42", user_email="owner@example.test")
+  assert _claim_ttl(env_over) == 601
+  assert authority.verify_user_claim(_fields(env_over), now=int(env_over["AGENT_API_CLAIM_ISSUED_AT"])) is None
+
+  app_state = SimpleNamespace(gateway_claim_signing_authority=authority)
+  valid_req = SimpleNamespace(
+    headers=Headers(agent_api_claim_http_headers(at_ceiling)),
+    app=SimpleNamespace(state=app_state),
+  )
+  verified_boundary = _verify_signed_user_claim(cast(Any, valid_req))
+  assert verified_boundary["user_id"] == "42"
+  assert verified_boundary["user_email"] == "owner@example.test"
+
+  over_req = SimpleNamespace(
+    headers=Headers(agent_api_claim_http_headers(over_ceiling)),
+    app=SimpleNamespace(state=app_state),
+  )
+  with pytest.raises(HTTPException) as exc_info:
+    _verify_signed_user_claim(cast(Any, over_req))
+  assert exc_info.value.status_code == 401
+  assert exc_info.value.detail == "Invalid signed user claim"
+
+
+def test_risk_catalog_fetch_mints_a_fresh_claim_per_tier_request(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import sys
+  from pathlib import Path
+  from types import SimpleNamespace
+  import requests
+
+  api_root = str(Path(__file__).resolve().parents[3] / "api")
+  if api_root not in sys.path:
+    sys.path.insert(0, api_root)
+  from agent.shared.prompts.code_execution import (
+    _build_registry_fetcher_headers,
+    _fetch_risk_function_catalog,
+  )
+
+  authority = GatewayClaimSigningAuthority(_SECRET)
+  captured_headers: list[dict[str, str]] = []
+
+  def fake_get(url: str, *, params: dict[str, str], headers: dict[str, str], timeout: int) -> Any:
+    assert url == "http://127.0.0.1:5001/api/agent/registry"
+    assert timeout == 3
+    captured_headers.append(dict(headers))
+    tier = params["tier"]
+    return SimpleNamespace(
+      raise_for_status=lambda: None,
+      json=lambda: {
+        "functions": {
+          f"fn_{tier}": {
+            "params": {},
+            "code_disposition": "direct",
+            "code_operation": f"op_{tier}",
+            "description": f"desc {tier}",
+          }
+        }
+      },
+    )
+
+  monkeypatch.setattr(requests, "get", fake_get)
+  catalog, _cache = _fetch_risk_function_catalog(
+    (0.0, None),
+    ttl_seconds=300,
+    base_url="http://127.0.0.1:5001",
+    claim_signing_authority=authority,
+    headers_builder=_build_registry_fetcher_headers,
+  )
+  assert catalog is not None
+  assert "fn_building_block()" in catalog
+  assert "fn_tool()" in catalog
+  assert len(captured_headers) == 2
+  verified = [
+    authority.verify_user_claim({
+      field: hdrs[header_name]
+      for field, header_name in AGENT_API_CLAIM_HEADERS.items()
+    })
+    for hdrs in captured_headers
+  ]
+  assert all(claim is not None for claim in verified)
   assert len({claim["nonce"] for claim in verified if claim}) == 2

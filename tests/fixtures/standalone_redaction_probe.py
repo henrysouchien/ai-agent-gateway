@@ -1,20 +1,26 @@
 # ruff: noqa: E402
 
 from __future__ import annotations
+from pathlib import Path
+import sys
+
+installed = Path(sys.argv[1]).resolve()
+state_root = Path(sys.argv[2]).resolve()
+# The wheel ships no test support: append (never insert) the source root so
+# gateway_test_support resolves while agent_gateway stays the installed wheel.
+sys.path.insert(0, str(installed))
+sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 import asyncio
 import io
 import json
 import logging
-from pathlib import Path
-import sys
 from types import SimpleNamespace
 from typing import Any
 
-
-installed = Path(sys.argv[1]).resolve()
-state_root = Path(sys.argv[2]).resolve()
-sys.path.insert(0, str(installed))
 
 import agent_gateway
 from agent_gateway import AgentRunner, EventLog, ToolDispatcher
@@ -266,6 +272,7 @@ async def _run_scenario(
     get_tool_definitions=lambda: [TOOL_DEFINITION],
     local_tool_class_resolver=lambda _name: "read",
     local_catalog_action_resolver=lambda _name: None,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   session_log = AgentSessionLog(path=state_root / f"{name}.jsonl")
   runner = AgentRunner(

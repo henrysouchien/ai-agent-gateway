@@ -425,16 +425,24 @@ def test_tick_error_from_exception() -> None:
   _run(case())
 
 
-def test_backoff_replaces_interval() -> None:
+def test_backoff_replaces_interval(monkeypatch: pytest.MonkeyPatch) -> None:
   async def case() -> None:
-    tick_times: list[float] = []
+    tick_results: list[TickResult] = []
+    delays: list[float] = []
+
+    async def elapsed_stop_wait(awaitable, *, timeout: float) -> None:
+      awaitable.close()
+      delays.append(timeout)
+      raise asyncio.TimeoutError
+
+    monkeypatch.setattr(heartbeat.asyncio, "wait_for", elapsed_stop_wait)
 
     async def run_fn() -> RunOutput:
       return _output(error="boom")
 
     async def on_tick(result: TickResult, _state: dict[str, Any]) -> None:
       assert result.error == "boom"
-      tick_times.append(asyncio.get_running_loop().time())
+      tick_results.append(result)
 
     loop = HeartbeatLoop(
       run_fn,
@@ -443,12 +451,11 @@ def test_backoff_replaces_interval() -> None:
     )
     await loop.start()
 
-    assert len(tick_times) == 2
-    delta = tick_times[1] - tick_times[0]
-    assert 0.02 <= delta < 0.2
+    assert len(tick_results) == 2
+    assert delays == [0.05]
     assert loop.state["consecutive_errors"] == 2
 
-  _run(asyncio.wait_for(case(), timeout=2.0))
+  _run(case())
 
 
 def test_backoff_reset_on_success() -> None:

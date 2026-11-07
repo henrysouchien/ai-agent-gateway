@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
+
+from hank_model_transport.capability_execution import MaterializedCredential
+from model_authority.binding import CredentialHandle
 
 from hank_contracts.commercial_claims import (
   CommercialClaimError,
@@ -65,6 +69,39 @@ def require_commercial_child_account(
     )
 
 
+@dataclass(frozen=True)
+class MeteredSeat:
+  """One turn's Hank-paid paid seat, minted only from a verified metered V4.
+
+  The product's admission owner mints it (``metered_seat_minter``); the turn
+  binds it as its ``service`` handle and attaches the same authorization.
+  """
+
+  authorization: VerifiedWorkAuthorization
+  handle: CredentialHandle
+  _materialize: Callable[[], MaterializedCredential] = field(repr=False, compare=False)
+
+  def __post_init__(self) -> None:
+    if (
+      type(self.authorization) is not VerifiedWorkAuthorization
+      or self.authorization.billing_mode != "metered"
+      or self.handle.principal != "service"
+      or self.handle.provider != self.authorization.provider
+    ):
+      raise ValueError("a metered seat is a service handle for its authorized provider")
+
+  @property
+  def provider(self) -> str:
+    return self.handle.provider
+
+  def materialize(self) -> MaterializedCredential:
+    materialized = self._materialize()
+    if type(materialized) is not MaterializedCredential or materialized.handle != self.handle:
+      raise RuntimeError("metered seat materializer returned a different credential handle")
+    return materialized
+
+
+MeteredSeatMinter = Callable[[VerifiedWorkAuthorization, Any], MeteredSeat | None]
 
 
 def commercial_budget_stop_fields(producer: object | None) -> dict[str, int] | None:
@@ -105,6 +142,7 @@ class CommercialWorkStartGate:
     consumption_store: WorkAuthorizationConsumptionStore | None = None,
     facts_resolver: CommercialWorkStartFactsResolver | None = None,
     pre_consume: CommercialWorkStartPreflight | None = None,
+    metered_seat_minter: MeteredSeatMinter | None = None,
   ) -> None:
     self.enabled = enabled
     self._claim_verifier = claim_verifier
@@ -112,6 +150,7 @@ class CommercialWorkStartGate:
     self._consumption_store = consumption_store
     self._facts_resolver = facts_resolver
     self._pre_consume = pre_consume
+    self._metered_seat_minter = metered_seat_minter
     self._binding = object()
     if enabled and any(
       dependency is None
@@ -149,6 +188,43 @@ class CommercialWorkStartGate:
         "Both commercial work-start headers are required.",
         status_code=401,
       )
+    claim = self._verify_owner_claim(
+      claim_token,
+      owner_user_id=str(getattr(session, "owner_user_id", "") or "").strip(),
+    )
+    return VerifiedCommercialWorkStartClaim(
+      claim=claim,
+      _authorization_token=authorization_token,
+      _gate_binding=self._binding,
+    )
+
+  def verify_session_claim(
+    self,
+    headers: Mapping[str, str],
+    *,
+    owner_user_id: str,
+  ) -> VerifiedCommercialClaim | None:
+    """The commercial claim a keyless session start presents, else None.
+
+    Verified by the same claim verifier and owner check as ``verify_claim``.
+    The claim names the session owner as a commercial account holder; it is
+    not work authorization. Only a turn's verified, consumed metered V4 binds
+    a credential (``metered_seat``).
+    """
+    if not self.enabled:
+      return None
+    claim_token = headers.get(COMMERCIAL_CLAIM_HEADER)
+    if claim_token is None:
+      return None
+    if not claim_token:
+      raise CommercialWorkStartError(
+        "commercial_work_authority_required",
+        "The commercial claim header is empty.",
+        status_code=401,
+      )
+    return self._verify_owner_claim(claim_token, owner_user_id=owner_user_id)
+
+  def _verify_owner_claim(self, claim_token: str, *, owner_user_id: str) -> VerifiedCommercialClaim:
     claim_verifier = self._claim_verifier
     if claim_verifier is None:
       raise CommercialWorkStartError(
@@ -164,7 +240,6 @@ class CommercialWorkStartGate:
         f"Commercial work-start claim was refused by its verifier: {exc.code}.",
         status_code=403,
       ) from exc
-    owner_user_id = str(getattr(session, "owner_user_id", "") or "").strip()
     if (
       not owner_user_id.isdecimal()
       or owner_user_id.startswith("0")
@@ -175,11 +250,63 @@ class CommercialWorkStartGate:
         "Commercial work-start authority is bound to a different session owner.",
         status_code=403,
       )
-    return VerifiedCommercialWorkStartClaim(
-      claim=claim,
-      _authorization_token=authorization_token,
-      _gate_binding=self._binding,
-    )
+    return claim
+
+  def metered_seat(
+    self,
+    verified_claim: VerifiedCommercialWorkStartClaim | None,
+    *,
+    session: Any,
+    request_id: str,
+  ) -> MeteredSeat | None:
+    """Mint the turn's metered paid seat from its verified authorization.
+
+    Runs before the turn binds: a metered authorization decides the turn's
+    credential, and ``authorize_request`` then attaches it only to that bind.
+    A byok authorization, or one the minter leaves on today's path, is None.
+    """
+    minter = self._metered_seat_minter
+    if not self.enabled or verified_claim is None or minter is None:
+      return None
+    if verified_claim._gate_binding is not self._binding:
+      raise CommercialWorkStartError(
+        "commercial_work_authority_invalid",
+        "Commercial work-start authority is not bound to this request gate.",
+        status_code=403,
+      )
+    authorization_verifier = self._authorization_verifier
+    if authorization_verifier is None:
+      raise CommercialWorkStartError(
+        "commercial_work_start_unavailable",
+        "Commercial work-start verification is unavailable.",
+        status_code=503,
+      )
+    try:
+      authorization = authorization_verifier.verify_token(
+        verified_claim._authorization_token,
+        execution_claim=verified_claim.claim,
+        request_id=request_id,
+        session_id=session.session_id,
+      )
+    except WorkAuthorizationError as exc:
+      raise CommercialWorkStartError(
+        "commercial_work_authority_invalid",
+        "Commercial work-start authorization was refused by its verifier: "
+        f"{exc.code}.",
+        status_code=403,
+      ) from exc
+    if authorization.billing_mode != "metered":
+      return None
+    seat = minter(authorization, session)
+    if seat is not None and (
+      type(seat) is not MeteredSeat or seat.authorization != authorization
+    ):
+      raise CommercialWorkStartError(
+        "commercial_work_start_unavailable",
+        "The metered seat minter returned a seat for different authority.",
+        status_code=503,
+      )
+    return seat
 
   def authorize_request(
     self,
@@ -188,6 +315,7 @@ class CommercialWorkStartGate:
     session: Any,
     request: Any,
     channel: str | None,
+    metered_seat: MeteredSeat | None = None,
   ) -> PendingCommercialWorkStart | None:
     if not self.enabled or verified_claim is None:
       return None
@@ -231,6 +359,18 @@ class CommercialWorkStartGate:
         f"{exc.code}.",
         status_code=403,
       ) from exc
+    if metered_seat is not None:
+      bind = getattr(request, "capability_bind", None)
+      if (
+        authorization.token_sha256 != metered_seat.authorization.token_sha256
+        or getattr(bind, "credential_principal", None) != "service"
+        or getattr(bind, "credential_ref", None) != metered_seat.handle.handle_id
+      ):
+        raise CommercialWorkStartError(
+          "commercial_metered_seat_unbound",
+          "The metered paid seat is not the credential this turn bound.",
+          status_code=403,
+        )
     return PendingCommercialWorkStart(
       claim=verified_claim.claim,
       authorization=authorization,
@@ -317,6 +457,8 @@ class CommercialWorkStartGate:
 
 __all__ = [
   "CommercialWorkStartGate",
+  "MeteredSeat",
+  "MeteredSeatMinter",
   "require_commercial_child_account",
   "commercial_budget_stop_fields",
 ]

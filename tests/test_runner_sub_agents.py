@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import time
@@ -22,17 +24,14 @@ from agent_gateway.event_log import EventLog
 from agent_gateway.session import GatewaySession
 from hank_model_transport.providers import ModelInfo, ModelProvider
 from hank_model_transport.providers.base import StreamEvent
-from hank_model_transport.providers.anthropic import (
-  AnthropicProvider,
-  _is_cacheable_message_block,
-)
+from hank_model_transport.message_prefix import is_cacheable_message_block
+from hank_model_transport.providers.anthropic import AnthropicProvider
 from agent_gateway.runner_budget import CostAccumulator
 from agent_gateway.mcp_client import McpClientManager
 from hank_model_transport.multi_user.billing import _UsageAggregator
 import agent_gateway.runner as gateway_runner
 import agent_gateway.runner_sub_agents as runner_sub_agents
 import agent_gateway.runner_stream_turn as runner_stream_turn
-from agent_gateway.runner_sub_agents import RunnerSubAgentMixin
 from agent_gateway.tool_dispatcher_approval_lifecycle import ApprovalPark
 from agent_gateway.tool_policy_registry import PreparedToolCall
 from agent_gateway.session_recap import compute_recap
@@ -154,6 +153,7 @@ def _approval_dispatcher(
       parent_session,
     )),
     get_tool_definitions=_Dispatcher(capability_bind=capability_bind).get_tool_definitions,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
@@ -449,13 +449,6 @@ def _resume(parent: AgentRunner, **overrides: Any):
   ))
 
 
-def test_runner_sub_agent_methods_are_inherited_from_mixin() -> None:
-  assert issubclass(AgentRunner, RunnerSubAgentMixin)
-  for method_name in ("spawn_sub_agent", "resume_sub_agent"):
-    assert getattr(AgentRunner, method_name) is getattr(
-      RunnerSubAgentMixin, method_name
-    )
-
 
 def test_spawn_sub_agent_materializes_exact_terminal_message(
   monkeypatch: pytest.MonkeyPatch,
@@ -671,7 +664,7 @@ def test_resume_fork_thinking_only_max_tokens_history_pins_cacheable_block(
     if isinstance(block, dict) and "cache_control" in block
   ]
   assert [(message_index, block_index) for message_index, block_index, _ in marked] == [(0, 0)]
-  assert _is_cacheable_message_block(marked[0][2])
+  assert is_cacheable_message_block(marked[0][2])
   assert request["messages"][1]["content"] == messages[1]["content"]
   parent_request = provider.build_request_params(
     model="claude-sonnet-5",
@@ -1187,6 +1180,7 @@ def test_child_approval_uses_parent_session_and_parent_visible_child_log(
     created_at=1,
     expires_at=2,
     user_id="owner",
+    owner_user_id="owner",
   )
   child_session = GatewaySession(
     session_id="sub0:parent-session",
@@ -1194,6 +1188,7 @@ def test_child_approval_uses_parent_session_and_parent_visible_child_log(
     created_at=1,
     expires_at=2,
     user_id="owner",
+    owner_user_id="owner",
   )
   capability_execution = _execution()
   dispatcher = _approval_dispatcher(parent_session, child_session, capability_bind=capability_execution.bind)
@@ -1204,6 +1199,7 @@ def test_child_approval_uses_parent_session_and_parent_visible_child_log(
     withheld_tools=frozenset(),
     research_binding=AdmittedResearchBinding(research_file_id=42),
     approval_route=dispatcher._approval_route,
+    selection_provenance=None,
   ))
   _ApprovalChildRunner.approved = approved
   monkeypatch.setattr(gateway_runner, "AgentRunner", _ApprovalChildRunner)
@@ -1273,6 +1269,7 @@ def test_child_runner_owns_captured_session_and_job_handler_context(
     created_at=1,
     expires_at=2,
     user_id="parent-owner",
+    owner_user_id="parent-owner",
   )
   child_session = GatewaySession(
     session_id="sub0:parent-session",
@@ -1290,6 +1287,7 @@ def test_child_runner_owns_captured_session_and_job_handler_context(
       withheld_tools=frozenset(),
       research_binding=AdmittedResearchBinding(research_file_id=research_file_id),
       approval_route=NoApprovalRoute(),
+      selection_provenance=None,
     ))
   parent._gateway_session = parent_session
   parent._context_research_file_id = 11
@@ -1555,6 +1553,7 @@ def _exercise_approval_park_child(
       capability_bind=execution.bind,
       role="owner",
       needs_approval=lambda *_args: False,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     parent = AgentRunner(
       event_log=EventLog(), dispatcher=dispatcher,
@@ -1578,12 +1577,14 @@ def _exercise_approval_park_child(
     child_session = GatewaySession(
       session_id="sub0:parent-session", api_key_hash="hash",
       created_at=1, expires_at=2, user_id="child-owner",
+      owner_user_id="child-owner",
     )
     capture_job_context(child_session, root_context_from_identity(
       tenant=None,
       job_id=admitted.attempt.physical_task_id,
       tool_ids=frozenset({SOURCE_TOOL_ID}), withheld_tools=frozenset(),
       research_binding=AdmittedResearchBinding(), approval_route=NoApprovalRoute(),
+      selection_provenance=None,
     ))
     kernel: Any = _ApprovalParkCodeResource(
       cancel_close=cleanup_failure == "code_cancel",

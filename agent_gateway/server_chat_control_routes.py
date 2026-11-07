@@ -1,13 +1,64 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal, TypedDict
 
 from fastapi import HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
 from starlette.background import BackgroundTask
 
+from .chat_history import ChatHistoryQuery, read_chat_history
 from .event_log import log_has_terminal
+from .session import session_owner_user_id
+
+
+class _BackgroundChildInterruptUnsupportedDetail(TypedDict):
+  code: Literal["background_child_interrupt_unsupported"]
+  message: str
+  task_id: str
+
+
+def _authorized_chat_session(
+  session: Any,
+  requested_session_id: str,
+  *,
+  get_session: Callable[[str], Any | None],
+  refusal: str,
+) -> Any:
+  """Return the session a subscribe/cancel acts on.
+
+  A chat bearer authorizes only the session it was minted for. A control
+  bearer may also act on a live session of the same owner; any other
+  requested session is refused.
+  """
+  if requested_session_id == session.session_id:
+    return session
+  if getattr(session, "kind", "chat") == "control":
+    target = get_session(requested_session_id)
+    owner = session_owner_user_id(session, required=False)
+    if target is not None and owner and owner == session_owner_user_id(target, required=False):
+      return target
+  raise HTTPException(status_code=403, detail=refusal)
+
+
+async def chat_history_response(
+  request: Request,
+  *,
+  auth: Any,
+  get_bearer_token: Callable[[str | None], str],
+) -> JSONResponse:
+  token = get_bearer_token(request.headers.get("Authorization"))
+  session = auth.verify_token(token)
+  try:
+    query = ChatHistoryQuery.model_validate(dict(request.query_params))
+  except ValidationError as exc:
+    raise RequestValidationError(exc.errors()) from exc
+  return JSONResponse(
+    content=await read_chat_history(session, query),
+    headers={"Cache-Control": "private, no-store"},
+  )
 
 
 async def chat_subscribe_response(
@@ -20,6 +71,7 @@ async def chat_subscribe_response(
   stream_subscriber_sse: Callable[..., Any],
   transcript_dir: Path | None,
   log: Any,
+  get_session: Callable[[str], Any | None],
 ) -> StreamingResponse:
   token = get_bearer_token(request.headers.get("Authorization"))
   session = auth.verify_token(token)
@@ -29,9 +81,12 @@ async def chat_subscribe_response(
       detail="schema_version is set at session init via POST /chat/init; create a new session to change versions",
     )
   requested_session_id = request.query_params.get("session_id") or session.session_id
-  # A chat bearer authorizes only the session it was minted for (auth).
-  if requested_session_id != session.session_id:
-    raise HTTPException(status_code=403, detail="Cannot subscribe to a different session")
+  session = _authorized_chat_session(
+    session,
+    requested_session_id,
+    get_session=get_session,
+    refusal="Cannot subscribe to a different session",
+  )
 
   raw_after_seq = request.query_params.get("after_seq", "0")
   try:
@@ -88,12 +143,15 @@ async def chat_cancel_response(
   get_bearer_token: Callable[[str | None], str],
   cancel_active_turn_runner: Callable[[Any], Awaitable[None]],
   clear_active_turn: Callable[[Any, Any], None],
+  get_session: Callable[[str], Any | None],
 ) -> JSONResponse:
   token = get_bearer_token(request.headers.get("Authorization"))
-  session = auth.verify_token(token)
-  # A chat bearer authorizes only the session it was minted for (auth).
-  if body.session_id != session.session_id:
-    raise HTTPException(status_code=403, detail="Cannot cancel a different session")
+  session = _authorized_chat_session(
+    auth.verify_token(token),
+    body.session_id,
+    get_session=get_session,
+    refusal="Cannot cancel a different session",
+  )
 
   active_turn = session.active_turn
   if active_turn is None:
@@ -102,6 +160,35 @@ async def chat_cancel_response(
   await cancel_active_turn_runner(active_turn)
   clear_active_turn(session, active_turn)
   return JSONResponse(content={"status": "cancelled", "session_id": session.session_id})
+
+
+async def chat_interrupt_background_child_response(
+  request: Request,
+  task_id: str,
+  *,
+  auth: Any,
+  get_bearer_token: Callable[[str | None], str],
+) -> JSONResponse:
+  token = get_bearer_token(request.headers.get("Authorization"))
+  session = auth.verify_token(token)
+  active_turn = session.active_turn
+  # Live ownership comes only from this bearer's turn, never a journal lookup
+  # or a newly constructed runtime. The registry owns target eligibility.
+  if active_turn is None or active_turn.runtime_owner is None:
+    raise HTTPException(status_code=409, detail="No live runner for this session")
+  interrupt = getattr(active_turn.runtime_owner, "interrupt_background_task", None)
+  if not callable(interrupt):
+    detail = _BackgroundChildInterruptUnsupportedDetail(
+      code="background_child_interrupt_unsupported",
+      message="This runner does not support background child interruption",
+      task_id=task_id,
+    )
+    raise HTTPException(status_code=409, detail=detail)
+  requested = interrupt(task_id, reason="user_interrupted")
+  return JSONResponse(content={
+    "task_id": task_id,
+    "interrupt_requested": requested,
+  })
 
 
 async def chat_recap_response(
@@ -324,6 +411,8 @@ async def chat_todo_patch_response(
 
 __all__ = [
   "chat_cancel_response",
+  "chat_history_response",
+  "chat_interrupt_background_child_response",
   "chat_recap_response",
   "chat_subscribe_response",
   "chat_todo_get_response",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -10,7 +11,11 @@ from hank_model_transport.capability_execution import BoundCapabilityExecution
 from .runner_hooks_lifecycle import prepare_session_id, rebind_refreshed_credential
 from model_authority.thinking import parse_effort
 from .runner_stream_turn import STREAM_PROGRESS_LOG_INTERVAL
-from hank_model_transport.runtime_helpers import select_run_max_tokens
+from hank_model_transport.runtime_helpers import (
+  credential_identity,
+  rotated_execution,
+  select_run_max_tokens,
+)
 from .runner_streaming import _stream_with_stall_timeout
 from hank_model_transport.spend_metering import ProviderCallMeter
 from .transport_runtime import GATEWAY_SEND_PROMPT_RUNTIME
@@ -89,48 +94,25 @@ def _add_usage_from_event(usage: dict[str, Any], event: Any) -> None:
     _apply_provider_unit_deltas(usage, getattr(event, "provider_unit_deltas", None))
 
 
-async def provider_summarize(
-  *,
+def _resolve_attempt(
   capability_execution: BoundCapabilityExecution,
-  messages: list[dict[str, Any]],
-  system_prompt: str | list[tuple[str, bool]] | None,
-  tools: list[dict[str, Any]] | None = None,
+  requested_effort: Any,
   max_tokens: int,
-  request_kwargs: dict[str, Any] | None = None,
-  on_event: Callable[[dict[str, Any]], object] | None = None,
-  session_id: str | None = None,
-  call_site: str = "compaction",
-) -> ProviderSummarizeResult:
-  if not isinstance(capability_execution, BoundCapabilityExecution):
-    raise TypeError(
-      "provider summarize requires a BoundCapabilityExecution"
-    )
-  capability_execution.validate()
+) -> tuple[dict[str, Any], Any, int, Any]:
+  """Run config, model info, output limit and preserved effort for one bind."""
   provider = capability_execution.provider
   model = capability_execution.bind.upstream_model
-  requested_effort = parse_effort(
-    capability_execution.bind.effort,
-    field_name="capability_execution.effort",
-  )
-  if requested_effort is None:
-    raise ValueError("provider summarize requires an explicitly bound effort")
-
-  capability_execution.revalidate()
-
   run_config = dict(capability_execution.auth_config)
   run_config["auth_mode"] = str(run_config.get("auth_mode", "api")).strip().lower() or "api"
   if not provider.has_active_credential(run_config):
     raise RuntimeError(f"No active credential configured for provider={provider.name}")
 
   model_info = provider.get_model_info(model)
-  if int(max_tokens) <= 0:
-    raise ValueError("provider summarize max_tokens must be positive")
-  max_tokens_selection = select_run_max_tokens(
+  token_limit = select_run_max_tokens(
     run_config,
     model_info=model_info,
-    requested=int(max_tokens),
-  )
-  token_limit = max_tokens_selection.value
+    requested=max_tokens,
+  ).value
   effort_resolution = provider.resolve_effort(
     requested=requested_effort,
     model=model,
@@ -151,6 +133,42 @@ async def provider_summarize(
         f"with max_tokens={token_limit}"
       )
     )
+  return run_config, model_info, token_limit, effort_resolution
+
+
+async def provider_summarize(
+  *,
+  capability_execution: BoundCapabilityExecution,
+  messages: list[dict[str, Any]],
+  system_prompt: str | list[tuple[str, bool]] | None,
+  tools: list[dict[str, Any]] | None = None,
+  max_tokens: int,
+  request_kwargs: dict[str, Any] | None = None,
+  on_event: Callable[[dict[str, Any]], object] | None = None,
+  session_id: str | None = None,
+  call_site: str = "compaction",
+) -> ProviderSummarizeResult:
+  if not isinstance(capability_execution, BoundCapabilityExecution):
+    raise TypeError(
+      "provider summarize requires a BoundCapabilityExecution"
+    )
+  capability_execution.validate()
+  provider = capability_execution.provider
+  requested_effort = parse_effort(
+    capability_execution.bind.effort,
+    field_name="capability_execution.effort",
+  )
+  if requested_effort is None:
+    raise ValueError("provider summarize requires an explicitly bound effort")
+  if int(max_tokens) <= 0:
+    raise ValueError("provider summarize max_tokens must be positive")
+
+  capability_execution.revalidate()
+
+  run_config, model_info, token_limit, effort_resolution = _resolve_attempt(
+    capability_execution, requested_effort, int(max_tokens),
+  )
+  model = capability_execution.bind.upstream_model
   prepared = await provider.prepare_credential(
     run_config,
     model=model,
@@ -162,106 +180,127 @@ async def provider_summarize(
       capability_execution = rebound
       run_config = dict(rebound.auth_config)
       run_config["auth_mode"] = str(run_config.get("auth_mode", "api")).strip().lower() or "api"
-  bind = capability_execution.bind
-  meter = ProviderCallMeter(
-    runtime=GATEWAY_SEND_PROMPT_RUNTIME,
-    provider=provider,
-    provider_name=bind.provider,
-    model=model,
-    model_key=bind.model_key,
-    config=run_config,
-    call_site=call_site,
-    session_id=session_id,
-    attrs={"capability_id": bind.capability_id},
-  )
-  meter.enforce()
-  client = provider.create_client(run_config)
+  attempted_credentials = {credential_identity(run_config)}
+  client: Any = None
   try:
-    kwargs = dict(request_kwargs or {})
-    kwargs.update(
-      {
-        "auth_mode": run_config["auth_mode"],
-        "base_url": run_config.get("base_url") or run_config.get("baseURL"),
-        "compat": run_config.get("compat"),
-        "compaction_trigger": None,
-        "compaction_instructions": None,
-      }
-    )
-    params = provider.build_request_params(
-      model=model,
-      messages=messages,
-      system_prompt=system_prompt,
-      tools=list(tools or []),
-      max_tokens=token_limit,
-      thinking_level=requested_effort,
-      effort_resolution=effort_resolution,
-      **kwargs,
-    )
+    while True:
+      bind = capability_execution.bind
+      meter = ProviderCallMeter(
+        runtime=GATEWAY_SEND_PROMPT_RUNTIME,
+        provider=provider,
+        provider_name=bind.provider,
+        model=model,
+        model_key=bind.model_key,
+        config=run_config,
+        call_site=call_site,
+        session_id=session_id,
+        attrs={"capability_id": bind.capability_id},
+      )
+      meter.enforce()
+      client = provider.create_client(run_config)
+      kwargs = dict(request_kwargs or {})
+      kwargs.update(
+        {
+          "auth_mode": run_config["auth_mode"],
+          "base_url": run_config.get("base_url") or run_config.get("baseURL"),
+          "compat": run_config.get("compat"),
+          "compaction_trigger": None,
+          "compaction_instructions": None,
+        }
+      )
+      params = provider.build_request_params(
+        model=model,
+        messages=messages,
+        system_prompt=system_prompt,
+        tools=list(tools or []),
+        max_tokens=token_limit,
+        thinking_level=requested_effort,
+        effort_resolution=effort_resolution,
+        **kwargs,
+      )
 
-    pieces: list[str] = []
-    fallback_blocks: list[str] = []
-    thinking_pieces: list[str] = []
-    thinking_blocks: list[str] = []
-    usage = _empty_usage()
-    bind = capability_execution.bind
-    usage.update({
-      "capability_bind": bind.to_json(),
-    })
-    saw_tool_use = False
-    stream_started_at = time.monotonic()
-    next_heartbeat_at = stream_started_at + STREAM_PROGRESS_LOG_INTERVAL
-    stream_events = 0
-    async for event in _stream_with_stall_timeout(
-      meter.stream(client, params),
-      config=run_config,
-      model_info=model_info,
-      max_tokens=token_limit,
-      effort_resolution=effort_resolution,
-    ):
-      event_type = getattr(event, "type", "")
-      now = time.monotonic()
-      # A provider heartbeat (an SSE keepalive ping) is not progress, as in
-      # the turn stream's _consume_stream: a summary that only pings stays
-      # silent to the parent's guard.
-      if event_type != "heartbeat":
-        stream_events += 1
-        if on_event is not None and now >= next_heartbeat_at:
-          # Liveness signal, same shape as the turn stream's: a parent's
-          # activity guard stamps a child from it while the child streams a
-          # summary, which appends nothing else until it ends.
-          on_event({
-            "type": "heartbeat",
-            "elapsed_s": int(now - stream_started_at),
-            "last_progress_s": 0,
-            "events": stream_events,
-          })
-          next_heartbeat_at = now + STREAM_PROGRESS_LOG_INTERVAL
-      reported_model = getattr(event, "provider_reported_model", None)
-      if event_type == "message_start" and reported_model is not None:
-        usage["provider_reported_model"] = validate_reported_identity(
-          bind,
-          reported_model,
-          registry=capability_execution.registry,
+      pieces: list[str] = []
+      fallback_blocks: list[str] = []
+      thinking_pieces: list[str] = []
+      thinking_blocks: list[str] = []
+      usage = _empty_usage()
+      usage.update({
+        "capability_bind": bind.to_json(),
+      })
+      saw_tool_use = False
+      stream_started_at = time.monotonic()
+      next_heartbeat_at = stream_started_at + STREAM_PROGRESS_LOG_INTERVAL
+      stream_events = 0
+      try:
+        async for event in _stream_with_stall_timeout(
+          meter.stream(client, params),
+          config=run_config,
+          model_info=model_info,
+          max_tokens=token_limit,
+          effort_resolution=effort_resolution,
+        ):
+          event_type = getattr(event, "type", "")
+          now = time.monotonic()
+          # A provider heartbeat (an SSE keepalive ping) is not progress, as in
+          # the turn stream's _consume_stream: a summary that only pings stays
+          # silent to the parent's guard.
+          if event_type != "heartbeat":
+            stream_events += 1
+            if on_event is not None and now >= next_heartbeat_at:
+              # Liveness signal, same shape as the turn stream's: a parent's
+              # activity guard stamps a child from it while the child streams a
+              # summary, which appends nothing else until it ends.
+              on_event({
+                "type": "heartbeat",
+                "elapsed_s": int(now - stream_started_at),
+                "last_progress_s": 0,
+                "events": stream_events,
+              })
+              next_heartbeat_at = now + STREAM_PROGRESS_LOG_INTERVAL
+          reported_model = getattr(event, "provider_reported_model", None)
+          if event_type == "message_start" and reported_model is not None:
+            usage["provider_reported_model"] = validate_reported_identity(
+              bind,
+              reported_model,
+              registry=capability_execution.registry,
+            )
+          _add_usage_from_event(usage, event)
+          if event_type == "text_delta":
+            text = str(getattr(event, "text", "") or "")
+            if text:
+              pieces.append(text)
+          elif event_type == "text_end" and isinstance(getattr(event, "raw_block", None), dict):
+            block_text = str(event.raw_block.get("text") or "").strip()
+            if block_text:
+              fallback_blocks.append(block_text)
+          elif event_type == "thinking_delta":
+            thinking = str(getattr(event, "thinking_text", "") or "")
+            if thinking:
+              thinking_pieces.append(thinking)
+          elif event_type == "thinking_end" and isinstance(getattr(event, "raw_block", None), dict):
+            thinking_block = str(event.raw_block.get("thinking") or "").strip()
+            if thinking_block:
+              thinking_blocks.append(thinking_block)
+          elif event_type in {"tool_use_start", "tool_use_end"}:
+            saw_tool_use = True
+      except asyncio.CancelledError:
+        raise
+      except Exception as exc:
+        rotated = await asyncio.to_thread(
+          rotated_execution, capability_execution, exc, attempted_credentials,
         )
-      _add_usage_from_event(usage, event)
-      if event_type == "text_delta":
-        text = str(getattr(event, "text", "") or "")
-        if text:
-          pieces.append(text)
-      elif event_type == "text_end" and isinstance(getattr(event, "raw_block", None), dict):
-        block_text = str(event.raw_block.get("text") or "").strip()
-        if block_text:
-          fallback_blocks.append(block_text)
-      elif event_type == "thinking_delta":
-        thinking = str(getattr(event, "thinking_text", "") or "")
-        if thinking:
-          thinking_pieces.append(thinking)
-      elif event_type == "thinking_end" and isinstance(getattr(event, "raw_block", None), dict):
-        thinking_block = str(event.raw_block.get("thinking") or "").strip()
-        if thinking_block:
-          thinking_blocks.append(thinking_block)
-      elif event_type in {"tool_use_start", "tool_use_end"}:
-        saw_tool_use = True
+        if rotated is None:
+          raise
+        await provider.close_client(client, timeout=5.0)
+        client = None
+        capability_execution = rotated
+        provider = rotated.provider
+        model = rotated.bind.upstream_model
+        run_config, model_info, token_limit, effort_resolution = _resolve_attempt(
+          rotated, requested_effort, int(max_tokens),
+        )
+        continue
+      break
 
     summary_text = "".join(pieces).strip()
     if not summary_text:

@@ -1,32 +1,31 @@
 """Injected approval-clock walks, with deterministic replay and seeded discovery.
 
+Self-contained: imports only ``agent_gateway``, so the module runs from the package
+copy (``CONTRIBUTING.md``). The remote publication caller (``_commit``, in the
+monorepo's ``api``) is walked by ``tests/test_runtime_approval_clock_port.py``.
 The package's standalone pytest configuration does not load tests/fuzz's lane
-plugin. Both bounded lanes run by default; ``-k generated`` selects discovery.
-The denominator comes from the product AST; the clock witnesses actual callers.
+plugin. Both bounded lanes run by default (the generated lane is a fixed-seed
+stdlib walk, deterministic and bounded); ``-k generated`` selects discovery.
 """
 from __future__ import annotations
 
-import ast
 import asyncio
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-import inspect
 import os
 from pathlib import Path
+import random
 import sys
 from tempfile import TemporaryDirectory
 from typing import Any, Callable
 
 import pytest
-from hypothesis import HealthCheck, given, seed, settings
-from hypothesis import strategies as st
 
 from agent_gateway import approval_store as owner
 from agent_gateway.approval_policy import ApprovalRequest, ApprovalVote
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.tool_policy_registry import PreparedToolCall
-from api import runtime_approval_service as remote
 
 
 _BASE = 2_051_222_400_123_456_789
@@ -41,7 +40,6 @@ _OPERATIONS = (
   "autonomous_approval_delivery_recovery_window",
   "record_autonomous_approval_delivery_failure",
   "quarantine_autonomous_approval_delivery",
-  "_commit",
 )
 
 
@@ -126,18 +124,6 @@ def _prepare(path: Path, clock: _Clock, operation: str, suffix: str) -> tuple[SQ
   if operation == "ensure_autonomous_approval_delivery_audited":
     return store, lambda: asyncio.run(store.ensure_autonomous_approval_delivery_audited(**identity))
   asyncio.run(store.ensure_autonomous_approval_delivery_audited(**identity))
-  if operation == "_commit":
-    service = remote.RuntimeApprovalService(
-      services_root=path.parent, audit_hmac_secret=b"clock-walk",
-      audit_hmac_key_id="clock-walk",
-    )
-    reserved = service._reserve(store, 1, {
-      "decision_id": identity["approval_id"], "tool_call_id": identity["tool_call_id"],
-      "nonce": identity["nonce"], "approved": True,
-    })
-    reservation = reserved.reservation
-    assert reservation is not None
-    return store, lambda: service._commit(store, 1, reservation)
   if operation == "autonomous_approval_delivery_append_transaction":
     def publish() -> None:
       with store.autonomous_approval_delivery_append_transaction(**identity, approved=True):
@@ -189,21 +175,6 @@ def _walk(root: Path, steps: list[tuple[str, int]]) -> None:
       assert _high_water(reopened) == high_water
 
 
-def test_trusted_time_operation_denominator() -> None:
-  callers = []
-  for module in (owner, remote):
-    tree = ast.parse(inspect.getsource(module))
-    for function in ast.walk(tree):
-      if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        for node in ast.walk(function):
-          if isinstance(node, ast.Call):
-            name = (
-              node.func.id if isinstance(node.func, ast.Name)
-              else node.func.attr if isinstance(node.func, ast.Attribute) else None
-            )
-            if name == "_trusted_utc_now":
-              callers.append(function.name)
-  assert Counter(callers) == Counter(_OPERATIONS)
 
 
 @pytest.mark.parametrize("operation", _OPERATIONS)
@@ -211,19 +182,18 @@ def test_clock_walk_replay(tmp_path: Path, operation: str) -> None:
   _walk(tmp_path, [(operation, delta) for delta in (0, 1, -1, 1_000_001, -1_000, 0)])
 
 
-def test_remote_publication_equal_clock_regression(tmp_path: Path) -> None:
-  _walk(tmp_path, [("_commit", 0)])
-
-
-@seed(20261030)
-@settings(
-  max_examples=int(os.environ.get("FUZZ_DISCOVERY_EXAMPLES", "40")),
-  deadline=None, database=None,
-  suppress_health_check=[HealthCheck.function_scoped_fixture],
-)
-@given(st.lists(st.tuples(st.sampled_from(_OPERATIONS), st.integers(-1_000_000, 1_000_000)), min_size=1, max_size=12))
-def test_generated_clock_walk(tmp_path: Path, steps: list[tuple[str, int]]) -> None:
-  _walk(tmp_path, steps)
+def test_generated_clock_walk(tmp_path: Path) -> None:
+  rng = random.Random(20261030)
+  for _ in range(int(os.environ.get("FUZZ_DISCOVERY_EXAMPLES", "40"))):
+    steps = [
+      (rng.choice(_OPERATIONS), rng.randint(-1_000_000, 1_000_000))
+      for _ in range(rng.randint(1, 12))
+    ]
+    try:
+      _walk(tmp_path, steps)
+    except Exception as exc:
+      exc.add_note(f"generated steps: {steps!r}")
+      raise
 
 
 def test_default_clock_is_resolved_after_construction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -259,7 +229,7 @@ def test_executable_binding_expiry_uses_clock(tmp_path: Path, delta: int) -> Non
       "tool_call_id": original.tool_call_id, "nonce": "nonce-clock",
       "tenant_storage_id": "owner", "tool_name": original.tool_name,
       "prepared_call": PreparedToolCall(prepared_input={}),
-      "dispatch_context": {}, "credential_generation_ref": None,
+      "dispatch_context": {"registry_scope": {"scope_type": "none"}}, "credential_generation_ref": None,
     }
     await store.record_executable_binding(**binding)
     await store.link_root_turn_executable_binding(

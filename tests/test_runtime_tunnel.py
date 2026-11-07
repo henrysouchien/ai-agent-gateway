@@ -5,9 +5,11 @@ import asyncio
 import json
 import os
 
+import pytest
+
 from agent_gateway.runtime_tunnel import (
   MAX_FRAME_CHARS, MAX_FRAMES_PER_SECOND, RESP_MAX_BODY_BYTES,
-  TunnelEndpoint, TunnelRequest, TunnelResponse,
+  TunnelEndpoint, TunnelFrameError, TunnelRequest, TunnelResponse,
 )
 
 def test_large_bodies_and_many_chunks_cross_within_frame_limits() -> None:
@@ -232,4 +234,111 @@ def test_single_frame_resp_negotiation_and_streaming_fallbacks() -> None:
     finally:
       for task in pumps:
         task.cancel()
+  asyncio.run(scenario())
+
+
+def _frame(**fields: object) -> str:
+  return json.dumps(fields)
+
+
+def test_malformed_request_frame_fails_that_request_and_never_reaches_the_handler() -> None:
+  async def scenario() -> None:
+    delivered: list[TunnelRequest] = []
+    sent: list[dict] = []
+    complete = asyncio.Event()
+
+    async def send(text: str) -> None:
+      frame = json.loads(text)
+      sent.append(frame)
+      complete.set()
+
+    async def handler(request: TunnelRequest) -> TunnelResponse:
+      delivered.append(request)
+
+      async def chunks():
+        yield b"ok"
+      return TunnelResponse(200, [], chunks())
+
+    endpoint = TunnelEndpoint(send=send, handler=handler, odd_ids=False)
+    good = dict(t="req", method="POST", path="/p", headers=[["a", "b"]], body="ZXhhY3Q=")
+    try:
+      for index, bad in enumerate((
+        {**good, "body": "!"}, {**good, "body": "ZXhhY3Q"}, {**good, "body": None}, {**good, "body": 5},
+        {**good, "method": 7}, {**good, "path": None}, {**good, "headers": [["a"]]},
+        {**good, "headers": [["a", 1]]}, {**good, "headers": {"a": "b"}},
+        {key: value for key, value in good.items() if key != "body"},
+      )):
+        complete.clear()
+        await endpoint.feed(json.dumps({**bad, "id": 2 * index + 1}))
+        await asyncio.wait_for(complete.wait(), 1)
+        assert sent[-1] == {"t": "fail", "id": 2 * index + 1, "error": "TunnelFrameError"}
+      assert delivered == []
+      complete.clear()
+      await endpoint.feed(json.dumps({**good, "id": 99}))
+      await asyncio.wait_for(complete.wait(), 1)
+      assert delivered == [TunnelRequest("POST", "/p", [("a", "b")], b"exact")]
+      assert not endpoint.closed
+    finally:
+      endpoint.close()
+  asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("text", [
+  "{", "[]", "null", _frame(t="frag", s=1, last=True), _frame(t="frag", s="x", last=1),
+  _frame(t="req", id=True, method="GET", path="/", headers=[], body=""),
+  _frame(t="req", id="1", method="GET", path="/", headers=[], body=""),
+  _frame(t="control", kind="bootstrap", body=[]), _frame(t="control", kind="bootstrap"),
+  _frame(t="control", kind=None, body={}), _frame(t="control", kind="bootstrap", body={"tunnel_features": "resp"}),
+  _frame(t="control", kind="bootstrap", body={"tunnel_features": [1]}),
+  _frame(t="resp", id=1, status=True, headers=[], b64=""), _frame(t="resp", id=1, status=200, headers=[], b64="!"),
+  _frame(t="resp", id=1, status=200, headers=[], b64=None), _frame(t="head", id=1, status="200", headers=[]),
+  _frame(t="head", id=1, status=200, headers=[["a", None]]), _frame(t="data", id=1, b64="!"),
+  _frame(t="data", id=1), _frame(t="end", id=None), _frame(t="fail", id=1, error=None),
+])
+def test_malformed_frame_raises_the_declared_error_and_changes_nothing(text: str) -> None:
+  async def scenario() -> None:
+    controls: list[tuple[str, dict]] = []
+
+    async def send(_text: str) -> None:
+      return None
+
+    async def on_control(kind: str, body: dict) -> None:
+      controls.append((kind, body))
+
+    endpoint = TunnelEndpoint(send=send, handler=None, on_control=on_control, odd_ids=False)
+    request = asyncio.create_task(endpoint.request("GET", "/", [], b""))
+    await asyncio.sleep(0)
+    try:
+      with pytest.raises(TunnelFrameError):
+        await endpoint.feed(text)
+      assert controls == []
+      assert not endpoint.single_frame_responses
+      assert not request.done()
+    finally:
+      endpoint.close()
+      await asyncio.gather(request, return_exceptions=True)
+  asyncio.run(scenario())
+
+
+def test_exact_frames_still_decode_and_unknown_frame_kinds_stay_ignored() -> None:
+  async def scenario() -> None:
+    controls: list[tuple[str, dict]] = []
+
+    async def send(_text: str) -> None:
+      return None
+
+    async def on_control(kind: str, body: dict) -> None:
+      controls.append((kind, body))
+
+    endpoint = TunnelEndpoint(send=send, handler=None, on_control=on_control, odd_ids=False)
+    try:
+      await endpoint.feed(_frame(t="control", kind="bootstrap", body={"tunnel_features": ["resp"], "x": 1}))
+      assert controls == [("bootstrap", {"tunnel_features": ["resp"], "x": 1})]
+      assert endpoint.single_frame_responses
+      await endpoint.feed(_frame(t="control", kind="lease", body={}))
+      assert controls[-1] == ("lease", {})
+      await endpoint.feed(_frame(t="unheard-of", id=1))
+      await endpoint.feed(_frame(t="resp", id=404, status=200, headers=[], b64=""))
+    finally:
+      endpoint.close()
   asyncio.run(scenario())

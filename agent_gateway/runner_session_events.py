@@ -116,17 +116,26 @@ def release_write_lease(write_lease_file: Any, *, clear_write_lease_file: Callab
   return True
 
 
+ANALYST_CONTENT_UNSET = object()
+
+
 def build_user_message_event(
   *,
   content: Any,
   client_kind: str,
   received_at: float,
   selected_content: tuple[dict[str, object], ...],
+  analyst_content: Any = ANALYST_CONTENT_UNSET,
   operator_messages: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
 ) -> Dict[str, Any]:
+  if analyst_content is ANALYST_CONTENT_UNSET:
+    analyst_content = content
+  if not isinstance(analyst_content, (str, list)):
+    raise TypeError("analyst content must be text or a content block list")
   payload: Dict[str, Any] = {
     "type": "user_message",
     "content": content,
+    "analyst_content": analyst_content,
     "client_kind": client_kind,
     "received_at": received_at,
     "selected_content": list(selected_content),
@@ -363,11 +372,20 @@ def _normalized_dispatch_record(dispatch: Mapping[str, Any]) -> Dict[str, Any]:
   return record
 
 
-def build_turn_complete_event(*, turn: int, usage: Dict[str, Any]) -> Dict[str, Any]:
+def build_turn_complete_event(
+  *, turn: int, usage: Dict[str, Any], upstream_model: str,
+) -> Dict[str, Any]:
+  """One completed model turn; ``upstream_model`` is the model that answered it.
+
+  A model_fallback hop rebinds the runner mid-run, so the model that served a
+  turn is not recoverable from the run's first bind.
+  """
+
   return {
     "type": "turn_complete",
     "turn": turn,
     "usage": dict(usage),
+    "upstream_model": upstream_model,
   }
 
 
@@ -472,7 +490,7 @@ def build_refusal_event(stop_details: Dict[str, Any] | None) -> Dict[str, Any]:
 def build_stream_complete_event(
   *,
   usage_totals: Dict[str, int],
-  estimated_cost: float,
+  estimated_cost: float | None,
   est_system_tokens: int,
   est_tools_tokens: int,
   todo_measurements: Dict[str, int] | None = None,
@@ -489,7 +507,7 @@ def build_stream_complete_event(
       "reasoning_tokens_observed": usage_totals.get("reasoning_tokens_observed", 0),
       "provider_wait_ms": usage_totals.get("provider_wait_ms", 0),
       "thinking_chars": usage_totals.get("thinking_chars", 0),
-      "estimated_cost": round(estimated_cost, 4),
+      "estimated_cost": None if estimated_cost is None else round(estimated_cost, 4),
       "est_system_tokens": est_system_tokens,
       "est_tools_tokens": est_tools_tokens,
     },
@@ -646,6 +664,11 @@ def build_stream_retry_event(
   error: str,
   attempt_elapsed_s: float,
   backoff_s: float | None,
+  settlement: Literal["retry", "preserve_partial"] = "retry",
+  retained_text_chars: int = 0,
+  retained_reasoning_chars: int = 0,
+  discarded_text_chars: int = 0,
+  discarded_reasoning_chars: int = 0,
 ) -> Dict[str, Any]:
   """``attempt_elapsed_s``: monotonic seconds from the failed attempt's start
   (after its own backoff sleep) to this retry. ``backoff_s``: the delay the
@@ -656,6 +679,13 @@ def build_stream_retry_event(
     "error": str(error),
     "attempt_elapsed_s": attempt_elapsed_s,
     "backoff_s": backoff_s,
+    "settlement": settlement,
+    "resumed_text_chars": 0,
+    "resumed_reasoning_chars": 0,
+    "discarded_text_chars": discarded_text_chars,
+    "discarded_reasoning_chars": discarded_reasoning_chars,
+    "retained_text_chars": retained_text_chars,
+    "retained_reasoning_chars": retained_reasoning_chars,
     **_provider_error_event_fields(error),
   }
 

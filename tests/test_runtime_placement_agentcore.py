@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from email.utils import formatdate
 from fnmatch import fnmatchcase
 import json
+from io import BytesIO
 from pathlib import Path
 import stat
 import threading
 from typing import Any
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -27,6 +30,7 @@ from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
 from agent_gateway.runtime_placement import DESK_LEASE_SECONDS, DeskLeaseRefused, RuntimePlacement
 from agent_gateway.runtime_placement_agentcore import (
   AgentCoreRuntimeBackend,
+  desk_observer_policy,
   desk_prelease_policy,
   desk_session_policy,
   generate_ws_connection,
@@ -43,6 +47,7 @@ from hank_model_transport.user_runtime_credentials import (
 
 ORG_KEY = "agentcore-test-org-authority-at-least-32-bytes"
 RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-2:123456789012:runtime/test_runtime-abc123"
+RUNTIME_QUALIFIER = "ai_0123456789ab_abcdef012345"
 ROLE_ARN = "arn:aws:iam::123456789012:role/desk-replica"
 BUCKET = "private-desk-replicas"
 SESSION_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"
@@ -52,7 +57,7 @@ IDENTITY = UserRuntimeIdentity(
 )
 SHARED_ENV = {
   "AGENT_API_USER_CLAIM_HMAC_KEY": ORG_KEY,
-  "GATEWAY_USER_KEYS": '[{"key":"other-user-secret"}]',
+  "GATEWAY_USER_KEYS": '[{"slug":"other-user","risk_user_id":18,"key":"other-user-secret"}]',
   "GATEWAY_API_KEY_WEB": "shared-web-authority",
   "GATEWAY_RESOLVER_HMAC_KEY": "shared-resolver-signing-authority",
   "RISK_MODULE_RESOLVER_URL": "https://private-resolver.example.test",
@@ -79,6 +84,40 @@ async def _body(*chunks: bytes) -> AsyncIterator[bytes]:
     yield chunk
 
 
+class _FakeWriterClient:
+  def __init__(self, owner: _FakeSession) -> None:
+    self.owner = owner
+
+  def list_objects_v2(self, *, Bucket: str, Prefix: str) -> dict[str, Any]:
+    assert Bucket == BUCKET
+    storage_id = Prefix.split("/")[1]
+    assert Prefix == f"users/{storage_id}/writer.json"
+    self.owner.events.append(("read", storage_id))
+    now = self.owner.writer_now
+    self.owner.writer_now += self.owner.writer_clock_step
+    response: dict[str, Any] = {"ResponseMetadata": {"HTTPHeaders": {"date": formatdate(now, usegmt=True)}}}
+    if storage_id in self.owner.writers:
+      response["Contents"] = [{"Key": Prefix}]
+    return response
+
+  def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+    assert Bucket == BUCKET
+    storage_id = Key.split("/")[1]
+    now = self.owner.writer_now
+    self.owner.writer_now += self.owner.writer_clock_step
+    headers = {"date": formatdate(now, usegmt=True)}
+    record = self.owner.writers.get(storage_id)
+    if record is None:
+      raise ClientError({
+        "Error": {"Code": "NoSuchKey", "Message": "writer absent"},
+        "ResponseMetadata": {"HTTPHeaders": headers},
+      }, "GetObject")
+    return {
+      "Body": BytesIO(json.dumps(record).encode()),
+      "ResponseMetadata": {"HTTPHeaders": headers},
+    }
+
+
 class _FakeSession:
   def __init__(self) -> None:
     self.credentials = Credentials("EDGEACCESS", "edge-secret", "edge-session-token")
@@ -87,12 +126,17 @@ class _FakeSession:
     self.stop_calls: list[dict[str, Any]] = []
     self.expirations: list[datetime] = []
     self.stop_error: ClientError | None = None
-
-  def client(self, name: str, region_name: str | None = None) -> _FakeSession:
-    assert name in {"sts", "bedrock-agentcore"}
+    self.writers: dict[str, dict[str, Any]] = {}
+    self.writer_now = datetime.now(timezone.utc).timestamp()
+    self.writer_clock_step = 0.0
+    self.events: list[tuple[str, str]] = []
+  def client(self, name: str, region_name: str | None = None, **kwargs: Any) -> Any:
+    assert name in {"sts", "bedrock-agentcore", "s3"}
     self.client_calls.append((name, region_name))
+    if name == "s3":
+      assert set(kwargs) == {"aws_access_key_id", "aws_secret_access_key", "aws_session_token"}
+      return _FakeWriterClient(self)
     return self
-
   def get_credentials(self) -> Credentials:
     return self.credentials
 
@@ -111,7 +155,7 @@ class _FakeSession:
     }}
 
   def stop_runtime_session(self, **kwargs: Any) -> dict[str, Any]:
-    assert kwargs["agentRuntimeArn"] == RUNTIME_ARN
+    self.events.append(("stop", kwargs["runtimeSessionId"]))
     assert isinstance(kwargs["runtimeSessionId"], str)
     self.stop_calls.append(kwargs)
     if self.stop_error is not None:
@@ -150,6 +194,9 @@ class _FakeRuntime:
     self.leases: dict[str, dict[str, Any]] = {}
     self.next_epoch = 41
     self.refusal: str | None = None
+    # Admission frames the edge sent, and sessions that will not acknowledge them.
+    self.admissions: list[tuple[str, dict[str, Any]]] = []
+    self.admission_silent: set[str] = set()
     self.refusal_writer: dict[str, Any] | None = None
     self.lease_override: dict[str, Any] | None = None
     self.writer_owner: Any = None
@@ -159,6 +206,7 @@ class _FakeRuntime:
     self.connect_calls: list[tuple[str, dict[str, str]]] = []
     self.changed = threading.Condition()
     self.stream_release: asyncio.Event | None = None
+    self.lease_gate: asyncio.Event | None = None
     self.ready_gate: asyncio.Event | None = None
     self.health_status = 200
     self.thread.start()
@@ -202,10 +250,14 @@ class _FakeRuntime:
           self.initializations.setdefault(session_id, body)
         elif kind == "credentials":
           self.credential_updates.append((session_id, body))
+        elif kind == "admission":
+          self.admissions.append((session_id, body))
         else:
           raise AssertionError(f"Unexpected edge control: {kind}")
         self.changed.notify_all()
       if kind == "bootstrap":
+        if self.lease_gate is not None:
+          await self.lease_gate.wait()
         if self.writer_owner is not None and session_id not in self.leases:
           try:
             self.leases[session_id] = self.writer_owner.acquire(session_id)
@@ -228,6 +280,9 @@ class _FakeRuntime:
           }
           self.next_epoch += 1
         await endpoint.control("lease", self.leases[session_id] if self.lease_override is None else self.lease_override)
+      elif kind == "admission":
+        if session_id not in self.admission_silent:
+          await endpoint.control("admission", body)
       elif kind == "credentials":
         if "bundle" in body:
           assert body["bundle"]["generation"] == self.leases[session_id]["epoch"]
@@ -287,6 +342,10 @@ class _FakeRuntime:
     with self.changed:
       assert self.changed.wait_for(lambda: len(self.bootstraps) >= count, timeout=5)
 
+  def wait_admissions(self, count: int) -> None:
+    with self.changed:
+      assert self.changed.wait_for(lambda: len(self.admissions) >= count, timeout=5)
+
   def wait_credentials(self, count: int) -> None:
     with self.changed:
       assert self.changed.wait_for(lambda: len(self.credential_updates) >= count, timeout=5)
@@ -311,6 +370,16 @@ class _FakeRuntime:
 
     asyncio.run_coroutine_threadsafe(disconnect(), self.loop).result(timeout=5)
 
+  def hold_lease(self) -> None:
+    async def hold() -> None:
+      self.lease_gate = asyncio.Event()
+
+    asyncio.run_coroutine_threadsafe(hold(), self.loop).result(timeout=5)
+
+  def release_lease(self) -> None:
+    if self.lease_gate is not None:
+      self.loop.call_soon_threadsafe(self.lease_gate.set)
+
   def hold_ready(self) -> None:
     async def hold() -> None:
       self.ready_gate = asyncio.Event()
@@ -327,6 +396,8 @@ class _FakeRuntime:
         self.stream_release.set()
       if self.ready_gate is not None:
         self.ready_gate.set()
+      if self.lease_gate is not None:
+        self.lease_gate.set()
       if self.server is not None:
         self.server.close()
         await self.server.wait_closed()
@@ -369,10 +440,16 @@ def egress_requests() -> list[TunnelRequest]:
 
 
 @pytest.fixture
+def runtime_qualifier() -> str:
+  return RUNTIME_QUALIFIER
+
+
+@pytest.fixture
 def backend(
   tmp_path: Path, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
   egress_calls: list[tuple[UserRuntimeIdentity, str, int, Mapping[str, str]]],
-  egress_requests: list[TunnelRequest],
+  egress_requests: list[TunnelRequest], runtime_qualifier: str,
+  monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[AgentCoreRuntimeBackend]:
   def egress_factory(
     identity: UserRuntimeIdentity, storage_id: str, placement_generation: int, config: Mapping[str, str],
@@ -387,14 +464,20 @@ def backend(
 
   runtime = AgentCoreRuntimeBackend(
     placement_root=tmp_path / "placements", org_claim_key=ORG_KEY,
-    runtime_arn=RUNTIME_ARN, desk_bucket=BUCKET, desk_role_arn=ROLE_ARN,
+    runtime_arn=RUNTIME_ARN, runtime_qualifier=runtime_qualifier,
+    desk_bucket=BUCKET, desk_role_arn=ROLE_ARN,
     extra_env=SHARED_ENV, egress_factory=egress_factory,
     session=aws_session, connect=fake_runtime.connect, ready_timeout=5,
+  )
+  monkeypatch.setattr(
+    "agent_gateway.runtime_placement_agentcore._supervise_agentcore_shutdown",
+    lambda **_kwargs: runtime._shutdown_owned(),
   )
   try:
     yield runtime
   finally:
     runtime.close()
+    assert runtime._thread is not None and runtime._loop is not None
     assert not runtime._thread.is_alive()
     assert runtime._loop.is_closed()
 
@@ -450,6 +533,26 @@ def test_prelease_policy_can_only_cas_writer_and_read_desk_until_deadline() -> N
   }
 
 
+def test_observer_policy_can_only_list_and_read_exact_writer_until_deadline() -> None:
+  policy = desk_observer_policy(BUCKET, "17", LEASE_DEADLINE.timestamp())
+  deadline = {"DateLessThan": {"aws:CurrentTime": "2026-10-30T12:34:56.123456Z"}}
+  assert policy == {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow", "Action": "s3:GetObject",
+        "Resource": f"arn:aws:s3:::{BUCKET}/users/17/writer.json", "Condition": deadline,
+      },
+      {
+        "Effect": "Allow", "Action": "s3:ListBucket",
+        "Resource": f"arn:aws:s3:::{BUCKET}",
+        "Condition": {"StringEquals": {"s3:prefix": "users/17/writer.json"}, **deadline},
+      },
+    ],
+  }
+  assert "PutObject" not in json.dumps(policy) and "DeleteObject" not in json.dumps(policy)
+
+
 @pytest.mark.parametrize(("storage_id", "prefix", "allowed"), [
   ("17", "users/17/", True),
   ("17", "users/17/research.db", True),
@@ -470,6 +573,25 @@ def test_listbucket_prefix_cannot_enumerate_numeric_siblings(
   assert any(fnmatchcase(prefix, pattern) for pattern in patterns) is allowed
 
 
+def test_stop_and_replace_retain_historical_generations_for_later_proof(
+  backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime,
+) -> None:
+  first = backend.start("17", IDENTITY, _desk())
+  assert first.handle is not None
+  fake_runtime.writer_owner = _ExpiredWriterOwner(fake_runtime.leases[first.handle], first.generation + 1)
+  replacement = backend.replace(first)
+  assert replacement.handle is not None
+  assert set(backend.store.list_shutdown_sessions()) == {
+    (first.handle, "17", first.generation),
+    (replacement.handle, "17", replacement.generation),
+  }
+  backend.stop(replacement)
+  assert set(backend.store.list_shutdown_sessions()) == {
+    (first.handle, "17", first.generation),
+    (replacement.handle, "17", replacement.generation),
+  }
+
+
 def test_websocket_sigv4_url_and_headers_are_deterministic(
   monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -478,7 +600,9 @@ def test_websocket_sigv4_url_and_headers_are_deterministic(
   credentials = Credentials(
     "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "fixed-session-token",
   )
-  url, headers = generate_ws_connection(RUNTIME_ARN, "test-session-one", "us-east-2", credentials)
+  url, headers = generate_ws_connection(
+    RUNTIME_ARN, "test-session-one", "us-east-2", credentials, runtime_qualifier="DEFAULT",
+  )
   assert url == (
     "wss://bedrock-agentcore.us-east-2.amazonaws.com/runtimes/"
     "arn%3Aaws%3Abedrock-agentcore%3Aus-east-2%3A123456789012%3Aruntime%2F"
@@ -496,7 +620,7 @@ def test_websocket_sigv4_url_and_headers_are_deterministic(
     SESSION_HEADER: "test-session-one",
   }
   second_url, second_headers = generate_ws_connection(
-    RUNTIME_ARN, "test-session-two", "us-east-2", credentials,
+    RUNTIME_ARN, "test-session-two", "us-east-2", credentials, runtime_qualifier="DEFAULT",
   )
   assert second_url == url
   assert second_headers == {**headers, SESSION_HEADER: "test-session-two"}
@@ -508,6 +632,48 @@ def test_websocket_sigv4_url_and_headers_are_deterministic(
   }
 
 
+def test_websocket_endpoint_qualifier_is_part_of_the_signed_query(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  instant = datetime(2026, 10, 13, 12, 34, 56, tzinfo=timezone.utc)
+  monkeypatch.setattr("botocore.auth.get_current_datetime", lambda: instant)
+  credentials = Credentials("EDGEACCESS", "edge-secret", "edge-session-token")
+  qualifiers = ("DEFAULT", RUNTIME_QUALIFIER, "ai_fedcba987654_543210fedcba")
+  connections = [
+    generate_ws_connection(
+      RUNTIME_ARN, "same-user-session", "us-east-2", credentials, runtime_qualifier=qualifier,
+    )
+    for qualifier in qualifiers
+  ]
+  assert [parse_qs(urlsplit(url).query) for url, _ in connections] == [
+    {"qualifier": [qualifier]} for qualifier in qualifiers
+  ]
+  # Identical credentials, time, runtime and session isolate the signed query:
+  # appending a qualifier after signing would leave these signatures equal.
+  assert len({headers["Authorization"] for _, headers in connections}) == len(qualifiers)
+
+
+@pytest.mark.parametrize("runtime_qualifier", [
+  RUNTIME_QUALIFIER, "ai_fedcba987654_543210fedcba",
+])
+def test_backend_connects_and_stops_at_the_configured_endpoint(
+  backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
+  runtime_qualifier: str,
+) -> None:
+  placement = backend.start("17", IDENTITY, _desk())
+  assert fake_runtime.connect_calls
+  assert all(
+    parse_qs(urlsplit(url).query) == {"qualifier": [runtime_qualifier]}
+    and headers[SESSION_HEADER] == placement.handle
+    for url, headers in fake_runtime.connect_calls
+  )
+  backend.stop(placement)
+  assert aws_session.stop_calls == [{
+    "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": placement.handle,
+    "qualifier": runtime_qualifier,
+  }]
+
+
 def test_cold_start_mints_prelease_only_after_websocket_connects(
   backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
   monkeypatch: pytest.MonkeyPatch,
@@ -515,7 +681,10 @@ def test_cold_start_mints_prelease_only_after_websocket_connects(
   import agent_gateway.runtime_placement_agentcore as owner
 
   now = [LEASE_DEADLINE.timestamp()]
-  monkeypatch.setattr(owner, "time", SimpleNamespace(time=lambda: now[0]))
+  import time as real_time
+  monkeypatch.setattr(owner, "time", SimpleNamespace(
+    time=lambda: now[0], monotonic=real_time.monotonic, sleep=real_time.sleep,
+  ))
 
   @asynccontextmanager
   async def cold_connect(*args: Any, **kwargs: Any):
@@ -736,7 +905,7 @@ def test_stop_uses_runtime_session_and_replacement_advances_generation(
   assert backend.start("17", IDENTITY, _desk()) == replacement
   assert Path(replacement.bundle_path).read_bytes() == retained_bundle
   assert aws_session.stop_calls == [{
-    "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": first.handle, "qualifier": "DEFAULT",
+    "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": first.handle, "qualifier": RUNTIME_QUALIFIER,
   }]
   assert [session_id for session_id, _ in fake_runtime.bootstraps] == [
     first.handle, replacement.handle,
@@ -758,7 +927,7 @@ def test_stop_uses_runtime_session_and_replacement_advances_generation(
   assert backend.store.get("17") == stopped
   assert not backend.health(stopped)
   assert aws_session.stop_calls[-1] == {
-    "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": replacement.handle, "qualifier": "DEFAULT",
+    "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": replacement.handle, "qualifier": RUNTIME_QUALIFIER,
   }
 
 
@@ -911,6 +1080,40 @@ def test_socket_reconnect_reuses_session_and_idempotent_bootstrap(
   asyncio.run(asyncio.wait_for(scenario(), timeout=10))
 
 
+def test_self_admission_close_is_acknowledged_redelivered_on_reconnect_and_reopened(
+  backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  placement = backend.start("17", IDENTITY, _desk())
+  handle = placement.handle
+  assert handle is not None
+  # Every connect delivers the edge's current state after bootstrap.
+  fake_runtime.wait_admissions(1)
+  assert [body["closed"] for _, body in fake_runtime.admissions] == [False]
+  controls = [frame["kind"] for frame in fake_runtime.edge_frames if frame["t"] == "control"]
+  assert controls.index("bootstrap") < controls.index("admission")
+
+  assert backend.close_self_admission([placement]) == frozenset({"17"})
+  assert fake_runtime.admissions[-1][1]["closed"] is True
+  fake_runtime.drop(handle)
+  fake_runtime.wait_bootstraps(2)
+  fake_runtime.wait_admissions(3)
+  assert fake_runtime.admissions[-1][0] == handle and fake_runtime.admissions[-1][1]["closed"] is True
+
+  backend.open_self_admission()
+  fake_runtime.wait_admissions(4)
+  assert fake_runtime.admissions[-1][1]["closed"] is False
+  seqs = [body["seq"] for _, body in fake_runtime.admissions]
+  assert seqs == sorted(set(seqs))
+
+  # An unacknowledged close is bounded and not confirmed.
+  monkeypatch.setattr("agent_gateway.runtime_placement_agentcore.SELF_ADMISSION_CONFIRM_SECONDS", 0.2)
+  fake_runtime.admission_silent.add(handle)
+  assert backend.close_self_admission([placement]) == frozenset()
+  assert fake_runtime.admissions[-1][1]["closed"] is True
+  assert backend.health(placement)
+
+
+
 def test_desk_credentials_remint_only_on_actual_lease_deadline_and_reconnect(
   backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
 ) -> None:
@@ -995,7 +1198,7 @@ def test_missing_aws_session_stops_locally_and_allows_a_new_generation(
     placement.generation, restarted.generation,
   ]
   assert aws_session.stop_calls == [{
-    "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": placement.handle, "qualifier": "DEFAULT",
+    "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": placement.handle, "qualifier": RUNTIME_QUALIFIER,
   }]
   assert backend.health(restarted)
 
@@ -1014,7 +1217,7 @@ def test_aws_stop_errors_preserve_the_handle_for_retry(
   assert retained.handle == placement.handle
   assert retained.generation == placement.generation
   assert aws_session.stop_calls == [{
-    "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": placement.handle, "qualifier": "DEFAULT",
+    "agentRuntimeArn": RUNTIME_ARN, "runtimeSessionId": placement.handle, "qualifier": RUNTIME_QUALIFIER,
   }]
   aws_session.stop_error = None
   stopped = backend.stop(retained)
@@ -1119,3 +1322,144 @@ def test_lease_control_parses_writer_record_before_minting_or_placement(
   assert not (backend.placement_root / "17" / "bundle.json").exists()
   assert len(aws_session.assume_calls) == 1
   assert fake_runtime.credential_updates == []
+
+
+@pytest.mark.parametrize("runtime_qualifier", [
+  RUNTIME_QUALIFIER, "ai_fedcba987654_543210fedcba",
+])
+def test_shutdown_stops_live_starting_retained_and_preplacement_handles_before_g6_waits(
+  backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
+  runtime_qualifier: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  backend.store.retain_shutdown_session("20", "hank-u20-retained-prelease")
+  first = backend.start("17", IDENTITY, _desk())
+  second = backend.start("18", replace(IDENTITY, risk_user_id=18), _desk())
+  assert first.handle is not None and second.handle is not None
+  # Shutdown owns persisted handles independently of their routing state.
+  backend.store.upsert(replace(first, state="starting"))
+  backend.store.upsert(replace(second, state="stopped"))
+
+  # A restore can hold an in-memory AWS session before its lease event creates
+  # the placement row. Store-only census would orphan precisely this handle.
+  fake_runtime.hold_lease()
+  from agent_gateway.runtime_placement_agentcore import _Session
+  pending = _Session("19", replace(IDENTITY, risk_user_id=19), "hank-u19-prelease")
+  backend._submit(backend._launch_session(pending)).result()
+  fake_runtime.wait_bootstraps(3)
+  assert backend.store.get("19") is None
+
+  now = aws_session.writer_now
+  aws_session.writers["17"] = {
+    **fake_runtime.leases[first.handle], "expires_at": now + 2, "state": "released",
+  }
+  aws_session.writers["18"] = {
+    **fake_runtime.leases[second.handle], "epoch": second.generation + 1,
+    "expires_at": now + 3600, "state": "held",
+  }
+  aws_session.writers["19"] = {
+    "epoch": 999, "holder": "unknown-prelease-writer", "expires_at": now + 2, "state": "held",
+  }
+  aws_session.writer_clock_step = 1
+  import agent_gateway.runtime_placement_agentcore as owner
+  import time as real_time
+  monkeypatch.setattr(owner, "time", SimpleNamespace(
+    time=real_time.time, monotonic=real_time.monotonic, sleep=lambda _seconds: None,
+  ))
+
+  backend.shutdown()
+
+  assert {call["runtimeSessionId"] for call in aws_session.stop_calls} == {
+    first.handle, second.handle, "hank-u19-prelease", "hank-u20-retained-prelease",
+  }
+  assert all(call["qualifier"] == runtime_qualifier for call in aws_session.stop_calls)
+  first_read = next(index for index, event in enumerate(aws_session.events) if event[0] == "read")
+  assert all(event[0] == "stop" for event in aws_session.events[:first_read])
+  assert {"17", "18", "19", "20"} <= {
+    event[1] for event in aws_session.events if event[0] == "read"
+  }
+  # A newer legitimate epoch proves the old deadline passed; its renewal is
+  # not our shutdown's to await. Unknown pre-placement writers stay conservative.
+  assert sum(event == ("read", "18") for event in aws_session.events) == 1
+  for storage_id in ("17", "18"):
+    stored = backend.store.get(storage_id)
+    assert stored is not None and stored.state == "stopped" and stored.handle is None
+  assert backend.store.get("19") is None
+  assert backend._thread is not None and backend._loop is not None
+  assert not backend._thread.is_alive() and backend._loop.is_closed()
+  assert backend.store.list_shutdown_sessions() == []
+
+
+def test_observer_expiry_covers_remaining_observation_budget_not_writer_deadline(
+  backend: AgentCoreRuntimeBackend, aws_session: _FakeSession,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  import agent_gateway.runtime_placement_agentcore as owner
+
+  monkeypatch.setattr(owner, "time", SimpleNamespace(
+    time=lambda: 1000.0, monotonic=lambda: 50.0, sleep=lambda _seconds: None,
+  ))
+  backend._await_writer_safe("20", None, 100.0)
+  assert aws_session.assume_calls == [{
+    "RoleArn": ROLE_ARN, "RoleSessionName": "hank-desk-20-observer", "DurationSeconds": 900,
+    "Policy": json.dumps(desk_observer_policy(BUCKET, "20", 1110.0)),
+  }]
+
+
+def test_shutdown_writer_proof_failure_is_non_successful_and_retains_handle(
+  backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  placement = backend.start("17", IDENTITY, _desk())
+  assert placement.handle is not None
+  aws_session.writers["17"] = {
+    **fake_runtime.leases[placement.handle], "state": "released",
+    "expires_at": aws_session.writer_now + 30,
+  }
+
+  def unproven(_storage_id: str, _generation: int | None, _deadline: float) -> None:
+    raise TimeoutError("G6 deadline remains unproven")
+
+  monkeypatch.setattr(backend, "_await_writer_safe", unproven)
+  with pytest.raises(ExceptionGroup, match="shutdown did not complete") as caught:
+    backend.shutdown()
+  assert any(isinstance(error, TimeoutError) for error in caught.value.exceptions)
+  retained = backend.store.get("17")
+  assert retained is not None and retained.state == "stopped"
+  assert backend.store.list_shutdown_sessions() == [(placement.handle, "17", placement.generation)]
+  assert aws_session.stop_calls[-1]["qualifier"] == RUNTIME_QUALIFIER
+
+
+def test_shutdown_aws_failure_durably_retains_preplacement_handle(
+  backend: AgentCoreRuntimeBackend, fake_runtime: _FakeRuntime, aws_session: _FakeSession,
+) -> None:
+  from agent_gateway.runtime_placement_agentcore import _Session
+
+  fake_runtime.hold_lease()
+  pending = _Session("19", replace(IDENTITY, risk_user_id=19), "hank-u19-prelease")
+  backend._submit(backend._launch_session(pending)).result()
+  fake_runtime.wait_bootstraps(1)
+  assert backend.store.get("19") is None
+  aws_session.stop_error = ClientError({
+    "Error": {"Code": "AccessDeniedException", "Message": "denied"},
+  }, "StopRuntimeSession")
+  with pytest.raises(ExceptionGroup, match="shutdown did not complete") as caught:
+    backend.shutdown()
+  assert any(isinstance(error, ClientError) for error in caught.value.exceptions)
+  assert backend.store.list_shutdown_sessions() == [("hank-u19-prelease", "19", None)]
+
+
+def test_close_bounds_stuck_tunnel_cleanup_without_executor_join(
+  backend: AgentCoreRuntimeBackend, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  from agent_gateway.runtime_placement_agentcore import _Session
+
+  backend._sessions["stuck"] = _Session("17", IDENTITY, "stuck")
+
+  async def stuck_disconnect(_handle: str) -> None:
+    await asyncio.Event().wait()
+
+  monkeypatch.setattr(backend, "_disconnect", stuck_disconnect)
+  with pytest.raises(TimeoutError, match="time budget"):
+    backend.close(timeout=0.05)
+  assert backend._thread is not None and backend._loop is not None
+  assert not backend._thread.is_alive() and backend._loop.is_closed()

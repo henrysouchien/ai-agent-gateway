@@ -18,7 +18,7 @@ control plane's authenticated deciders; no dispatcher executes on it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Generic, TypeVar, Union
 
 from .autonomous_approval_channel import AutonomousApprovalChannelChild
@@ -147,10 +147,18 @@ def route_ledger(
 def child_approval_route(
   route: ApprovalRoute[_StoreT, _PolicyT],
 ) -> ApprovalRoute[_StoreT, _PolicyT]:
-  """The route an in-process child of ``route``'s owner admits with."""
+  """The route an in-process child of ``route``'s owner admits with.
+
+  A child of a detached run asks through the run's channel, but its job is not
+  the run's: the parent admits a private executable capture only for the run's
+  own job, and no relaunch can restore an in-process child. Its route therefore
+  carries no capture writer, so its ask is the public request and a live wait.
+  """
 
   if isinstance(route, DurableLocalApprovalRoute):
     return InProcessDelegatedApprovalRoute(route)
+  if isinstance(route, ParentDelegatedApprovalRoute):
+    return replace(route, private_capture_writer=None)
   return route
 
 

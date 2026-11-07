@@ -9,7 +9,10 @@ from hank_model_transport.streaming import (
   STREAM_THINKING_STALL_TIMEOUT,
   LOCAL_PREFILL_TOKENS_PER_SECOND,
   StreamStallError,
+  ThinkingOnlyProgress,
+  ThinkingWithoutProgressError,
   effective_stream_stall_timeout,
+  stream_event_is_progress,
   _stream_with_stall_timeout,
 )
 
@@ -55,6 +58,8 @@ def classify_guard_outcome(
   if not guard_reason:
     return ("not_guard", "", "")
   guard_kind, guard_message = guard_reason
+  if guard_kind == ThinkingWithoutProgressError.code:
+    return ("abort", guard_message, guard_kind)
   guard_error = f"Stream watchdog: {guard_message}"
   if guard_kind == "stall" and attempt < max_attempts:
     return ("retry", guard_error, guard_kind)

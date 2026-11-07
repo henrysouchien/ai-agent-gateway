@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from agent_workflow_contracts import ExecutionIdentity
+from hank_model_transport.user_provider_keys import parse_user_key_handle_id
 if TYPE_CHECKING:
   from .admission import ParentContext
 
@@ -41,12 +42,11 @@ def execution_identity_from_session(
 ) -> ExecutionIdentity | None:
   """Resolve the one identity a session executes under.
 
-  Single tier by construction: the session's credential binding is the only
-  source consulted.  ``credential_handle_id`` is populated only from a bound
-  :class:`~model_authority.binding.CredentialHandle` that matches
-  ``bind`` exactly (handle id, provider, principal) — a handle that does not
-  match the capability bind is not a weaker identity, it is a different one,
-  and the resolution fails rather than degrading.
+  Single tier by construction: the session owns the tenant and user.
+  ``credential_handle_id`` names its bound
+  :class:`~model_authority.binding.CredentialHandle` when ``bind`` matches
+  exactly (handle id, provider, principal), or the same session user's
+  provider-key hop. A hop does not replace the seat in the session.
 
   Returns ``None`` when the session carries no tenant at all.
   """
@@ -70,7 +70,15 @@ def execution_identity_from_session(
       or _text(getattr(handle, "principal", None)).lower()
       != _text(getattr(bind, "credential_principal", None)).lower()
     ):
-      return None
+      provider = getattr(bind, "provider", None)
+      if not (
+        getattr(bind, "credential_principal", None) == "user"
+        and getattr(handle, "provider", None) == provider
+        and parse_user_key_handle_id(getattr(bind, "credential_ref", None))
+        == (getattr(session, "risk_user_id", None), provider)
+      ):
+        return None
+      handle_id = bind.credential_ref
   return ExecutionIdentity(
     tenant_id=tenant_id,
     credential_handle_id=handle_id,

@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from agent_workflow_contracts.ticker_contract import normalize_contract_ticker
+from .issue_inbox_schema import IssueInboxRowError, StoredIssueV1
 
 
 # Component length cap (128 chars) is owned by the artifact-store and skill-catalog
@@ -23,6 +24,7 @@ MAX_ARTIFACT_FILENAME_LENGTH = MAX_ARTIFACT_COMPONENT_LENGTH + len(".payload.jso
 _SKILL_NAME_RE = re.compile(r"^(?=.{1,128}$)[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 ISSUE_INBOX_DB_ENV = "AGENT_ISSUE_INBOX_DB_PATH"
+FRICTIONS_DIR_NAME = "frictions"
 _ISSUE_INBOX_STORE_DIRECTORY = ("gateway", "issue-inbox")
 _ISSUE_INBOX_DB_FILENAME = "issue-inbox.sqlite3"
 _ISSUE_INBOX_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
@@ -32,6 +34,10 @@ log = logging.getLogger(__name__)
 
 class ArtifactPathError(ValueError):
   """Raised when a requested artifact path is not safe to resolve."""
+
+
+class _LegacyIssueInboxRefused(ValueError):
+  """The legacy issue-inbox rows cannot be carried into the new store."""
 
 
 @dataclass(frozen=True)
@@ -166,9 +172,18 @@ def reject_unsafe_path(path: str) -> None:
     _validate_path_component(component, "path")
 
 
+def user_desk_root(data_dir: Path, storage_id: str) -> Path:
+  """Locate a desk using the storage id already parsed at its entry boundary."""
+  return data_dir / "users" / storage_id
+
+
+def user_friction_queue_dir(data_dir: Path, storage_id: str) -> Path:
+  """The directory `report_friction` writes a desk's friction reports to."""
+  return user_desk_root(data_dir, storage_id) / "workspace" / FRICTIONS_DIR_NAME
+
+
 def user_workspace_root(user_id: str) -> Path:
-  normalized_user_id = _validate_user_id(user_id)
-  return (user_data_dir() / "users" / normalized_user_id / "workspace").resolve()
+  return (user_desk_root(user_data_dir(), user_id) / "workspace").resolve()
 
 
 def user_issue_inbox_db_path(user_id: str) -> Path:
@@ -189,22 +204,29 @@ def existing_user_issue_inbox_db_paths(
   An entry that is not a plain user-id directory or whose inbox file resolves
   outside that user's workspace is logged and skipped, never followed.
   """
-  users_root = user_data_dir(environ=environ) / "users"
+  data_dir = user_data_dir(environ=environ)
+  users_root = data_dir / "users"
   try:
     user_dirs = sorted(users_root.iterdir(), key=lambda child: child.name)
   except FileNotFoundError:
     return []
+  from agent_gateway.user_identity_mapping import (
+    StorageIdentityFinding,
+    parse_storage_identity,
+  )
+
   paths: list[Path] = []
   for user_dir in user_dirs:
     if not user_dir.is_dir():
       continue
     try:
-      _validate_user_id(user_dir.name)
-      workspace_root = (users_root / user_dir.name / "workspace").resolve()
+
+      identity = parse_storage_identity(user_dir.name)
+      workspace_root = (user_desk_root(data_dir, identity.storage_id) / "workspace").resolve()
       path = _resolve_under_workspace(
         workspace_root, "issue-inbox", _ISSUE_INBOX_DB_FILENAME,
       )
-    except ArtifactPathError as exc:
+    except (ArtifactPathError, StorageIdentityFinding) as exc:
       log.warning("issue-inbox enumeration skipped user directory %r: %s", user_dir.name, exc)
       continue
     if path.is_file():
@@ -233,6 +255,45 @@ def user_data_dir(
     else (Path.home() if home is None else home) / ".local" / "state"
   )
   return state_root / "hank" / "data"
+
+
+INDUSTRY_ARTIFACTS_DIR_ENV = "INDUSTRY_ARTIFACTS_DIR"
+
+
+def industry_artifacts_dir(
+  *, environ: Mapping[str, str] | None = None, home: Path | None = None,
+) -> Path:
+  """Runtime industry data root shared by the writer, bootstrap and Risk MCP children.
+
+  ``INDUSTRY_ARTIFACTS_DIR`` is the contract with readers that cannot import the
+  gateway (``industry_slice_core``). When it is unset the root derives from
+  ``user_data_dir``, so an unset ``USER_DATA_DIR`` names the same place for the
+  writer and for the environment bootstrap hands to those readers.
+  """
+  env = os.environ if environ is None else environ
+  configured = env.get(INDUSTRY_ARTIFACTS_DIR_ENV, "").strip()
+  if configured:
+    return Path(configured).expanduser()
+  return user_data_dir(environ=env, home=home) / "industry_artifacts"
+
+
+def autonomous_log_dir(*, environ: Mapping[str, str] | None = None) -> Path | None:
+  """The autonomous run store the gateway writes, or None when none is configured.
+
+  Writer (``server.py`` autonomous storage root) and offline readers
+  (``session_archive``) resolve it here, so they cannot name different roots.
+  """
+  env = os.environ if environ is None else environ
+  explicit = env.get("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", "").strip()
+  if explicit:
+    return Path(explicit).expanduser()
+  gateway_log_dir = env.get("GATEWAY_LOG_DIR", "").strip()
+  if gateway_log_dir:
+    return Path(gateway_log_dir).expanduser() / "autonomous"
+  legacy_agents_log_dir = env.get("AGENTS_MCP_LOG_DIR", "").strip()
+  if legacy_agents_log_dir:
+    return Path(legacy_agents_log_dir).expanduser()
+  return None
 
 
 def resolve_issue_inbox_db_path(
@@ -295,11 +356,13 @@ def resolve_issue_inbox_db_path(
       "message": f"Issue-inbox parent directory is not writable: {parent}",
     }
   if source == "USER_DATA_DIR":
-    _adopt_legacy_issue_inbox_store(target)
+    adoption_error = _adopt_legacy_issue_inbox_store(target)
+    if adoption_error is not None:
+      return None, adoption_error
   return target, None
 
 
-def _adopt_legacy_issue_inbox_store(target: Path) -> None:
+def _adopt_legacy_issue_inbox_store(target: Path) -> dict[str, str] | None:
   """Fold a pre-directory inbox file into the store, exactly once.
 
   The derived default was `<state>/gateway/issue-inbox.sqlite3` before the
@@ -312,15 +375,17 @@ def _adopt_legacy_issue_inbox_store(target: Path) -> None:
   digest, so an id already present is the same observation and its live
   status/attempt counters win. Either way the legacy path is left behind
   under a different name, so adoption runs once and cannot double-publish:
-  each row's delivery marker travels with the row.
+  each row's delivery marker travels with the row. A legacy row the store
+  rejects is never skipped: the import is refused whole, the legacy path is
+  not retired, and the refusal is returned for `resolve_issue_inbox_db_path`.
   """
   legacy = target.parent.parent / target.name
   if not legacy.is_file():
-    return
+    return None
   if not target.exists():
     _rename_legacy_issue_inbox_store(legacy, target)
-    return
-  _merge_legacy_issue_inbox_store(legacy, target)
+    return None
+  return _merge_legacy_issue_inbox_store(legacy, target)
 
 
 def _rename_legacy_issue_inbox_store(legacy: Path, target: Path) -> None:
@@ -343,12 +408,20 @@ def _rename_legacy_issue_inbox_store(legacy: Path, target: Path) -> None:
   )
 
 
-def _merge_legacy_issue_inbox_store(legacy: Path, target: Path) -> None:
+def _merge_legacy_issue_inbox_store(legacy: Path, target: Path) -> dict[str, str] | None:
   try:
     imported = _import_issue_inbox_rows(legacy, target)
+  except (IssueInboxRowError, sqlite3.IntegrityError, _LegacyIssueInboxRefused) as exc:
+    return {
+      "code": "issue_sink_invalid",
+      "message": (
+        f"Legacy issue inbox {legacy} cannot be imported into {target} ({exc}); "
+        "nothing was imported and the legacy store was not retired."
+      ),
+    }
   except (OSError, sqlite3.Error) as exc:
     log.warning("Issue-inbox legacy store %s could not be imported: %s", legacy, exc)
-    return
+    return None
   stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
   retired = legacy.with_name(f"{legacy.name}.adopted-{stamp}")
   try:
@@ -361,7 +434,7 @@ def _merge_legacy_issue_inbox_store(legacy: Path, target: Path) -> None:
     # The rows are in the new store; without the rename the next resolve
     # re-imports them, which the id-keyed insert makes a no-op.
     log.warning("Issue-inbox legacy store %s could not be retired: %s", legacy, exc)
-    return
+    return None
   log.info(
     "Issue-inbox imported %d legacy row(s) from %s into %s; legacy store kept as %s",
     imported,
@@ -369,27 +442,40 @@ def _merge_legacy_issue_inbox_store(legacy: Path, target: Path) -> None:
     target,
     retired.name,
   )
+  return None
 
 
 def _import_issue_inbox_rows(legacy: Path, target: Path) -> int:
   with closing(sqlite3.connect(target, timeout=5.0)) as connection:
+    connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 5000")
     columns = [row[1] for row in connection.execute("PRAGMA table_info(issue_inbox)")]
     if not columns:
-      return 0
+      raise _LegacyIssueInboxRefused(
+        f"the target store has no issue_inbox table; remove {target} if it is an "
+        "empty file and retry, and the legacy store is then adopted whole"
+      )
     connection.execute("ATTACH DATABASE ? AS legacy", (str(legacy),))
     try:
-      legacy_columns = {
+      legacy_columns = [
         row[1] for row in connection.execute("PRAGMA legacy.table_info(issue_inbox)")
-      }
-      carried = [name for name in columns if name in legacy_columns]
-      if "issue_id" not in carried:
+      ]
+      if not legacy_columns:
         return 0
-      projection = ", ".join(f'"{name}"' for name in carried)
+      if "issue_id" not in legacy_columns:
+        raise _LegacyIssueInboxRefused("the legacy issue_inbox table has no issue_id column")
+      projection = ", ".join(f'"{name}"' for name in legacy_columns)
       with connection:
+        # Keep the validated source snapshot through the INSERT and commit.
+        connection.execute("BEGIN IMMEDIATE")
+        for row in connection.execute("SELECT * FROM legacy.issue_inbox"):
+          StoredIssueV1.parse(dict(row))
         cursor = connection.execute(
-          f"INSERT OR IGNORE INTO main.issue_inbox ({projection}) "
-          f"SELECT {projection} FROM legacy.issue_inbox"
+          f"INSERT INTO main.issue_inbox ({projection}) "
+          f"SELECT {projection} FROM legacy.issue_inbox AS source "
+          "WHERE NOT EXISTS ("
+          "SELECT 1 FROM main.issue_inbox AS present WHERE present.issue_id = source.issue_id"
+          ")"
         )
       return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
     finally:
@@ -433,18 +519,6 @@ def _ensure_under_workspace(path: Path, workspace_root: Path) -> Path:
   return resolved_path
 
 
-def _validate_user_id(user_id: str) -> str:
-  raw = str(user_id or "").strip()
-  if not raw:
-    raise ArtifactPathError("missing user_id")
-  candidate = Path(raw)
-  if candidate.is_absolute():
-    raise ArtifactPathError("invalid user_id path component")
-  for part in candidate.parts:
-    _validate_path_component(part, "user_id")
-  return raw
-
-
 def _validate_ticker(ticker: str) -> str:
   return normalize_ticker_for_artifact_request(ticker)
 
@@ -479,7 +553,7 @@ def _validate_artifact_id(artifact_id: str) -> str:
 def _validate_path_component(value: str, label: str) -> str:
   decoded = _decode_path_component(value).strip()
   max_len = MAX_ARTIFACT_FILENAME_LENGTH if label == "path" else MAX_ARTIFACT_COMPONENT_LENGTH
-  if not decoded or len(decoded) > max_len:
+  if not decoded or decoded == "." or len(decoded) > max_len:
     raise ArtifactPathError(f"invalid {label} path component")
   if ".." in decoded or "/" in decoded or "\\" in decoded:
     raise ArtifactPathError(f"invalid {label} path component")
@@ -513,6 +587,8 @@ __all__ = [
   "existing_user_issue_inbox_db_paths",
   "ISSUE_INBOX_DB_ENV",
   "letter_docx_path_for_request",
+  "industry_artifacts_dir",
+  "INDUSTRY_ARTIFACTS_DIR_ENV",
   "normalize_ticker_for_artifact_request",
   "reject_unsafe_path",
   "resolve_issue_inbox_db_path",

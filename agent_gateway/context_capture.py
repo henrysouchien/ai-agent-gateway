@@ -26,11 +26,14 @@ def _operational_surfaces(surfaces: list[dict[str, Any]]) -> list[dict[str, Any]
 def canonical_manifest_digest(
   surfaces: list[dict[str, Any]],
   system_prompt_hash: str | None,
+  *,
+  record_reminder_hash: str | None = None,
 ) -> str:
   """Return stable plain JSON for callers that suppress repeat events."""
   return json.dumps(
     {
       "system_prompt_hash": system_prompt_hash,
+      "record_reminder_hash": record_reminder_hash,
       "surfaces": _operational_surfaces(surfaces),
     },
     sort_keys=True,
@@ -47,13 +50,21 @@ def build_context_manifest_event(
   request_id: str | None,
   turn: int | None,
   invocation: int | None = None,
+  record_reminder_hash: str | None = None,
 ) -> dict[str, Any]:
+  """The request's context manifest.
+
+  ``record_reminder_hash`` names the run-record reminder the request carried
+  (``runner_state.record_reminder_hash``), the way ``system_prompt_hash`` names
+  the rendered prompt; None when the request carried none.
+  """
   event: dict[str, Any] = {
     "type": "context_manifest",
     "session_id": session_id,
     "request_id": request_id,
     "turn": turn,
     "system_prompt_hash": system_prompt_hash,
+    "record_reminder_hash": record_reminder_hash,
     "surfaces": _operational_surfaces(surfaces),
   }
   if invocation is not None:

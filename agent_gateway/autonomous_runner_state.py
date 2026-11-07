@@ -19,7 +19,7 @@ from types import MappingProxyType
 from typing import Any, Literal, SupportsIndex, TYPE_CHECKING, TypedDict
 
 from agent_workflow_contracts import ResolvedAuthority
-from agent_workflow_contracts.models import AdmittedContextWire
+from agent_workflow_contracts.models import AdmittedContextWire, SelectionProvenance
 from .autonomous_event_channel import (
   AutonomousEventAcknowledgement,
   AutonomousEventChannelParent,
@@ -34,6 +34,7 @@ from .autonomous_claim_broker import AutonomousClaimBroker
 from model_authority.bind import CapabilityBind
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
 from .control_run_lifecycle import read_persisted_autonomous_state
+from .event_log import TERMINAL_EVENT_TYPES
 from .role_validation import require_exact_role
 from .skill_limits import (
   AutonomousSkillAdmissionPolicy,
@@ -301,7 +302,7 @@ def _skip_warned_key_belongs_to_dir(key: str, dir_key: str) -> bool:
 
 
 _DISPATCH_SCOPE_KEYS = frozenset({"kind", "source", "portfolio_name", "portfolio_id", "display_name"})
-_ROOT_TERMINAL_EVENT_TYPES = frozenset({"error", "stream_error", "stream_complete"})
+_ROOT_TERMINAL_EVENT_TYPES = TERMINAL_EVENT_TYPES
 _AUTONOMOUS_TERMINAL_REASONS = frozenset({"writer_lease_already_held"})
 
 
@@ -537,6 +538,9 @@ class AutonomousTask:
   owner_run_limit: int | None = None
   credential_handoff_bytes: int | None = None
   state: str = "running"
+  # The last child process's exit status. `state` (and `terminal_reason`) carry the run's
+  # outcome: a run cancelled while parked on approval is `killed` with the parked process's
+  # clean `0` here, so a consumer that reads `exit_code` alone misreads it as success.
   exit_code: int | None = None
   error: str | None = None
   terminal_reason: str | None = None
@@ -580,6 +584,8 @@ class AutonomousTask:
   tool_result_spill_dir: Path | None = None
   capability_bind: CapabilityBind | None = None
   admitted_context: AdmittedContextWire | None = None
+  # This run's provenance, including roots with no admitted context.
+  selection_provenance: SelectionProvenance | None = None
   tool_authority: ResolvedAuthority | None = None
   claim_broker: AutonomousClaimBroker | None = None
   launch_nonce: str | None = None
@@ -593,6 +599,10 @@ class AutonomousTask:
   # The signed pre-authorized call this launch carries. The parent holds it in
   # memory only; it is never persisted to the manifest.
   launch_approval_continuation: dict[str, Any] | None = None
+  # The parent-owned approval settings snapshot taken at first launch and
+  # copied by every successor. Unlike the continuation it is persisted: a
+  # resume after a restart reads it back. None marks a run that predates the pin.
+  launch_approval_settings: dict[str, Any] | None = None
   # Claims this broker served. Written into the task manifest when the
   # broker closes; unset until that close.
   claims_served: int | None = None
@@ -1271,6 +1281,7 @@ class AutonomousRegistryStateMixin:
       "resumed_from": record.resumed_from,
       "resumed_as": list(record.resumed_as),
       "approval_continuation": record.approval_continuation,
+      "launch_approval_settings": record.launch_approval_settings,
       "resumed_approval_id": record.resumed_approval_id,
       "schedule_id": record.schedule_id,
       "schedule_name": record.schedule_name,
@@ -1290,6 +1301,10 @@ class AutonomousRegistryStateMixin:
     payload["admitted_context"] = (
       record.admitted_context.model_dump(mode="json")
       if record.admitted_context is not None else None
+    )
+    payload["selection_provenance"] = (
+      record.selection_provenance.model_dump(mode="json")
+      if record.selection_provenance is not None else None
     )
     payload["tool_authority"] = (
       record.tool_authority.model_dump(mode="json")
@@ -1634,7 +1649,7 @@ class AutonomousRegistryStateMixin:
           f"Invalid autonomous terminal_reason: {terminal_reason!r}",
           None,
         )
-      if event_type in {"error", "stream_error"}:
+      if event_type != "stream_complete":
         if terminal_reason is not None:
           return (
             "failed",
@@ -1646,8 +1661,6 @@ class AutonomousRegistryStateMixin:
           _terminal_cause_text(event, ("error", "message")) or event_type,
           None,
         )
-      if event_type != "stream_complete":
-        continue
       disposition = event.get("terminal_disposition")
       if disposition == "awaiting_approval":
         return "awaiting_approval", None, None
@@ -2022,6 +2035,7 @@ class AutonomousRegistryStateMixin:
       return None
     raw_admitted_context = manifest.get("admitted_context")
     raw_tool_authority = manifest.get("tool_authority")
+    raw_selection_provenance = manifest.get("selection_provenance")
     try:
       admitted_context = (
         AdmittedContextWire.model_validate(raw_admitted_context)
@@ -2030,6 +2044,11 @@ class AutonomousRegistryStateMixin:
       tool_authority = (
         ResolvedAuthority.model_validate(raw_tool_authority)
         if raw_tool_authority is not None else None
+      )
+      selection_provenance = (
+        SelectionProvenance.model_validate(raw_selection_provenance)
+        if raw_selection_provenance is not None
+        else admitted_context.selection_provenance if admitted_context is not None else None
       )
     except (TypeError, ValueError):
       self._warn_once(manifest_path, "Skipping autonomous manifest with invalid admitted authority: %s")
@@ -2273,6 +2292,7 @@ class AutonomousRegistryStateMixin:
         resumed_from=record_resumed_from,
         resumed_as=record_resumed_as,
         approval_continuation=manifest.get("approval_continuation"),
+        launch_approval_settings=manifest.get("launch_approval_settings"),
         resumed_approval_id=self._coerce_manifest_str(
           manifest, "resumed_approval_id",
         ),
@@ -2280,6 +2300,7 @@ class AutonomousRegistryStateMixin:
         schedule_name=record_schedule_name,
         capability_bind=capability_bind,
         admitted_context=admitted_context,
+        selection_provenance=selection_provenance,
         tool_authority=tool_authority,
         tool_result_spill_dir=record_tool_result_spill_dir,
         tool_surface=record_tool_surface,

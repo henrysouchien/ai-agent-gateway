@@ -7,6 +7,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from . import sdk_runner_helpers as _sdk_runner_helpers
 from .model_bound_wire import serialize_model_bound_result
+from .registry_scope import DeclaredRegistryScope
 from .runner import ToolResultContext
 from .secret_boundary import sanitize_boundary_value
 from .tool_result_semantics import classify_semantic_tool_error
@@ -290,6 +291,7 @@ async def build_hook_additional_context(
   result: Any | None,
   error: dict[str, Any] | None,
   completion_event: Mapping[str, Any],
+  registry_scope: DeclaredRegistryScope,
   logger: Any,
 ) -> str | None:
   duration_ms = int(completion_event["duration_ms"])
@@ -304,6 +306,7 @@ async def build_hook_additional_context(
   )
   extra_blocks = await runner._call_on_tool_result(
     ToolResultContext(
+      registry_scope=copy.copy(registry_scope),
       tool_name=tool_name,
       tool_input=dict(tool_input),
       redacted_tool_input=copy.deepcopy(redacted_tool_input),

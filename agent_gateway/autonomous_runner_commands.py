@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable
 from typing import Any
@@ -31,6 +32,7 @@ def build_autonomous_cmd(
   skill: str | None = None,
   pack: str | None = None,
   deliver: bool = True,
+  context: str | None = None,
   ticker: str | None = None,
   research_file_id: int | None = None,
   normalize_autonomous_profile_func: Callable[[str], str] = normalize_autonomous_profile,
@@ -48,8 +50,8 @@ def build_autonomous_cmd(
     cmd.append("--no-deliver")
 
   if normalized_mode == "once":
-    if task or skill or pack or ticker:
-      raise ValueError("mode='once' does not accept task, skill, pack, or ticker")
+    if task or skill or pack or context or ticker:
+      raise ValueError("mode='once' does not accept task, skill, pack, context, or ticker")
     if research_file_id is not None:
       raise ValueError("research_file_id requires mode='skill' or mode='task'")
     return cmd
@@ -57,7 +59,7 @@ def build_autonomous_cmd(
   if normalized_mode == "task":
     if not task or not task.strip():
       raise ValueError("task is required when mode='task'")
-    if skill or pack or ticker:
+    if skill or pack or context or ticker:
       raise ValueError("mode='task' only accepts the task parameter")
     cmd.extend(["--task", task.strip()])
     if research_file_id is not None:
@@ -67,7 +69,7 @@ def build_autonomous_cmd(
   if normalized_mode == "pack":
     if not pack or not pack.strip():
       raise ValueError("pack is required when mode='pack'")
-    if task or skill or ticker:
+    if task or skill or context or ticker:
       raise ValueError("mode='pack' only accepts the pack parameter")
     if research_file_id is not None:
       raise ValueError("research_file_id requires mode='skill' or mode='task'")
@@ -83,6 +85,22 @@ def build_autonomous_cmd(
     cmd.extend(["--research-file-id", str(research_file_id)])
   if ticker and ticker.strip():
     cmd.extend(["--ticker", canonicalize_ticker(ticker)])
+  normalized_context = context.strip() if context else None
+  if normalized_context:
+    # The signed file always carries context; argv is only a convenience
+    # projection when it fits the host's per-argument and aggregate budgets.
+    argv_bytes = sum(len(os.fsencode(arg)) + 1 for arg in cmd)
+    context_bytes = len(os.fsencode(normalized_context)) + 1
+    environment_bytes = sum(
+      len(os.fsencode(key)) + len(os.fsencode(value)) + 2
+      for key, value in os.environ.items()
+    )
+    if (
+      context_bytes <= 32 * os.sysconf("SC_PAGE_SIZE")
+      and argv_bytes + len("--context") + 1 + context_bytes + environment_bytes
+      < os.sysconf("SC_ARG_MAX")
+    ):
+      cmd.extend(["--context", normalized_context])
   return cmd
 
 

@@ -4,7 +4,7 @@ import asyncio
 import time
 from collections import deque
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
   Any,
   AsyncIterator,
@@ -21,7 +21,9 @@ from typing import (
 )
 
 
-TERMINAL_EVENT_TYPES = {"stream_complete", "error"}
+# stream_error is advisory: the gateway substitutes it and keeps streaming.
+# It is not a member, so it does not end a turn.
+TERMINAL_EVENT_TYPES = frozenset({"stream_complete", "error"})
 OnEvent = Callable[[Dict[str, Any], str], None]
 PrepareEvent = Callable[[Dict[str, Any]], Dict[str, Any]]
 OnEventErrorPolicy = Literal["ignore", "raise"]
@@ -209,6 +211,24 @@ class EventLog:
   def next_seq(self) -> int:
     return self._next_seq
 
+  def completion_read(self) -> dict[str, Any]:
+    """Copy journal facts without treating a closed buffer as a receipt."""
+    terminal = next(
+      (
+        {"seq": entry.seq, "event": deepcopy(entry.event)}
+        for entry in reversed(self._entries)
+        if entry.event.get("type") in TERMINAL_EVENT_TYPES
+      ),
+      None,
+    )
+    return {
+      "closed": self._closed,
+      "cursor": self._next_seq - 1,
+      "next_seq": self._next_seq,
+      "terminal": terminal,
+      "revision": self._version,
+    }
+
 
 def log_has_terminal(log: Any) -> bool:
   has_terminal = getattr(log, "has_terminal", None)
@@ -250,6 +270,20 @@ class _Subscriber:
   oldest_dropped_ts: float | None = None
   dropped_through_seq: int | None = None
   closed: bool = False
+  #: Set while the queue is below the backpressure mark; a producer that found
+  #: it above waits on this until the consumer drains it (bounded).
+  drained: asyncio.Event = field(default_factory=asyncio.Event)
+  #: The current backlog episode already spent its bounded wait: producers
+  #: stop waiting on this subscriber until it drains below the mark or shows it
+  #: is reading again (`reads_since_spent`), so a stalled watcher costs a run
+  #: one deadline, not one per event.
+  backpressure_spent: bool = False
+  #: Reads since the episode was spent; half a bound of them re-arms
+  #: backpressure for a watcher that resumed at its normal rate.
+  reads_since_spent: int = 0
+  #: High-water bound: a global subscriber's allotment never shrinks while it
+  #: lives, so runs ending cannot evict events already queued for it.
+  bound_high: int = 0
 
   def matches(self, user_id: str, control_run_id: str) -> bool:
     if self.user_id != user_id:
@@ -346,6 +380,7 @@ class UserEventBus:
     self,
     *,
     subscriber_queue_max: int = 1000,
+    backpressure_wait_seconds: float = 2.0,
     replay_buffer_max: int = 5000,
   ):
     if subscriber_queue_max < 1:
@@ -354,6 +389,7 @@ class UserEventBus:
       raise ValueError("replay_buffer_max must be positive")
 
     self._subscriber_queue_max = subscriber_queue_max
+    self._backpressure_wait_seconds = backpressure_wait_seconds
     self._replay_buffer_max = replay_buffer_max
     self._cleanup_delay_seconds = 60.0
     self._lock = asyncio.Lock()
@@ -440,10 +476,30 @@ class UserEventBus:
         self._replay_buffers[key] = replay_buffer
       replay_buffer.append(entry)
 
+      backlogged: list[_Subscriber] = []
       for subscriber in list(self._subscribers.get(normalized_user_id, ())):
         if not subscriber.matches(normalized_user_id, normalized_run_id):
           continue
         self._enqueue_for_subscriber(subscriber, entry)
+        if (
+          not subscriber.backpressure_spent
+          and len(subscriber.queue) * 2 >= self._subscriber_queue_bound(subscriber)
+        ):
+          subscriber.drained.clear()
+          backlogged.append(subscriber)
+    for subscriber in backlogged:
+      # Backpressure: a live subscriber is behind by half its bound, so this
+      # producer waits (bounded) for it to drain below that mark instead of
+      # racing it to the cliff where drop-oldest discards the stream. The
+      # deadline ends the episode: until the consumer drains below the mark no
+      # producer waits on it again, and drop-oldest plus the sentinel apply as
+      # before. A watcher that stops reading costs the runs it watches one
+      # deadline per episode; reading half a bound again re-arms the wait.
+      try:
+        await asyncio.wait_for(subscriber.drained.wait(), self._backpressure_wait_seconds)
+      except asyncio.TimeoutError:
+        subscriber.backpressure_spent = True
+        subscriber.reads_since_spent = 0
 
   async def seed_replay_buffer(
     self,
@@ -646,6 +702,7 @@ class UserEventBus:
       for subscribers in self._subscribers.values():
         for subscriber in subscribers:
           subscriber.closed = True
+          subscriber.drained.set()
           subscriber.updated.set()
       self._subscribers.clear()
       self._terminated_runs.clear()
@@ -662,6 +719,7 @@ class UserEventBus:
   def _unregister_subscriber_locked(self, subscriber: _Subscriber) -> None:
     subscriber.closed = True
     subscriber.updated.set()
+    subscriber.drained.set()  # a producer waiting on this subscriber is released
     subscribers = self._subscribers.get(subscriber.user_id)
     if subscribers is None:
       return
@@ -694,13 +752,32 @@ class UserEventBus:
           subscriber.dropped_count = 0
           subscriber.oldest_dropped_ts = None
           subscriber.dropped_through_seq = None
+          self._note_drained_locked(subscriber)
           return sentinel
         if subscriber.queue:
-          return deepcopy(subscriber.queue.popleft().event)
+          popped = subscriber.queue.popleft()
+          self._note_drained_locked(subscriber)
+          return deepcopy(popped.event)
         if subscriber.closed or self._shutdown:
           raise _SubscriberClosed()
         subscriber.updated.clear()
       await subscriber.updated.wait()
+
+  def _note_drained_locked(self, subscriber: _Subscriber) -> None:
+    bound = self._subscriber_queue_bound(subscriber)
+    if subscriber.backpressure_spent:
+      # A watcher that takes half a bound of deliveries (events or the
+      # events_dropped sentinel) after its deadline is live again: producers wait
+      # for it once more. A trickle reader stays spent, so it
+      # cannot throttle the runs it watches.
+      subscriber.reads_since_spent += 1
+      if subscriber.reads_since_spent * 2 >= bound:
+        subscriber.backpressure_spent = False
+        subscriber.reads_since_spent = 0
+    if len(subscriber.queue) * 2 < bound:
+      subscriber.backpressure_spent = False
+      subscriber.reads_since_spent = 0
+      subscriber.drained.set()
 
   async def _next_entry(self, subscriber: _Subscriber) -> _BusEvent:
     while True:
@@ -718,6 +795,7 @@ class UserEventBus:
           subscriber.dropped_count = 0
           subscriber.oldest_dropped_ts = None
           subscriber.dropped_through_seq = None
+          self._note_drained_locked(subscriber)
           return _BusEvent(
             event=event,
             timestamp=time.time(),
@@ -725,13 +803,39 @@ class UserEventBus:
             control_run_id=subscriber.control_run_id,
           )
         if subscriber.queue:
-          return _copy_bus_event(subscriber.queue.popleft())
+          popped = subscriber.queue.popleft()
+          self._note_drained_locked(subscriber)
+          return _copy_bus_event(popped)
         if subscriber.closed or self._shutdown:
           raise _SubscriberClosed()
         if subscriber.stop_at_terminal and subscriber.stream_terminated:
           raise _SubscriberTerminated()
         subscriber.updated.clear()
       await subscriber.updated.wait()
+
+  def _subscriber_queue_bound(self, subscriber: _Subscriber) -> int:
+    """A subscriber's queue holds `subscriber_queue_max` events per run it spans.
+
+    A per-run subscriber spans one run. A global subscriber spans every live run
+    of its user, so its bound scales with that count: with the fixed bound a
+    global `control watch` over N streaming runs received N runs' deltas into
+    one run's worth of slots and drop-oldest discarded most of the stream
+    (R28 R10-04: 95 % of lines were `events_dropped` under one concurrent
+    watcher). The floor is the per-run bound, and the bound never shrinks
+    while the subscriber lives: when runs end, the events already queued for
+    them stay within the allotment instead of being evicted.
+    """
+    if subscriber.control_run_id is not None:
+      return subscriber.max_queue_size
+    live_runs = sum(
+      1 for key in self._replay_buffers
+      if key[0] == subscriber.user_id and key not in self._terminated_runs
+    )
+    subscriber.bound_high = max(
+      subscriber.bound_high,
+      subscriber.max_queue_size * max(1, live_runs),
+    )
+    return subscriber.bound_high
 
   def _enqueue_for_subscriber(self, subscriber: _Subscriber, entry: _BusEvent) -> None:
     terminal_transition = subscriber.stop_at_terminal and entry.terminal
@@ -744,7 +848,7 @@ class UserEventBus:
       if terminal_transition:
         subscriber.updated.set()
       return
-    if len(subscriber.queue) >= subscriber.max_queue_size:
+    if len(subscriber.queue) >= self._subscriber_queue_bound(subscriber):
       dropped = subscriber.queue.popleft()
       subscriber.dropped_count += 1
       if subscriber.oldest_dropped_ts is None:

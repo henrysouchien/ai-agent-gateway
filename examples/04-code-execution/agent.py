@@ -6,6 +6,5 @@ app = create_agent(
   code_execution=True,
   code_execution_config=CodeExecutionConfig(
     default_timeout_ms=20_000,
-    max_timeout_ms=60_000,
   ),
 )

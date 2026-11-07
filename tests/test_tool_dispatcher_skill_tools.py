@@ -1,6 +1,8 @@
 # ruff: noqa: E402
 
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import sys
@@ -71,6 +73,7 @@ def test_tool_dispatcher_skill_tool_wrapper_preserves_parent_current_skill_seam(
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
     session=session,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   monkeypatch.setattr(tool_dispatcher, "current_skill", lambda: "patched-skill")
 

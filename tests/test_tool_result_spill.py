@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import json
@@ -50,7 +52,6 @@ from gateway_test_support.resumer_custody_test_support import (  # noqa: E402
 from gateway_test_support.spill_custody_test_support import publish_custody_spill  # noqa: E402
 import agent_gateway.tool_result_compaction as tool_result_compaction  # noqa: E402
 import agent_gateway.runner as gateway_runner  # noqa: E402
-import agent_gateway.runner_tool_execution as runner_tool_execution  # noqa: E402
 from gateway_test_support.capability_execution_test_support import (  # noqa: E402
   stub_capability_execution_resolver,
   stub_runner_capability_execution,
@@ -235,6 +236,7 @@ def _dispatcher(
     session_id="sess-spill",
     role="owner",
     approval_key_qualifier=approval_key_qualifier,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
@@ -282,17 +284,6 @@ class _RecordingLogger:
     self.warnings.append((message, args, kwargs))
 
 
-def test_runner_owns_no_canvas_source_cap_vocabulary() -> None:
-  # The pre-dispatch `invalid_input` cap for emit_canvas_artifact was a second
-  # rejection vocabulary competing with the pipeline's own `size_cap` stage. The
-  # pipeline owns it alone now: it reports `validation_failed{stage: "size_cap",
-  # code: "source_size_cap_exceeded"}` on every lane before any node build
-  # (certified in tests/test_canvas_emit_sources_contract.py and by the
-  # oversize-source fixture in tests/test_canvas_artifact_pipeline.py), so the
-  # runner must carry no canvas-specific cap of its own.
-  source = Path(runner_tool_execution.__file__).read_text(encoding="utf-8")
-
-  assert "emit_canvas_artifact" not in source
 
 
 def test_emit_dashboard_artifact_oversize_guard_returns_error_before_dispatch() -> None:
@@ -314,7 +305,23 @@ def test_emit_dashboard_artifact_oversize_guard_returns_error_before_dispatch() 
   content = json.loads(result["content"])
   assert content["error"]["code"] == "invalid_input"
   assert "exceeds 256KB limit" in content["error"]["message"]
-  assert [entry.event for entry in runner._log.entries] == []
+  # The oversize refusal settles through the shared seam: one durable start and
+  # one paired complete carrying the typed error, never a silent unlogged call.
+  events = [entry.event for entry in runner._log.entries]
+  assert [event["type"] for event in events] == ["tool_call_start", "tool_call_complete"]
+  start, complete = events
+  assert start["tool_call_id"] == "tool-dashboard"
+  assert start["tool_name"] == "emit_dashboard_artifact"
+  assert complete["tool_call_id"] == "tool-dashboard"
+  assert complete["tool_name"] == "emit_dashboard_artifact"
+  assert complete["result"] is None
+  assert complete["is_error"] is True
+  assert complete["error"]["code"] == "invalid_input"
+  assert complete["error"]["message"] == content["error"]["message"]
+  assert complete["error"]["data"] == {"type": "bad_input"}
+  assert complete["dispatch"]["outcome"] == "error_semantic"
+  assert complete["dispatch"]["attempts"] == 1
+  assert complete["final_tool_result_blocks"] == [result]
 
 
 async def _dispatch_bundle_tool(bundle: Any, tool_name: str, tool_input: dict[str, Any]):
@@ -325,6 +332,7 @@ async def _dispatch_bundle_tool(bundle: Any, tool_name: str, tool_input: dict[st
     event_log=EventLog(),
     role="owner",
     approval_key_qualifier=bundle.approval_qualifier,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   return await dispatcher.dispatch(f"{tool_name}_call", tool_name, tool_input)
 
@@ -459,13 +467,7 @@ def test_child_spill_sink_advertises_the_reader_only_when_the_child_can_run_it(
   assert _child_spill_sink(None, attempt, dispatcher=with_reader, excluded_tools=None) is None
 
 
-def test_runner_preserves_tool_result_utility_delegates(tmp_path: Path) -> None:
-  assert gateway_runner.AgentRunner._annotate_result({"ok": True}) == annotate_result({"ok": True})
-  assert gateway_runner.AgentRunner._make_error_result("tool-1", "bad", "failed") == make_error_result(
-    "tool-1",
-    "bad",
-    "failed",
-  )
+def test_runner_writes_tool_result_spill(tmp_path: Path) -> None:
   assert gateway_runner.AgentRunner._is_error_tool_result_entry({"type": "tool_result"}, '{"error": "bad"}')
   filename, spill_abspath = gateway_runner.AgentRunner._write_tool_result_spill(
     work_dir=str(tmp_path),

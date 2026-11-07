@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from dataclasses import replace
 import sys
 import time
 from pathlib import Path
@@ -26,8 +27,16 @@ from hank_model_transport.providers.anthropic_oauth import (
 from hank_model_transport.send_prompt import _rotated_execution, send_prompt
 from gateway_test_support.capability_execution_test_support import stub_bound_capability_execution
 from gateway_test_support.transport_runtime import TEST_SEND_PROMPT_RUNTIME
-from model_authority.binding import AuthContext, CredentialHandle, ModelSelectionIntent
+from agent_workflow_contracts.models import SelectionProvenance
+from model_authority.binding import AuthContext, CredentialHandle
 from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECTION_POLICY
+from model_authority.selection import (
+  CapabilityDefault,
+  FallbackEntry,
+  TierModelsDefault,
+  TierSelectionPolicy,
+  capture_selection_snapshot,
+)
 
 _REFUSED = "sk-ant-oat01-refused-org"
 _SERVING = "sk-ant-oat01-serving"
@@ -229,6 +238,27 @@ def test_send_prompt_parking_persists_across_second_bind(
   pool: None,
 ) -> None:
   model = "anthropic.claude-opus-5-5"
+  fallback_model = "anthropic.claude-sonnet-5-5"
+  policy = replace(
+    INITIAL_MODEL_SELECTION_POLICY,
+    capabilities={
+      **INITIAL_MODEL_SELECTION_POLICY.capabilities,
+      "session.driver": replace(
+        INITIAL_MODEL_SELECTION_POLICY.capabilities["session.driver"],
+        default=CapabilityDefault(kind="tier", tier="lineage"),
+        by_channel={},
+      ),
+    },
+    tiers={
+      **INITIAL_MODEL_SELECTION_POLICY.tiers,
+      "lineage": TierSelectionPolicy(
+        default=TierModelsDefault((model,), "high"),
+        allowed_model_keys=frozenset({model, fallback_model}),
+        fallback=(FallbackEntry(model=fallback_model),),
+      ),
+    },
+  )
+  snapshot = capture_selection_snapshot(policy)
 
   def bind(config: dict[str, Any], provider: _PoolProvider):
     generation_ref = config["credential_source"]["generation_ref"]
@@ -239,12 +269,12 @@ def test_send_prompt_parking_persists_across_second_bind(
     )
     resolver = CapabilityExecutionResolver(
       registry=INITIAL_MODEL_REGISTRY,
-      selection_policy=INITIAL_MODEL_SELECTION_POLICY,
+      selection_policy=policy,
       auth_context=AuthContext(
         run_mode="batch", actor_id="alice", tenant_id="tenant",
         user_provider_handles={}, service_provider_handles={"anthropic": handle},
         entitled_capabilities=frozenset({"session.driver"}),
-        entitled_model_keys=frozenset({model}),
+        entitled_model_keys=frozenset({model, fallback_model}),
       ),
       credential_materializer=lambda selected: MaterializedCredential(
         handle=selected, auth_config=config,
@@ -253,10 +283,22 @@ def test_send_prompt_parking_persists_across_second_bind(
     )
     execution = resolver.resolve(
       "session.driver",
-      explicit_intent=ModelSelectionIntent(model_key=model, effort=None, source="explicit_user"),
+      selection_snapshot=snapshot,
     )
     assert execution.bind.credential_ref == generation_ref
-    assert execution.resolver is resolver
+    assert execution.bind.model_key == model
+    assert execution.resolver is not None
+    execution.resolver._record_model_fallback_failure(
+      execution, snapshot,
+      selection_provenance=SelectionProvenance(
+        role=None, role_source=None, effort_source=None, preset=None,
+      ),
+      previous=None, reason="usage_limit", reset_at=time.time() + 3600,
+    )
+    # A later execution skips the primary parked by the first execution's resolver.
+    assert resolver.resolve(
+      "session.driver", selection_snapshot=snapshot,
+    ).bind.model_key == fallback_model
     return execution
 
   # SEAT-SERVES-RUN-IFF-OWNER-EQUALS-RUN-OWNER: alice binds her own operator seats.

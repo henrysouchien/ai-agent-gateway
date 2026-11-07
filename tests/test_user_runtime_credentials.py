@@ -9,6 +9,7 @@ import pytest
 
 from agent_gateway import server_artifact_helpers
 from agent_gateway.claim_signing_authority import GatewayClaimSigningAuthority
+from agent_gateway.session import AuthManager, SessionStore
 from hank_model_transport.user_runtime_credentials import (
   APPROVAL_CLAIM_KEY_SCHEME, USER_RUNTIME_CREDENTIALS_FILE_ENV, DeskReplica, UserRuntimeIdentity,
   bundle_from_json, bundle_storage_id, bundle_to_json, derive_approval_claim_key,
@@ -268,3 +269,61 @@ def test_artifact_auth_without_a_signed_claim_is_refused_under_a_bundle(
   with pytest.raises(HTTPException) as excinfo:
     server_artifact_helpers._artifact_auth_dependency(request)
   assert excinfo.value.status_code == 401
+
+
+def test_artifact_auth_without_a_bundle_returns_the_parsed_claimed_owner(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.delenv(USER_RUNTIME_CREDENTIALS_FILE_ENV, raising=False)
+  authority = GatewayClaimSigningAuthority("x" * 64)
+  request = _signed_request(authority, authority, "42", "alice@example.com")
+  assert server_artifact_helpers._artifact_auth_dependency(request) == "42"
+
+
+def test_artifact_auth_without_a_bundle_reports_a_malformed_claimed_owner_as_invalid_claim(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  monkeypatch.delenv(USER_RUNTIME_CREDENTIALS_FILE_ENV, raising=False)
+  authority = GatewayClaimSigningAuthority("x" * 64)
+  request = _signed_request(authority, authority, "../Alice", "alice@example.com")
+  with pytest.raises(HTTPException) as excinfo:
+    server_artifact_helpers._artifact_auth_dependency(request)
+  assert excinfo.value.status_code == 401
+  assert excinfo.value.detail == "Invalid signed user claim"
+
+
+def test_artifact_bearer_auth_uses_the_session_storage_owner() -> None:
+  store = SessionStore()
+  auth = AuthManager("artifact-auth-test-secret-0123456789", {"test-key"}, store)
+  session = store.create_session(
+    auth.hash_api_key("test-key"),
+    user_id="Alice@Example.com",
+    owner_user_id="42",
+  )
+  token = auth.issue_token(session)
+  app = SimpleNamespace(state=SimpleNamespace(auth=auth))
+  request = Request({
+    "type": "http", "method": "GET", "path": "/",
+    "headers": [(b"authorization", f"Bearer {token}".encode("ascii"))],
+    "app": app,
+  })
+
+  assert server_artifact_helpers._artifact_auth_dependency(request) == "42"
+
+
+def test_artifact_auth_parses_the_bundle_storage_owner(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+  payload = bundle_to_json(make_bundle())
+  payload["storage_id"] = "../alice"
+  bundle = bundle_from_json(payload)
+  path = tmp_path / "bundle.json"
+  write_user_runtime_credentials(bundle, path)
+  monkeypatch.setenv(USER_RUNTIME_CREDENTIALS_FILE_ENV, str(path))
+  authority = GatewayClaimSigningAuthority(bundle.claim_signing.key)
+  request = _signed_request(authority, authority, "alice", "alice@example.com")
+
+  with pytest.raises(HTTPException) as finding:
+    server_artifact_helpers._artifact_auth_dependency(request)
+  assert finding.value.status_code == 401
+  assert finding.value.detail == "Invalid signed user claim"

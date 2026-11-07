@@ -36,7 +36,6 @@ from agent_workflow_contracts import (
   OrdinaryDelegationTaskRef,
   OutcomeRequirement,
   OwnerBinding,
-  ParentResultPolicy,
   PhaseOutputSelector,
   ProjectionRequirement,
   PublishedInlineView,
@@ -72,9 +71,10 @@ DIGEST = f"sha256:{HEX}"
 
 
 def test_all_exports_every_module_model() -> None:
-  """`__all__` is a literal now (pyright reads nothing else); the removed
-  derivation — every module BaseModel subclass but WireModel, then the
-  hand-owned non-model exports — is the oracle."""
+  """Export every module model plus the hand-owned non-model exports.
+
+  SelectionLane is grouped with its selection-provenance models.
+  """
 
   module_models = [
     name
@@ -84,6 +84,7 @@ def test_all_exports_every_module_model() -> None:
     and value.__module__ == models.__name__
     and value is not models.WireModel
   ]
+  module_models.insert(module_models.index("SelectionProvenance") + 1, "SelectionLane")
   assert models.__all__ == module_models + [
     "PreviewDigest",
     "DELIVERY_PREVIEW_POLICY_VERSION",
@@ -460,9 +461,6 @@ def test_exact_parent_materialization_has_no_clipping_semantics() -> None:
     parent_materialization=materialization,
   )
   assert AgentCompletionEnvelope.model_validate_json(envelope.model_dump_json()) == envelope
-  policy_schema = json.dumps(ParentResultPolicy.model_json_schema())
-  assert "truncated" not in policy_schema
-  assert "clipped" not in policy_schema
   with pytest.raises(ValidationError, match="byte count"):
     TerminalNarrativeInlineExact(source=handle, content="clipped")
   with pytest.raises(ValidationError, match="successful completion"):

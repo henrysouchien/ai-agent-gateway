@@ -145,6 +145,14 @@ def project_research_file_current_projection(
   )
 
 
+def _require_no_quarantined_marker_line(session_log: AgentSessionLog) -> None:
+  # A torn line the strict scan stepped over could be a committed marker.
+  if session_log.quarantined_lines:
+    raise ResearchFileCurrentProjectionUnavailable(
+      "torn session-log line may hide a current projection cutoff"
+    )
+
+
 async def load_research_file_current_projection(
   session_log: AgentSessionLog,
   *,
@@ -158,6 +166,7 @@ async def load_research_file_current_projection(
     order="asc",
     limit=_DISCOVERY_LIMIT,
   )
+  _require_no_quarantined_marker_line(session_log)
   if cursor is not None:
     raise ResearchFileCurrentProjectionUnavailable(
       "current projection cutoffs exceed their discovery bound"
@@ -180,6 +189,7 @@ def load_research_file_current_projection_sync(
     order="asc",
     limit=_DISCOVERY_LIMIT,
   )
+  _require_no_quarantined_marker_line(session_log)
   if cursor is not None:
     raise ResearchFileCurrentProjectionUnavailable(
       "current projection cutoffs exceed their discovery bound"

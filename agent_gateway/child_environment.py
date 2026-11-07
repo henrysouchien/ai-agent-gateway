@@ -70,7 +70,8 @@ _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES = frozenset({
   "AGENT_GATEWAY_ENV",
   "HANK_MODEL_AUTHORITY_DIR",
   "HANK_LOCAL_FALLBACK_ENABLED",
-  "HANK_MODEL_PRESET",
+  # HANK_RUN_ROUTE_FILE is not filtered: a gateway hands it to every child, "" when it has no
+  # route (`model_authority.run_route.handed_run_route_env`).
   # Spend-ledger paths and attribution: the child's provider calls write the
   # machine-wide ledger under the parent's repo/service/instance labels.
   "HANK_SPEND_LEDGER_PATH",
@@ -80,6 +81,7 @@ _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES = frozenset({
   "HANK_SPEND_INSTANCE_ID",
   "HANK_SPEND_GIT_SHA",
   "USER_DATA_DIR",
+  "HANK_CREDENTIAL_POOL",
   USER_STORAGE_ID_ENV,
   "CORPUS_LOG_DIR",
   "CORPUS_STATE_DIR",
@@ -96,7 +98,6 @@ _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES = frozenset({
   "MCP_STDIO_CONNECT_RETRIES",
   "MCP_STDIO_CONNECT_STABILIZE_S",
   "LOCAL_GATEWAY_PYTHON",
-  "LOCAL_GATEWAY_CONTROL_GENERATION",
   "LOCAL_GATEWAY_CONTROL_GENERATION_ID",
   "LOCAL_GATEWAY_CONTROL_STATE_ROOT",
   "LOCAL_GATEWAY_RUNTIME_ROOT",
@@ -144,6 +145,9 @@ _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES = frozenset({
   "GATEWAY_AUDIT_HMAC_SECRET",
   # The operator file the child's live ``ContainmentSettings`` reads.
   SETTINGS_PATH_ENV,
+  # A pinned cost store (production keeps it off the log root) must reach the
+  # child unchanged; unpinned, the child's default follows GATEWAY_LOG_DIR.
+  "TOOL_TIMING_DB_PATH",
 })
 
 # Profiles whose runtime limits and delivery destination are configured per
@@ -158,11 +162,17 @@ _AUTONOMOUS_CHILD_PROFILE_LIMIT_ENV_NAMES = frozenset(
   )
 )
 
+AUTONOMOUS_CHILD_MODEL_ENDPOINT_ENV_NAMES = frozenset({
+  "OLLAMA_CLOUD_BASE_URL",
+  "OLLAMA_BASE_URL",
+})
+
 # What the launcher computes or forwards as the child's own runtime contract;
 # a sibling server's dotenv never supplies one of these names.
 AUTONOMOUS_CHILD_RUNTIME_ENV_NAMES = (
   _AUTONOMOUS_CHILD_PROCESS_ENV_NAMES
   | _AUTONOMOUS_CHILD_PROFILE_LIMIT_ENV_NAMES
+  | AUTONOMOUS_CHILD_MODEL_ENDPOINT_ENV_NAMES
 )
 
 # Tool configuration the child's MCP servers read. One set for every
@@ -173,11 +183,19 @@ _AUTONOMOUS_CHILD_TOOL_ENV_NAMES = frozenset({
   # Transport configuration, not gateway authority: a sibling's declared
   # setting supplies it only when the gateway does not already carry a value.
   "GATEWAY_SSL_VERIFY",
+  "BRAVE_API_KEY",
   "FMP_API_KEY",
   "FMP_CACHE_DIR",
   "FRED_API_KEY",
   "ORATS_API_KEY",
   "EDGAR_API_KEY",
+  "EDGAR_API_STATE_DIR",
+  "EDGAR_API_EXPORT_DIR",
+  "EDGAR_TABLE_READER_CACHE_DIR",
+  "DOCUMENT_SERVICE_FILINGS_DIR",
+  "EDGAR_RAW_STORE_DIR",
+  "EDGAR_API_LOG_DIR",
+  "EDGAR_API_RUNTIME_DIR",
   "SEC_BUDGET_SITE",
   "SEC_USER_AGENT",
   "SEC_EXPECTED_MACHINE_IDENTITY",
@@ -247,6 +265,7 @@ def filter_child_environment(
 
 __all__ = [
   "AUTONOMOUS_CHILD_ENVIRONMENT",
+  "AUTONOMOUS_CHILD_MODEL_ENDPOINT_ENV_NAMES",
   "AUTONOMOUS_CHILD_PROFILES",
   "AUTONOMOUS_CHILD_RUNTIME_ENV_NAMES",
   "CHILD_ENVIRONMENT_ALLOWLISTS",

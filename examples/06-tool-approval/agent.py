@@ -10,6 +10,8 @@ from model_authority.current import INITIAL_MODEL_REGISTRY, INITIAL_MODEL_SELECT
 from model_authority.selection import project_capability_default
 from agent_gateway.tool_dispatcher import LocalToolHandler
 from agent_gateway.server import ChatRequest, MaterializedCredential
+from agent_gateway.approval_policy import RunContext
+from agent_gateway.registry_scope import RegistryScope
 
 
 BASE_DIR = Path(__file__).parent
@@ -162,6 +164,7 @@ async def build_chat_runtime(
     return list(TOOL_DEFINITIONS)
 
   def build_runner(event_log, session_id, started_at):
+    run_id = str(request.request_id or session_id)
     dispatcher = ToolDispatcher(
       capability_bind=capability_execution.bind,
       mcp_client=mcp_client,
@@ -170,6 +173,14 @@ async def build_chat_runtime(
       request_approval=make_request_approval(session, event_log),
       event_log=event_log,
       session_id=session_id,
+      run_context=RunContext(
+        user_id=session.user_id,
+        request_id=run_id,
+        session_id=session_id,
+        run_id=run_id,
+        channel=str(channel or session.channel or "web"),
+        registry_scope=RegistryScope("run", run_id, str(BASE_DIR)),
+      ),
     )
     return AgentRunner(
       event_log=event_log,

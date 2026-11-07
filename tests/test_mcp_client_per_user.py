@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 # ruff: noqa: E402
 
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
@@ -430,6 +432,7 @@ def test_dispatcher_passes_authenticated_session_to_per_user_mcp(monkeypatch, ow
       mcp_client=manager,
       session=session,
       risk_user_id=7,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     result, error = await dispatcher.dispatch(
       "call-1",
@@ -1220,6 +1223,7 @@ def test_future_dispatch_reuses_refreshed_per_user_sheets_session(monkeypatch, o
       session=_gateway_session(),
       get_tool_definitions=lambda: [{"name": "gsheets_read_range"}],
       allowed_mcp_tools_by_server={"gsheets-mcp": {"gsheets_read_range"}},
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
 
     first_result, first_error = await dispatcher.dispatch(

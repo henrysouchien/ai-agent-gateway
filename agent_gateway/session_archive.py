@@ -11,7 +11,10 @@ from pathlib import Path
 import re
 from typing import Any, Iterator
 
+from hank_model_transport.openai_history_fence import _SCOPE_SEPARATOR
+
 from .agent_session_log_records import slugify
+from .artifact_paths import autonomous_log_dir as configured_autonomous_log_dir
 from .tool_result_spill import (
   SPILL_READ_DEFAULT_FILE_MAX_BYTES,
   _SPILL_REF_RE,
@@ -30,26 +33,36 @@ class ArchiveResult:
   warnings: list[str]
 
 
-def _configured_path(name: str, default: Path) -> Path:
-  return Path(os.environ.get(name, "").strip() or default).expanduser()
+def _absolute_env_path(name: str) -> Path | None:
+  configured = os.environ.get(name, "").strip()
+  if not configured:
+    return None
+  path = Path(configured).expanduser()
+  if not path.is_absolute():
+    raise ValueError(f"{name} must be an absolute path")
+  return path
 
 
-def _default_chat_dir() -> Path:
-  # Precedence: records_root/state/logs/chat (selected by archive_session),
-  # GATEWAY_CHAT_LOG_DIR, GATEWAY_LOG_DIR/chat_logs, then the production
-  # data/gateway_logs/chat_logs convention below. Isolated launcher proof:
-  # scripts/local_gateway_isolated.py:290 defines state/logs/chat; :1351 exports it.
-  # Resolve offline without gateway_log_root's directory-creation side effects.
-  configured = os.environ.get("GATEWAY_CHAT_LOG_DIR", "").strip()
-  if configured:
-    path = Path(configured).expanduser()
-    if not path.is_absolute():
-      raise ValueError("GATEWAY_CHAT_LOG_DIR must be an absolute path")
-    return path
+def _chat_dir_from_env() -> Path | None:
+  # The writer (api/main_logging.py) uses GATEWAY_CHAT_LOG_DIR, else
+  # <gateway log dir>/chat_logs. Its last step, the default log root, lives in
+  # api/ and scripts/ and cannot be imported here: no literal stand-in is used.
+  configured = _absolute_env_path("GATEWAY_CHAT_LOG_DIR")
+  if configured is not None:
+    return configured
   log_root = os.environ.get("GATEWAY_LOG_DIR", "").strip()
-  if log_root:
-    return Path(log_root).expanduser() / "chat_logs"
-  return Path.home() / ".local/state/hank/data/gateway_logs/chat_logs"
+  return Path(log_root).expanduser() / "chat_logs" if log_root else None
+
+
+def _required_root(
+  resolved: Path | None, what: str, *, argument: str, env_names: str,
+) -> Path:
+  if resolved is None:
+    raise ValueError(
+      f"Cannot locate the {what}: pass --records-root (or {argument}), "
+      f"or set {env_names} to the value the gateway writes with"
+    )
+  return resolved
 
 
 def _json_object(path: Path, warnings: list[str]) -> dict[str, Any]:
@@ -96,26 +109,31 @@ def archive_session(
 
   Missing, malformed, ambiguous, or expired source records are reported in the
   manifest rather than aborting collection. Destination I/O errors propagate.
-  Explicit store paths take precedence over records-root and environment defaults.
+  Explicit store paths take precedence over records-root, which takes precedence over
+  the environment the gateway writes with. A chat or session root none of these
+  names raises ValueError rather than reading a guessed location.
   """
   if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", session_id):
     raise ValueError("session_id must be a filename-safe session identifier")
   records = Path(records_root).expanduser() if records_root is not None else None
   chat_dir = Path(chat_log_dir).expanduser() if chat_log_dir is not None else (
-    records / "state/logs/chat" if records else _default_chat_dir()
+    records / "state/logs/chat" if records else _required_root(
+      _chat_dir_from_env(), "chat log directory", argument="chat_log_dir",
+      env_names="GATEWAY_CHAT_LOG_DIR or GATEWAY_LOG_DIR",
+    )
   )
   session_base = Path(session_log_base).expanduser() if session_log_base is not None else (
-    records / "state/logs/sessions" if records else _configured_path("AGENT_SESSION_LOG_BASE_DIR", Path("api/sessions"))
+    records / "state/logs/sessions" if records else _required_root(
+      _absolute_env_path("AGENT_SESSION_LOG_BASE_DIR"), "session log directory",
+      argument="session_log_base", env_names="AGENT_SESSION_LOG_BASE_DIR",
+    )
   )
-  auto_default = _configured_path("AGENTS_MCP_LOG_DIR", Path.home() / ".cache/agent-gateway/autonomous")
-  if os.environ.get("GATEWAY_LOG_DIR", "").strip():
-    auto_default = Path(os.environ["GATEWAY_LOG_DIR"]).expanduser() / "autonomous"
-  auto_dir = Path(autonomous_log_dir).expanduser() if autonomous_log_dir is not None else _configured_path(
-    "AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", auto_default,
-  )
-  surface_path = Path(surface_content_path).expanduser() if surface_content_path is not None else _configured_path(
-    "GATEWAY_SURFACE_CONTENT_PATH",
-    Path.home() / ".local/state/hank/data/telemetry/surface_content.jsonl",
+  # The writer persists autonomous runs only when a root is configured; absent
+  # root means there are no autonomous records to find, not a place to guess.
+  auto_dir = Path(autonomous_log_dir).expanduser() if autonomous_log_dir is not None else configured_autonomous_log_dir()
+  surface_env = os.environ.get("GATEWAY_SURFACE_CONTENT_PATH", "").strip()
+  surface_path = Path(surface_content_path).expanduser() if surface_content_path is not None else (
+    Path(surface_env).expanduser() if surface_env else None
   )
   destination = Path(output_dir).expanduser() / session_id
   destination.mkdir(parents=True, exist_ok=False)
@@ -169,14 +187,17 @@ def archive_session(
   metadata = _json_object(transcript_meta, warnings) if transcript_meta.is_file() else {}
   user_id = metadata.get("user_id")
   pattern = f"agentsess_{escape(session_id)}*"
+  patterns = [f"{pattern}.jsonl"]
   if isinstance(user_id, str) and user_id:
-    pattern += f"_{escape(user_id)}"
-  pattern += ".jsonl"
+    base = f"agentsess_{escape(session_id)}_{escape(user_id)}"
+    patterns = [f"{base}.jsonl", f"{base}{escape(_SCOPE_SEPARATOR)}*.jsonl"]
   try:
-    streams = set(session_base.glob(f"*/{pattern}"))
-    # A rotation may have moved the active JSONL away before its replacement.
-    for segments in session_base.glob(f"*/{pattern[:-6]}.segments"):
-      streams.add(segments.with_name(f"{segments.name[:-9]}.jsonl"))
+    streams: set[Path] = set()
+    for pattern in patterns:
+      streams.update(session_base.glob(f"*/{pattern}"))
+      # A rotation may have moved the active JSONL away before its replacement.
+      for segments in session_base.glob(f"*/{pattern[:-6]}.segments"):
+        streams.add(segments.with_name(f"{segments.name[:-9]}.jsonl"))
   except OSError as exc:
     warnings.append(f"Cannot enumerate session logs in {session_base}: {exc}")
     streams = set()
@@ -196,7 +217,7 @@ def archive_session(
     copy_stream(active, Path("session") / active.parent.relative_to(session_base))
 
   try:
-    tasks = sorted(auto_dir.glob("bg_*.task.json"))
+    tasks = sorted(auto_dir.glob("bg_*.task.json")) if auto_dir is not None else []
   except OSError as exc:
     warnings.append(f"Cannot enumerate autonomous records in {auto_dir}: {exc}")
     tasks = []
@@ -292,7 +313,10 @@ def archive_session(
           publications[ref] = root if isinstance(root, str) else None
 
   prompt_content: dict[str, str] = {}
-  if prompt_hashes or not surface_path.is_file():
+  if surface_path is None:
+    if prompt_hashes:
+      warnings.append("Surface content path is not configured (GATEWAY_SURFACE_CONTENT_PATH); system prompt bodies were not resolved")
+  elif prompt_hashes or not surface_path.is_file():
     for row in _json_lines(surface_path, warnings):
       content_hash, content = row.get("content_hash"), row.get("content")
       if isinstance(content_hash, str) and content_hash in prompt_hashes and isinstance(content, str):
@@ -302,7 +326,7 @@ def archive_session(
     content = prompt_content.get(prompt_hash)
     valid_hash = re.fullmatch(r"(?:sha256:)?([0-9a-f]{64})", prompt_hash)
     present = content is not None and valid_hash is not None
-    if present and valid_hash is not None and content is not None:
+    if present and valid_hash is not None and content is not None and surface_path is not None:
       write_payload(f"prompts/{valid_hash.group(1)}.txt", surface_path, content.encode("utf-8"))
     else:
       warnings.append(f"System prompt {prompt_hash} is missing or invalid in {surface_path}")

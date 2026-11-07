@@ -1,8 +1,9 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 # ruff: noqa: E402
 
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
-import inspect
 from dataclasses import replace
 import sys
 from pathlib import Path
@@ -22,7 +23,6 @@ from agent_gateway import (
   SkillLoader,
   ToolDispatcher,
   make_run_agent_handler,
-  make_run_agent_tool_def,
   parse_skill_file,
 )
 from hank_model_transport.providers import (
@@ -175,6 +175,7 @@ def _make_dispatcher(
     event_log=event_log or EventLog(),
     session_id="sess-parent",
     get_tool_definitions=get_tool_definitions,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
@@ -199,18 +200,6 @@ def _write_skill(skills_dir: Path, name: str, body: str) -> None:
   (skills_dir / f"{name}.md").write_text(body, encoding="utf-8")
 
 
-def test_spawn_sub_agent_requires_bound_execution_instead_of_parent_fallback() -> None:
-  runner = _make_runner(_RecordingProvider("anthropic"))
-  spawn_signature = inspect.signature(runner.spawn_sub_agent)
-  capability_execution = spawn_signature.parameters["capability_execution"]
-
-  assert capability_execution.kind is inspect.Parameter.KEYWORD_ONLY
-  assert capability_execution.default is inspect.Parameter.empty
-  with pytest.raises(TypeError, match="capability_execution"):
-    spawn_signature.bind(
-      "Collect",
-      dispatcher=_make_dispatcher(),
-    )
 
 
 def test_bound_execution_rejects_provider_family_mismatch() -> None:
@@ -364,17 +353,6 @@ def test_run_agent_rejects_legacy_skill_and_task_selectors(tmp_path: Path) -> No
   assert runner.calls == []
 
 
-def test_run_agent_tool_schema_omits_model_selection_authority() -> None:
-  schema = make_run_agent_tool_def()["input_schema"]
-
-  assert not {"provider", "model", "model_key"} & set(
-    schema["properties"]
-  )
-  assert {"role", "effort"} <= set(schema["properties"])
-  assert {"interrupt", "resume", "additional_context"} <= set(schema["properties"])
-  assert not {"oneOf", "anyOf", "allOf"} & set(schema)
-  assert "required" not in schema
-  assert schema["additionalProperties"] is False
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,11 @@ from typing import Any
 
 import pytest
 
+from hank_model_transport.openai_history_fence import (
+  RESPONSES_HISTORY_VERSION,
+  scope_provider_session_id,
+)
+
 from agent_gateway import session_archive
 from agent_gateway.tool_result_spill import (
   SPILL_LANE_FILE_TOOLS,
@@ -49,7 +54,11 @@ def archive_tree(tmp_path: Path) -> dict[str, Any]:
   spill = root / "result.json"
   spill.write_bytes(payload)
   ref = f"spill:v1:{spill.name}:{hashlib.sha256(payload).hexdigest()}"
-  active = sessions / "analyst" / f"agentsess_{session_id}--openai-era_alice.jsonl"
+  log_id = scope_provider_session_id(
+    f"agentsess_{session_id}_alice",
+    provider="openai", durable=True, openai_epoch=RESPONSES_HISTORY_VERSION,
+  )
+  active = sessions / "analyst" / f"{log_id}.jsonl"
   _jsonl(active, [
     *[_event({"type": "context_manifest", "system_prompt_hash": value}, seq) for seq, value in enumerate(hashes, 1)],
     _event({"type": "tool_call_complete", "spill_publication": {"spill_ref": ref, "producer_root": str(root)}}, 3),
@@ -101,7 +110,7 @@ def test_archive_restores_prompts_spills_and_children(
   assert not (result.output_dir / "autonomous/unknown-parent").exists()
   assert any("Unknown parent" in value and "bg_2" in value for value in result.warnings)
   assert (result.output_dir / "session" / f"{archive_tree['session_id']}.jsonl").is_file()
-  assert (result.output_dir / "session/analyst" / archive_tree["active"].name).is_file()
+  assert (result.output_dir / "session/analyst" / archive_tree["active"].name).read_bytes() == archive_tree["active"].read_bytes()
 
 
 def test_archive_orphans_are_explicitly_bucketed(tmp_path: Path, archive_tree: dict[str, Any]) -> None:
@@ -111,8 +120,16 @@ def test_archive_orphans_are_explicitly_bucketed(tmp_path: Path, archive_tree: d
   assert not (result.output_dir / "autonomous/bg_2").exists()
 
 
-def test_archive_copies_all_provider_eras_and_segments(tmp_path: Path, archive_tree: dict[str, Any]) -> None:
-  second = archive_tree["active"].with_name(f"agentsess_{archive_tree['session_id']}--openai-other_alice.jsonl")
+@pytest.mark.parametrize("epoch", [None, "responses-v2"])
+def test_archive_copies_all_provider_eras_and_segments(
+  tmp_path: Path, archive_tree: dict[str, Any], epoch: str | None,
+) -> None:
+  log_id = scope_provider_session_id(
+    f"agentsess_{archive_tree['session_id']}_alice",
+    provider="openai" if epoch is not None else "anthropic",
+    durable=True, openai_epoch=epoch,
+  )
+  second = archive_tree["active"].with_name(f"{log_id}.jsonl")
   _jsonl(second, [_event({"type": "text", "text": "other era"})])
   segments = second.with_name(f"{second.stem}.segments")
   _jsonl(segments / "000001.jsonl", [_event({"type": "text", "text": "rotated"})])
@@ -214,3 +231,67 @@ def test_archive_resolves_chat_logs_directly_under_gateway_log_dir(
   assert (result.output_dir / "session" / f"{session_id}.jsonl").is_file()
   assert (result.output_dir / "session" / f"{session_id}.meta.json").is_file()
   assert not any("logs/chat_logs" in value for value in result.warnings)
+
+
+_WRITER_ENV = (
+  "GATEWAY_CHAT_LOG_DIR", "GATEWAY_LOG_DIR", "AGENT_SESSION_LOG_BASE_DIR",
+  "AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", "AGENTS_MCP_LOG_DIR", "GATEWAY_SURFACE_CONTENT_PATH",
+)
+
+
+def _clear_writer_env(monkeypatch: pytest.MonkeyPatch) -> None:
+  for name in _WRITER_ENV:
+    monkeypatch.delenv(name, raising=False)
+
+
+def test_archive_without_records_root_resolves_the_writers_environment(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, archive_tree: dict[str, Any],
+) -> None:
+  _clear_writer_env(monkeypatch)
+  monkeypatch.setenv("GATEWAY_CHAT_LOG_DIR", str(archive_tree["records"] / "state/logs/chat"))
+  monkeypatch.setenv("AGENT_SESSION_LOG_BASE_DIR", str(archive_tree["sessions"]))
+  monkeypatch.setenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", str(archive_tree["auto"]))
+  monkeypatch.setenv("GATEWAY_SURFACE_CONTENT_PATH", str(archive_tree["surface"]))
+  result = session_archive.archive_session(archive_tree["session_id"], tmp_path / "output")
+  assert (result.output_dir / "session" / f"{archive_tree['session_id']}.jsonl").is_file()
+  assert (result.output_dir / "session/analyst" / archive_tree["active"].name).is_file()
+  assert [present for _, present in result.prompts] == [True, True]
+  assert (result.output_dir / "autonomous/bg_1/bg_1.events.jsonl").is_file()
+
+
+def test_archive_does_not_read_guessed_home_or_cwd_roots(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, archive_tree: dict[str, Any],
+) -> None:
+  session_id = archive_tree["session_id"]
+  home = tmp_path / "home"
+  literal_chat = home / ".local/state/hank/data/gateway_logs/chat_logs"
+  _jsonl(literal_chat / f"{session_id}.jsonl", [{"role": "user", "content": "stray"}])
+  _json(literal_chat / f"{session_id}.meta.json", {"user_id": "alice"})
+  cwd = tmp_path / "cwd"
+  _jsonl(cwd / "api/sessions/analyst" / archive_tree["active"].name, [_event({"type": "x"})])
+  monkeypatch.setenv("HOME", str(home))
+  monkeypatch.chdir(cwd)
+  _clear_writer_env(monkeypatch)
+  with pytest.raises(ValueError, match="chat log directory"):
+    session_archive.archive_session(session_id, tmp_path / "output")
+  monkeypatch.setenv("GATEWAY_CHAT_LOG_DIR", str(archive_tree["records"] / "state/logs/chat"))
+  with pytest.raises(ValueError, match="session log directory"):
+    session_archive.archive_session(session_id, tmp_path / "output")
+  assert not (tmp_path / "output").exists()
+
+
+def test_archive_unconfigured_autonomous_and_surface_roots_find_nothing_at_home(
+  tmp_path: Path, monkeypatch: pytest.MonkeyPatch, archive_tree: dict[str, Any],
+) -> None:
+  home = tmp_path / "home"
+  stray_auto = home / ".cache/agent-gateway/autonomous"
+  _json(stray_auto / "bg_1.task.json", {"session_id": "bg_1", "user_id": "alice", "admitted_context": {"lineage": {"parent_job_id": archive_tree["session_id"]}}})
+  stray_surface = home / ".local/state/hank/data/telemetry/surface_content.jsonl"
+  _jsonl(stray_surface, [{"content_hash": h, "content": t} for h, t in zip(archive_tree["hashes"], archive_tree["prompts"])])
+  monkeypatch.setenv("HOME", str(home))
+  _clear_writer_env(monkeypatch)
+  result = session_archive.archive_session(
+    archive_tree["session_id"], tmp_path / "output", records_root=archive_tree["records"],
+  )
+  assert [present for _, present in result.prompts] == [False, False]
+  assert not (result.output_dir / "autonomous/bg_1").exists()

@@ -11,7 +11,45 @@ from agent_gateway.artifact_paths import (
   artifact_json_path_for_request,
   artifact_json_paths_for_request,
   ticker_artifact_paths_for_request,
+  existing_user_issue_inbox_db_paths,
+  user_issue_inbox_db_path,
+  user_desk_root,
+  user_workspace_root,
 )
+
+
+def test_parsed_storage_identity_locates_desk_and_artifact_workspace(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  data_dir = tmp_path / "data"
+  monkeypatch.setenv("USER_DATA_DIR", str(data_dir))
+  storage_id = "42"
+
+  assert user_desk_root(data_dir, storage_id) == data_dir / "users" / "42"
+  assert user_workspace_root(storage_id) == (
+    data_dir / "users" / "42" / "workspace"
+  ).resolve()
+
+
+
+def test_issue_inbox_enumeration_parses_disk_owner_names(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  caplog: pytest.LogCaptureFixture,
+) -> None:
+  data_dir = tmp_path / "data"
+  monkeypatch.setenv("USER_DATA_DIR", str(data_dir))
+  inbox = user_issue_inbox_db_path("42")
+  inbox.touch()
+  for name in ("042", "CalmGlen", "hc@henrychien.com"):
+    foreign = data_dir / "users" / name / "workspace" / "issue-inbox" / inbox.name
+    foreign.parent.mkdir(parents=True)
+    foreign.touch()
+
+  with caplog.at_level(logging.WARNING, logger="agent_gateway.artifact_paths"):
+    assert existing_user_issue_inbox_db_paths() == [inbox]
+  assert all(name in caplog.text for name in ("042", "CalmGlen", "hc@henrychien.com"))
 
 
 @pytest.mark.parametrize(

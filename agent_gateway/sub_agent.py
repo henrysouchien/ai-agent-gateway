@@ -81,6 +81,7 @@ from .admission import (
 )
 from .autonomous_output import extract_state_update
 from .approval_policy import RunContext
+from .registry_scope import DeclaredRegistryScope
 from .agent_result_content import (
   ResultContentUnavailable,
   make_get_agent_result_content_handler,
@@ -134,6 +135,7 @@ from hank_model_transport.policy_imports import require_inherited_role
 from .mcp_activation import RunAgentMcpActivationError
 from .operation_catalog import (
   AgentOperationCatalog,
+  OperationRefusedError,
   OperationRuntimePolicy,
   ResolvedOperationRuntime,
 )
@@ -266,6 +268,7 @@ def _child_run_context(
   *,
   parent_session: GatewaySession | None,
   tool_ctx: Any,
+  registry_scope: DeclaredRegistryScope,
   skill_run_id: str | None,
   skill_name: str | None,
   admitted_skill_execution_limits: SkillExecutionLimits | None,
@@ -277,7 +280,9 @@ def _child_run_context(
   """Bind lifecycle tools to the exact server-owned child run identity."""
 
   return RunContext(
-    user_id=str(user_id or getattr(parent_session, "user_id", None) or "unknown"),
+    registry_scope=registry_scope,
+    # caller-supplied id. The login is never a desk identity.
+    user_id=str(getattr(parent_session, "owner_user_id", None) or user_id or "unknown"),
     request_id=str(
       getattr(tool_ctx, "request_id", None)
       or getattr(parent_session, "request_id", None)
@@ -856,6 +861,7 @@ def _operation_unavailable_error(
     "details": {
       "operation": unavailable.operation_name,
       "reason": unavailable.code,
+      "missing_routes": list(unavailable.missing_routes),
       "unsatisfied": [
         item.model_dump(mode="json", exclude={"kind"})
         for item in unavailable.unsatisfied
@@ -868,14 +874,19 @@ def _operation_unavailable_error(
 def _ticker_refusal(
   code: str, message: str, tool_input: Mapping[str, Any], *, required: bool,
 ) -> dict[str, Any]:
-  """A ticker refusal whose repair follows the operation's declared context."""
+  """A ticker refusal whose repair follows the operation's declared context.
+
+  A required subject's `next_call` carries the typed `ticker` argument to fill (the
+  candidates the prose offered are in the message); an operation that declares no
+  ticker repeats the call without one.
+  """
+  arguments = {key: value for key, value in tool_input.items() if key != "ticker"}
+  if required:
+    arguments["ticker"] = "<the one issuer this operation is about>"
   refusal: dict[str, Any] = {
     "code": code,
     "message": message,
-    "next_call": build_next_call(
-      "run_agent",
-      {key: value for key, value in tool_input.items() if key != "ticker"},
-    ),
+    "next_call": build_next_call("run_agent", arguments),
   }
   if required:
     refusal["missing_keys"] = ["ticker"]
@@ -2157,6 +2168,8 @@ def make_run_agent_handler(
         operation_activation_target = canonical_operation
       except FileNotFoundError as exc:
         return None, {"code": "not_found", "message": str(exc)}
+      except OperationRefusedError as exc:
+        return None, {"code": exc.code, "message": exc.message}
       except Exception as exc:
         return None, {"code": "invalid_operation", "message": str(exc)}
       profile = None
@@ -2178,7 +2191,11 @@ def make_run_agent_handler(
       runtime_policy = None
       operation_activation_target = profile
       operation_dispatch_tool_ids = operation_tool_ids(profile)
-      canonical_to_exposed_mcp_tool_ids = MappingProxyType({})
+      canonical_to_exposed_mcp_tool_ids = MappingProxyType({
+        route_id: route_id.split("__", 2)[2]
+        if route_id.startswith("mcp__") else route_id
+        for route_id in operation.essential_routes
+      })
       mcp_tools_by_server = profile.mcp_tools or {}
       operation_scope = profile.scope
       operation_persist_state = profile.persist_state
@@ -2694,6 +2711,7 @@ def make_run_agent_handler(
         local_tool_handlers=sub_local,
         mcp_client=mcp_client,
         identity=execution_identity_from_session(parent_session),
+        exposed_route_ids=canonical_to_exposed_mcp_tool_ids,
       )
       if (
         spill_reader_companion
@@ -3061,6 +3079,7 @@ def make_run_agent_handler(
           run_context=_child_run_context(
             parent_session=parent_session,
             tool_ctx=tool_ctx,
+            registry_scope=runner._dispatcher.run_context.registry_scope,
             skill_run_id=skill_run_id,
             skill_name=agent_name,
             admitted_skill_execution_limits=SkillExecutionLimits(),
@@ -3675,6 +3694,8 @@ def make_resume_handler(
       None,
       withheld_tools=frozenset(excluded_tools_resolver()),
       research_file_id=None,
+      # No parent selection is recorded for this sessionless frozen resume.
+      selection_provenance=None,
     )
 
   async def _execute_resume(
@@ -4019,8 +4040,11 @@ def make_resume_handler(
     resumer_job_id = root.job_id
 
     try:
+      # The revival spends in the lane admission recorded; a task admitted
+      # before the lane carries none and revives as its owner rules.
       execution = materialize_frozen_bind(
         capability_execution_resolver, original_bind,
+        selection_lane=continuation.wire.selection_lane,
         user_scope=getattr(parent_session, "risk_user_id", None),
         base_config=getattr(parent_session, "auth_config", None) or {},
       )
@@ -4558,6 +4582,7 @@ def make_resume_handler(
           run_context=_child_run_context(
             parent_session=parent_session,
             tool_ctx=tool_ctx,
+            registry_scope=runner._dispatcher.run_context.registry_scope,
             skill_run_id=skill_run_id,
             skill_name=agent_name,
             admitted_skill_execution_limits=SkillExecutionLimits(),

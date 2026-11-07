@@ -17,6 +17,7 @@ from agent_gateway.approvals import (
   ApprovalActionError,
   _cancel_pending_approval_and_unblock,
 )
+from agent_gateway.approval_store import RUN_CANCELLED_REASON
 from agent_gateway.autonomous_launch_envelope import (
   AUTONOMOUS_RUNTIME_SESSION_PURPOSE,
 )
@@ -25,15 +26,16 @@ from agent_gateway.autonomous_runner_state import (
   is_root_run_event,
   is_root_terminal_event,
 )
+from agent_gateway.completion_reads import read_chat_completion, read_workflow_completion
 from agent_gateway.session import AuthManager, GatewaySession
 from agent_gateway.session_recap import _verdict_summary_from_skill_result
 from agent_gateway.control_run_lifecycle import (
   CONTROL_ACTIVE_RUN_STATES,
+  CONTROL_RUN_STATE_CLASSIFICATION,
   CONTROL_TERMINAL_RUN_STATES,
   canonical_control_run_state,
   coerce_control_run_state,
   is_autonomous_run_internal_messageable_state,
-  is_autonomous_run_internal_resumable_state,
   is_control_run_active_state,
 )
 from .autonomous_approval_delivery import (
@@ -172,14 +174,20 @@ def _state_from_session(session: GatewaySession, events: list[dict[str, Any]]) -
       if state is not None:
         return state
 
-  for event in events:
-    if not is_root_terminal_event(event):
-      continue
+  # The latest turn's state is the run's state: a parked turn's
+  # `awaiting_approval` is superseded by the continued turn's own terminal event
+  # once the approval was decided (R24 approval-clock F1: the projection stayed
+  # approval_pending after approve or deny because the first terminal event of
+  # the whole history answered). Within one turn the first terminal event still
+  # wins, so an error is never laundered by a trailing completed event.
+  terminals = [event for event in events if is_root_terminal_event(event)]
+  if terminals:
+    latest_turn = terminals[-1].get("root_turn_id")
+    terminals = [event for event in terminals if event.get("root_turn_id") == latest_turn]
+  for event in terminals:
     event_type = event.get("type")
-    if event_type in {"error", "stream_error"}:
-      return "failed"
     if event_type != "stream_complete":
-      continue
+      return "failed"
     disposition = event.get("terminal_disposition")
     if disposition == "completed":
       return "completed"
@@ -614,6 +622,7 @@ def _chat_run_from_session(session: GatewaySession) -> ChatRunResponse:
     pending_approval=_pending_approval(session),
     latest_tool_result=_latest_tool_result(events),
     dispatch_scope=_dispatch_scope_response(session.dispatch_scope),
+    completion=read_chat_completion(session),
   )
 
 
@@ -732,6 +741,7 @@ async def _deny_autonomous_pending_approvals_for_cancel(
       created_at=int(record.started_at),
       expires_at=int(time.time()) + 600,
       user_id=_record_owner_user_id(record),
+      owner_user_id=_record_owner_user_id(record),
       user_email=record.user_email,
       role=authenticated.role,
       kind="chat",
@@ -740,6 +750,17 @@ async def _deny_autonomous_pending_approvals_for_cancel(
     bind_session_approval_route(shim_session, store, policy)
     shim_session.pending_tools[tool_call_id] = pending_entry
     shim_session.approval_queues[tool_call_id] = approval_queue
+    # A parked ask recorded its durable continuation and its process has
+    # exited (or is exiting): a denial has no live call to unblock, and through
+    # the outbox its only effect would be relaunching the run. Cancelling ends
+    # the run first, so that no decision on this request can relaunch it, then
+    # denies the request with no delivery.
+    parked = (
+      record.approval_continuation is not None
+      and record.approval_continuation["approval_id"] == approval_id
+    )
+    if parked:
+      await registry.cancel(record.task_id)
 
     try:
       result = await _cancel_pending_approval_and_unblock(
@@ -749,7 +770,7 @@ async def _deny_autonomous_pending_approvals_for_cancel(
         nonce=nonce,
         decider_id=owner_user_id,
         decider_role=getattr(authenticated, "role", None),
-        reason="run_cancelled",
+        reason=RUN_CANCELLED_REASON,
         app_state=app_state,
         authoritative_store=store,
         authoritative_policy=policy,
@@ -758,17 +779,22 @@ async def _deny_autonomous_pending_approvals_for_cancel(
         expected_run_id=record.control_run_id,
         expected_session_id=record.session_id,
         expected_channel=record.channel,
-        autonomous_delivery=autonomous_approval_delivery_context(
-          record,
-          tool_call_id=tool_call_id,
-          nonce=nonce,
+        autonomous_delivery=(
+          None
+          if parked
+          else autonomous_approval_delivery_context(
+            record,
+            tool_call_id=tool_call_id,
+            nonce=nonce,
+          )
         ),
         release_queue=False,
       )
     finally:
       wake_autonomous_approval_delivery(app_state)
     if (
-      result.get("identity_matches") is not True
+      parked
+      or result.get("identity_matches") is not True
       or result.get("transitioned") is not True
     ):
       continue
@@ -802,7 +828,7 @@ def _autonomous_task_resumable(record: AutonomousTask) -> bool:
     return False
   if record.mode != "skill" or not record.skill:
     return False
-  if not is_autonomous_run_internal_resumable_state(record.state):
+  if not CONTROL_RUN_STATE_CLASSIFICATION[_autonomous_state(record.state)]["resumable"]:
     return False
   return record.skill_resume_allowed
 
@@ -834,6 +860,7 @@ def _autonomous_run_from_task(record: AutonomousTask) -> AutonomousRunResponse:
   if state in CONTROL_ACTIVE_RUN_STATES and _autonomous_has_pending_approval(events):
     state = "approval_pending"
   owner_user_id = _record_owner_user_id(record)
+  terminal_receipt = _autonomous_terminal_receipt(record, state=state, events=events)
   return AutonomousRunResponse(
     kind="autonomous",
     run_id=record.control_run_id,
@@ -856,7 +883,15 @@ def _autonomous_run_from_task(record: AutonomousTask) -> AutonomousRunResponse:
     state=state,
     exit_code=record.exit_code,
     error=record.error,
-    terminal_receipt=_autonomous_terminal_receipt(record, state=state, events=events),
+    terminal_receipt=terminal_receipt,
+    completion=read_workflow_completion(
+      record,
+      terminal_receipt=terminal_receipt.model_dump(mode="json") if terminal_receipt is not None else None,
+      pending_approval_refs=[
+        {"tool_call_id": event.get("tool_call_id"), "approval_id": event.get("approval_id")}
+        for event in _autonomous_pending_approval_events(record)
+      ],
+    ),
     record_paths=AutonomousRunRecordPaths(
       task_manifest=str(record.log_path.with_name(f"{record.task_id}.task.json")),
       log=str(record.log_path),

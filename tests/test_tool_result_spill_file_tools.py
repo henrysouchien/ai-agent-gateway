@@ -831,6 +831,61 @@ def test_exact_reader_fails_closed_on_missing_replaced_or_tampered_members(
     read_spill_result(member_sink, spill_ref=member_publication.spill_ref)
 
 
+def _publish_chunked_json(root: Path, tool_use_id: str) -> tuple[SpillSink, Any]:
+  sink = _sink(root)
+  publication = write_spill_set(
+    sink=sink,
+    tool_name="lookup",
+    tool_use_id=tool_use_id,
+    content=json.dumps({"long": "x" * 300_000, "sibling": [0, False, None]}),
+    model_max_chars=60_000,
+  )
+  return sink, publication
+
+
+def _rewrite_manifest(path: Path, manifest: dict[str, Any]) -> str:
+  path.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+  return f"spill:v1:{path.name}:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+
+@pytest.mark.parametrize("version", [True, 1.0, "1", None, [1]])
+def test_manifest_version_is_exactly_integer_one_in_both_readers(tmp_path: Path, version: Any) -> None:
+  sink, publication = _publish_chunked_json(tmp_path, "version")
+  manifest_path = Path(publication.abspath)
+  manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+  assert manifest["schema_version"] == 1
+  manifest["schema_version"] = version
+  spill_ref = _rewrite_manifest(manifest_path, manifest)
+
+  with pytest.raises(SpillError, match="unsupported spill manifest"):
+    reconstruct_spill_manifest(manifest_path)
+  with pytest.raises(SpillReadUnavailable, match="unsupported spill manifest schema_version"):
+    read_spill_result(sink, spill_ref=spill_ref)
+
+
+@pytest.mark.parametrize("part", ["manifest", "index", "chunks"])
+def test_truncated_stored_json_is_a_spill_error_never_a_json_error(tmp_path: Path, part: str) -> None:
+  sink, publication = _publish_chunked_json(tmp_path, "truncated")
+  manifest_path = Path(publication.abspath)
+  manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+  if part == "manifest":
+    manifest_path.write_bytes(b"{")
+    spill_ref = f"spill:v1:{manifest_path.name}:{hashlib.sha256(b'{').hexdigest()}"
+    with pytest.raises(SpillError, match="spill manifest is not valid JSON"):
+      reconstruct_spill_manifest(manifest_path)
+    with pytest.raises(SpillReadUnavailable, match="spill manifest is not valid JSON"):
+      read_spill_result(sink, spill_ref=spill_ref)
+    return
+  entry = next(member for member in manifest["members"] if member["role"] == part)
+  data = b"{" if part == "index" else f"@{manifest['refs'][0]['ref_id']} 0-1 {{\n".encode()
+  (tmp_path / entry["filename"]).write_bytes(data)
+  entry.update(bytes=len(data), chars=len(data.decode()), sha256=hashlib.sha256(data).hexdigest())
+  _rewrite_manifest(manifest_path, manifest)
+
+  with pytest.raises(SpillError, match="is not valid JSON"):
+    reconstruct_spill_manifest(manifest_path)
+
+
 @pytest.mark.asyncio
 async def test_exact_reader_handler_reports_expired_reference_without_fallback(
   tmp_path: Path,
@@ -860,6 +915,55 @@ async def test_exact_reader_handler_reports_expired_reference_without_fallback(
   assert error == {
     "code": "spill_unavailable",
     "message": "spill is missing or expired",
+    "next_call": None,
+  }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause", ["version", "json", "expired"])
+async def test_spill_unavailable_names_its_cause_and_the_producing_call(
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+  cause: str,
+) -> None:
+  monkeypatch.setenv("AGENT_GATEWAY_MAX_MODEL_TOOL_RESULT_CHARS", "16000")
+  journal = AgentSessionLog(tmp_path / "session.jsonl")
+  (tmp_path / "spills").mkdir()
+  sink = _sink(tmp_path / "spills")
+  spill_ref, _durable, _live, _provider = await publish_custody_spill(
+    sink, _job("root"), journal,
+    tool_use_id="call-big", payload={"payload": "x" * 40_000},
+  )
+  manifest_path = tmp_path / "spills" / spill_ref.split(":")[2]
+  manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+  if cause == "version":
+    manifest["schema_version"] = True
+    spill_ref = _rewrite_manifest(manifest_path, manifest)
+    message = "unsupported spill manifest schema_version"
+  elif cause == "json":
+    manifest_path.write_bytes(b"{")
+    spill_ref = f"spill:v1:{manifest_path.name}:{hashlib.sha256(b'{').hexdigest()}"
+    message = "spill manifest is not valid JSON"
+  else:
+    manifest_path.unlink()
+    message = "spill is missing or expired"
+  stored = {
+    path.name: path.read_bytes() for path in (tmp_path / "spills").iterdir() if path.is_file()
+  }
+
+  result, error = await _read_custody_spill(journal, _job("root"), spill_ref, sink=sink)
+
+  assert result is None
+  assert error == {
+    "code": "spill_unavailable",
+    "message": message,
+    "next_call": {
+      "tool_name": "session_query",
+      "arguments": {"tool_call_id": "call-big"},
+    },
+  }
+  assert stored == {
+    path.name: path.read_bytes() for path in (tmp_path / "spills").iterdir() if path.is_file()
   }
 
 

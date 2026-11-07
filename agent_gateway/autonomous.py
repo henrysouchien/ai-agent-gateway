@@ -11,13 +11,14 @@ replace them. ``HeartbeatLoop`` delegates each tick here. See
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import logging
 import os
 import secrets
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Coroutine, Iterable, Mapping, ParamSpec, Sequence, TypeVar
 
 import httpx
 from agent_workflow_contracts.tool_registration import (
@@ -25,6 +26,8 @@ from agent_workflow_contracts.tool_registration import (
   ToolRegistrationCatalog,
 )
 from .autonomous_claim_broker import AutonomousClaimSigner
+from .production_identity import ProductionSendHeld, require_production_runtime
+from .registry_scope import DeclaredRegistryScope
 
 from ._io import _atomic_write_json, _read_json_object
 from .approval_route import session_approval_route
@@ -58,7 +61,7 @@ from hank_model_transport.openai_history_fence import (
   OPENAI_SESSION_EPOCH_ENV,
   scope_provider_session_id,
 )
-from .admission import current_parent_context, root_context
+from .admission import current_parent_context, root_context, root_preset_layer
 from .approval_policy import RunContext
 from .containment_settings import ContainmentSettings
 from .runner import AgentRunner, ToolResultContext
@@ -69,7 +72,8 @@ from .skill_lifecycle import (
 )
 from .skills import SkillLoader
 from .skill_limits import SkillExecutionLimits
-from .session import GatewaySession
+from .session import GatewaySession, session_owner_user_id
+from .single_user_policy import pin_approval_settings
 from .sub_agent import (
   make_get_background_result_handler,
   make_get_background_result_tool_def,
@@ -600,6 +604,13 @@ def split_messages(text: str, max_len: int = 4096) -> list[str]:
 
 
 async def send_telegram(message: str, bot_token: str, chat_id: str) -> None:
+  """Post ``message`` to Telegram in chunks.
+
+  Raises ``ProductionSendHeld`` before any request unless this process is a
+  production runtime (``agent_gateway.production_identity``).
+  """
+
+  require_production_runtime("telegram")
   url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
   chunks = split_messages(message)
   async with httpx.AsyncClient(timeout=10.0) as client:
@@ -635,6 +646,13 @@ async def send_webhook(
   payload: dict[str, Any],
   headers: dict[str, str] | None = None,
 ) -> None:
+  """POST ``payload`` to ``url``.
+
+  Raises ``ProductionSendHeld`` before any request unless this process is a
+  production runtime (``agent_gateway.production_identity``).
+  """
+
+  require_production_runtime("webhook")
   async with httpx.AsyncClient(timeout=10.0) as client:
     response = await client.post(url, json=payload, headers=headers)
     response.raise_for_status()
@@ -658,6 +676,8 @@ async def deliver(
       await send_telegram(message, bot_token, chat_id)
       if config.briefing_file is not None:
         await send_telegram_file(config.briefing_file, bot_token, chat_id)
+    except ProductionSendHeld as exc:
+      log.warning("%s", exc)
     except Exception as exc:
       log.warning("Telegram delivery failed (non-fatal): %s", exc)
 
@@ -672,6 +692,8 @@ async def deliver(
           "summary": message,
         },
       )
+    except ProductionSendHeld as exc:
+      log.warning("%s", exc)
     except Exception as exc:
       log.warning("Webhook delivery failed (non-fatal): %s", exc)
 
@@ -684,11 +706,35 @@ async def deliver(
       log.warning("Completion callback failed (non-fatal): %s", exc)
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _pinned_to_launch_approval_settings(
+  run: Callable[_P, Coroutine[Any, Any, _R]],
+) -> Callable[_P, Coroutine[Any, Any, _R]]:
+  """A headless run binds the approval switches once, at its launch.
+
+  A run launched under an existing pin (an autonomous child) keeps it; any other
+  caller snapshots the live operator file here, so a later flip does not change
+  the mode a run in progress decides under.
+  """
+
+  @functools.wraps(run)
+  async def pinned(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+    with pin_approval_settings():
+      return await run(*args, **kwargs)
+
+  return pinned
+
+
+@_pinned_to_launch_approval_settings
 async def run_autonomous(
   system_prompt: str | list[tuple[str, bool]],
   initial_message: str,
   *,
   capability_execution: BoundCapabilityExecution,
+  registry_scope: DeclaredRegistryScope,
   admitted_skill_execution_limits: SkillExecutionLimits | None = None,
   session: GatewaySession,
   mcp_servers: dict[str, dict[str, Any]] | None = None,
@@ -846,11 +892,13 @@ async def run_autonomous(
     ),
   )
   run_context = RunContext(
-    user_id=session.user_id,
+    registry_scope=registry_scope,
+    user_id=session_owner_user_id(session),
     request_id=str(getattr(session, "request_id", "") or sid),
     session_id=sid,
     run_id=trusted_skill_run_id,
     profile="autonomous",
+    autonomous=True,
     channel=str(session.channel or "autonomous"),
     skill=trusted_skill_name,
     admitted_skill_execution_limits=admitted_skill_execution_limits,
@@ -1047,6 +1095,12 @@ async def run_autonomous(
         role_source="spawn",
         effort_source="spawn",
         preset=None,
+        preset_layer=root_preset_layer(
+          capability_execution_resolver.selection_policy
+          if capability_execution_resolver is not None
+          else None,
+          chosen_by_session=False,
+        ),
       ),
     )
     if context.children is None:
@@ -1193,6 +1247,7 @@ def run_autonomous_sync(
   initial_message: str,
   *,
   capability_execution: BoundCapabilityExecution,
+  registry_scope: DeclaredRegistryScope,
   session: GatewaySession,
   compaction_trigger: int | None = None,
   **kwargs: Any,
@@ -1231,6 +1286,7 @@ def run_autonomous_sync(
           system_prompt,
           initial_message,
           capability_execution=capability_execution,
+          registry_scope=registry_scope,
           session=session,
           compaction_trigger=compaction_trigger,
           **kwargs,

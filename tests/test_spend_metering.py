@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 # ruff: noqa: E402
 
 import asyncio
@@ -24,6 +26,7 @@ from agent_gateway.mcp_client import McpClientManager
 from agent_gateway.provider_summarize import provider_summarize
 from hank_model_transport.providers import CostEstimate, ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.sdk_runner import AgentSDKRunner
+from agent_gateway.session import GatewaySession
 from hank_model_transport.send_prompt import send_prompt
 from hank_model_transport.spend_metering import (
   ProviderCallMeter,
@@ -394,7 +397,12 @@ def test_a_per_key_ceiling_met_by_the_shared_ledger_refuses_the_next_payg_call()
 # ── runner: retries, refusal ──────────────────────────────────────────────────────
 
 
-def _runner(provider: ModelProvider, config: dict[str, Any] | None = None) -> tuple[AgentRunner, list[dict]]:
+def _runner(
+  provider: ModelProvider,
+  config: dict[str, Any] | None = None,
+  *,
+  session: GatewaySession | None = None,
+) -> tuple[AgentRunner, list[dict]]:
   event_log = EventLog()
   execution = stub_bound_capability_execution(
     provider=provider,
@@ -411,10 +419,12 @@ def _runner(provider: ModelProvider, config: dict[str, Any] | None = None) -> tu
       event_log=event_log,
       session_id="sess-spend",
       get_tool_definitions=None,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     ),
     session_id="sess-spend",
     capability_execution=execution,
-    user_id="alice",
+    user_id=session.owner_user_id if session is not None else "alice",
+    gateway_session=session,
     billing_mode="byok",
     rate_table_version="unknown",
   )
@@ -777,6 +787,7 @@ MUSE_KEY = {
     ("commercial_byok", "api_key", "payg_api_key"),
     ("org_commercial", "api_key", "payg_api_key"),
     ("platform_metered", "api_key", "payg_api_key"),
+    ("model_replay", "api_key", "model_replay"),
   ],
 )
 def test_the_entitlement_overrides_the_wire_mechanism_for_every_kind(
@@ -796,6 +807,19 @@ def test_a_muse_subscription_is_a_seat_and_is_not_refused_under_a_freeze() -> No
 
   assert meter.credential.auth_kind == "oauth_subscription"
   assert meter.credential.fingerprint == fingerprint_credential("muse-minted-key")
+  meter.enforce()
+
+
+def test_a_replay_served_credential_is_marked_and_not_refused_under_a_freeze() -> None:
+  _freeze_payg()
+  replay = {
+    "provider": "ollama_cloud", "auth_mode": "api", "api_key": "replay-synthetic-key-not-a-credential",
+    "auth_token": "", "auth_mechanism": "api_key", "entitlement_kind": "model_replay",
+  }
+  meter = _meter(_Provider(_ok_step()), replay, provider_name="ollama_cloud")
+
+  assert meter.credential.auth_kind == "model_replay"
+  assert meter.credential.tier == "local_or_free"
   meter.enforce()
 
 
@@ -1020,7 +1044,7 @@ def _sdk_result() -> Any:
   )
 
 
-def _sdk_runner(**auth: Any) -> AgentSDKRunner:
+def _sdk_runner(*, session: GatewaySession | None = None, **auth: Any) -> AgentSDKRunner:
   from hank_model_transport.providers import AgentSDKConfig
   from agent_gateway import EventLog
   from gateway_test_support.sdk_capability_execution_test_support import stub_sdk_capability_execution
@@ -1033,6 +1057,7 @@ def _sdk_runner(**auth: Any) -> AgentSDKRunner:
     ),
     capability_execution=stub_sdk_capability_execution(**auth),
     system_prompt="test",
+    session=session,
   )
 
 
@@ -1104,3 +1129,52 @@ def test_compaction_summary_under_a_freeze_is_refused_for_payg_only() -> None:
 
   assert provider.stream_calls == 0
   assert [row["status"] for row in _rows()] == ["budget_blocked"]
+
+
+def _risk_session(session_id: str) -> GatewaySession:
+  return GatewaySession(
+    session_id=session_id, api_key_hash="test", created_at=0, expires_at=2**31,
+    user_id="alice", owner_user_id="101", user_slug="alice", risk_user_id=101,
+  )
+
+
+@pytest.mark.parametrize("risk_user_id,expected_owner", [(101, "101"), (0, "alice")])
+def test_user_triggered_deployment_call_attributes_resolved_owner(risk_user_id, expected_owner) -> None:
+  session = dataclasses.replace(
+    _risk_session("sess-spend"), risk_user_id=risk_user_id, owner_user_id=expected_owner,
+  )
+  runner, _ = _runner(_Provider(_ok_step()), session=session)
+  asyncio.run(runner.run(messages=[{"role": "user", "content": "go"}]))
+  [row] = _rows()
+  assert (row["run_owner"], row["credential_tier"]) == (expected_owner, "deployment_payg")
+
+
+@pytest.mark.parametrize("risk_user_id,expected_owner", [(101, "101"), (0, "alice")])
+def test_user_triggered_sdk_call_attributes_resolved_owner(monkeypatch: pytest.MonkeyPatch, risk_user_id, expected_owner) -> None:
+  _install_sdk(monkeypatch, [_sdk_result()])
+  session = dataclasses.replace(
+    _risk_session("sess-sdk-spend"), risk_user_id=risk_user_id, owner_user_id=expected_owner,
+  )
+  runner = _sdk_runner(session=session)
+  asyncio.run(runner.run([{"role": "user", "content": "go"}]))
+  [row] = _rows()
+  assert (row["run_owner"], row["credential_tier"]) == (expected_owner, "deployment_payg")
+
+
+@pytest.mark.parametrize("risk_user_id,expected_owner", [(101, "101"), (0, "alice")])
+def test_tool_model_call_inherits_resolved_owner(monkeypatch: pytest.MonkeyPatch, risk_user_id, expected_owner) -> None:
+  session = dataclasses.replace(
+    _risk_session("sess-spend"), risk_user_id=risk_user_id, owner_user_id=expected_owner,
+  )
+  runner, _ = _runner(_Provider(_ok_step()), session=session)
+
+  async def tool_model_call(*args: Any, **kwargs: Any) -> Any:
+    meter = _meter(_Provider(_ok_step()))
+    meter.enforce()
+    meter.record(tokens={}, shadow_cost_usd=0.1)
+    return None
+
+  monkeypatch.setattr(runner, "_execute_tool_call_unattributed", tool_model_call)
+  asyncio.run(runner.execute_tool_call("test-id", "test-model-tool", {}))
+  [row] = _rows()
+  assert (row["run_owner"], row["credential_tier"]) == (expected_owner, "deployment_payg")

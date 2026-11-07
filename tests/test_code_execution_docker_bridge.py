@@ -14,7 +14,6 @@ import contextlib
 import dataclasses
 import json
 import os
-import sys
 import tempfile
 import textwrap
 from pathlib import Path
@@ -22,11 +21,6 @@ from typing import Any, AsyncIterator
 
 import pytest
 
-PKG_DIR = Path(__file__).resolve().parents[1]
-# The suite uses importlib mode; explicitly expose the sibling fixture module.
-for path in (PKG_DIR, Path(__file__).resolve().parent):
-  if str(path) not in sys.path:
-    sys.path.insert(0, str(path))
 
 from agent_gateway import SessionStore
 from agent_gateway.code_execution import CodeExecutionConfig, build_code_execution, cleanup_code_execution
@@ -60,6 +54,14 @@ from tests.host_timing_test_support import harness_wait_seconds
 # then by host load. These are hang guards for the test, never product latency bounds.
 def _docker_wait(solo_seconds: float) -> float:
   return harness_wait_seconds(solo_seconds * 3.5)
+
+
+# A cell's compute clock arms when its frame is written, and a session's first cell is
+# still waiting for the container's interpreter to boot then (1.3-6.2 s, median 3.8 s, on
+# a host at load 90 on 18 cores; 5000 ms timed out 44 of 90 loop runs), so a cell budget
+# that is not the thing under test scales like every other wait that spans a container start.
+def _docker_cell_budget_ms(solo_seconds: float) -> int:
+  return int(_docker_wait(solo_seconds) * 1000)
 
 
 @pytest.fixture(scope="module")
@@ -484,7 +486,7 @@ def test_docker_cell_done_cancels_pending_dispatch_without_blocking_output(docke
       while not pathlib.Path("release-exit").exists():
           time.sleep(0.01)
       print("done", flush=True)
-    """, background=background, timeout_ms=5000))
+    """, background=background, timeout_ms=_docker_cell_budget_ms(30)))
     try:
       await asyncio.wait_for(mcp.entered.wait(), timeout=_docker_wait(20))
       [(_backend, handle)] = handles
@@ -540,12 +542,14 @@ def test_docker_descendant_pipe_does_not_mask_cell_exit(docker_runtime: Any) -> 
   async def run() -> None:
     config, handles = docker_runtime
     session, bundle, _mcp, dispatcher, opened = _setup(config)
+    budget_ms = _docker_cell_budget_ms(10)
     try:
-      result, error = await _run_cell(dispatcher, """
+      # The descendant outlives any budget this cell is given, so a masked exit times the cell out.
+      result, error = await _run_cell(dispatcher, f"""
         import subprocess
-        subprocess.Popen(["sleep", "120"])
+        subprocess.Popen(["sleep", "{2 * budget_ms // 1000}"])
         print("done")
-      """, timeout_ms=5000)
+      """, timeout_ms=budget_ms)
       assert error is None, error
       assert result["stdout"] == "done\n"
       assert result["return_code"] == 0 and result["timed_out"] is False, result

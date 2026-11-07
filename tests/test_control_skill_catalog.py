@@ -133,11 +133,21 @@ def test_control_wire_snapshots_all_six_sequence_fields() -> None:
   )
 
 
+# Field membership is a loop over one canonical-text check: every field is refused the
+# empty string, and one field takes every other invalid shape.
 @pytest.mark.parametrize(
-  "field_name",
-  ["name", "label", "scope", "action_class", "approval_policy", "path"],
+  ("field_name", "value"),
+  [
+    *(
+      (field_name, "")
+      for field_name in ("name", "label", "scope", "action_class", "approval_policy", "path")
+    ),
+    ("name", None),
+    ("name", 1),
+    ("name", b"text"),
+    ("name", " padded "),
+  ],
 )
-@pytest.mark.parametrize("value", [None, 1, b"text", "", " padded "])
 def test_control_summary_rejects_invalid_canonical_text(
   field_name: str,
   value: object,
@@ -184,20 +194,29 @@ def test_control_summary_rejects_invalid_optional_text(
     _summary(**{field_name: value})
 
 
+_BOOLEAN_SUMMARY_FIELDS = (
+  "requires_portfolio_context",
+  "agent_callable",
+  "resumable",
+  "persist_state",
+  "catalog",
+  "schedule_eligible",
+  "can_launch",
+  "can_schedule",
+)
+
+
+# Field membership is a loop over one exact-bool check: every field is refused `1`, and
+# one field takes every other non-bool value.
 @pytest.mark.parametrize(
-  "field_name",
+  ("field_name", "value"),
   [
-    "requires_portfolio_context",
-    "agent_callable",
-    "resumable",
-    "persist_state",
-    "catalog",
-    "schedule_eligible",
-    "can_launch",
-    "can_schedule",
+    *((field_name, 1) for field_name in _BOOLEAN_SUMMARY_FIELDS),
+    ("can_launch", 0),
+    ("can_launch", "true"),
+    ("can_launch", None),
   ],
 )
-@pytest.mark.parametrize("value", [0, 1, "true", None])
 def test_control_summary_requires_exact_booleans(
   field_name: str,
   value: object,
@@ -220,20 +239,27 @@ def test_control_summary_requires_typed_contract_string_or_none(
     _summary(typed_contract=value)
 
 
+# Field membership is a loop over one helper: every field is refused a string where a
+# sequence is owed, and one field takes every other non-sequence shape.
 @pytest.mark.parametrize(
-  "field_name",
+  ("field_name", "value"),
   [
-    "required_context",
-    "profiles",
-    "modes",
-    "outputs",
-    "tier_availability",
-    "credential_requirements",
+    *(
+      (field_name, "ticker")
+      for field_name in (
+        "required_context",
+        "profiles",
+        "modes",
+        "outputs",
+        "tier_availability",
+        "credential_requirements",
+      )
+    ),
+    ("required_context", b"ticker"),
+    ("required_context", {"ticker"}),
+    ("required_context", (item for item in ("ticker",))),
+    ("required_context", 1),
   ],
-)
-@pytest.mark.parametrize(
-  "value",
-  ["ticker", b"ticker", {"ticker"}, (item for item in ("ticker",)), 1],
 )
 def test_control_summary_rejects_non_sequence_fields(
   field_name: str,

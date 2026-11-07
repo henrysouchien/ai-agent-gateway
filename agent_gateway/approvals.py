@@ -4,6 +4,7 @@ import asyncio
 import logging
 from dataclasses import asdict, is_dataclass
 from typing import Any, Mapping, Protocol
+from urllib.parse import quote
 
 from fastapi.encoders import jsonable_encoder
 
@@ -19,6 +20,7 @@ from .approval_policy import (
   utc_now,
 )
 from .approval_store import (
+  TERMINAL_STATES,
   ApprovalExecutableBindingError,
   ApprovalRequestLocator,
   ApprovalRequestStore,
@@ -32,8 +34,6 @@ from .tool_dispatcher import ToolDispatcher
 
 
 log = logging.getLogger("agent_gateway.approvals")
-
-TERMINAL_APPROVAL_STATES = frozenset({"auto_approved", "auto_denied", "approved", "denied", "expired"})
 
 class _RecordVoteWithAutonomousDelivery(Protocol):
   async def __call__(
@@ -68,6 +68,24 @@ def _approval_request_to_dict(request_record: ApprovalRequest) -> dict[str, Any]
       result.pop("notification", None)
     return result
   return {"approval": encoded}
+
+
+def _approval_replay_result(request_record: ApprovalRequest, *, approved: bool) -> dict[str, Any]:
+  requested_decision = "approved" if approved else "denied"
+  settled_decision = (
+    request_record.state.removeprefix("auto_")
+    if request_record.decision is None else request_record.decision
+  )
+  return {
+    "approval": _approval_request_to_dict(request_record),
+    "outcome": "already_decided" if requested_decision == settled_decision else "conflict",
+    "requested_act": "approve" if approved else "deny",
+    "state_unchanged": True,
+    "next_call": {
+      "method": "GET",
+      "path": f"/api/control/approvals/{quote(request_record.approval_id, safe='')}",
+    },
+  }
 
 
 def _resolve_store_and_policy(
@@ -165,15 +183,12 @@ def _release_cancelled_approval(
     )
 
 
-def _validate_pending_entry(*, pending_entry: dict[str, Any], tool_call_id: str, nonce: str | None, target_session: GatewaySession) -> Any:
+def _validate_pending_entry(*, pending_entry: dict[str, Any], tool_call_id: str, target_session: GatewaySession) -> Any:
   if pending_entry.get("status") == "approval_received":
     raise ApprovalActionError(409, {"error": "Approval already submitted"})
 
   if pending_entry.get("status") != "approval_pending":
     raise ApprovalActionError(409, {"error": "Invalid pending tool state for approval submission"})
-
-  if pending_entry.get("nonce") != nonce:
-    raise ApprovalActionError(409, {"error": "Nonce mismatch"})
 
   approval_queue = target_session.approval_queues.get(tool_call_id)
   if approval_queue is None:
@@ -239,14 +254,9 @@ async def _record_vote_and_unblock_locked(
   autonomous_delivery: Mapping[str, Any] | None = None,
   durable_request: ApprovalRequest | None = None,
 ) -> dict[str, Any]:
-  approval_queue = None
   if pending_entry is not None:
-    approval_queue = _validate_pending_entry(
-      pending_entry=pending_entry,
-      tool_call_id=tool_call_id,
-      nonce=nonce,
-      target_session=target_session,
-    )
+    if pending_entry.get("nonce") != nonce:
+      raise ApprovalActionError(409, {"error": "Nonce mismatch"})
     approval_id = pending_entry.get("approval_id")
   else:
     approval_id = durable_request.approval_id if durable_request is not None else None
@@ -257,8 +267,13 @@ async def _record_vote_and_unblock_locked(
     authoritative_policy=authoritative_policy,
   )
   if not approval_id:
-    if pending_entry is None or approval_queue is None:
+    if pending_entry is None:
       raise ApprovalActionError(404, {"error": "Approval request not found"})
+    approval_queue = _validate_pending_entry(
+      pending_entry=pending_entry,
+      tool_call_id=tool_call_id,
+      target_session=target_session,
+    )
     effective_allow = effective_allow_tool_type(
       pending_entry.get("tool_class"),
       pending_entry.get("tool_name"),
@@ -285,17 +300,13 @@ async def _record_vote_and_unblock_locked(
   ):
     raise ApprovalActionError(404, {"error": "Approval request not found", "approval_id": str(approval_id)})
 
-  # One decision per request (concurrency): a vote lands only on a
-  # `pending_user` row whose card nonce matches (`_validate_pending_entry`), so
-  # two deciders, a replayed card, or a vote after the row resolved or expired
-  # cannot decide the same call twice.
+  # The store's first-terminal-wins transaction protects one decision per call.
+  # Terminal replay reads that winner before considering transient queue state.
   if request_record.state == "expired":
     raise ApprovalActionError(410, {"error": "Approval request expired", "approval_id": str(approval_id)})
 
-  if request_record.state in TERMINAL_APPROVAL_STATES:
-    if pending_entry is None:
-      return {"approval": _approval_request_to_dict(request_record)}
-    raise ApprovalActionError(409, {"error": "Approval request already resolved", "approval_id": str(approval_id)})
+  if request_record.state in TERMINAL_STATES:
+    return _approval_replay_result(request_record, approved=approved)
 
   if request_record.state != "pending_user":
     raise ApprovalActionError(
@@ -305,6 +316,14 @@ async def _record_vote_and_unblock_locked(
         "approval_id": str(approval_id),
         "state": request_record.state,
       },
+    )
+
+  approval_queue = None
+  if pending_entry is not None:
+    approval_queue = _validate_pending_entry(
+      pending_entry=pending_entry,
+      tool_call_id=tool_call_id,
+      target_session=target_session,
     )
 
   effective_allow = effective_allow_tool_type(
@@ -392,7 +411,7 @@ async def _record_vote_and_unblock_locked(
   # The store can return the winner of a concurrent decision. Read it back
   # without resolving policy or creating reuse grants a second time.
   if request_record.decided_at != vote.decided_at:
-    return {"approval": _approval_request_to_dict(request_record)}
+    return _approval_replay_result(request_record, approved=approved)
 
   await policy.on_resolve(request=request_record)
   if _cancellation_requested(pending_entry):
@@ -507,6 +526,11 @@ async def _record_durable_vote_and_continue(
     authoritative_policy=policy,
     durable_request=request_record,
   )
+  if result.get("outcome") == "conflict":
+    return result
+  # A matching replay (already_decided) changes no stored decision, so it still
+  # reaches the idempotent continuation: an approved, undelivered call is
+  # delivered, restored or re-issued here; a delivered one answers already_delivered.
   root_hook = getattr(app_state, "root_continue_hook", None)
   if root_hook is None:
     result["continuation"] = {
@@ -523,6 +547,14 @@ async def _record_durable_vote_and_continue(
         tenant_storage_id=tenant_storage_id,
       )
     )
+  except asyncio.CancelledError as exc:
+    if exc.args != ("caller_aborted",):
+      raise
+    result["continuation"] = {
+      "status": "cancelled",
+      "reason": "caller_aborted",
+    }
+    return result
   except Exception:
     log.warning("Root approval continuation failed | approval_id=%s", locator.approval_id, exc_info=True)
     result["continuation"] = {
@@ -581,6 +613,8 @@ async def _record_durable_vote_and_continue(
     "job_id": child_outcome.job_id,
     "tool_call_id": child_outcome.tool_call_id,
   }
+  if child_outcome.detail is not None:
+    result["continuation"]["detail"] = child_outcome.detail
   return result
 
 
@@ -820,7 +854,7 @@ async def _cancel_pending_approval_and_unblock(
         str(getattr(request_record, "channel", "") or "").strip().lower()
         == normalized_expected_channel,
       ))
-      if not identity_matches or request_record.state not in TERMINAL_APPROVAL_STATES:
+      if not identity_matches or request_record.state not in TERMINAL_STATES:
         raise
       transitioned = True
     except KeyError as exc:
@@ -833,7 +867,7 @@ async def _cancel_pending_approval_and_unblock(
         409,
         {"error": "Approval cancellation did not terminalize", "approval_id": approval_id},
       )
-    if identity_matches and request_record.state not in TERMINAL_APPROVAL_STATES:
+    if identity_matches and request_record.state not in TERMINAL_STATES:
       raise ApprovalActionError(
         409,
         {

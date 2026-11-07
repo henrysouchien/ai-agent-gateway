@@ -9,6 +9,7 @@ import pytest
 
 from agent_gateway import AgentRunner, EventLog
 from agent_gateway.event_adapter import adapt_control_event, adapt_event
+from agent_gateway.registry_scope import RegistryScope
 from agent_gateway.tool_display import DETAIL_MAX_CHARS, resolve_display
 from agent_gateway.tool_dispatch_classification import (
   ToolResultSettlement,
@@ -18,6 +19,7 @@ from agent_gateway.tool_policy_registry import PreparedToolCall
 from gateway_test_support.capability_execution_test_support import (
   stub_runner_capability_execution,
 )
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 
 
@@ -101,6 +103,24 @@ def test_excel_display_prefers_workbook_name_over_injected_routing_session() -> 
     "workbook": "",
     "workbook_name": "Coverage Model.xlsx",
   }) == {"label": "Listing workbook sheets", "detail": "Coverage Model.xlsx"}
+
+
+def test_apply_render_plan_display_names_the_sheets_the_plan_carries() -> None:
+  tool_input = {
+    "_workbook": "a77b9ec6-b2ab-4d63-9245-5dced32baf78",
+    "sheets": [
+      {"name": "PCTY Comps", "column_widths": {"A": 28}},
+      {"name": "Peers"},
+    ],
+    "writes": [{"sheet": "PCTY Comps", "range": "A1:B2", "values": [[1, 2], [3, 4]]}],
+    "formats": [],
+    "conflict_strategy": "overwrite",
+  }
+
+  assert resolve_display("mcp__excel__apply_render_plan", tool_input) == {
+    "label": "Applying workbook updates",
+    "detail": "PCTY Comps, Peers",
+  }
 
 
 @pytest.mark.parametrize(
@@ -403,6 +423,13 @@ def test_clean_emission_sites_stamp_display_from_redacted_input() -> None:
       return SimpleNamespace(total_usd=0.0, breakdown={})
 
   class _Dispatcher:
+    run_context = run_context_for_test(
+      registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
+    )
+
+    def bind_research_file_activity_owner(self, ensure_activity: Any) -> None:
+      self.ensure_research_file_activity = ensure_activity
+
     @staticmethod
     def redact_prepared_tool_input(
       tool_name: str,

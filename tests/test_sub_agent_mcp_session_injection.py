@@ -1,6 +1,7 @@
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -10,6 +11,7 @@ if str(PKG_DIR) not in sys.path:
 
 from hank_model_transport.capability_execution import BoundCapabilityExecution  # noqa: E402
 from agent_gateway.containment_settings import ContainmentSettings  # noqa: E402
+from agent_gateway.registry_scope import NoRegistryScope  # noqa: E402
 from agent_gateway.sub_agent import (  # noqa: E402
   _effective_mcp_session_inject_servers,
   make_run_agent_handler,
@@ -19,6 +21,7 @@ from gateway_test_support.capability_execution_test_support import (  # noqa: E4
 )
 from gateway_test_support.child_task_result import succeeded_child_task_result
 from gateway_test_support.host_policy import owner_session_host_policy
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 
 def _run(coro):
@@ -48,6 +51,10 @@ class _StubRunner:
     self._full_session_id = "session-sub-agent"
     self._spill_dir_provider = None
     self.calls: list[dict[str, Any]] = []
+    # sub_agent reads the child's scope from the parent's declared run_context.
+    self._dispatcher = SimpleNamespace(
+      run_context=run_context_for_test(registry_scope=NoRegistryScope()),
+    )
 
   async def spawn_sub_agent(self, task: str, **kwargs: Any):
     self.calls.append({"task": task, **kwargs})

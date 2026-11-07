@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 import copy
 from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
 import logging
-import os
 from pathlib import Path
 import time
-from typing import AbstractSet, TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Protocol, Tuple
+from typing import AbstractSet, TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from agent_workflow_contracts import AgentCompletionEnvelope, TaskResult
 
@@ -49,14 +49,22 @@ from .tool_dispatch_classification import (
   DispatchEntry,
   RETRYABLE_OUTCOMES as _RETRYABLE_DISPATCH_OUTCOMES,
   ToolResultSettlement,
+  ToolErrorType,
   build_dispatch_record_from_sources,
   classify_semantic_tool_error,
+  classify_tool_error_type,
   resolve_dispatch_entry,
   retry_backoff_seconds,
   retry_decision,
 )
-from .tool_result_compaction import project_tool_call_complete_for_stream
-from .tool_result_spill import SpillPublication
+from .tool_result_aging import INSTRUCTION_RESULT_TOOLS, build_aging_stub
+from .tool_result_compaction import (
+  is_error_tool_result_entry,
+  model_tool_result_max_chars,
+  project_tool_call_complete_for_stream,
+  spill_truncated_tool_results_enabled,
+)
+from .tool_result_spill import SpillPublication, write_spill_set
 from .workflow_evidence_provenance import (
   WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY as _WORKFLOW_EVIDENCE_PROJECTION_RESULT_KEY,
 )
@@ -70,15 +78,19 @@ from .workflow_output_attachment import (
 
 if TYPE_CHECKING:
   from model_authority.bind import CapabilityBind
+  from hank_model_transport.capability_execution import BoundCapabilityExecution
 
   from .approval_policy import RunContext
   from .approval_route import ApprovalRoute
+  from .containment_settings import ContainmentSettings
   from .execution_identity import DispatchIdentity
   from .session import GatewaySession
   from .event_log import EventLog
   from .mcp_client import McpClientManager
   from .task_registry import TaskRegistry
   from .sub_agent import ApprovedCallRef
+  from .tool_dispatcher import AdmittedApprovedBinding
+  from .tool_result_spill import SpillSink
 
 
 
@@ -104,33 +116,64 @@ def reset_current_parent_skill_run_id(token: Token[str | None]) -> None:
   _CURRENT_PARENT_SKILL_RUN_ID.reset(token)
 
 
+@dataclass(frozen=True, slots=True)
+class ToolCallOutcome:
+  tool_call_id: str
+  tool_name: str
+  server: str | None
+  result: Any
+  error: dict[str, Any] | None
+  semantic_error: dict[str, Any] | None
+  error_type: ToolErrorType | None
+  outcome: str
+  dispatch_record: dict[str, Any] | None
+  result_entry: dict[str, Any]
+  extra_blocks: list[dict[str, Any]]
+  load_servers: tuple[str, ...] = ()
+  load_local_tools: tuple[str, ...] = ()
+  skill_allow_activated: bool = False
+
+
 class ApprovedBindingExecutor(Protocol):
-  async def __call__(
-    self,
-    *,
-    job_id: str,
-    tool_call_id: str,
-    nonce: str,
-    abort_event: asyncio.Event,
+  async def admit_approved_binding(
+    self, *, job_id: str, tool_call_id: str, nonce: str,
+  ) -> tuple[AdmittedApprovedBinding | None, dict[str, Any] | None]: ...
+
+  async def execute_admitted_binding(
+    self, admitted: AdmittedApprovedBinding, *,
+    abort_event: asyncio.Event | None,
     on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
   ) -> ToolResult: ...
 
 
-class AgentRunnerDispatcher(Protocol):
+class AgentRunnerDispatcher(ApprovedBindingExecutor, Protocol):
   """Dispatcher surface consumed by the runner and tool-execution mixin."""
 
+
+  def tool_input_schema(self, tool_name: str, server: str | None = None) -> Mapping[str, Any]: ...
+
+  @property
+  def mcp_client(self) -> Any: ...
+
+  @property
+  def allowed_mcp_tools_by_server(self) -> Mapping[str, AbstractSet[str]] | None: ...
+
+  def bind_tool_definitions(
+    self,
+    definitions: Sequence[Mapping[str, Any]] | Callable[[], Sequence[Mapping[str, Any]]],
+  ) -> None: ...
   def bind_secret_boundary(self, boundary: SecretBoundary) -> None: ...
 
   def bind_research_file_activity_owner(
     self, ensure_activity: Callable[[Path, int], bool]
   ) -> None: ...
 
-  def replace_capability_bind(self, bind: CapabilityBind) -> None: ...
+  def replace_capability_bind(self, bind: CapabilityBind | BoundCapabilityExecution) -> None: ...
 
   def local_tool_handlers(self) -> Mapping[str, LocalToolHandler]: ...
 
   @property
-  def run_context(self) -> RunContext | None: ...
+  def run_context(self) -> RunContext: ...
 
   def capture_spawning_turn(self) -> _SpawningTurn: ...
 
@@ -143,6 +186,8 @@ class AgentRunnerDispatcher(Protocol):
     abort_event: asyncio.Event | None,
     on_executed_prepared_call: Callable[[PreparedToolCall], None] | None,
   ) -> ToolResult: ...
+
+  def rebind_run_context(self, run_context: RunContext) -> None: ...
 
   def fork_child(
     self,
@@ -386,10 +431,16 @@ def _readable_resource_event_from_snapshot(
   truncated = snapshot.get("truncated")
   if not isinstance(truncated, bool):
     return _drop("truncated is not a bool")
-  control_run_id = str(os.getenv("AGENT_AUTONOMOUS_CONTROL_RUN_ID") or getattr(runner, "_full_session_id", "")).strip()
-  if not control_run_id:
-    return _drop("control_run_id is unavailable")
-  seed = "\0".join([control_run_id, tool_call_id, source_path, normalized_sha256])
+  # An autonomous run's control id is the signed run context's request id, never an ambient
+  # env name (the child env strips it). An interactive session's control run id is the
+  # session id (readable_resources._chat_event_sources keys chat resources by it). An
+  # unsigned autonomous context carries none; the session id still names the owner.
+  run_context = runner._dispatcher.run_context
+  session_id = str(runner._full_session_id).strip()
+  control_run_id = (
+    str(run_context.request_id if run_context.autonomous else session_id).strip() or None
+  )
+  seed = "\0".join([control_run_id or "", tool_call_id, source_path, normalized_sha256])
   resource_id = f"rr:{hashlib.sha256(seed.encode('utf-8')).hexdigest()}"
   skill_run_id = str(getattr(runner, "_skill_run_id", "") or "").strip() or f"tool:{tool_call_id}"
   content_bytes = snapshot.get("content_bytes")
@@ -402,6 +453,7 @@ def _readable_resource_event_from_snapshot(
     "resource_id": resource_id,
     "run_id": control_run_id,
     "control_run_id": control_run_id,
+    "session_id": session_id,
     "skill_run_id": skill_run_id,
     "contract_name": contract_name.strip(),
     "content_type": content_type,
@@ -429,16 +481,23 @@ def _readable_resource_event_from_snapshot(
 # the model reads them: FMS doors write them there, and every other producer
 # sets them top-level on its error dict, carried over here. ``next_call`` keeps
 # an explicit ``None`` — "no repair call" is the producer's answer too.
-_MODEL_VISIBLE_ERROR_KEYS = ("tool_usage_hint", "next_call", "missing_keys", "fix", "details")
+_MODEL_VISIBLE_ERROR_KEYS = ("type", "tool_usage_hint", "next_call", "missing_keys", "fix", "details")
 
 
-def _model_error_data(error: Dict[str, Any]) -> Dict[str, Any] | None:
+def _model_error_data(
+  error: Dict[str, Any],
+  *,
+  result: Any = None,
+  semantic_error: Mapping[str, Any] | None = None,
+) -> Dict[str, Any] | None:
   raw_data = error.get("data")
   data: Dict[str, Any] = dict(raw_data) if isinstance(raw_data, dict) else {}
   for key in _MODEL_VISIBLE_ERROR_KEYS:
     if key in error and key not in data:
       data[key] = error[key]
-  return data or None
+  if "type" not in data:
+    data["type"] = classify_tool_error_type(error, result, semantic_error)
+  return data
 
 
 def _error_with_model_error_data(error: Dict[str, Any]) -> Dict[str, Any]:
@@ -484,11 +543,17 @@ def retained_tool_result_entry(
 class RunnerToolExecutionMixin:
   if TYPE_CHECKING:
     _batch_id: str | None
+    _containment: ContainmentSettings
+    _spill_dir_provider: SpillSink | None
+    _tool_result_aging_spill_failure_logged: bool
+    _tool_result_aging_stubs: dict[str, str]
+    _disconnected: bool
     _dispatcher: AgentRunnerDispatcher
     _excluded_tools: set[str]
     _dispatcher_accepts_abort_event: bool
     _dispatcher_accepts_skill_run_context: bool
     _full_session_id: str
+    _gateway_session: GatewaySession | None
     _last_assistant_message_seq: int | None
     _mcp_client: McpClientManager | None
     _pending_background_result_acks: dict[
@@ -594,6 +659,80 @@ class RunnerToolExecutionMixin:
     self._resume_approved_call: ApprovedCallRef | None = approved_call
     self._resume_approved_executor = executor
 
+  def _tool_result_aging_receipt(
+    self,
+    *,
+    tool_id: str,
+    tool_name: str,
+    live_entry: Dict[str, Any],
+    retained_entry: Dict[str, Any],
+    spill_publication: SpillPublication | None,
+    failed: bool,
+  ) -> tuple[str | None, SpillPublication | None]:
+    """Register the stub a large data result is replaced by once it ages.
+
+    Returns ``(stub, publication)``; ``publication`` is the spill this call
+    wrote for the stub (``None`` when truncation already spilled, or when no
+    stub was registered). Kind and size are decided here and nowhere else:
+    only a successful result of a tool outside ``INSTRUCTION_RESULT_TOOLS``
+    whose model-visible content exceeds ``tool_result_aging_min_chars`` ages.
+    The stub and its spill come from the retained (boundary-projected)
+    content, never the raw live text. Without a readable spill sink, or when
+    the spill write fails, nothing is registered and the result never ages.
+    """
+    stubs = getattr(self, "_tool_result_aging_stubs", None)
+    containment = getattr(self, "_containment", None)
+    if (
+      stubs is None
+      or containment is None
+      or failed
+      or containment.tool_result_aging_after_replies is None
+      or tool_name in INSTRUCTION_RESULT_TOOLS
+    ):
+      return None, None
+    live_content = live_entry.get("content")
+    retained_content = retained_entry.get("content")
+    if (
+      not isinstance(live_content, str)
+      or not isinstance(retained_content, str)
+      or len(live_content) <= containment.tool_result_aging_min_chars
+      or live_entry.get("is_error")
+      or is_error_tool_result_entry(retained_entry, retained_content)
+    ):
+      return None, None
+    sink = self._spill_dir_provider
+    if sink is None or not sink.capabilities.spill_read or not spill_truncated_tool_results_enabled():
+      return None, None
+    publication: SpillPublication | None = None
+    if spill_publication is not None:
+      spill_ref = spill_publication.spill_ref
+    else:
+      try:
+        publication = write_spill_set(
+          sink=sink,
+          tool_name=tool_name,
+          tool_use_id=tool_id,
+          content=retained_content,
+          model_max_chars=model_tool_result_max_chars(),
+        )
+      except Exception as exc:
+        if not getattr(self, "_tool_result_aging_spill_failure_logged", False):
+          self._tool_result_aging_spill_failure_logged = True
+          log.warning(
+            "[%s] Tool %s result cannot age: spill failed: %s",
+            self._sid,
+            tool_name,
+            exc,
+            exc_info=True,
+          )
+        return None, None
+      spill_ref = publication.spill_ref
+    stub = build_aging_stub(retained_content, tool_name=tool_name, spill_ref=spill_ref)
+    if len(stub) >= len(live_content):
+      return None, publication
+    stubs[tool_id] = stub
+    return stub, publication
+
   async def _execute_resume_approved_call(
     self,
     messages: List[Dict[str, Any]],
@@ -645,20 +784,46 @@ class RunnerToolExecutionMixin:
     *,
     approved_call: ApprovedCallRef | None = None,
   ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
-    # Every vendor call a tool makes (HTTP headers, ledger rows) reads this turn's
-    # attribution from `spend_context`, the same ids the provider meter stamps.
+    outcome = await self.execute_tool_call(
+      tool_id, tool_name, tool_input, call_index=call_index,
+      approved_call=approved_call,
+      advertised_tool_names=base_kwargs.get("_request_advertised_tool_names"),
+      _base_kwargs=base_kwargs,
+    )
+    return outcome.result_entry, outcome.tool_name, outcome.extra_blocks
+
+  async def execute_tool_call(
+    self,
+    tool_id: str,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    *,
+    call_index: int = 0,
+    approved_call: ApprovedCallRef | None = None,
+    advertised_tool_names: AbstractSet[str] | None = None,
+    _base_kwargs: Dict[str, Any] | None = None,
+  ) -> ToolCallOutcome:
+    base_kwargs = _base_kwargs if _base_kwargs is not None else {}
+    if advertised_tool_names is None:
+      advertised_tool_names = base_kwargs.get("_request_advertised_tool_names")
+    run_owner = (
+      str(self._gateway_session.risk_user_id)
+      if self._gateway_session is not None and self._gateway_session.risk_user_id > 0
+      else self._usage_user_id
+    )
     with spend_context(
-      run_owner=self._usage_user_id,
+      run_owner=run_owner,
       session_id=self._full_session_id,
       request_id=self._request_id,
       run_id=self._skill_run_id or None,
       skill=current_skill(),
     ):
-      return await self._execute_single_tool_unattributed(
-        tool_id, tool_name, tool_input, base_kwargs, call_index, approved_call=approved_call,
+      return await self._execute_tool_call_unattributed(
+        tool_id, tool_name, tool_input, base_kwargs, call_index,
+        approved_call=approved_call, advertised_tool_names=advertised_tool_names,
       )
 
-  async def _execute_single_tool_unattributed(
+  async def _execute_tool_call_unattributed(
     self,
     tool_id: str,
     tool_name: str,
@@ -667,7 +832,8 @@ class RunnerToolExecutionMixin:
     call_index: int = 0,
     *,
     approved_call: ApprovedCallRef | None = None,
-  ) -> Tuple[Dict[str, Any], str, List[Dict[str, Any]]]:
+    advertised_tool_names: AbstractSet[str] | None = None,
+  ) -> ToolCallOutcome:
     json_module = _runner_attr(self, "json", json)
     logger = _runner_attr(self, "log", log)
     time_module = _runner_attr(self, "time", time)
@@ -682,6 +848,13 @@ class RunnerToolExecutionMixin:
       if isinstance(parent_skill_run_id, str) and parent_skill_run_id.strip()
       else None
     )
+    def _cancellation_requested() -> bool:
+      current_task = asyncio_module.current_task()
+      return self._disconnected or (
+        current_task is not None and current_task.cancelling() > 0
+      )
+    if _cancellation_requested():
+      raise cancelled_error_type("caller_aborted")
 
     prepared_call = PreparedToolCall(tool_input)
     preparation_failed = False
@@ -712,6 +885,8 @@ class RunnerToolExecutionMixin:
         if parent_scope_token is not None:
           reset_current_parent_skill_run_id(parent_scope_token)
     executed_prepared_call = prepared_call
+    if _cancellation_requested():
+      raise cancelled_error_type("caller_aborted")
 
     def capture_executed_prepared_call(call: PreparedToolCall) -> None:
       nonlocal executed_prepared_call
@@ -762,15 +937,11 @@ class RunnerToolExecutionMixin:
     if tool_name == "emit_dashboard_artifact":
       payload_bytes = len(json_module.dumps(tool_input.get("payload") or {}).encode("utf-8"))
       if payload_bytes > 256 * 1024:
-        return (
-          self._make_error_result(
-            tool_id,
-            "invalid_input",
-            f"emit_dashboard_artifact: payload {payload_bytes} bytes exceeds 256KB limit",
-          ),
-          tool_name,
-          [],
-        )
+        preparation_failed = True
+        preparation_error = {
+          "code": "invalid_input",
+          "message": f"emit_dashboard_artifact: payload {payload_bytes} bytes exceeds 256KB limit",
+        }
     tool_t0 = time_module.time()
     server = self._mcp_client.get_server_for_tool(tool_name) if self._mcp_client is not None else None
     get_provider_id = (
@@ -850,8 +1021,12 @@ class RunnerToolExecutionMixin:
     background_result_ack: tuple[str, int] | None = None
     workflow_output_attachment: WorkflowOutputAttachment | None = None
     superseded_continuation_run_id: str | None = None
+    registry_scope = copy.copy(self._dispatcher.run_context.registry_scope)
+    admission_failed = False
 
     try:
+      if _cancellation_requested():
+        raise cancelled_error_type("caller_aborted")
       if preparation_failed:
         error = preparation_error or {
           "code": "tool_input_preparation_failed",
@@ -868,9 +1043,7 @@ class RunnerToolExecutionMixin:
       else:
         dispatch_kwargs: Dict[str, Any] = {"call_index": call_index}
         if getattr(self, "_dispatcher_accepts_advertised_tool_names", False):
-          dispatch_kwargs["advertised_tool_names"] = base_kwargs.get(
-            "_request_advertised_tool_names"
-          )
+          dispatch_kwargs["advertised_tool_names"] = advertised_tool_names
         dispatch_kwargs["allow_uncertain_mcp_replay"] = False
         if self._dispatcher_accepts_abort_event:
           dispatch_kwargs["abort_event"] = self._tool_abort_event
@@ -925,22 +1098,27 @@ class RunnerToolExecutionMixin:
         while True:
           result = None
           error = None
-          dispatch_coro = (
-            self._resume_approved_executor(
+          if approved_call is not None:
+            admitted, error = await self._resume_approved_executor.admit_approved_binding(
               job_id=approved_call.job_id,
               tool_call_id=approved_call.tool_call_id,
               nonce=approved_call.nonce,
-              abort_event=self._tool_abort_event,
-              on_executed_prepared_call=capture_executed_prepared_call,
             )
-            if approved_call is not None
-            else self._dispatcher.dispatch_prepared(
-              tool_id,
-              tool_name,
-              prepared_call,
-              **dispatch_kwargs,
+            admission_failed = error is not None
+            if admission_failed:
+              dispatch_coro = None
+            else:
+              assert admitted is not None
+              registry_scope = copy.copy(admitted.registry_scope)
+              dispatch_coro = self._resume_approved_executor.execute_admitted_binding(
+                admitted,
+                abort_event=self._tool_abort_event,
+                on_executed_prepared_call=capture_executed_prepared_call,
+              )
+          else:
+            dispatch_coro = self._dispatcher.dispatch_prepared(
+              tool_id, tool_name, prepared_call, **dispatch_kwargs,
             )
-          )
           expectation_timer = (
             asyncio.get_running_loop().call_later(
               expected_seconds,
@@ -958,7 +1136,8 @@ class RunnerToolExecutionMixin:
             if parent_skill_run_id is not None else None
           )
           try:
-            result, error = await dispatch_coro
+            if dispatch_coro is not None:
+              result, error = await dispatch_coro
           finally:
             if parent_scope_token is not None:
               reset_current_parent_skill_run_id(parent_scope_token)
@@ -998,6 +1177,8 @@ class RunnerToolExecutionMixin:
             dispatch_attempts,
           )
           await asyncio_module.sleep(retry_backoff_seconds(dispatch_attempts))
+          if _cancellation_requested():
+            raise cancelled_error_type("caller_aborted")
           dispatch_attempts += 1
 
       if error is None:
@@ -1284,6 +1465,27 @@ class RunnerToolExecutionMixin:
     model_result = result
     if error is None:
       model_result = self._annotate_result(result, tool_name=tool_name)
+      if semantic_error is not None and isinstance(model_result, Mapping):
+        model_result = dict(model_result)
+        nested_error = model_result.get("error")
+        owner_error = nested_error if isinstance(nested_error, Mapping) else model_result
+        model_error = dict(owner_error)
+        data = owner_error.get("data")
+        model_error["type"] = classify_tool_error_type(None, result, semantic_error)
+        if "next_call" not in model_error:
+          result_data = model_result.get("data")
+          if isinstance(data, Mapping) and "next_call" in data:
+            model_error["next_call"] = data["next_call"]
+          elif "next_call" in model_result:
+            model_error["next_call"] = model_result["next_call"]
+          elif isinstance(result_data, Mapping) and "next_call" in result_data:
+            model_error["next_call"] = result_data["next_call"]
+          else:
+            model_error["next_call"] = None
+        if isinstance(nested_error, Mapping):
+          model_result["error"] = model_error
+        else:
+          model_result = model_error
 
     if error is not None:
       error_code = str(error.get("code", "tool_error"))
@@ -1292,7 +1494,7 @@ class RunnerToolExecutionMixin:
         error_code,
         str(error.get("message", "Tool failed")),
         sub_code=str(error.get("sub_code", "")),
-        data=_model_error_data(error),
+        data=_model_error_data(error, result=result, semantic_error=semantic_error),
       )
     else:
       result_entry = {
@@ -1305,7 +1507,7 @@ class RunnerToolExecutionMixin:
       if tool_complete_event["is_error"]:
         result_entry["is_error"] = True
 
-    extra_blocks = await self._call_on_tool_result(
+    extra_blocks = [] if admission_failed else await self._call_on_tool_result(
       _runner_attr(self, "ToolResultContext", ToolResultContext)(
         tool_name=tool_name,
         tool_input={} if preparation_failed else dict(tool_input),
@@ -1323,6 +1525,7 @@ class RunnerToolExecutionMixin:
         result_entry=result_entry,
         provider_id=provider_id,
         skill_run_id=self._skill_run_id,
+        registry_scope=registry_scope,
         workspace_dir=self._workspace_dir,
         batch_id=getattr(self, "_batch_id", None),
         child_evidence=child_evidence,
@@ -1359,6 +1562,16 @@ class RunnerToolExecutionMixin:
       on_spill_publication=_capture_spill_publication,
       retained_entry=retained_entry,
     )
+    aging_stub, aging_publication = self._tool_result_aging_receipt(
+      tool_id=tool_id,
+      tool_name=tool_name,
+      live_entry=live_entry,
+      retained_entry=retained_entry,
+      spill_publication=spill_publication,
+      failed=error is not None or semantic_error is not None,
+    )
+    if spill_publication is None:
+      spill_publication = aging_publication
     final_tool_result_blocks = [dict(durable_entry)]
     final_tool_result_blocks.extend(dict(block) for block in extra_blocks)
     tool_complete_event["final_tool_result_blocks"] = final_tool_result_blocks
@@ -1386,6 +1599,11 @@ class RunnerToolExecutionMixin:
           "producer_job_id": producer.job_id,
           "producer_root": str(Path(spill_publication.abspath).parent),
         }
+    if aging_stub is not None:
+      # Durable only: the stub restores the map when a later turn rebuilds
+      # this history from the log; it never rides the stream.
+      durable_tool_complete_event = dict(durable_tool_complete_event)
+      durable_tool_complete_event["aging_stub"] = aging_stub
     await self._append_durable_event(durable_tool_complete_event)
     self._append(streamed_tool_complete_event)
     if superseded_continuation_run_id is not None:
@@ -1423,4 +1641,22 @@ class RunnerToolExecutionMixin:
       if resource_event is not None:
         await self._append_durable_event(resource_event)
         self._append(resource_event)
-    return live_entry, tool_name, extra_blocks
+    return ToolCallOutcome(
+      tool_call_id=tool_id,
+      tool_name=tool_name,
+      server=server,
+      result=result,
+      error=error,
+      semantic_error=semantic_error,
+      error_type=(
+        None if error is None and semantic_error is None
+        else classify_tool_error_type(error, result, semantic_error)
+      ),
+      outcome=dispatch_record["outcome"],
+      dispatch_record=dispatch_record,
+      result_entry=live_entry,
+      extra_blocks=extra_blocks,
+      load_servers=tuple(load_servers_signal or ()),
+      load_local_tools=tuple(load_local_tools_signal or ()),
+      skill_allow_activated=skill_allow_signal,
+    )

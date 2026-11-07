@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .registry_scope import DeclaredRegistryScope
 
 import asyncio
 import logging
@@ -10,7 +11,9 @@ from typing import Any, Awaitable, Callable, Dict, Literal, Mapping, Optional, P
 from agent_workflow_contracts.next_call import next_call as build_next_call
 if TYPE_CHECKING:
   from .ui_blocks_run import UiBlocksRunContext
+  from model_authority.bind import CapabilityBind
 
+from .approval_policy import new_approval_id
 from hank_model_transport.policy_imports import deferred_local_tool_pack as _deferred_local_tool_pack
 _log = logging.getLogger("agent_gateway.dispatcher")
 
@@ -432,6 +435,7 @@ class TransportApprovalRequest:
   timeout: float = 120.0
   reason: str = ""
   allow_persistent_approval: bool = True
+  approval_id: str = field(default_factory=new_approval_id)
 
 
 @dataclass
@@ -613,6 +617,7 @@ class ToolExecutionContext:
   tool_call_id: str
   tool_name: str
   event_log: EventLogWriter | None
+  registry_scope: DeclaredRegistryScope
   resolved_qualifier: str = ""
   abort_event: asyncio.Event | None = None
   skill_run_id: str | None = None
@@ -625,6 +630,10 @@ class ToolExecutionContext:
   # The calling run's label and product profile; a child run inherits profile_name (sub_agent).
   profile: str | None = None
   profile_name: str | None = None
+  # The bind of the execution serving this call: the dispatcher's current bind, so a
+  # model-fallback hop or credential rotation is already reflected. None only where no
+  # dispatcher built the context.
+  capability_bind: "CapabilityBind | None" = None
   ui_blocks_run: "UiBlocksRunContext | None" = field(default=None, repr=False)
   approval_id: str | None = None
   approval_chain_id: str | None = None

@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 # ruff: noqa: E402
 
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
@@ -34,6 +36,7 @@ from model_authority.selection import SelectionSnapshot
 from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityExecutionResolver,
+  ExecutionLane,
 )
 from agent_gateway.containment_settings import ContainmentSettings
 from agent_gateway.mcp_client import McpClientManager
@@ -107,6 +110,12 @@ class _StubRunner:
   def __init__(self) -> None:
     self._full_session_id = "session-coordinator"
     self.calls: list[dict[str, Any]] = []
+    # sub_agent reads the child's scope from the parent's declared run_context.
+    self._dispatcher = SimpleNamespace(
+      run_context=run_context_for_test(
+        registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
+      ),
+    )
 
   async def spawn_sub_agent(self, task: str, **kwargs: Any):
     self.calls.append({"task": task, **kwargs})
@@ -165,7 +174,9 @@ class _CapabilityResolver(CapabilityExecutionResolver):
     )
     return bind
 
-  def materialize_bind(self, bind: CapabilityBind) -> BoundCapabilityExecution:
+  def materialize_bind(
+    self, bind: CapabilityBind, *, lane: ExecutionLane | None = None,
+  ) -> BoundCapabilityExecution:
     entry = INITIAL_MODEL_REGISTRY.require(bind.model_key)
     return BoundCapabilityExecution(
       bind=bind,
@@ -186,6 +197,7 @@ def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
     local_tool_handlers={},
     event_log=event_log or EventLog(),
     session_id="sess-coordinator",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 

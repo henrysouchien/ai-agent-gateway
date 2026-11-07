@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 from collections.abc import AsyncGenerator
 import asyncio
@@ -86,6 +88,7 @@ class _TestTurnRunner(AgentRunner):
         local_tool_handlers={},
         event_log=event_log,
         session_id=session_id,
+        run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
       ),
       session_id=session_id,
       capability_execution=capability_execution,
@@ -1050,7 +1053,7 @@ def test_chat_interrupted_terminal_stays_interrupted() -> None:
     assert response.json()["state"] == "interrupted"
 
 
-def test_chat_interrupted_stop_with_channel_error_projects_failed() -> None:
+def test_chat_stream_error_does_not_override_interrupted_terminal() -> None:
   app = _make_app()
   with TestClient(app) as client:
     control = _control_session(client, "alice")
@@ -1073,7 +1076,7 @@ def test_chat_interrupted_stop_with_channel_error_projects_failed() -> None:
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["state"] == "failed"
+    assert response.json()["state"] == "interrupted"
 
 
 def test_chat_first_terminal_error_wins_over_trailing_completed_event() -> None:
@@ -1151,6 +1154,51 @@ def test_chat_awaiting_approval_terminal_projects_approval_pending() -> None:
 
     assert response.status_code == 200, response.text
     assert response.json()["state"] == "approval_pending"
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+def test_chat_run_state_follows_the_continued_turn_after_a_parked_approval_was_decided(decision) -> None:
+  """R24 approval-clock F1 (RUNNER): after the parked approval was decided and the
+  continued model-driven turn completed, the control `runs` projection still said
+  approval_pending with ended_at null, because the first root terminal event, not
+  the latest, answered. The latest terminal event is the state."""
+  app = _make_app()
+  with TestClient(app) as client:
+    control = _control_session(client, "alice")
+    chat = _chat_session(client, "alice")
+    session = app.state.auth.session_store.get_session(chat["session_id"])
+    assert session is not None
+    session.pending_tools.clear()
+    session.stream_active = False
+    session.event_history.append({
+      "type": "stream_complete",
+      "terminal_disposition": "awaiting_approval",
+      "job_id": "job-parked-1",
+      "approval_id": "appr-parked-1",
+      "root_turn_id": "turn-parked-1",
+      "original_tool_call_id": "call-parked-1",
+      "usage": {},
+    })
+    session.event_history.append({
+      "type": "approval_decision",
+      "approval_id": "appr-parked-1",
+      "decision": decision,
+      "root_turn_id": "turn-parked-1",
+    })
+    session.event_history.append({
+      "type": "stream_complete",
+      "terminal_disposition": "completed",
+      "root_turn_id": "turn-continued-1",
+      "usage": {},
+    })
+
+    response = client.get(
+      f"/api/control/runs/{chat['session_id']}",
+      headers=_headers(control),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "completed"
 
 
 def test_chat_child_awaiting_approval_does_not_settle_root_state() -> None:
@@ -1450,6 +1498,21 @@ def test_get_run_returns_chat_run_shape_and_404s_unknown_or_cross_user() -> None
       "pending_approval": None,
       "latest_tool_result": None,
       "dispatch_scope": None,
+      "completion": {
+        "schema_version": 1,
+        "source": "chat",
+        "consistency": "unknown",
+        "terminal": None,
+        "receipt": None,
+        "journal": None,
+        "durable": None,
+        "children": None,
+        "obligations": None,
+        "pending_approval": {"count": 0, "refs": []},
+        "unknown": [
+          "runner:unavailable", "children:unknown_epoch", "durable:unavailable",
+        ],
+      },
     }
 
     unknown = client.get("/api/control/runs/not-a-run", headers=_headers(alice_control))

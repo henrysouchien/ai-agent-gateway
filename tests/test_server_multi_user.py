@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 import asyncio
 import json
 import logging
@@ -407,6 +409,7 @@ def test_chat_stream_rebuilds_multi_turn_memory_from_session_log(tmp_path: Path)
           local_tool_handlers={},
           event_log=event_log,
           session_id=session_id,
+          run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
         ),
         session_id=session_id,
         capability_execution=capability_execution,
@@ -566,6 +569,7 @@ def test_chat_stream_rebuilds_memory_past_large_context_manifest(tmp_path: Path)
           local_tool_handlers={},
           event_log=event_log,
           session_id=session_id,
+          run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
         ),
         session_id=session_id,
         capability_execution=capability_execution,
@@ -670,19 +674,17 @@ def test_chat_init_requires_top_level_user_id_without_resolver() -> None:
   assert missing.json()["error"] == "missing_user_id"
 
 
-def test_chat_init_request_accepts_byok_fields_without_channel_field() -> None:
+def test_chat_init_request_accepts_byok_fields() -> None:
   request = ChatInitRequest(
     api_key="gateway-key",
     anthropic_auth_mode="oauth",
     anthropic_api_key="sk-ant-api",
     anthropic_auth_token="sk-ant-oat",
   )
-  fields = ChatInitRequest.model_fields if hasattr(ChatInitRequest, "model_fields") else ChatInitRequest.__fields__
 
   assert request.anthropic_auth_mode == "oauth"
   assert request.anthropic_api_key == "sk-ant-api"
   assert request.anthropic_auth_token == "sk-ant-oat"
-  assert "channel" not in fields
 
 
 def test_chat_init_accepts_resolver_derived_user_without_request_user_id() -> None:

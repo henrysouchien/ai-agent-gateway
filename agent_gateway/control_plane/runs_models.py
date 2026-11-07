@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from agent_workflow_contracts.research_file_contract import is_research_file_id
 from agent_gateway.control_run_lifecycle import ControlRunState
+from agent_gateway.completion_reads import CompletionRead
 from model_authority.thinking import parse_effort
 
 ChatRunState = ControlRunState
@@ -81,6 +82,7 @@ class AutonomousTerminalReceipt(BaseModel):
     "interrupted",
     "cancelled",
   ]
+  # The last process's exit status; `disposition` is the outcome (a cancelled run carries 0 here).
   exit_code: int | None
   error: str | None
   terminal_reason: Literal["writer_lease_already_held"] | None
@@ -166,6 +168,7 @@ class ChatRunResponse(BaseModel):
   pending_approval: PendingApprovalResponse | None
   latest_tool_result: ToolResultSummaryResponse | None = None
   dispatch_scope: DispatchScope | None = None
+  completion: CompletionRead | None = None
 
 
 class AutonomousRunResponse(BaseModel):
@@ -206,6 +209,7 @@ class AutonomousRunResponse(BaseModel):
   dispatch_scope: DispatchScope | None = None
   schedule_id: str | None = None
   schedule_name: str | None = None
+  completion: CompletionRead | None = None
 
 
 class ChatMessage(BaseModel):
@@ -256,6 +260,8 @@ class AutonomousDispatchRequest(BaseModel):
   research_file_id: int | None = Field(default=None, ge=1)
   dispatch_start_decision_id: int | None = Field(default=None, ge=0, strict=True)
   dispatch_scope: DispatchScope | None = None
+  # False runs the child with --no-deliver: no external delivery of the output.
+  deliver: bool = Field(default=True, strict=True)
   # A published preset name the skill launch's subtree admits under.
   model_preset: str | None = None
 

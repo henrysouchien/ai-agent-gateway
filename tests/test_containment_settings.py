@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import math
-import sys
 import time
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -12,9 +11,6 @@ from typing import Any
 
 import pytest
 
-TESTS_DIR = Path(__file__).resolve().parent
-if str(TESTS_DIR) not in sys.path:
-  sys.path.insert(0, str(TESTS_DIR))
 
 import agent_gateway.runner_sub_agents as runner_sub_agents  # noqa: E402
 from agent_gateway.admission import AdmittedContext, Refusal, admit  # noqa: E402

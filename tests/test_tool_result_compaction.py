@@ -596,3 +596,118 @@ def test_redaction_that_lengthens_content_spills_the_projected_text_and_leaves_l
   assert json.loads(spilled) == json.loads(retained["content"])
   assert short_secret not in spilled
   assert publication.spill_ref.startswith(f"spill:v1:{spill_files[0].name}:")
+
+
+def test_report_door_receipt_omits_source_map_instruction_and_artifact_path(tmp_path) -> None:
+  """PCTY turn 2 copied the door path and the source-map quote instruction.
+
+  The model-visible receipt must not carry either, at any size: a small
+  envelope used to pass through whole, and a large one kept both inside the
+  shape-preserving truncation the model was told it may report as-is.
+  """
+  warning = {
+    "message": "source-map ref S17 quote was not found in the verified handle text",
+    "reason": "quote_not_found",
+    "data": {
+      "outcome": "handle_only",
+      "fix": "Replace the submitted quote with one contiguous exact quote from the cited source.",
+      "next_action": "Copy one contiguous exact quote from the canonical source text and retry the same source_ref with that quote.",
+      "citation_readiness": "quote_mintable",
+    },
+  }
+  payload = {
+    "status": "applied",
+    "subcommand": "report_business_quality",
+    "mutation_mode": "thesis_writer",
+    "ticker": "PCTY",
+    "artifact_ref": "artifacts/PCTY/business-quality-assessment/2026-11-05T023057.655-93bac72e.json",
+    "typed_artifact_ref": "artifacts/PCTY/business-quality-assessment/2026-11-05T023057.655-93bac72e.json",
+    "gate_code": "PROCEED",
+    "artifact_id": "2026-11-05T023057.655-93bac72e",
+    "sidecar_hash": "sha256:36cddbf3195e90f8d5a093ac612c882562b4a493",
+    "next_actions": [
+      "Before the imminent Q1 FY27 print, build the GAAP-to-adjusted margin bridge."
+    ],
+    "verdict": {
+      "verdict": "HIGH_QUALITY",
+      "confidence": "MEDIUM",
+      "composite": 4.2,
+      "summary": "Five reinforcing pillars; the quality rating stands.",
+      "recommended_next_action": "Build the GAAP-to-adjusted margin bridge before the print.",
+      "data_gap_count": 6,
+      "source_count": 18,
+      # R23 GOOGL shape: the door admitted with findings naming the failing source-map
+      # refs; the receipt keeps the typed facts (code, field, refs), never the prose
+      # message with its "source-map ref" instruction or the next_call.
+      "findings": [
+        {"field": "sources", "code": "quote_not_found",
+         "message": "source-map ref S1515 quote was not found in the verified handle text",
+         "next_call": {"tool_name": "thesis_read", "arguments": {}}},
+        {"field": "sources", "code": "quote_not_found",
+         "message": "source-map ref S1514 quote was not found in the verified handle text",
+         "next_call": {"tool_name": "thesis_read", "arguments": {}}},
+        {"field": "thesis_projection.thesis", "code": "field_withheld",
+         "message": "the typed Thesis ThesisField does not hold conviction, date_initiated",
+         "next_call": {"tool_name": "thesis_read", "arguments": {}}},
+      ],
+    },
+    "readback": {
+      "citation_degradation_warnings": [warning, warning],
+      "decisions_log": [
+        {
+          "thesis_id": "4d459e6d-027b-4535-9a9b-67f28377982a",
+          "artifact_refs": [
+            {"artifact_path": "artifacts/PCTY/business-quality-assessment/2026-11-05T023057.655-93bac72e.json"}
+          ],
+        }
+      ],
+      "typed_outputs": {
+        "thesis_projection": {"business_overview": {"description": "Payroll and HCM"}},
+        "bulk": "x" * 80_000,
+      },
+    },
+  }
+  content = json.dumps(payload)
+  assert len(content) > 60_000
+  entry = {"type": "tool_result", "tool_use_id": "tool-bq", "content": content}
+
+  live_entry, durable_entry = compact_model_tool_result_entry(
+    entry,
+    tool_name="fms_report_business_quality_assessment",
+    spill_dir_provider=lambda: str(tmp_path),
+    log_session_id="sess-report",
+    logger=_NullLogger(),
+  )
+
+  assert live_entry == durable_entry
+  assert live_entry is not entry
+  text = live_entry["content"]
+  assert "artifacts/" not in text
+  assert "source-map ref" not in text
+  assert "handle_only" not in text
+  assert "quote_mintable" not in text
+  assert "citation_use" not in text
+  assert "contiguous exact quote" not in text
+  assert "4d459e6d" not in text
+  assert "may be reported as-is" not in text
+  receipt = json.loads(text)
+  assert receipt["status"] == "applied"
+  assert receipt["verdict"] == "HIGH_QUALITY"
+  assert receipt["confidence"] == "MEDIUM"
+  assert receipt["findings"] == [
+    {"code": "quote_not_found", "field": "sources", "source_refs": ["S1515"]},
+    {"code": "quote_not_found", "field": "sources", "source_refs": ["S1514"]},
+    {"code": "field_withheld", "field": "thesis_projection.thesis"},
+  ]
+  assert "thesis_read" not in text
+  assert receipt["composite"] == 4.2
+  assert "bridge" in receipt["recommended_next_action"]
+  assert receipt["next_actions"] == payload["next_actions"]
+  assert receipt["decision_log_appended"] is True
+  assert receipt["business_overview_projected"] is True
+  assert "readback" not in receipt
+  assert "artifact_ref" not in receipt
+  assert "typed_artifact_ref" not in receipt
+  assert receipt["artifact_id"] == payload["artifact_id"]
+  assert "/" not in receipt["artifact_id"]
+  assert "citation_degradation_warnings" not in receipt

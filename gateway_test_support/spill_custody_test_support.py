@@ -11,6 +11,8 @@ from agent_gateway.mcp_client import McpClientManager
 from hank_model_transport.providers import ModelInfo, ModelProvider, StreamEvent
 from agent_gateway.task_registry import RegistryOwner, TaskRegistry
 from agent_gateway.tool_result_spill import SpillSink
+from agent_gateway.approval_policy import RunContext
+from agent_gateway.registry_scope import RegistryScope
 
 from .capability_execution_test_support import stub_runner_capability_execution
 
@@ -126,6 +128,13 @@ async def publish_custody_spill(
     event_log=event_log,
     session_id="session-alias",
     role="owner",
+    run_context=RunContext(
+      user_id=context.tenant.storage_id,
+      request_id=f"request:{tool_use_id}",
+      session_id="session-alias",
+      decider_role="owner",
+      registry_scope=RegistryScope("session", "session-alias", str(sink)),
+    ),
   )
   runner = AgentRunner(
     event_log=event_log,

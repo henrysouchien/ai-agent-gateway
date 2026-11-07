@@ -24,6 +24,7 @@ if str(PKG_DIR) not in sys.path:
 
 import agent_gateway.sub_agent as sub_agent_module
 from agent_gateway import EventLog, McpClientManager, ToolResultContext, create_agent
+from agent_gateway.registry_scope import NoRegistryScope
 from agent_gateway.tool_result_spill import SpillSink, TOOL_RESULT_READ_TOOL_DEF
 from agent_gateway.auth import AuthConfig, ResolverResult
 from hank_model_transport._provider_utils import _resolve_provider
@@ -1463,6 +1464,47 @@ def test_create_agent_registers_local_tool_handlers_and_definitions() -> None:
   assert runner._dispatcher._request_approval is not None
 
 
+def test_create_agent_runner_declares_no_registry_and_executes_a_tool_call(
+  owner_session_host_policy,
+) -> None:
+  # 8afa7f7b851f made run_context required; the chat_embedded factory branch
+  # dropped it, so building the easy runner raised TypeError (UNC-FMS 2ac8f992).
+  # Tool authority comes from the deployment's host policy.
+  from agent_gateway.registry_scope import NoRegistryScope
+
+  calls: list[dict[str, object]] = []
+
+  async def _tool(tool_input, **_kwargs):
+    calls.append(dict(tool_input))
+    return {"ok": True}, None
+
+  app = create_agent(
+    "test",
+    api_key="test-key",
+    tool_handlers={"t": _tool},
+    tool_definitions=[{
+      "name": "t",
+      "description": "test tool",
+      "input_schema": {"type": "object", "properties": {}},
+    }],
+  )
+  session, runtime = _build_runtime(app)
+  # create_agent configures the app's server_policy (none here), so the
+  # deployment's host policy is installed after the app is built.
+  runner = runtime.build_runner(EventLog(), session.session_id)
+  from hank_model_transport.policy_imports import configure_server_policy
+  configure_server_policy(owner_session_host_policy)
+
+  run_context = runner._dispatcher.run_context
+  assert isinstance(run_context.registry_scope, NoRegistryScope)
+  assert run_context.session_id == session.session_id
+  assert run_context.profile == "chat_embedded"
+  result, error = _run(runner._dispatcher.dispatch("call-1", "t", {}))
+  assert error is None
+  assert result == {"ok": True}
+  assert calls == [{}]
+
+
 def test_create_agent_code_execution_wires_hooks_approval_and_expiry_cleanup(tmp_path: Path) -> None:
   async def _user_on_tool_result(_ctx):
     return [{"type": "text", "text": "extra"}]
@@ -1488,6 +1530,7 @@ def test_create_agent_code_execution_wires_hooks_approval_and_expiry_cleanup(tmp
   assert session.tool_result_spill_sink.capabilities.spill_read
 
   ctx = ToolResultContext(
+    registry_scope=NoRegistryScope(),
     tool_name="code_execute",
     tool_input={},
     redacted_tool_input={},

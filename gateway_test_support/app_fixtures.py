@@ -41,6 +41,8 @@ def make_test_app():
     ProductModelSelectionPolicy,
   )
   from agent_gateway.auth import AuthConfig, ResolverResult
+  from agent_gateway.approval_policy import RunContext
+  from agent_gateway.registry_scope import NoRegistryScope, RegistryScope
   from hank_model_transport.capability_execution import MaterializedCredential
   from hank_model_transport.providers.agent_sdk import AgentSDKConfig
   from hank_model_transport.providers import AnthropicProvider
@@ -285,6 +287,17 @@ def make_test_app():
               local_tool_handlers={},
               event_log=event_log,
               session_id=session_id,
+              run_context=RunContext(
+                user_id=str(session.user_id or "test-user"),
+                request_id=str(getattr(request, "request_id", None) or session_id),
+                session_id=session_id,
+                channel=str(session.channel or "web"),
+                registry_scope=(
+                  RegistryScope("session", session_id, str(storage_root))
+                  if storage_root is not None
+                  else NoRegistryScope()
+                ),
+              ),
             )
           elif callable(dispatcher):
             dispatcher_obj = dispatcher(event_log, session_id, session)

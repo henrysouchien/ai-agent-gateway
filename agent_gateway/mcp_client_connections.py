@@ -7,20 +7,23 @@ import logging
 import os
 import threading
 import time
+import uuid
 from concurrent import futures
 from collections.abc import AsyncGenerator, Awaitable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
+from typing import Any, Callable, Literal, Mapping, MutableMapping, Protocol, Sequence
 
 from anyio import EndOfStream
 import httpx2
+import psutil
 from mcp.types import PaginatedRequestParams
 
 from .claim_mint_client import mint_gateway_user_claim
 from .claim_signing_authority import UserClaimHttpAuth, agent_api_claim_http_headers
 from .mcp_client_config import expand_http_template, iter_exception_tree
 from .mcp_client_oauth_storage import oauth_token_cache_path
+from .mcp_client_errors import McpStdioStartupBoundError, StdioStartupOutcome
 
 
 class _RemoteUserClaimHttpAuth(UserClaimHttpAuth):
@@ -244,6 +247,100 @@ _STDERR_DRAIN_GRACE_SECONDS = 1.0
 # without end, not to size a catalog.
 _LIST_TOOLS_PAGE_CEILING = 256
 
+#: Set in each stdio child's environment to a value unique to that spawn. The
+#: SDK's stdio transport does not expose the process it starts, so the startup
+#: bound finds the child among this process's children by this value.
+STDIO_SPAWN_MARKER_ENV = "AGENT_GATEWAY_MCP_SPAWN_ID"
+
+# CPU seconds a starting stdio child and its descendants must spend inside one
+# startup window to count as working. An interpreter blocked on a read spends
+# none; an import under heavy machine load still spends far more than this per
+# window, while a periodic timer in an otherwise stuck server stays below it.
+_STDIO_STARTUP_PROGRESS_CPU_SECONDS = 0.1
+
+# A working stdio child gets further startup windows until this many startup
+# bounds have passed since its spawn (360 s at the product's 120 s bound,
+# inside the 420 s readiness wait of a deploy). It ends a child that computes
+# without ever answering.
+_STDIO_STARTUP_CEILING_BOUNDS = 3
+
+
+@dataclass(frozen=True)
+class _StdioChildSample:
+  state: Literal["alive", "died", "unobserved"]
+  pid: int | None
+  cpu_seconds: float = 0.0
+
+
+class StdioChildProgress:
+  """Whether one starting stdio child is working, measured as the CPU it spends.
+
+  Created at the spawn; the startup bound samples it when a step starts and
+  when the step's window ends. Wall seconds alone cannot tell a child importing
+  on a saturated machine from one that will never answer.
+  """
+
+  def __init__(self, spawn_id: str, *, spawned_wall: float, ceiling_at: float, ceiling_seconds: float) -> None:
+    self._spawn_id = spawn_id
+    self._spawned_wall = spawned_wall
+    self.ceiling_at = ceiling_at
+    self.ceiling_seconds = ceiling_seconds
+    self._process: psutil.Process | None = None
+
+  def _find(self) -> psutil.Process | None:
+    if self._process is not None:
+      return self._process
+    for child in psutil.Process().children():
+      try:
+        # The clock tick of a process start time is coarse; a second of slack.
+        if child.create_time() < self._spawned_wall - 1.0:
+          continue
+        if child.environ().get(STDIO_SPAWN_MARKER_ENV) == self._spawn_id:
+          self._process = child
+          return child
+      except psutil.Error:
+        continue
+    return None
+
+  def sample(self) -> _StdioChildSample:
+    """Blocking: the child's and its descendants' CPU seconds, or why there are none."""
+    process = self._find()
+    if process is None:
+      return _StdioChildSample("unobserved", None)
+    try:
+      if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+        return _StdioChildSample("died", process.pid)
+      times = process.cpu_times()
+      total = times.user + times.system + times.children_user + times.children_system
+      for descendant in process.children(recursive=True):
+        try:
+          descendant_times = descendant.cpu_times()
+        except psutil.Error:
+          continue
+        total += descendant_times.user + descendant_times.system
+    except psutil.NoSuchProcess:
+      return _StdioChildSample("died", process.pid)
+    except psutil.Error:
+      return _StdioChildSample("unobserved", process.pid)
+    return _StdioChildSample("alive", process.pid, total)
+
+
+def _stdio_startup_failure(
+  outcome: StdioStartupOutcome,
+  pid: int | None,
+  *,
+  bound: float,
+  ceiling: float,
+) -> str:
+  if outcome == "stalled":
+    return f"stdio child pid {pid} alive but stalled (no CPU progress in its last {bound:g}s window)"
+  if outcome == "died":
+    return f"stdio child pid {pid} died"
+  if outcome == "busy_past_ceiling":
+    return f"stdio child pid {pid} still working at the {ceiling:g}s startup ceiling"
+  return f"startup resource bound {bound:g}s; stdio child process not observed"
+
+
 
 class _StdioStderr:
   """Drain child stderr without blocking it or retaining an unbounded log."""
@@ -349,6 +446,7 @@ async def connect_or_warn(
       "MCP server %s connected after %.3fs", name, time.monotonic() - started,
     )
     manager._startup_diagnostics.pop(manager._canonical_server_name(name), None)
+    manager._stdio_startup_failures.pop(name, None)
     return state
   except Exception as exc:
     elapsed = time.monotonic() - started
@@ -367,6 +465,10 @@ async def connect_or_warn(
       retryable=bool(diagnostic["retryable"]),
       error_type=str(diagnostic["error_type"]) if diagnostic.get("error_type") else None,
     )
+    if str(config.get("type", "stdio")).strip().lower() == "stdio":
+      # The one owner that restores a stdio child holds its prepared config:
+      # its startup-recovery task reconnects it off every call's path.
+      manager._stdio_startup_failures[name] = config
     runtime.logger.warning(
       "MCP server %s failed to connect after %.3fs: %s",
       name, elapsed, message,
@@ -551,6 +653,8 @@ async def connect_stdio(
       absent=absent_env,
     )
     runtime.preflight_stdio_executable(command, args, env)
+    spawn_id = uuid.uuid4().hex
+    env[STDIO_SPAWN_MARKER_ENV] = spawn_id
 
     cwd = config.get("cwd")
     tool_prefix = str(config.get("tool_prefix", "") or "").strip()
@@ -564,8 +668,16 @@ async def connect_stdio(
     stderr = _StdioStderr(name, runtime.logger)
     exit_contexts.append(stderr)
     stdio_cm = runtime.stdio_client_factory(server_params, errlog=stderr.errlog)
+    spawned_wall = time.time()
+    ceiling_seconds = _STDIO_STARTUP_CEILING_BOUNDS * manager._startup_timeout
     read_stream, write_stream = await stdio_cm.__aenter__()
     exit_contexts.append(stdio_cm)
+    child = StdioChildProgress(
+      spawn_id,
+      spawned_wall=spawned_wall,
+      ceiling_at=time.monotonic() + ceiling_seconds,
+      ceiling_seconds=ceiling_seconds,
+    )
     read_stream = _StdioReadStream(read_stream)
 
     session = runtime.client_session_factory(read_stream, write_stream)
@@ -578,8 +690,9 @@ async def connect_stdio(
       exit_contexts=[host],
       tool_prefix=tool_prefix,
       allowed_tools=runtime.parse_allowed_tools(config.get("allowed_tools")),
+      stdio_child=child,
     )
-    await manager._verify_stdio_session_stable(session)
+    await manager._verify_stdio_session_stable(session, stdio_child=child)
     state.config = {k: v for k, v in config.items() if k != "_projected_env"}
     state.stdio_eof = read_stream.eof
     state.stdio_receive_done = read_stream.receive_done
@@ -726,24 +839,83 @@ def build_http_auth(
   )
 
 
+async def _await_while_child_works(
+  request: asyncio.Future[Any],
+  child: StdioChildProgress,
+  bound: float,
+  name: str | None,
+) -> tuple[StdioStartupOutcome, int | None] | None:
+  """Wait for ``request`` while the child keeps spending CPU.
+
+  Returns None once the request is done, or why the wait ended with its pid:
+  a window of ``bound`` seconds in which the child spent no CPU, a child gone
+  or not found, or one still working at its ceiling. The request is cancelled
+  and settled before any return or exception leaves.
+  """
+  window_end = time.monotonic() + bound
+  baseline = await asyncio.to_thread(child.sample)
+  try:
+    while True:
+      remaining = window_end - time.monotonic()
+      if remaining > 0:
+        await asyncio.wait({request}, timeout=remaining)
+      if request.done():
+        return None
+      current = await asyncio.to_thread(child.sample)
+      if request.done():
+        return None
+      if current.state != "alive":
+        return current.state, current.pid
+      spent = current.cpu_seconds - (baseline.cpu_seconds if baseline.state == "alive" else 0.0)
+      if spent < _STDIO_STARTUP_PROGRESS_CPU_SECONDS:
+        return "stalled", current.pid
+      now = time.monotonic()
+      if now >= child.ceiling_at:
+        return "busy_past_ceiling", current.pid
+      log.info(
+        "MCP stdio server %s (pid %s) is still starting and spent %.2fs CPU in its last "
+        "%gs window; extending its startup window (ceiling %gs after spawn)",
+        name, current.pid, spent, bound, child.ceiling_seconds,
+      )
+      baseline = current
+      window_end = min(now + bound, child.ceiling_at)
+  finally:
+    if not request.done():
+      request.cancel()
+      await asyncio.wait({request})
+
+
 async def _bounded_startup_step(
   manager: Any,
   step: str,
   awaitable: Any,
   *,
   name: str | None = None,
+  stdio_child: StdioChildProgress | None = None,
 ) -> Any:
-  """Contain an unanswered handshake that otherwise holds startup and shutdown's lock."""
+  """Contain an unanswered handshake that otherwise holds startup and shutdown's lock.
+
+  The step is bounded by ``manager._startup_timeout``. For a stdio child the
+  bound is a window of no progress, not wall seconds: a child that spent CPU in
+  the window gets another, up to ``stdio_child.ceiling_at``; a child that is
+  idle, gone or unobservable ends the step at the bound with
+  ``McpStdioStartupBoundError`` naming which.
+  """
   started = time.monotonic()
   request = asyncio.ensure_future(awaitable)
   server = f"MCP server {name}" if name is not None else "MCP server"
+  bound = manager._startup_timeout
   try:
-    return await asyncio.wait_for(request, timeout=manager._startup_timeout)
+    if stdio_child is None:
+      return await asyncio.wait_for(request, timeout=bound)
+    ended = await _await_while_child_works(request, stdio_child, bound, name)
+    if ended is None:
+      return request.result()
   except asyncio.TimeoutError as exc:
     elapsed = time.monotonic() - started
     # A peer's own TimeoutError is its cause, not our no-response diagnosis.
     cause = (
-      f"no response (startup resource bound {manager._startup_timeout:g}s)"
+      f"no response (startup resource bound {bound:g}s)"
       if request.cancelled() else str(exc).strip() or type(exc).__name__
     )
     raise TimeoutError(
@@ -755,6 +927,18 @@ async def _bounded_startup_step(
       server, step, time.monotonic() - started, str(exc).strip() or type(exc).__name__,
     )
     raise
+  outcome, pid = ended
+  detail = _stdio_startup_failure(
+    outcome, pid, bound=bound, ceiling=stdio_child.ceiling_seconds,
+  )
+  raise McpStdioStartupBoundError(
+    f"{server} startup {step} failed after {time.monotonic() - started:.3f}s: "
+    f"no response; {detail}",
+    server=name,
+    step=step,
+    outcome=outcome,
+    pid=pid,
+  )
 
 
 async def initialize_session_state(
@@ -766,8 +950,11 @@ async def initialize_session_state(
   tool_prefix: str,
   allowed_tools: tuple[str, ...] | None,
   runtime: McpConnectionRuntime,
+  stdio_child: StdioChildProgress | None = None,
 ) -> Any:
-  await _bounded_startup_step(manager, "initialize", session.initialize(), name=name)
+  await _bounded_startup_step(
+    manager, "initialize", session.initialize(), name=name, stdio_child=stdio_child,
+  )
 
   tools: list[McpListedTool] = []
   cursor: str | None = None
@@ -781,6 +968,7 @@ async def initialize_session_state(
       "list_tools",
       session.list_tools(params=PaginatedRequestParams(cursor=cursor)),
       name=name,
+      stdio_child=stdio_child,
     )
     tools.extend(listed.tools or [])
     if listed.next_cursor is None:
@@ -860,6 +1048,7 @@ async def verify_stdio_session_stable(
   manager: Any,
   session: McpConnectionSession,
   runtime: McpConnectionRuntime,
+  stdio_child: StdioChildProgress | None = None,
 ) -> None:
   delay = runtime.stdio_connect_stabilize_delay()
   if delay > 0:
@@ -868,6 +1057,7 @@ async def verify_stdio_session_stable(
     manager,
     "stability check",
     session.list_tools(params=PaginatedRequestParams()),
+    stdio_child=stdio_child,
   )
 
 
@@ -886,6 +1076,8 @@ __all__ = [
   "connect_stdio_with_retries",
   "connect_streamable_http",
   "initialize_session_state",
+  "STDIO_SPAWN_MARKER_ENV",
+  "StdioChildProgress",
   "LOOPBACK_REFUSAL_RETRY_DELAYS_SECONDS",
   "is_loopback_connection_refused",
   "verify_stdio_session_stable",

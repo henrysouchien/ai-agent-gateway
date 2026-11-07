@@ -12,6 +12,7 @@ from mcp import MCPError
 from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT
 
 from hank_model_transport.user_runtime_credentials import USER_STORAGE_ID_ENV
+from model_authority.run_route import handed_run_route_env
 
 
 class _McpConfigPathUnset(Enum):
@@ -36,7 +37,19 @@ DEFAULT_ENV_ALLOWLIST = {
   "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "USER",
   "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE", "NODE_PATH",
   "HANK_MODEL_AUTHORITY_DIR",
+  # The instance's org store and key-pool switch, never provider secret values.
+  "USER_DATA_DIR", "HANK_CREDENTIAL_POOL",
   USER_STORAGE_ID_ENV, "INVESTMENT_TOOLS_STATE_DIR",
+}
+# Set in every stdio child the gateway starts, whatever its repo or interpreter.
+# FastMCP's server banner makes a blocking PyPI version check on every `run()`:
+# an outbound call per spawn that stalls the spawn for seconds wherever the
+# resolver does not answer. Both are FastMCP's own settings (`FASTMCP_` prefix;
+# read by fastmcp 4.0.4 and 4.1.0, the versions the gateway, Risk and Edgar
+# children pin). A server entry's own `env` still overrides either.
+MCP_CHILD_FIXED_ENV: Final[Mapping[str, str]] = {
+  "FASTMCP_SHOW_SERVER_BANNER": "false",
+  "FASTMCP_CHECK_FOR_UPDATES": "off",
 }
 MCP_STDIO_CONNECT_RETRIES_ENV = "MCP_STDIO_CONNECT_RETRIES"
 MCP_STDIO_CONNECT_BACKOFF_ENV = "MCP_STDIO_CONNECT_BACKOFF_S"
@@ -91,6 +104,27 @@ def resolve_mcp_config_path(
   return Path(config_path).expanduser()
 
 
+def declared_run_scoped_env(config: Mapping[str, Any]) -> tuple[str, ...]:
+  """The environment names a server entry's `run_scoped_env` declares; absent declares none.
+
+  The one parse of the field: the gateway reads each entry with it, and the isolated start's
+  boot probe refuses the entries it refuses.
+  """
+  raw = config.get("run_scoped_env")
+  if raw is None:
+    return ()
+  if (
+    not isinstance(raw, list)
+    or not raw
+    or any(not isinstance(name, str) or not name.strip() for name in raw)
+  ):
+    raise ValueError("run_scoped_env must be a non-empty list of environment names")
+  names = tuple(name.strip() for name in raw)
+  if len(set(names)) != len(names):
+    raise ValueError("run_scoped_env must not contain duplicate environment names")
+  return names
+
+
 def scope_run_env(
   declared: Iterable[str],
   environ: Mapping[str, str],
@@ -126,6 +160,8 @@ def build_mcp_env(
     else os.environ
   )
   env = {k: str(v) for k, v in allowlist_source.items() if k in DEFAULT_ENV_ALLOWLIST}
+  env.update(handed_run_route_env(allowlist_source))
+  env.update(MCP_CHILD_FIXED_ENV)
   if not isinstance(server_env, dict):
     return env
 
@@ -423,6 +459,7 @@ def parse_allowed_tools(value: Any) -> tuple[str, ...] | None:
 __all__ = [
   "DEFAULT_ENV_ALLOWLIST",
   "ENV_REF_RE",
+  "MCP_CHILD_FIXED_ENV",
   "MCP_STARTUP_CONCURRENCY_ENV",
   "MCP_STARTUP_CONCURRENCY_DEFAULT",
   "MCP_STDIO_CONNECT_BACKOFF_DEFAULT",
@@ -443,6 +480,7 @@ __all__ = [
   "UNSET",
   "build_http_headers",
   "build_mcp_env",
+  "declared_run_scoped_env",
   "env_nonnegative_float",
   "env_nonnegative_int",
   "expand_env_refs",

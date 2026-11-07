@@ -87,6 +87,9 @@ def usage_delta(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]
   for key in (
     "capability_bind",
     "provider_reported_model",
+    "tier",
+    "failover_reason",
+    "failed_over_from",
   ):
     value = after.get(key)
     if value is not None:

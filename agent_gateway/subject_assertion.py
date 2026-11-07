@@ -12,6 +12,7 @@ from typing import Annotated, Any, Literal, Mapping
 from uuid import UUID
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from fastapi import HTTPException
 import jwt
 from pydantic import (
   BaseModel,
@@ -126,11 +127,20 @@ def _decode_public_key(value: object) -> Ed25519PublicKey:
   return Ed25519PublicKey.from_public_bytes(raw)
 
 
+def _unique_key_ids(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+  result: dict[str, Any] = {}
+  for key_id, encoded in pairs:
+    if key_id in result:
+      raise ValueError("duplicate public key id")
+    result[key_id] = encoded
+  return result
+
+
 def load_subject_assertion_public_keys(
   value: str,
 ) -> dict[str, Ed25519PublicKey]:
   try:
-    parsed = json.loads(value)
+    parsed = json.loads(value, object_pairs_hook=_unique_key_ids)
   except (TypeError, ValueError) as exc:
     raise SubjectAssertionError("invalid_public_keys_config") from exc
   if not isinstance(parsed, dict) or not parsed:
@@ -264,8 +274,51 @@ class GatewaySubjectAssertionVerifier:
       self._consumed[replay_key] = expires_at
 
 
+class SubjectVerificationUnavailable(HTTPException):
+  """The web subject verifier cannot answer: a typed 503 with the repair.
+
+  The credentials resolver raises this where it needs a verifier the process
+  does not have (``not_configured``) or whose replay cache is full
+  (``replay_cache_saturated``); the gateway's credential-error mappers project
+  ``error_body`` so the caller sees the cause and the next call, not a generic
+  authentication failure.
+  """
+
+  _DETAIL = {
+    "not_configured": "Web subject assertion verification is not configured",
+    "replay_cache_saturated": "Web subject assertion verification is temporarily unavailable",
+  }
+  _NEXT_CALL = {
+    "not_configured": (
+      f"set {SUBJECT_ASSERTION_PUBLIC_KEYS_ENV} to a JSON object of distinct key ids to "
+      "Ed25519 public keys (the gateway startup log names the invalid_public_keys_config "
+      "cause when the value is invalid), restart the gateway, then retry POST /api/chat/init"
+    ),
+    "replay_cache_saturated": (
+      "retry POST /api/chat/init with a freshly signed subject assertion once earlier "
+      "assertions have expired"
+    ),
+  }
+
+  def __init__(self, reason: Literal["not_configured", "replay_cache_saturated"]) -> None:
+    super().__init__(status_code=503, detail=self._DETAIL[reason])
+    self.reason = reason
+
+  def error_body(self, *, user_id: str | None = None) -> dict[str, str]:
+    body = {
+      "error": "credentials_unavailable",
+      "message": str(self.detail),
+      "reason": f"web_subject_verification_{self.reason}",
+      "next_call": self._NEXT_CALL[self.reason],
+    }
+    if user_id is not None:
+      body["user_id"] = user_id
+    return body
+
+
 __all__ = [
   "GatewaySubjectAssertionVerifier",
+  "SubjectVerificationUnavailable",
   "SUBJECT_ASSERTION_ALGORITHM",
   "SUBJECT_ASSERTION_AUDIENCE",
   "SUBJECT_ASSERTION_ISSUER",

@@ -10,6 +10,9 @@ import secrets
 import stat
 from typing import Any, Callable, Literal, Mapping
 
+from .autonomous_event_channel import (
+  AUTONOMOUS_EVENT_CHANNEL_MAX_EVENT_BYTES,
+)
 from .canonical_json_target_lock import (
   LockedCanonicalJsonTarget,
   lock_canonical_json_target,
@@ -20,7 +23,18 @@ from .canonical_json_target_lock import (
 WAL_SCHEMA_VERSION = 1
 EFFECT_SCHEMA_VERSION = 1
 MAX_AFTER_IMAGE_BYTES = 4 * 1024 * 1024
-MAX_WAL_BYTES = MAX_AFTER_IMAGE_BYTES + 512 * 1024
+# The record also stages the run's durable result and terminal events, which
+# the session log keeps at full fidelity (FRAME-CAPS-ARE-CONTAINMENT): a
+# result carries every door envelope the run captured, so its size follows the
+# run, not a fixed headroom. The one ceiling on a run's event bytes is the
+# autonomous event channel's; the record may hold that much beside its
+# after-image and the lifecycle/fence/effect envelope.
+_WAL_ENVELOPE_BYTES = 512 * 1024
+MAX_WAL_BYTES = (
+  MAX_AFTER_IMAGE_BYTES
+  + AUTONOMOUS_EVENT_CHANNEL_MAX_EVENT_BYTES
+  + _WAL_ENVELOPE_BYTES
+)
 _WAL_DIRECTORY_MODE = 0o700
 _WAL_FILE_MODE = 0o600
 _WAL_FILE_NAME = "completion.json"

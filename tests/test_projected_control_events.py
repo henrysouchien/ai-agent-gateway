@@ -63,7 +63,7 @@ def _session(
     user_id=user_id,
     kind=kind,
     channel=channel,
-    owner_user_id=owner_user_id,
+    owner_user_id=owner_user_id if owner_user_id is not None else user_id,
   )
   session.purpose = purpose
   return session

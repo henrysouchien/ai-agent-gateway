@@ -140,24 +140,63 @@ _TICKER_STOPWORDS = {
 }
 
 
+# A subject the objective declares as such, in rank order: `ticker "TER"` / `ticker=TER` /
+# `ticker: TER` (named), then `TER (Teradyne)` (introduced with its name) or `$TER`. A bare
+# capitalised word that happens to be an entity ticker (HIGH, STEP, EV) is not a declaration.
+_TICKER_NAMED_RE = re.compile(
+  r"""\btickers?\s*(?:[:=]|is)?\s*["'`]?(?P<ticker>[A-Z0-9][A-Z0-9.-]{0,14})["'`]?(?![A-Za-z0-9.-])"""
+)
+_TICKER_INTRODUCED_RE = re.compile(
+  r"""(?<![A-Za-z0-9.-])(?P<ticker>[A-Z0-9][A-Z0-9.-]{0,14})\s+\((?=[A-Z][A-Za-z0-9&.,' -]{1,60}\))"""
+  r"""|\$(?P<dollar>[A-Z][A-Z0-9.-]{0,14})(?![A-Za-z0-9.-])"""
+)
+
+
+def _entity_ticker(candidate: str) -> str | None:
+  if _DISCOVERY_EXCLUSION_RE.fullmatch(candidate):
+    return None
+  if any(char.isdigit() for char in candidate) and not _B3_DISCOVERY_RE.fullmatch(candidate):
+    return None
+  try:
+    normalized = normalize_contract_ticker(candidate)
+  except ValueError:
+    return None
+  if normalized in _TICKER_STOPWORDS or not is_entity_ticker(normalized):
+    return None
+  return normalized
+
+
 def _extract_ticker_from_task(task: str) -> str | None:
+  """The one issuer the objective is about, read from prose only where prose declares it.
+
+  Declared subjects decide, a named `ticker "TER"` before an introduced `TER (Teradyne)`
+  or `$TER`: one distinct ticker at the strongest rank is the subject; several is ambiguous. With no declaration, the bare
+  entity-ticker words decide as before: one is the subject, several is ambiguous — an
+  imperative or metric capital (HIGH, STEP, EV) can only confuse an undeclared objective.
+  """
+  for pattern in (_TICKER_NAMED_RE, _TICKER_INTRODUCED_RE):
+    declared: list[str] = []
+    for match in pattern.finditer(task):
+      candidate = match.group("ticker") if "ticker" in match.groupdict() and match.group("ticker") else match.groupdict().get("dollar")
+      normalized = _entity_ticker(candidate) if candidate else None
+      if normalized is not None and normalized not in declared:
+        declared.append(normalized)
+    if len(declared) > 1:
+      raise ValueError(
+        "objective declares several ticker subjects: " + ", ".join(declared) + "; pass the one `ticker`"
+      )
+    if declared:
+      return declared[0]
+
   candidates: list[str] = []
   for match in _TICKER_DISCOVERY_TOKEN_RE.finditer(task):
-    candidate = match.group(1)
-    if _DISCOVERY_EXCLUSION_RE.fullmatch(candidate):
-      continue
-    if any(char.isdigit() for char in candidate) and not _B3_DISCOVERY_RE.fullmatch(candidate):
-      continue
-    try:
-      normalized = normalize_contract_ticker(candidate)
-    except ValueError:
-      continue
-    if normalized in _TICKER_STOPWORDS or not is_entity_ticker(normalized):
-      continue
-    if normalized not in candidates:
+    normalized = _entity_ticker(match.group(1))
+    if normalized is not None and normalized not in candidates:
       candidates.append(normalized)
   if len(candidates) > 1:
-    raise ValueError("objective contains multiple plausible ticker subjects")
+    raise ValueError(
+      "objective contains multiple plausible ticker subjects: " + ", ".join(candidates) + "; pass the one `ticker`"
+    )
   return candidates[0] if candidates else None
 
 

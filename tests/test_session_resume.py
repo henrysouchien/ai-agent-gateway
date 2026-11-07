@@ -4,9 +4,10 @@ The server resolves the caller, asks the configured resume resolver for the
 caller's own log, refuses with 409 `session_resume_refused`, or binds the new
 session to that log so the next turn replays it.
 """
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 import json
-import sys
 import asyncio
 from pathlib import Path
 from typing import Any
@@ -14,9 +15,6 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-TESTS_DIR = Path(__file__).resolve().parent
-if str(TESTS_DIR) not in sys.path:
-  sys.path.insert(0, str(TESTS_DIR))
 
 from agent_gateway import (  # noqa: E402
   AgentRunner,
@@ -82,6 +80,8 @@ def _make_app(
   logs_dir: Path,
   provider: _ReplayProvider,
   resume_resolver: _ResumeResolver | None,
+  *,
+  turn_context_message: str | None = None,
 ) -> FastAPI:
   async def _credentials_resolver(_api_key: str, init_request):
     return _resolver_result_for(init_request.user_id, channel="excel")
@@ -124,6 +124,7 @@ def _make_app(
           local_tool_handlers={},
           event_log=event_log,
           session_id=session_id,
+          run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
         ),
         session_id=session_id,
         capability_execution=capability_execution,
@@ -144,6 +145,7 @@ def _make_app(
       system_prompt="system",
       build_runner=_build_runner,
       capability_execution=capability_execution,
+      turn_context_message=turn_context_message,
     )
 
   def _resolve_adapter(adapter: str):
@@ -404,7 +406,14 @@ def test_resume_refuses_in_use_while_the_prior_session_is_answering(
     portal.call(_cancel_turn, prior_session.active_turn)
 
   assert response.status_code == 409
-  assert response.json() == {"error": "session_resume_refused", "reason": "in_use"}
+  # The refusal names the turn's session and the call that ends it: a resume never
+  # cancels a turn, the cancel route does.
+  assert response.json() == {
+    "error": "session_resume_refused",
+    "reason": "in_use",
+    "in_use_session_id": prior["session_id"],
+    "next_call": {"method": "POST", "path": "/chat/cancel", "body": {"session_id": prior["session_id"]}},
+  }
   assert still_live is prior_session
   assert live_ids == {prior["session_id"]}
   assert _tree(tmp_path) == before

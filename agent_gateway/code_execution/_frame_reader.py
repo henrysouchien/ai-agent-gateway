@@ -204,7 +204,8 @@ class ActiveCell:
       raise ToolInputPreparationError({"code": "bridge_unavailable", "message": f"{operation!r} is not code-callable here; call {operation!r} directly as a tool, not from inside a cell"})
     refusal = cell._refusal(dispatcher, operation)
     if refusal is not None:
-      raise ToolInputPreparationError({"code": refusal, "message": f"{operation!r} is not code-callable here"})
+      message, _next_call = cell._refusal_message(refusal, operation)
+      raise ToolInputPreparationError({"code": refusal, "message": message})
     # The native producer has already executed these kwargs. Capture them as
     # the MCP transport does for settlement, without re-running preparation.
     prepared = PreparedToolCall(tool_input)
@@ -667,6 +668,30 @@ class CellChannel:
       return "not_code_callable"
     return None
 
+  def _refusal_message(self, refusal: str, operation: str) -> tuple[str, Optional[Dict[str, Any]]]:
+    """The reply text, and `next_call` where one applies, for one `_refusal` code.
+
+    Every door that refuses an operation (`hank.call`, `describe`, a native
+    producer's begin) names the real reason: an operation absent from the live
+    surface, one granted by a pack not yet loaded, or one not registered as
+    code-callable.
+    """
+    if refusal == "unknown_operation":
+      return f"{operation!r} is not a tool on this session's live surface", None
+    if refusal == "not_granted":
+      pack = self._grant_hint(operation) if self._grant_hint is not None else None
+      if pack is None:
+        return (
+          f"{operation!r} is not granted to this turn; load its pack with load_tools (or call it directly as a tool)",
+          None,
+        )
+      return (
+        f'{operation!r} is not granted to this turn; load its pack first: '
+        f'hank.call("load_tools", pack="{pack}") (or call it directly as a tool)',
+        build_next_call("load_tools", {"pack": pack}),
+      )
+    return f"{operation!r} is not registered as code-callable", None
+
   def _new_entry(self, operation: Any) -> Dict[str, Any]:
     with self._lock:
       self._ordinal += 1
@@ -747,22 +772,9 @@ class CellChannel:
     refusal = self._refusal(dispatcher, operation)
     entry["server"] = _server_of(operation)
     entry["policy_class"] = _policy_class(operation)
-    if refusal == "unknown_operation":
-      return _refuse(refusal, f"{operation!r} is not a tool on this session's live surface")
-    if refusal == "not_granted":
-      pack = self._grant_hint(operation) if self._grant_hint is not None else None
-      return _refuse(
-        refusal,
-        (
-          f'{operation!r} is not granted to this turn; load its pack first: '
-          f'hank.call("load_tools", pack="{pack}") (or call it directly as a tool)'
-          if pack is not None else
-          f"{operation!r} is not granted to this turn; load its pack with load_tools (or call it directly as a tool)"
-        ),
-        next_call=build_next_call("load_tools", {"pack": pack}) if pack is not None else None,
-      )
     if refusal is not None:
-      return _refuse(refusal, f"{operation!r} is not registered as code-callable")
+      message, next_call = self._refusal_message(refusal, operation)
+      return _refuse(refusal, message, next_call)
     reply = await self._dispatch_granted("tool_result", call_id, entry, dispatcher, operation, tool_input)
     if operation == "load_tools" and entry["ok"]:
       self._grant = None
@@ -832,64 +844,14 @@ class CellChannel:
     return _ok_reply("wait_result", call_id, result)
 
   async def _completion(self, frame: Dict[str, Any]) -> Dict[str, Any]:
-    """`hank.completion`: leaf model call under a registered model-call operation."""
-    call_id = frame.get("call_id")
-    operation = frame.get("operation")
-    if not isinstance(operation, str) or not operation.strip():
-      return _error_reply("completion_result", call_id, "protocol_error", "completion needs a non-empty string operation")
-
-    op_name = operation.strip()
-    op = lookup_model_call_operation(op_name)
-    if op is None or op.kind != "completion":
-      registered = [o.name for o in list_model_call_operations(kind="completion")]
-      return _error_reply(
-        "completion_result",
-        call_id,
-        "unknown_operation",
-        f"unknown completion operation {operation!r}; registered: {registered}",
-      )
-
-    material = frame.get("material")
-    if material is not None and not isinstance(material, str):
-      return _error_reply("completion_result", call_id, "protocol_error", "material must be a string")
-
-    runner = self._job_runner() if self._job_runner is not None else None
-    if runner is None:
-      return _error_reply("completion_result", call_id, "bridge_unavailable", "no job runner is bound to this session; call the outer completion tool directly outside the cell, or run in a session with delegation bound")
-
-    role = frame.get("role")
-    effort = frame.get("effort")
-    evidence_handles = frame.get("evidence_handles") or ()
-    if not isinstance(evidence_handles, (list, tuple)):
-      return _error_reply("completion_result", call_id, "protocol_error", "evidence_handles must be a list or tuple")
-
-    started = time.monotonic()
-    entry = self._new_entry(f"model_call:{op.name}")
-    entry["server"] = "model_call"
-    entry["policy_class"] = "read"
-
-    try:
-      launched = await execute_leaf_model_call(
-        op.name,
-        runtime=GATEWAY_SEND_PROMPT_RUNTIME,
-        material=material or "",
-        role=role,
-        effort=effort,
-        evidence_handles=evidence_handles,
-        runner=runner,
-        wait=False,
-      )
-    except Exception as exc:
-      entry["duration_ms"] = _elapsed_ms(started)
-      entry["error_code"] = "execution_error"
-      reply = _error_reply("completion_result", call_id, "execution_error", str(exc))
-      reply["nested_call_id"] = entry["nested_call_id"]
-      return reply
-
-    entry["duration_ms"] = _elapsed_ms(started)
-    entry["ok"] = True
-    entry["error_code"] = None
-    return self._producer_reply("completion_result", call_id, launched, entry)
+    """`hank.completion` has no gateway-executed capability."""
+    return _error_reply(
+      "completion_result",
+      frame.get("call_id"),
+      "unsupported_operation",
+      "hank.completion is unsupported: no gateway-executed completion capability is defined",
+      next_call=None,
+    )
 
   async def _judge(self, frame: Dict[str, Any]) -> Dict[str, Any]:
     """`hank.judge`: leaf judgment under a registered judgment operation."""
@@ -1589,7 +1551,8 @@ class CellChannel:
         })
       refusal = self._refusal(dispatcher, operation)
       if refusal is not None:
-        return _error_reply("catalog", call_id, refusal, f"{operation!r} is not code-callable here")
+        message, next_call = self._refusal_message(refusal, operation)
+        return _error_reply("catalog", call_id, refusal, message, next_call)
       definition = self._granted()[operation]
       return _ok_reply("catalog", call_id, self._route_row(operation, definition))
     return _error_reply("catalog", call_id, "protocol_error", f"unknown catalog request {request!r}")

@@ -13,6 +13,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from agent_workflow_contracts.next_call import next_call as build_next_call
+
 from .model_bound_wire import model_bound_result_fits
 
 
@@ -692,6 +694,26 @@ def _decode_spill_text(data: bytes) -> str:
     raise SpillReadUnavailable("spill member integrity mismatch") from exc
 
 
+def _loads_member(text: str, what: str) -> Any:
+  try:
+    return json.loads(text)
+  except ValueError as exc:
+    raise SpillError(f"{what} is not valid JSON") from exc
+
+
+def _parse_manifest(data: bytes) -> dict[str, Any]:
+  """The one reader of a committed manifest's bytes: UTF-8 JSON object with exact integer version 1."""
+  try:
+    text = data.decode("utf-8")
+  except UnicodeDecodeError as exc:
+    raise SpillError("spill manifest is not UTF-8") from exc
+  manifest = _loads_member(text, "spill manifest")
+  version = manifest.get("schema_version") if isinstance(manifest, dict) else None
+  if type(version) is not int or version != SPILL_MANIFEST_VERSION:
+    raise SpillError("unsupported spill manifest schema_version")
+  return manifest
+
+
 def _manifest_member_entry(
   manifest_data: bytes,
   *,
@@ -703,17 +725,10 @@ def _manifest_member_entry(
       raise SpillReadAccessDenied("spill member is not admitted by this reference")
     return None
   try:
-    manifest = json.loads(_decode_spill_text(manifest_data))
-  except SpillReadError:
-    raise
-  except Exception as exc:
-    raise SpillReadUnavailable("spill manifest integrity mismatch") from exc
-  if (
-    not isinstance(manifest, dict)
-    or manifest.get("schema_version") != SPILL_MANIFEST_VERSION
-    or manifest.get("lane") != SPILL_LANE_FILE_TOOLS
-    or not isinstance(manifest.get("members"), list)
-  ):
+    manifest = _parse_manifest(manifest_data)
+  except SpillError as exc:
+    raise SpillReadUnavailable(str(exc)) from exc
+  if manifest.get("lane") != SPILL_LANE_FILE_TOOLS or not isinstance(manifest.get("members"), list):
     raise SpillReadUnavailable("spill manifest integrity mismatch")
   if requested_member_ref == pointer_ref:
     return None
@@ -950,6 +965,34 @@ def make_tool_result_read_handler(
   )
 
 
+async def _spill_producing_call_lookup(durable_log: Any | None, spill_ref: Any) -> dict[str, Any] | None:
+  """The read-only call that returns the input and outcome of the call that published ``spill_ref``'s set.
+
+  Stored spill bytes that are lost, expired or changed cannot be re-read; the
+  authenticated journal still names the publishing call, whose recorded input
+  lets the model re-run the producing tool with a narrower request. The set
+  is identified by its published name (the reference without its digest, which
+  a changed pointer no longer matches). ``None`` when the journal holds no
+  publication of that set: its producing call is then not identifiable.
+  """
+
+  if durable_log is None or not isinstance(spill_ref, str):
+    return None
+  published_name = spill_ref.rpartition(":")[0]
+  publications, _ = await durable_log.query(event_types={"tool_call_complete"})
+  for item in publications:
+    publication = item.event.get("spill_publication")
+    tool_call_id = item.event.get("tool_call_id")
+    if (
+      isinstance(publication, dict)
+      and isinstance(publication.get("spill_ref"), str)
+      and publication["spill_ref"].rpartition(":")[0] == published_name
+      and isinstance(tool_call_id, str)
+    ):
+      return build_next_call("session_query", {"tool_call_id": tool_call_id})
+  return None
+
+
 def _tool_result_read_handler(
   sink_provider: Callable[[], SpillSink | None],
   caller: Callable[[], Any],
@@ -992,7 +1035,12 @@ def _tool_result_read_handler(
       args["producer_root"] = producers[0]
       return read_spill_result(sink, **args), None
     except SpillReadError as exc:
-      return None, {"code": exc.code, "message": str(exc)}
+      error: dict[str, Any] = {"code": exc.code, "message": str(exc)}
+      if isinstance(exc, SpillReadUnavailable):
+        error["next_call"] = await _spill_producing_call_lookup(
+          journal(), (tool_input or {}).get("spill_ref"),
+        )
+      return None, error
     except TypeError:
       return None, {
         "code": "invalid_input",
@@ -1008,9 +1056,7 @@ def reconstruct_spill_manifest(manifest_path: str | Path) -> Any:
   path = Path(manifest_path)
   if path.is_symlink() or not _is_regular_file(path):
     raise SpillError("spill manifest must be a regular non-symlink file")
-  manifest = json.loads(path.read_text(encoding="utf-8"))
-  if not isinstance(manifest, dict) or manifest.get("schema_version") != SPILL_MANIFEST_VERSION:
-    raise SpillError("unsupported spill manifest")
+  manifest = _parse_manifest(path.read_bytes())
   if manifest.get("lane") != SPILL_LANE_FILE_TOOLS:
     raise SpillError("spill manifest lane mismatch")
   stem = manifest.get("stem")
@@ -1111,7 +1157,7 @@ def reconstruct_spill_manifest(manifest_path: str | Path) -> Any:
   index_entry = next((entry for entry in members.values() if entry.get("role") == "index"), None)
   if index_entry is None:
     raise SpillError("JSON spill index missing")
-  index = json.loads(index_entry["data"].decode("utf-8"))
+  index = _loads_member(index_entry["data"].decode("utf-8"), "spill index")
   counts = {ref_id: 0 for ref_id in ref_values}
 
   def _restore(value: Any) -> Any:
@@ -1389,7 +1435,7 @@ def _decode_chunk_records(text: str, expected_ref_id: str) -> str:
     end = int(end_raw)
     if ref_id != expected_ref_id or start != cursor or end < start:
       raise SpillError("non-contiguous spill chunk record")
-    segment = json.loads(literal)
+    segment = _loads_member(literal, "spill chunk record")
     if not isinstance(segment, str) or len(segment) != end - start:
       raise SpillError("spill chunk offset mismatch")
     segments.append(segment)

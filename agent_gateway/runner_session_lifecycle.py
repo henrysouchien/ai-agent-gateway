@@ -4,7 +4,9 @@ import asyncio
 from copy import deepcopy
 import fcntl
 from functools import partial
+from pathlib import Path
 import logging
+import os
 import socket
 import sys
 import time
@@ -26,6 +28,7 @@ from .runner_session_events import (
   terminal_closure_decision,
 )
 from .runner_session_events import (
+  ANALYST_CONTENT_UNSET,
   build_assistant_message_event as _build_assistant_message_event,
   build_attach_event as _build_attach_event,
   build_detach_event as _build_detach_event,
@@ -58,7 +61,9 @@ from .skill_completion_wal import (
   TopLevelSkillCompletionEffectPlan,
   apply_completion_effect,
   envelope_digest,
+  ensure_completion_effect_parent,
 )
+from .run_control import run_control_root
 from .runner_tool_audit import get_tool_risk_value as _get_tool_risk_value
 from .selected_content import serialize_selected_content_bindings
 from .secret_boundary import sanitize_tool_event
@@ -128,6 +133,9 @@ class RunnerSessionLifecycleMixin:
   _terminal_closure_receipts: list[Dict[str, Any]] | None = None
   _terminal_closure_interruption: tuple[str, Dict[str, Any] | None] | None = None
   _terminal_recap_payload: Dict[str, Any] | None = None
+  _completion_detach_ack: Dict[str, Any] | None = None
+  _completion_detach_error: tuple[str | None, Dict[str, str]] | None = None
+  _completion_receipt_error: tuple[str | None, Dict[str, str]] | None = None
   # The registration of the job a top-level run is, as a function of the
   # writer's runner id and gateway session id (see
   # ``_journal_top_level_job_registration``).
@@ -192,6 +200,74 @@ class RunnerSessionLifecycleMixin:
     def _required_skill_lifecycle(
       bg_task: TaskEntry,
     ) -> dict[str, Any] | None: ...
+
+  def session_completion_read(self) -> dict[str, Any]:
+    """Copy native staging and acknowledgement facts, not a completion verdict.
+
+    A persistence exception leaves its append outcome unknown. A detach
+    acknowledgement says only that detach committed, never that receipts did.
+    """
+    def error_fact(error: BaseException | None) -> dict[str, str] | None:
+      return (
+        {"type": type(error).__name__, "message": str(error)}
+        if error is not None else None
+      )
+
+    lifecycle = self._top_level_skill_lifecycle
+    detach = self._completion_detach_ack
+    detach = (
+      detach if detach is not None
+      and detach["event"].get("runner_id") == self._runner_id else None
+    )
+    detach_error = self._completion_detach_error
+    detach_error = (
+      detach_error[1] if detach_error is not None
+      and detach_error[0] == self._runner_id else None
+    )
+    receipt_error = self._completion_receipt_error
+    receipt_error = (
+      receipt_error[1] if receipt_error is not None
+      and receipt_error[0] == self._runner_id else None
+    )
+    has_target = self._agent_session_log is not None and self._runner_id is not None
+    return deepcopy({
+      "runner_id": self._runner_id,
+      "status": "observed" if has_target else "no_target",
+      "durable_target": self._agent_session_log is not None,
+      "attach_committed": self._durable_attach_emitted,
+      "cursor": self._last_durable_seq,
+      "closure": {
+        "deferred": self._run_closure_deferred,
+        "terminal": self._terminal_closure_event,
+        "receipts_staged": self._terminal_closure_receipts,
+        "hook_receipts_staged": getattr(self, "_terminal_success_staged_events", None),
+      },
+      "required_skill": {
+        "enrolled": lifecycle is not None,
+        "skill_run_id": lifecycle.skill_run_id if lifecycle is not None else None,
+        "started_committed": self._top_level_skill_started_committed,
+        "result_committed": self._top_level_skill_result_committed,
+        "result_projected": self._top_level_skill_result_projected,
+        "result": self._top_level_skill_result_event,
+        "terminal_committed": self._top_level_skill_terminal_committed,
+        "terminal_projected": self._deferred_top_level_terminal_flushed,
+        "settlement_complete": self._top_level_skill_settlement_complete.is_set(),
+        "settlement_error": error_fact(self._top_level_skill_settlement_error),
+        "result_error": error_fact(self._top_level_skill_result_failure),
+        "result_failure_code": self._top_level_skill_result_failure_code,
+      },
+      "detach": detach,
+      "detach_committed": detach is not None,
+      "detach_status": (
+        "observed" if detach is not None
+        else "unknown" if detach_error is not None
+        else "missing" if has_target else "no_target"
+      ),
+      "detach_persistence_error": detach_error,
+      "detach_persistence_uncertain": detach is None and detach_error is not None,
+      "receipt_persistence_error": receipt_error,
+      "receipt_persistence_uncertain": receipt_error is not None,
+    })
 
   def _durable_event_for_append(
     self,
@@ -869,6 +945,56 @@ class RunnerSessionLifecycleMixin:
       )
     return SkillCompletionWal(self._agent_session_log.path)
 
+  def _completion_effect_root(self) -> Path | None:
+    """The directory a top-level completion effect is relative to: the run control root."""
+    workspace_dir = self._workspace_dir
+    if workspace_dir is None:
+      return None
+    return run_control_root(Path(workspace_dir))
+
+  def _upgrade_pre_relocation_completion_intent(
+    self,
+    wal: SkillCompletionWal,
+    record: Dict[str, Any] | None,
+  ) -> Dict[str, Any] | None:
+    """Rebase intents written before a21a2f33668f stamped the workspace.
+
+    The migration moved their target beneath the run control root.
+    """
+    if (
+      record is None
+      or record["record_type"] != "intent"
+      or record["effect"]["kind"] != "canonical_json_replace_v1"
+      or self._workspace_dir is None
+    ):
+      return record
+    workspace = Path(self._workspace_dir)
+    workspace_stat = os.stat(workspace)
+    if record["effect"]["workspace_identity"] != {
+      "dev": workspace_stat.st_dev,
+      "ino": workspace_stat.st_ino,
+      "uid": workspace_stat.st_uid,
+    }:
+      return record
+    control_root = run_control_root(workspace)
+    control_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ensure_completion_effect_parent(
+      workspace_path=control_root,
+      target_path=control_root / record["effect"]["target"],
+    )
+    control_stat = os.stat(control_root)
+    return wal.store({
+      **record,
+      "effect": {
+        **record["effect"],
+        "workspace_identity": {
+          "dev": control_stat.st_dev,
+          "ino": control_stat.st_ino,
+          "uid": control_stat.st_uid,
+        },
+      },
+    })
+
   def _require_top_level_writer_lease_fence(self) -> Any:
     admission = getattr(
       self,
@@ -1372,7 +1498,7 @@ class RunnerSessionLifecycleMixin:
     try:
       apply_completion_effect(
         current["effect"],
-        expected_workspace=self._workspace_dir,
+        expected_workspace=self._completion_effect_root(),
       )
     except SkillCompletionEffectConflict:
       self._append_completion_ambiguity_marker_sync(
@@ -1835,10 +1961,19 @@ class RunnerSessionLifecycleMixin:
     )
     self._durable_attach_emitted = entry is not None
 
-  async def _append_user_message_event(self, message: Dict[str, Any]) -> Any | None:
+  async def _append_user_message_event(
+    self,
+    message: Dict[str, Any],
+    *,
+    analyst_turn: bool = False,
+  ) -> Any | None:
     return await self._append_durable_event(
       _runner_attr(self, "_build_user_message_event", _build_user_message_event)(
         content=message.get("content"),
+        analyst_content=(
+          getattr(self, "_analyst_content", ANALYST_CONTENT_UNSET)
+          if analyst_turn else ANALYST_CONTENT_UNSET
+        ),
         client_kind=self._client_kind,
         received_at=_runner_attr(self, "time", time).time(),
         selected_content=serialize_selected_content_bindings(
@@ -2514,7 +2649,9 @@ class RunnerSessionLifecycleMixin:
     """Recover final or orphaned lifecycles while retaining parked attempts."""
 
     wal = self._top_level_completion_wal()
-    wal_record = wal.load()
+    wal_record = self._upgrade_pre_relocation_completion_intent(
+      wal, wal.load(),
+    )
     if (
       wal_record is not None
       and wal_record.get("record_type") == "ambiguous"
@@ -2784,7 +2921,7 @@ class RunnerSessionLifecycleMixin:
           effect = (
             TopLevelSkillCompletionEffectPlan.from_durable_payload(
               matching_wal["effect"],
-              expected_workspace=self._workspace_dir,
+              expected_workspace=self._completion_effect_root(),
             )
           )
           existing_intent = matching_wal
@@ -3036,6 +3173,10 @@ class RunnerSessionLifecycleMixin:
           if self._append_durable_event_sync(receipt) is None:
             raise RuntimeError("durable terminal receipt target is unavailable")
     except Exception as exc:
+      self._completion_receipt_error = (
+        self._runner_id,
+        {"type": type(exc).__name__, "message": str(exc)},
+      )
       # No completion intent or effect exists yet. Decide the failed pair once;
       # the same WAL and projection path carries it to every consumer.
       decision = terminal_closure_decision(
@@ -3248,31 +3389,42 @@ class RunnerSessionLifecycleMixin:
     if failure is not None:
       event["error"] = _format_exc(failure)
       event["committed_terminal"] = deepcopy(committed_terminal)
-    if recap is not None and self._agent_session_log is not None:
-      recap_payload = self._durable_event_for_append(deepcopy(recap))
-      detach_payload = self._durable_event_for_append(deepcopy(event))
-      if recap_payload is not None and detach_payload is not None:
-        _, entry = self._agent_session_log.append_terminal_pair_sync(
-          recap_payload, detach_payload,
-        )
-        self._last_durable_seq = entry.seq
-        self._terminal_recap_payload = recap
+    try:
+      if recap is not None and self._agent_session_log is not None:
+        recap_payload = self._durable_event_for_append(deepcopy(recap))
+        detach_payload = self._durable_event_for_append(deepcopy(event))
+        if recap_payload is not None and detach_payload is not None:
+          _, entry = self._agent_session_log.append_terminal_pair_sync(
+            recap_payload, detach_payload,
+          )
+          self._last_durable_seq = entry.seq
+          self._terminal_recap_payload = recap
+        else:
+          entry = self._append_durable_event_sync(event)
       else:
         entry = self._append_durable_event_sync(event)
-    else:
-      entry = self._append_durable_event_sync(event)
-    if self._top_level_skill_lifecycle is not None:
-      if entry is None:
-        raise RuntimeError(
-          "Top-level skill durable detach target is unavailable"
+      if self._top_level_skill_lifecycle is not None:
+        if entry is None:
+          raise RuntimeError(
+            "Top-level skill durable detach target is unavailable"
+          )
+        self._require_append_acknowledgement(
+          entry,
+          event,
+          target="durable top-level detach",
         )
-      self._require_append_acknowledgement(
-        entry,
-        event,
-        target="durable top-level detach",
+    except BaseException as exc:
+      self._completion_detach_error = (
+        self._runner_id,
+        {"type": type(exc).__name__, "message": str(exc)},
       )
+      raise
     if entry is not None:
       self._top_level_skill_detach_committed = True
+      self._completion_detach_ack = {
+        "seq": entry.seq,
+        "event": deepcopy(entry.event),
+      }
 
   async def _emit_operator_pause_event(self, safe_boundary: str) -> None:
     event = _runner_attr(self, "_build_operator_pause_event", _build_operator_pause_event)(safe_boundary)

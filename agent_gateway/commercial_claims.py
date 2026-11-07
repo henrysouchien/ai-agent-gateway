@@ -171,7 +171,8 @@ class CommercialClaimVerifier:
   def _validate_payload(payload: dict, *, key_id: str) -> VerifiedCommercialClaim:
     if set(payload) != COMMERCIAL_CLAIM_REQUIRED_FIELDS:
       raise CommercialClaimError("unknown_or_missing_claim")
-    if payload.get("schema_version") != 1:
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version != 1:
       raise CommercialClaimError("unknown_schema")
     if payload.get("kid") != key_id:
       raise CommercialClaimError("key_id_mismatch")
@@ -183,7 +184,7 @@ class CommercialClaimVerifier:
     if not isinstance(subject, str) or not _SUBJECT.fullmatch(subject):
       raise CommercialClaimError("invalid_subject")
     environment = payload.get("environment")
-    if environment not in {"dev", "staging", "prod"}:
+    if type(environment) is not str or environment not in {"dev", "staging", "prod"}:
       raise CommercialClaimError("invalid_environment")
     surface = _require_code(payload, "surface")
     offer = _require_code(payload, "offer_code")

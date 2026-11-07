@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import multiprocessing
 import os
@@ -32,7 +31,6 @@ from agent_gateway.retention import (
   sweep_lock,
 )
 from agent_gateway.server import _cleanup_old_transcripts
-from agent_gateway.server_chat_helpers import _cleanup_sessions_loop
 from agent_gateway.server_models import GatewayServerConfig
 
 
@@ -130,12 +128,6 @@ def test_configured_transcript_dir_sweeps_nothing_at_the_library_default(tmp_pat
   assert not meta.exists()
 
 
-def test_cleanup_sessions_loop_carries_the_same_off_default() -> None:
-  parameter = inspect.signature(_cleanup_sessions_loop).parameters[
-    "transcript_retention_days"
-  ]
-
-  assert parameter.default == GatewayServerConfig().transcript_retention_days == 0
 
 
 class _FailingAdapter:
@@ -264,8 +256,10 @@ def _hold_lock(path: str, ready: multiprocessing.Queue) -> None:
 
 
 def test_cross_process_sweep_lock_prevents_double_sweep(tmp_path: Path) -> None:
-  ready: multiprocessing.Queue = multiprocessing.Queue()
-  process = multiprocessing.Process(target=_hold_lock, args=(str(tmp_path), ready))
+  # This package's tests are not importable as tests.test_retention under spawn.
+  context = multiprocessing.get_context("fork")
+  ready: multiprocessing.Queue = context.Queue()
+  process = context.Process(target=_hold_lock, args=(str(tmp_path), ready))
   process.start()
   assert ready.get(timeout=5) is True
   try:

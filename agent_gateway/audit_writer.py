@@ -72,9 +72,13 @@ class AuditWriter(Protocol):
   ) -> str: ...
 
 
+def default_audit_root() -> Path:
+  return user_data_dir() / "audit" / "approvals"
+
+
 class JSONLAuditWriter:
   def __init__(self, root: str | os.PathLike[str] | None = None) -> None:
-    selected_root = user_data_dir() / "audit" / "approvals" if root is None else root
+    selected_root = default_audit_root() if root is None else root
     self.root = Path(os.path.abspath(os.fspath(selected_root)))
     self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
     self._require_private_directory(self.root)

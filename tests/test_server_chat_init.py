@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 # ruff: noqa: E402
 
@@ -77,7 +79,7 @@ def _make_app(
     def _build_runner(event_log, session_id, started_at):
       return AgentRunner(
         event_log,
-        ToolDispatcher(capability_bind=request.capability_execution.bind, mcp_client=McpClientManager(config_path=None)),
+        ToolDispatcher(capability_bind=request.capability_execution.bind, mcp_client=McpClientManager(config_path=None), run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'))),
         session_id,
         capability_execution=request.capability_execution,
         started_at=started_at,
@@ -101,6 +103,20 @@ def _make_app(
       on_session_created=on_session_created,
     )
   )
+
+
+@pytest.mark.parametrize("source", ["", " alice ", "042", "0", "../alice", "Alice"])
+def test_chat_init_fallback_storage_owner_finding_returns_400_without_desk(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str,
+) -> None:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  (tmp_path / "gateway").mkdir(mode=0o700)
+  app = _make_app(None, identity_resolver=None)
+  with TestClient(app) as client:
+    response = client.post("/api/chat/init", json={"api_key": "legacy-key", "user_id": source})
+  assert response.status_code == 400
+  assert not app.state.auth.session_store.sessions
+  assert not (tmp_path / "users").exists()
 
 
 def test_delete_model_preference_uses_authenticated_resolver_identity(
@@ -438,6 +454,83 @@ def test_init_with_unsupported_effort_preference_binds_default(
   ) == stored
 
 
+def test_init_with_mistyped_stored_driver_preference_refuses_with_a_usable_next_call(
+  tmp_path: Path,
+) -> None:
+  import sqlite3
+
+  async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    return _resolver_result(channel="cli")
+
+  store = ModelPreferenceStore(tmp_path / "model-preferences.sqlite3")
+  store.put(
+    tenant_id="test-product",
+    actor_id="101",
+    capability_id="session.driver",
+    model_key="anthropic.claude-sonnet-5",
+    effort="high",
+  )
+  with sqlite3.connect(store.path) as connection:
+    connection.execute("UPDATE model_preferences SET model_key=x'3432'")
+  app = _make_app(_resolver, model_preference_store=store)
+
+  with TestClient(app) as client:
+    refused = client.post(
+      "/api/chat/init",
+      json={"api_key": "cli-key", "context": {"channel": "cli"}},
+    )
+    assert refused.status_code == 409, refused.text
+    body = refused.json()
+    assert body["error_code"] == "stored_model_preference_invalid"
+    assert body["scope"] == "preference"
+    assert body["column"] == "model_key"
+    assert body["message"] == "stored preference column model_key must be text, got bytes"
+    assert body["next_call"].startswith("DELETE /api/model-preferences/session.driver ")
+    assert "b'42'" not in refused.text
+    assert refused.headers["Cache-Control"] == "private, no-store"
+
+    # The refusal's own session token is the credential its next_call needs.
+    repaired = client.delete(
+      "/api/model-preferences/session.driver",
+      headers={"Authorization": f"Bearer {body['session_token']}"},
+    )
+    assert repaired.status_code == 200, repaired.text
+    retry = client.post(
+      "/api/chat/init",
+      json={"api_key": "cli-key", "context": {"channel": "cli"}},
+    )
+  assert retry.status_code == 200, retry.text
+
+
+def test_init_with_mistyped_stored_user_preset_names_the_preset_repair(
+  tmp_path: Path,
+) -> None:
+  import sqlite3
+
+  async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    return _resolver_result(channel="cli")
+
+  store = ModelPreferenceStore(tmp_path / "model-preferences.sqlite3")
+  store.put_user_preset(
+    tenant_id="test-product", actor_id="101", name="economy", policy_revision="candidate-1",
+  )
+  with sqlite3.connect(store.path) as connection:
+    connection.execute("UPDATE user_model_presets SET policy_revision=x'3432'")
+  app = _make_app(_resolver, model_preference_store=store)
+
+  with TestClient(app) as client:
+    refused = client.post(
+      "/api/chat/init",
+      json={"api_key": "cli-key", "context": {"channel": "cli"}},
+    )
+
+  assert refused.status_code == 409, refused.text
+  body = refused.json()
+  assert body["scope"] == "user_preset"
+  assert body["column"] == "policy_revision"
+  assert body["next_call"].startswith("DELETE /api/model-presets/self ")
+
+
 def test_channel_mismatch_at_init_returns_400() -> None:
   async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
     return _resolver_result(channel="cli")
@@ -578,13 +671,14 @@ def test_chat_init_returns_only_session_executable_stable_key_choices() -> None:
     "effort": SESSION_DRIVER.effort,
     "reason": "capability_default",
   }
-  # Only session.driver keys this anthropic-only session can execute.
+  # Only active session.driver keys this anthropic-only session can select.
   driver_allowed = INITIAL_MODEL_SELECTION_POLICY.capabilities[
     "session.driver"
   ].allowed_model_keys
   anthropic_keys = {
     key for key in driver_allowed
     if INITIAL_MODEL_REGISTRY.require(key).provider == "anthropic"
+    and INITIAL_MODEL_REGISTRY.require(key).lifecycle == "active"
   }
   assert anthropic_keys and anthropic_keys != driver_allowed
   assert {choice["model_key"] for choice in driver["choices"]} == anthropic_keys
@@ -908,6 +1002,44 @@ def test_httpexception_from_resolver_passes_through_status() -> None:
   }
 
 
+@pytest.mark.parametrize(
+  ("reason", "expected_reason", "next_call_prefix"),
+  [
+    (
+      "not_configured",
+      "web_subject_verification_not_configured",
+      "set GATEWAY_SUBJECT_ASSERTION_ED25519_PUBLIC_KEYS",
+    ),
+    (
+      "replay_cache_saturated",
+      "web_subject_verification_replay_cache_saturated",
+      "retry POST /api/chat/init",
+    ),
+  ],
+)
+def test_subject_verification_unavailable_reaches_the_caller_with_reason_and_next_call(
+  reason: str,
+  expected_reason: str,
+  next_call_prefix: str,
+) -> None:
+  from agent_gateway.subject_assertion import SubjectVerificationUnavailable
+
+  async def _resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    raise SubjectVerificationUnavailable(reason)  # type: ignore[arg-type]
+
+  app = _make_app(_resolver)
+
+  with TestClient(app) as client:
+    response = client.post("/api/chat/init", json={"api_key": "web-key", "user_id": "alice"})
+
+  assert response.status_code == 503
+  body = response.json()
+  assert body["error"] == "credentials_unavailable"
+  assert body["reason"] == expected_reason
+  assert body["user_id"] == "alice"
+  assert body["next_call"].startswith(next_call_prefix)
+
+
 def test_generic_resolver_exception_is_value_free_in_chat_init_response() -> None:
   secret = "CUSTOM-ACTIVE-CREDENTIAL-chat-init-error-8f21d7"
 
@@ -930,3 +1062,131 @@ def test_generic_resolver_exception_is_value_free_in_chat_init_response() -> Non
     "user_id": "alice",
   }
   assert secret not in response.text
+
+
+def test_capability_choices_refresh_keeps_the_authenticated_session(tmp_path: Path) -> None:
+  async def resolver(_api_key: str, _init_request: Any) -> ResolverResult:
+    return _resolver_result()
+
+  store = ModelPreferenceStore(tmp_path / "model-preferences.sqlite3")
+  app = _make_app(resolver, model_preference_store=store)
+  with TestClient(app) as client:
+    initial = client.post("/api/chat/init", json={"api_key": "cli-key", "context": {"channel": "cli"}})
+    assert initial.status_code == 200
+    original = app.state.auth.session_store.get_session(initial.json()["session_id"])
+    assert original is not None
+    changed_choice = next(
+      choice for choice in initial.json()["capability_choices"]["session.driver"]["choices"]
+      if choice["model_key"] != SESSION_DRIVER.model_key
+    )
+    headers = {"Authorization": f"Bearer {initial.json()['session_token']}"}
+    selected = client.put(
+      "/api/model-preferences/session.driver",
+      headers=headers, json={"model_key": changed_choice["model_key"], "effort": changed_choice["default_effort"]},
+    )
+    assert selected.status_code == 200
+    refreshed = client.get("/api/capability-choices/session.driver", headers=headers)
+    assert refreshed.status_code == 200
+    assert refreshed.json()["selected"]["reason"] == "saved_preference"
+    assert refreshed.json()["selected"]["model_key"] == changed_choice["model_key"]
+    assert refreshed.headers["cache-control"] == "private, no-store"
+    assert tuple(app.state.auth.session_store.sessions) == (original.session_id,)
+    assert app.state.auth.session_store.get_session(original.session_id) is original
+    assert client.get("/api/capability-choices/session.driver").status_code == 401
+    from agent_gateway.server_chat_helpers import prepare_session_driver_turn
+    from agent_gateway.server_models import ChatMessage, ChatTurnInputs
+
+    prepared = prepare_session_driver_turn(
+      original,
+      ChatTurnInputs(
+        messages=[ChatMessage(role="user", content="next turn")],
+        request_id=None, context={}, metadata={}, model_key=None,
+      ),
+      build_chat_runtime=app.state.gateway_build_chat_runtime,
+    )
+    next_turn = prepared.request
+    assert next_turn.capability_execution is not None
+    assert next_turn.capability_execution.bind.model_key == changed_choice["model_key"]
+    assert next_turn.capability_execution.bind.effort == changed_choice["default_effort"]
+
+
+@pytest.mark.parametrize("provider", ["xai", "google", "kimi_code", "muse", "ollama_cloud"])
+def test_r4_init_exposes_key_service_outage_as_unavailable_not_unenrolled(provider, tmp_path):
+  from agent_gateway.server_chat_helpers import (
+    KeyServiceUnavailable, _capability_execution_resolver_for_session, prepare_session_driver_turn,
+  )
+  from agent_gateway.server_models import ChatMessage, ChatTurnInputs
+  from model_authority.selection import CapabilityDefault
+
+  slot = INITIAL_MODEL_SELECTION_POLICY.capabilities["session.driver"]
+  entry = next(
+    entry for entry in INITIAL_MODEL_REGISTRY.models.values()
+    if entry.provider == provider and entry.key in slot.allowed_model_keys
+  )
+  registry = replace(INITIAL_MODEL_REGISTRY, models={
+    **INITIAL_MODEL_REGISTRY.models,
+    entry.key: replace(entry, lifecycle="active"),
+  })
+  policy = replace(INITIAL_MODEL_SELECTION_POLICY, capabilities={
+    **INITIAL_MODEL_SELECTION_POLICY.capabilities,
+    "session.driver": replace(
+      slot, default=CapabilityDefault(kind="model", model_key=entry.key, effort=entry.default_effort),
+    ),
+  })
+
+  async def resolver(_api_key, _request):
+    return replace(
+      _resolver_result(), auth_config=AuthConfig.from_dict({
+        "provider": provider, "api_key": "r4-key", "billing_mode": "metered",
+      }),
+      unavailable_user_key_providers=frozenset({"anthropic", "openai"}),
+    )
+
+  app = _make_app(
+    resolver, model_registry=registry, model_selection_policy=policy,
+    model_preference_store=ModelPreferenceStore(tmp_path / "preferences.sqlite"),
+  )
+  with TestClient(app) as client:
+    response = client.post("/api/chat/init", json={"api_key": "cli-key"})
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    driver = payload["capability_choices"]["session.driver"]
+    assert driver["selected"]["model_key"] == entry.key
+    assert all(not choice["model_key"].startswith(("anthropic.", "openai.")) for choice in driver["choices"])
+    unavailable = {
+      notice["model_key"]: notice
+      for notice in driver["notices"] if notice["code"] == "key_service_unavailable"
+    }
+    assert {"anthropic.claude-sonnet-5-5", "openai.gpt-6-1-sol"} <= unavailable.keys()
+    assert all(notice["reason"] == "key_service_unavailable" for notice in unavailable.values())
+    [deep] = [role for role in driver["roles"] if role["role"] == "deep"]
+    assert deep["unavailable"] == "key_service_unavailable"
+    session = app.state.auth.session_store.get_session(payload["session_id"])
+    assert session is not None
+    assert session.unavailable_user_key_providers == frozenset({"anthropic", "openai"})
+    bound_resolver = _capability_execution_resolver_for_session(
+      session=session, build_chat_runtime=app.state.gateway_build_chat_runtime,
+    )
+    assert not {"anthropic", "openai"} & bound_resolver.auth_context.user_provider_handles.keys()
+    for model_key in ("anthropic.claude-sonnet-5-5", "openai.gpt-6-1-sol"):
+      selected = client.post("/api/chat/init", json={
+        "api_key": "cli-key",
+        "capability_selections": {"plan.author": {"model_key": model_key}},
+      })
+      assert selected.status_code == 422, selected.text
+      assert selected.json()["reason"] == "key_service_unavailable"
+      saved = client.put(
+        "/api/model-preferences/session.driver", json={"model_key": model_key},
+        headers={"Authorization": f"Bearer {payload['session_token']}"},
+      )
+      assert saved.status_code == 422, saved.text
+      assert saved.json()["reason"] == "key_service_unavailable"
+      with pytest.raises(KeyServiceUnavailable) as caught:
+        prepare_session_driver_turn(
+          session, ChatTurnInputs(
+            messages=[ChatMessage(role="user", content="next")], request_id=None,
+            context={}, metadata={}, model_key=model_key,
+          ),
+          build_chat_runtime=app.state.gateway_build_chat_runtime,
+        )
+      assert caught.value.reason == "key_service_unavailable"

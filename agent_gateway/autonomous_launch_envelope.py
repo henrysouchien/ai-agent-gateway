@@ -12,18 +12,19 @@ from typing import Any, Literal, Mapping, overload
 
 from agent_workflow_contracts.research_file_contract import is_research_file_id
 from agent_workflow_contracts import ResolvedAuthority
-from agent_workflow_contracts.models import AdmittedContextWire
+from agent_workflow_contracts.models import AdmittedContextWire, SelectionProvenance
 
 from model_authority.bind import CapabilityBind
 from model_authority.binding import CredentialHandle
 from model_authority.capabilities import SESSION_DRIVER_CAPABILITY
+from hank_model_transport.user_provider_keys import NO_API_KEY_CONSUMER
 from .agent_session_log_layout import (
   AutonomousSessionLogAuthority,
   SESSION_LOG_LAYOUT_V2,
   derive_v2_agent_session_log_paths,
 )
 from .role_validation import require_exact_role
-from .session import GatewaySession
+from .session import AUTONOMOUS_RUNTIME_SESSION_PURPOSE, GatewaySession
 from .skill_limits import (
   SkillExecutionLimits,
   skill_execution_limits_from_mapping,
@@ -42,7 +43,6 @@ AUTONOMOUS_CAPABILITY_ENVELOPE_VERSION = 7
 AUTONOMOUS_CAPABILITY_ENVELOPE_TTL_SECONDS = 60
 AUTONOMOUS_CAPABILITY_ENVELOPE_CLOCK_SKEW_SECONDS = 5
 AUTONOMOUS_CAPABILITY_ENVELOPE_HMAC_MIN_BYTES = 32
-AUTONOMOUS_RUNTIME_SESSION_PURPOSE = "autonomous_runtime"
 
 _NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 _SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -60,11 +60,13 @@ _ENVELOPE_FIELDS = frozenset({
   "capability_bind",
   "admitted_context",
   "tool_authority",
+  "selection_provenance",
   "workload",
   "control_authority",
   "session_authority",
   "signature",
 })
+_OPTIONAL_ENVELOPE_FIELDS = frozenset({"selection_provenance"})
 _WORKLOAD_FIELDS = frozenset({
   "profile",
   "mode",
@@ -79,6 +81,7 @@ _WORKLOAD_FIELDS = frozenset({
   "admitted_skill_execution_limits",
   "session_log_authority",
   "approval_continuation",
+  "approval_settings",
 })
 _CONTROL_AUTHORITY_FIELDS = frozenset({
   "control_mode",
@@ -416,6 +419,10 @@ class AutonomousLaunchWorkload:
     default=None,
     compare=False,
   )
+  approval_settings: dict[str, Any] | None = field(
+    default=None,
+    compare=False,
+  )
 
   def __post_init__(self) -> None:
     profile = _canonical_workload_text(
@@ -539,6 +546,7 @@ class AutonomousLaunchWorkload:
       optional_fields=frozenset({
         "admitted_skill_execution_limits",
         "approval_continuation",
+        "approval_settings",
       }),
     )
     try:
@@ -596,6 +604,7 @@ class AutonomousLaunchWorkload:
         else None
       ),
       "approval_continuation": self.approval_continuation,
+      "approval_settings": self.approval_settings,
     }
 
 
@@ -1118,9 +1127,7 @@ class AutonomousSessionAuthority:
       )
     session = GatewaySession(
       session_id=authority.session_id,
-      api_key_hash=hashlib.sha256(
-        f"autonomous-session:{authority.session_id}".encode("utf-8")
-      ).hexdigest()[:16],
+      api_key_hash=NO_API_KEY_CONSUMER,
       created_at=authority.created_at,
       expires_at=authority.expires_at,
       user_id=authority.user_id,
@@ -1143,6 +1150,9 @@ class AutonomousSessionAuthority:
       is_public=authority.is_public,
       schema_version=authority.schema_version,
       purpose=authority.purpose,
+      # A detached runtime is an agent at every product door (its purpose is
+      # the runtime's by this envelope's contract, see `verify`).
+      caller_kind="agent",
     )
     session.dispatch_scope = (
       self.dispatch_scope.receipt()
@@ -1171,6 +1181,7 @@ class AutonomousLaunchEnvelope:
   session_authority: AutonomousSessionAuthority
   signature: str
   admitted: tuple[AdmittedContextWire, ResolvedAuthority] | None = None
+  selection_provenance: SelectionProvenance | None = None
 
   def payload(self) -> dict[str, Any]:
     return {
@@ -1189,6 +1200,10 @@ class AutonomousLaunchEnvelope:
       ),
       "tool_authority": (
         self.admitted[1].model_dump(mode="json") if self.admitted is not None else None
+      ),
+      "selection_provenance": (
+        self.selection_provenance.model_dump(mode="json")
+        if self.selection_provenance is not None else None
       ),
       "workload": self.workload.receipt(),
       "control_authority": self.control_authority.receipt(),
@@ -1445,6 +1460,7 @@ def sign_autonomous_launch_envelope(
   session_authority: AutonomousSessionAuthority,
   admitted_context: AdmittedContextWire | None = None,
   tool_authority: ResolvedAuthority | None = None,
+  selection_provenance: SelectionProvenance | None = None,
   ttl_seconds: int = AUTONOMOUS_CAPABILITY_ENVELOPE_TTL_SECONDS,
   now_ns: int | None = None,
   nonce: str | None = None,
@@ -1453,6 +1469,10 @@ def sign_autonomous_launch_envelope(
 
   bind = _autonomous_bind(bind)
   admitted = _admitted_launch_authority(admitted_context, tool_authority, bind=bind)
+  selection_provenance = (
+    SelectionProvenance.model_validate(selection_provenance)
+    if selection_provenance is not None else None
+  )
   if type(workload) is not AutonomousLaunchWorkload:
     raise TypeError(
       "autonomous capability envelope workload "
@@ -1549,6 +1569,10 @@ def sign_autonomous_launch_envelope(
     "tool_authority": (
       admitted[1].model_dump(mode="json") if admitted is not None else None
     ),
+    "selection_provenance": (
+      selection_provenance.model_dump(mode="json")
+      if selection_provenance is not None else None
+    ),
     "workload": workload.receipt(),
     "control_authority": control_authority.receipt(),
     "session_authority": session_authority.receipt(),
@@ -1601,7 +1625,7 @@ def _decode_autonomous_launch_envelope(
       "autonomous capability envelope must use canonical JSON"
     )
   fields = set(raw)
-  missing = _ENVELOPE_FIELDS - fields
+  missing = _ENVELOPE_FIELDS - fields - _OPTIONAL_ENVELOPE_FIELDS
   extra = fields - _ENVELOPE_FIELDS
   if missing:
     raise ValueError(
@@ -1717,6 +1741,11 @@ def _decode_autonomous_launch_envelope(
   admitted = _admitted_launch_authority(
     raw["admitted_context"], raw["tool_authority"], bind=bind,
   )
+  raw_selection_provenance = raw.get("selection_provenance")
+  selection_provenance = (
+    SelectionProvenance.model_validate(raw_selection_provenance)
+    if raw_selection_provenance is not None else None
+  )
   try:
     workload = AutonomousLaunchWorkload.from_receipt(
       raw["workload"]
@@ -1776,6 +1805,7 @@ def _decode_autonomous_launch_envelope(
     session_authority=session_authority,
     signature=signature,
     admitted=admitted,
+    selection_provenance=selection_provenance,
   )
 
 

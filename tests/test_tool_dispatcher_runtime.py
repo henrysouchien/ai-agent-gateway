@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 # ruff: noqa: E402
 
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
@@ -167,6 +169,7 @@ def test_tool_dispatcher_forwards_the_exact_replay_control_to_every_client() -> 
     role="owner",
     get_tool_definitions=lambda: [{"name": "corpus_search"}],
     allowed_mcp_tools_by_server={"research-corpus-mcp": {"corpus_search"}},
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   kwargs_only = _ScopedCorpusMcpClient()
   kwargs_dispatcher = ToolDispatcher(
@@ -176,6 +179,7 @@ def test_tool_dispatcher_forwards_the_exact_replay_control_to_every_client() -> 
     role="owner",
     get_tool_definitions=lambda: [{"name": "corpus_search"}],
     allowed_mcp_tools_by_server={"research-corpus-mcp": {"corpus_search"}},
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   assert asyncio.run(strict_dispatcher.dispatch(
@@ -213,6 +217,7 @@ def test_dispatcher_adds_argument_guidance_to_direct_mcp_validation_errors() -> 
     local_tool_handlers={},
     role="owner",
     get_tool_definitions=lambda: [{"name": "get_price_target"}],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = asyncio.run(
@@ -238,6 +243,7 @@ def test_dispatcher_does_not_add_argument_guidance_to_non_validation_mcp_errors(
     local_tool_handlers={},
     role="owner",
     get_tool_definitions=lambda: [{"name": "get_price_target"}],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = asyncio.run(
@@ -265,6 +271,7 @@ def test_dispatcher_uses_original_tool_name_for_prefixed_mcp_argument_guidance()
     local_tool_handlers={},
     role="owner",
     get_tool_definitions=lambda: [{"name": "portfolio_get_price_target"}],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   result, error = asyncio.run(
@@ -294,6 +301,7 @@ def test_call_mcp_tool_forwards_invocation_report_unchanged(monkeypatch, cancell
       local_tool_handlers={},
       role="owner",
       get_tool_definitions=lambda: [],
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     seen = []
 
@@ -373,6 +381,7 @@ def _corpus_dispatcher(client, *, session=None) -> ToolDispatcher:
     role="owner",
     session=session,
     get_tool_definitions=lambda: [dict(_CORPUS_STATE_DEFINITION)],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
@@ -488,6 +497,7 @@ def test_local_required_file_and_mcp_omission_use_same_session_binding(
     session=session,
     role="owner",
     get_tool_definitions=lambda: [local_definition, _CORPUS_STATE_DEFINITION],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   assert asyncio.run(dispatcher.dispatch("local", local_name, {})) == (
@@ -534,6 +544,7 @@ def test_prepare_resolves_research_scope_only_for_an_omitted_scope_parameter(
     get_tool_definitions=lambda: [{
       "name": "example", "input_schema": {"type": "object", "properties": properties},
     }],
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   def unexpected_context_read():
@@ -558,6 +569,7 @@ def _scoped_dispatcher(definitions, *, binding=None, local_names=()):
       tool_research_binding=binding or AdmittedResearchBinding(research_file_id=2, ticker="AAPL"),
     ),
     get_tool_definitions=lambda: definitions,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 

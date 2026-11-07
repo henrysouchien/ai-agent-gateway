@@ -492,7 +492,12 @@ class KernelBackend(ExecutionBackend):
     protocol_error: str | None = None
     displays: list[Dict[str, Any]] = []
     images: list[Dict[str, Any]] = []
-    # Two clocks: `timeout_ms` bounds compute only. The runner brackets every
+    # Three clocks. The boot bound covers the cell frame's write to the runner's
+    # `started` frame (a new session's interpreter is still importing; 28 of 90
+    # first cells on a host at load ~90 had not started at 5 s); `timeout_ms` bounds
+    # compute only and is armed by `started`, never by the frame write. A boot
+    # that outlasts `kernel_boot_timeout_ms` is a lost kernel typed
+    # `kernel_boot_failed`, never the user's timeout. The runner brackets every
     # bridge request made on the cell's own thread, and every `hank.acall`
     # worker's, with host_wait_begin/host_wait_end (any other spawned thread's
     # call sends none, so it never pauses a computing interpreter); while any is
@@ -501,6 +506,9 @@ class KernelBackend(ExecutionBackend):
     # intervals, measured here from the empty->nonempty to the nonempty->empty
     # transition of `host_waits`, so overlapping concurrent waits are never
     # summed. A host wait never times the cell out or interrupts it.
+    boot_s = self._config.kernel_boot_timeout_ms / 1000
+    runner_started = False
+    boot_failed = False
     host_waits: set[str] = set()
     host_wait_ms = 0
     wait_started: float | None = None
@@ -588,7 +596,7 @@ class KernelBackend(ExecutionBackend):
         await asyncio.gather(*pending, return_exceptions=True)
 
     async def read_frames() -> Dict[str, Any]:
-      nonlocal host_wait_ms, wait_started
+      nonlocal host_wait_ms, wait_started, runner_started
       while True:
         try:
           line = await stdout.readline()
@@ -627,6 +635,10 @@ class KernelBackend(ExecutionBackend):
           if frame.get("protocol_error") or budget.error:
             fail_protocol(str(frame.get("protocol_error") or budget.error))
           return frame
+        if kind == "started":
+          runner_started = True
+          resume_compute()
+          continue
         if kind == "host_wait_begin":
           if not host_waits:
             wait_started = time.monotonic()
@@ -659,12 +671,14 @@ class KernelBackend(ExecutionBackend):
     try:
       stdin.write(encode_frame(cell_frame, budget))
       await stdin.drain()
-      # The deadline is rearmed on every host-wait transition: `clock` wakes
-      # this wait, and only unpaused elapsed time is spent from `timeout_ms`.
-      # An expired deadline still collects tasks that finished at that moment.
-      resume_compute()
+      boot_deadline = time.monotonic() + boot_s
+      # The compute deadline is rearmed on `started` and on every host-wait
+      # transition: `clock` wakes this wait, and only unpaused elapsed time
+      # after `started` is spent from `timeout_ms`. An expired deadline still
+      # collects tasks that finished at that moment.
       while True:
-        remaining = compute_remaining_s()
+        booting = not runner_started
+        remaining = boot_deadline - time.monotonic() if booting else compute_remaining_s()
         clock.clear()
         clock_task = asyncio.create_task(clock.wait())
         try:
@@ -675,13 +689,24 @@ class KernelBackend(ExecutionBackend):
         finally:
           clock_task.cancel()
         finished.discard(clock_task)
-        if finished or (remaining is not None and remaining <= 0):
+        if finished:
+          break
+        if remaining is not None and remaining <= 0:
+          if booting and runner_started:
+            continue  # `started` landed as the boot bound expired: the cell is running
+          boot_failed = booting
           break
       pause_compute()
       compute_ms = int(compute_s * 1000)
       if dispatch_task in finished:
         dispatch_task.result()
-      if reader_task not in finished:
+      if boot_failed:
+        # The interpreter never reached the cell; an interrupt would only
+        # abort its imports, so the kernel is lost, not the cell timed out.
+        dispatch_task.cancel()
+        await asyncio.gather(dispatch_task, return_exceptions=True)
+        lost = f"interpreter did not start the cell within {boot_s:g} s"
+      elif reader_task not in finished:
         cancelled = interrupt_task in finished
         timed_out = not finished
         dispatch_task.cancel()
@@ -743,7 +768,9 @@ class KernelBackend(ExecutionBackend):
       "timed_out": timed_out, "cancelled": cancelled,
       "host_wait_ms": host_wait_ms, "compute_ms": compute_ms,
     }
-    if error is not None:
+    if boot_failed:
+      result["error"] = {"code": "kernel_boot_failed", "message": lost}
+    elif error is not None:
       result["error"] = error
     if done is not None and isinstance(done.get("kernel_locals"), dict):
       self._state.user_ns_locals = {

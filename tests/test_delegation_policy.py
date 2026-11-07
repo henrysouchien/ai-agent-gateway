@@ -1,3 +1,4 @@
+from agent_gateway.registry_scope import RegistryScope
 # ruff: noqa: E402
 
 import asyncio
@@ -68,6 +69,7 @@ def _run_context(*, delegation: DelegationGrant | None = None) -> RunContext:
     profile="chat",
     channel="excel",
     delegation=delegation,
+    registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
   )
 
 
@@ -243,8 +245,13 @@ def test_delegated_money_boundary_asks_and_portfolio_config_does_not() -> None:
   _run(_case())
 
 
-def test_compute_asks_at_the_existing_approval_door() -> None:
+def test_code_execute_does_not_ask_in_either_approval_mode() -> None:
   async def _case() -> None:
+    from agent_gateway.single_user_policy import (
+      ApprovalSettings,
+      pin_approval_settings,
+    )
+
     policy = SingleUserApprovalPolicy()
     run_context = _run_context()
     request, payload = _request_and_payload(
@@ -252,14 +259,21 @@ def test_compute_asks_at_the_existing_approval_door() -> None:
       tool_class="pure_transform",
       tool_name="code_execute",
     )
+    outcomes: dict[str, str] = {}
+    for mode in ("approve_all", "ask_all"):
+      with pin_approval_settings(ApprovalSettings(mode, False)):
+        decision = await policy.decide(
+          payload=payload,
+          request=request,
+          run_context=run_context,
+        )
+      outcomes[mode] = decision.outcome
 
-    decision = await policy.decide(
-      payload=payload,
-      request=request,
-      run_context=run_context,
-    )
-
-    assert decision.outcome == "request_user_approval"
+    # Containment is the backend, not a card, in either operator mode.
+    assert outcomes == {
+      "approve_all": "auto_approve",
+      "ask_all": "auto_approve",
+    }
 
   _run(_case())
 

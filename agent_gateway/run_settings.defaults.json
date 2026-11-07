@@ -1,4 +1,6 @@
 {
+  "approval_policy": "approve_all",
+  "approve_live_orders": false,
   "writer_soft_turn_budget": null,
   "child_soft_turn_budget": 100,
   "fork_soft_turn_budget": 10,
@@ -12,5 +14,8 @@
   "context_warning_pct": 80,
   "context_pressure_reminder_pct": 60,
   "context_pressure_reminder_step_pct": 10,
-  "compaction_trigger_pct": 25
+  "compaction_trigger_pct": 25,
+  "tool_result_aging_after_replies": null,
+  "tool_result_aging_min_chars": 8000,
+  "tool_result_aging_step_replies": 8
 }

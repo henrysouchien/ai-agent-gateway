@@ -1,4 +1,5 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
@@ -124,6 +125,7 @@ def test_custom_dispatcher_routes_same_run_identity_to_model_mcp_tools(
     request_id="request-1",
     session_id="session-1",
     run_id="skill-run-custom",
+    registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
   )
   dispatcher = ToolDispatcher(
     capability_bind=TEST_CAPABILITY_BIND,
@@ -163,6 +165,7 @@ def test_custom_runner_preserves_request_snapshot_and_run_identity() -> None:
       request_id="request-runner",
       session_id="session-runner",
       run_id="skill-run-custom",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     )
     provider = _Provider()
     _dispatcher_execution_206 = stub_bound_capability_execution(
@@ -247,6 +250,7 @@ def test_custom_dispatcher_gives_author_chain_legacy_attribution() -> None:
       request_id="request-1",
       session_id="session-1",
       run_id="skill-run-custom",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
     mcp_meta_inject_servers=frozenset({"portfolio-producers-mcp"}),
   )
@@ -291,6 +295,7 @@ def test_custom_dispatcher_forwards_lifecycle_call_to_the_identity_owner(
       request_id="request-1",
       session_id="session-1",
       run_id=context_run_id,
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
     mcp_meta_inject_servers=frozenset({"portfolio-producers-mcp"}),
   )
@@ -324,6 +329,7 @@ def test_custom_dispatcher_routes_prefixed_model_tool_identity_metadata() -> Non
       request_id="request-1",
       session_id="session-1",
       run_id="skill-run-prefixed",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
     mcp_meta_inject_servers=frozenset({"portfolio-producers-mcp"}),
   )
@@ -366,6 +372,7 @@ def test_custom_report_context_matches_runtime_run_identity() -> None:
       request_id="request-1",
       session_id="session-1",
       run_id="skill-run-custom",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
   )
 

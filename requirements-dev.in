@@ -8,9 +8,10 @@ PyJWT>=2.14.0
 PyYAML
 mcp>=2,<3  # raw client API: typed pagination, float timeouts, httpx2 transport
 fastmcp>=4,<5  # paired with MCP 2
-hank-model-transport>=1.0.2,<2
+hank-model-transport>=1.2.1,<2
 httpx>=0.28.1
 httpx2>=2.5,<3
+psutil>=7,<8
 pydantic
 
 # Optional deps we use locally (must match pyproject.toml [project.optional-dependencies])

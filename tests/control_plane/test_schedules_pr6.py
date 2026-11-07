@@ -11,6 +11,7 @@ from typing import Any, Literal
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from agent_gateway.user_identity_mapping import StorageIdentityFinding
 
 from agent_gateway.approval_route import ControlPlaneApprovalRoute
 from agent_gateway.approval_store import SQLiteApprovalStore
@@ -113,8 +114,53 @@ def test_agent_run_schedule_store_path_is_scoped_to_owner(monkeypatch: pytest.Mo
   assert schedules_module.schedule_store_path_for("alice") == (
     tmp_path / "users" / "alice" / "agent-run-schedules.json"
   )
-  with pytest.raises(ValueError, match="user_id is required for per-user store access"):
-    schedules_module.schedule_store_for(None)
+  assert schedules_module.agent_run_schedule_users_root() == tmp_path / "users"
+
+@pytest.mark.parametrize("owner", [None, 42, True, "", " 42 ", "042", "0", "../alice", "Alice"])
+def test_persisted_schedule_owner_is_parsed_before_dispatch(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: Path, owner: object,
+) -> None:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  path = tmp_path / "schedule-input.json"
+  path.write_text(json.dumps({
+    "version": 1,
+    "schedules": [{"kind": "agent_run_schedule", "owner_user_id": owner}],
+    "idempotency": {},
+  }), encoding="utf-8")
+  store = schedules_module.AgentRunScheduleStore(path)
+  with pytest.raises(StorageIdentityFinding) as finding:
+    store.list_for_owner("42")
+  assert finding.value.input == owner
+  assert finding.value.reason
+  assert not (tmp_path / "users").exists()
+
+
+@pytest.mark.parametrize("owner", ["Alice", "042", "0", " 42 "])
+def test_schedule_scan_parses_directory_owner_before_opening_store(
+  tmp_path: Path, owner: str,
+) -> None:
+  users_root = tmp_path / "users"
+  path = users_root / owner / "agent-run-schedules.json"
+  path.parent.mkdir(parents=True)
+  path.write_text('{"version":1,"schedules":[],"idempotency":{}}', encoding="utf-8")
+  opened: list[str] = []
+
+  def store_for(storage_id: str) -> schedules_module.AgentRunScheduleStore:
+    opened.append(storage_id)
+    return schedules_module.AgentRunScheduleStore(path)
+
+  runner = schedules_module.AgentRunScheduleRunner(
+    store_for=store_for,
+    users_root=users_root,
+    autonomous_registry=AutonomousRegistry(
+      api_dir=tmp_path / "api", log_dir=tmp_path / "logs",
+    ),
+    poll_interval_seconds=0,
+  )
+
+  assert runner._existing_stores() == []
+  assert opened == []
+
 
 
 @pytest.fixture
@@ -867,6 +913,44 @@ def _agent_run_schedule_payload(**overrides: Any) -> dict[str, Any]:
   }
   payload.update(overrides)
   return payload
+
+
+@pytest.mark.parametrize("user_id", ["42"])
+def test_agent_run_schedule_store_numeric_user_id_persists_in_same_desk(
+  monkeypatch: pytest.MonkeyPatch,
+  tmp_path: Path,
+  user_id: str,
+) -> None:
+  monkeypatch.setenv("USER_DATA_DIR", str(tmp_path))
+  store = schedules_module.schedule_store_for(user_id)
+  session = GatewaySession(
+    session_id="numeric-schedule-owner",
+    api_key_hash="hash",
+    created_at=1,
+    expires_at=4_000_000_000,
+    user_id="42",
+    owner_user_id="42",
+    raw_user_id="42",
+    user_email=None,
+    user_slug="42",
+    risk_user_id=42,
+    user_aliases=("42",),
+    identity_status="active",
+    channel="web",
+    role="owner",
+  )
+  request = schedules_module.CreateAgentRunScheduleRequest.model_validate(
+    _agent_run_schedule_payload()
+  )
+
+  record = store.create(request, session)
+
+  assert store.path == tmp_path / "users" / "42" / "agent-run-schedules.json"
+  assert store.path.is_file()
+  assert schedules_module.schedule_store_for("42").get_for_owner(
+    "42", record["schedule_id"],
+  ) == record
+  assert schedules_module.schedule_store_for("43").list_for_owner("43") == []
 
 
 @pytest.mark.parametrize("role", ["owner", "invite"])

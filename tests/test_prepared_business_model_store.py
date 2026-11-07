@@ -1,4 +1,5 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
 
 import asyncio
 import hashlib
@@ -79,6 +80,7 @@ def _request_and_record(
       request_id=locator,
       profile="research_http",
       channel="web",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
     state="pending_user",
   )
@@ -138,6 +140,7 @@ async def test_approval_and_prepared_change_are_created_atomically(
       request_id="request-1",
       profile="research_http",
       channel="web",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
     state="pending_user",
   )
@@ -575,7 +578,7 @@ async def test_approval_store_persists_typed_authorization_mode(
     tool_class="state_write",
     tool_args_redacted={"ticker": "PCTY"},
     args_hash="args-hash",
-    run_context=RunContext(user_id="alice", request_id="request-1"),
+    run_context=RunContext(user_id="alice", request_id="request-1", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   request = replace(
     request,

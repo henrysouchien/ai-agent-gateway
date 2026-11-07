@@ -1223,3 +1223,36 @@ async def test_ordinary_child_without_declared_door_stays_succeeded(
   assert result.execution.status == "succeeded"
   assert result.outcome is not None
   assert result.outcome.disposition == "complete"
+
+
+@pytest.mark.asyncio
+async def test_final_child_visible_text_retains_partial_stream_failure_narrative(
+  tmp_path,
+) -> None:
+  log = _NarrativeLog(
+    [
+      SimpleNamespace(
+        seq=1,
+        event={
+          "type": "assistant_message",
+          "role": "sub_agent",
+          "sub_agent_id": "sub0:child",
+          "runner_id": "runner_child",
+          "stop_reason": "partial_stream_failure",
+          "logical_response_id": "resp_partial_1",
+          "logical_response_segment_ordinal": 0,
+          "content_blocks": [{"type": "text", "text": "Preserved child synthesis."}],
+        },
+      )
+    ]
+  )
+  observed = await final_child_visible_text(
+    log,
+    sub_session_id="sess_partial_child",
+    role="sub_agent",
+    sub_agent_id="sub0:child",
+    workspace_dir=str(tmp_path),
+    runner_id="runner_child",
+  )
+  assert observed.text == "Preserved child synthesis."
+  assert observed.final_narrative is not None

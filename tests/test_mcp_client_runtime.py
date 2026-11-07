@@ -12,9 +12,11 @@ PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
+import pytest
+
 import agent_gateway.mcp_client as mcp_client_module
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.mcp_client_runtime import extract_text, read_claude_config
+from agent_gateway.mcp_client_runtime import McpConfigError, extract_text, read_claude_config
 
 
 class _CaptureLogger(logging.Logger):
@@ -32,7 +34,7 @@ class _CaptureLogger(logging.Logger):
     self.warnings.append((msg, *args))
 
 
-def test_extract_text_matches_parent_private_wrapper() -> None:
+def test_extract_text_combines_nonblank_content() -> None:
   content = [
     {"text": " alpha "},
     {"text": "   "},
@@ -41,7 +43,6 @@ def test_extract_text_matches_parent_private_wrapper() -> None:
   ]
 
   assert extract_text(content) == "alpha \nbeta"
-  assert McpClientManager._extract_text(content) == "alpha \nbeta"
 
 
 def test_parent_close_contexts_routes_suppression_and_logger(monkeypatch) -> None:
@@ -140,27 +141,34 @@ def test_parent_cancel_tool_call_uses_parent_consume_callback(monkeypatch) -> No
   assert consumed[0].done() is True
 
 
-def test_parent_read_claude_config_routes_parent_logger(monkeypatch, tmp_path: Path) -> None:
-  logger = _CaptureLogger()
+def test_parent_read_claude_config_refuses_malformed_file(tmp_path: Path) -> None:
   config_path = tmp_path / "mcp.json"
   config_path.write_text("{not json", encoding="utf-8")
   manager = McpClientManager(config_path=config_path)
-  monkeypatch.setattr(mcp_client_module, "log", logger)
 
-  assert manager._read_claude_config() == {}
-  assert logger.warnings
-  assert logger.warnings[0][0] == "Failed to read %s: %s"
-  assert logger.warnings[0][1] == config_path
+  with pytest.raises(McpConfigError, match="not valid JSON"):
+    manager._read_claude_config()
+  with pytest.raises(McpConfigError):
+    manager._configured_server_configs()
+  assert config_path.read_text(encoding="utf-8") == "{not json"
 
 
-def test_runtime_read_claude_config_accepts_only_dict_payloads(tmp_path: Path) -> None:
-  logger = _CaptureLogger()
+def test_runtime_read_claude_config_refuses_every_non_config_document(tmp_path: Path) -> None:
   config_path = tmp_path / "mcp.json"
+  load = __import__("json").load
 
-  config_path.write_text("[]", encoding="utf-8")
-  assert read_claude_config(config_path, json_load=lambda f: __import__("json").load(f), logger=logger) == {}
+  assert read_claude_config(None, json_load=load) == {}
+  assert read_claude_config(tmp_path / "absent.json", json_load=load) == {}
+
+  for stored in ("[]", '"text"', "null", '{"mcpServers": []}', '{"mcpServers": null}', "", "{"):
+    config_path.write_text(stored, encoding="utf-8")
+    with pytest.raises(McpConfigError):
+      read_claude_config(config_path, json_load=load)
+  config_path.write_bytes(b"\xff\xfe")
+  with pytest.raises(McpConfigError):
+    read_claude_config(config_path, json_load=load)
 
   config_path.write_text('{"mcpServers": {}}', encoding="utf-8")
-  assert read_claude_config(config_path, json_load=lambda f: __import__("json").load(f), logger=logger) == {
-    "mcpServers": {}
-  }
+  assert read_claude_config(config_path, json_load=load) == {"mcpServers": {}}
+  config_path.write_text("{}", encoding="utf-8")
+  assert read_claude_config(config_path, json_load=load) == {}

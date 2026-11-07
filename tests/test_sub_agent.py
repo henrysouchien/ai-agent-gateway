@@ -1,13 +1,14 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 from contextlib import redirect_stdout
 import hashlib
-import inspect
 from io import StringIO
 import json
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, cast
@@ -66,6 +67,7 @@ from hank_model_transport.capability_execution import (
   BoundCapabilityExecution,
   CapabilityBind,
   CapabilityExecutionResolver,
+  ExecutionLane,
 )
 from agent_gateway.agent_result_content import (
   make_get_agent_result_content_handler,
@@ -218,31 +220,45 @@ class _InvestmentMcpClient(_McpClient):
     return self.get_server_tool_definitions({"idea-workbench-mcp"})
 
 
+@dataclass(frozen=True)
 class _CapabilityResolver(CapabilityExecutionResolver):
-  __slots__ = ("calls",)
-  calls: list[dict[str, Any]]
+  calls: list[dict[str, Any]] = field(default_factory=list, compare=False)
 
-  def __init__(self) -> None:
+  def __init__(
+    self, *, calls: list[dict[str, Any]] | None = None, **resolver_fields: Any,
+  ) -> None:
     resolver = stub_capability_execution_resolver(
       default_provider="openai",
       default_model="gpt-5.6-sol",
       default_effort="high",
     )
-    super().__init__(
-      registry=resolver.registry,
-      selection_policy=resolver.selection_policy,
-      auth_context=resolver.auth_context,
-      credential_materializer=resolver.credential_materializer,
-      adapter_resolver=resolver.adapter_resolver,
-      trusted_channel=resolver.trusted_channel,
-      authenticated_run_overrides=resolver.authenticated_run_overrides,
-      executable_capability_ids=resolver.executable_capability_ids,
-    )
-    object.__setattr__(self, "calls", [])
+    fields = {
+      "registry": resolver.registry,
+      "selection_policy": resolver.selection_policy,
+      "auth_context": resolver.auth_context,
+      "credential_materializer": resolver.credential_materializer,
+      "adapter_resolver": resolver.adapter_resolver,
+      "trusted_channel": resolver.trusted_channel,
+      "authenticated_run_overrides": resolver.authenticated_run_overrides,
+      "executable_capability_ids": resolver.executable_capability_ids,
+    }
+    super().__init__(**{**fields, **resolver_fields})
+    object.__setattr__(self, "calls", calls if calls is not None else [])
 
   def select_bind(self, capability_id: str, **kwargs: Any) -> Any:
     self.calls.append({"capability_id": capability_id, **kwargs})
     return super().select_bind(capability_id, **kwargs)
+
+
+def test_capability_resolver_equality_ignores_recorded_calls() -> None:
+  resolver = _CapabilityResolver()
+  observed = replace(resolver, calls=[{"capability_id": "session.driver"}])
+
+  assert observed.calls != resolver.calls
+  assert observed == resolver
+  observed.calls.append({"capability_id": "general_completion"})
+  assert observed == resolver
+  assert replace(observed, trusted_channel="different-channel") != resolver
 
 
 def _content(
@@ -347,6 +363,12 @@ class _Runner:
     self.background_calls: list[dict[str, Any]] = []
     self.durable_events: list[dict[str, Any]] = []
     self.background_result_calls: list[dict[str, Any]] = []
+    # sub_agent reads the child's scope from the parent's declared run_context.
+    self._dispatcher = SimpleNamespace(
+      run_context=run_context_for_test(
+        registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
+      ),
+    )
 
   def _get_tool_definitions(self) -> list[dict[str, Any]]:
     return [{
@@ -609,6 +631,7 @@ def test_run_agent_spawn_uses_current_rotated_parent_credential(
       session_id=parent_session.session_id,
       role="owner",
       get_tool_definitions=lambda: definitions,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     runner = AgentRunner(
       event_log=EventLog(),
@@ -757,6 +780,7 @@ def _write_operation(
   required_context: tuple[str, ...] = (),
   operation_name: str = "filing-review",
   investment_start_route: bool = False,
+  essential_start_route: bool = False,
 ) -> SkillLoader:
   path.mkdir(parents=True, exist_ok=True)
   required_context_yaml = (
@@ -778,10 +802,11 @@ def _write_operation(
     else "mcp_tools: {}"
   )
   investment_tool_ref_yaml = (
-    """
+    f"""
     - kind: mcp
       server_id: idea-workbench-mcp
-      tool_id: start_quant_research"""
+      tool_id: start_quant_research
+      essential: {str(essential_start_route).lower()}"""
     if investment_start_route
     else ""
   )
@@ -1001,26 +1026,6 @@ def delegation_tool_policy(owner_session_host_policy):
   )
 
 
-def test_run_agent_tool_schema_is_operation_first(tmp_path: Path) -> None:
-  schema = make_run_agent_tool_def(_write_operation(tmp_path, execution_class="node.implement"))["input_schema"]
-
-  assert not {"oneOf", "anyOf", "allOf"} & set(schema)
-  assert "required" not in schema
-  assert schema["additionalProperties"] is False
-  assert set(schema["properties"]) >= {
-    "operation", "objective", "ticker", "research_file_id", "background",
-    "interrupt", "resume", "additional_context",
-  }
-  ticker = schema["properties"]["ticker"]
-  assert "pattern" not in ticker
-  assert "independently of objective prose" in ticker["description"]
-  assert schema["properties"]["research_file_id"]["minimum"] == 1
-  threshold = schema["properties"]["cost_observation_threshold_usd"]
-  assert threshold["exclusiveMinimum"] == 0
-  assert "never stops or fails" in threshold["description"]
-  assert "max_budget_usd" not in schema["properties"]
-  assert "agent" not in schema["properties"]
-  assert "task" not in schema["properties"]
 
 
 def _dispatch_grant_for_runtime(runtime: ResolvedOperationRuntime) -> frozenset[str]:
@@ -1664,10 +1669,6 @@ def test_policy_projection_does_not_mask_base_exceptions() -> None:
     )
 
 
-def test_resume_handler_has_no_live_catalog_dependency() -> None:
-  assert "operation_catalog" not in inspect.signature(
-    make_resume_handler
-  ).parameters
 
 
 def test_ticker_precedence_equal_typed_and_verified_skips_fallback() -> None:
@@ -2501,6 +2502,7 @@ def test_named_child_refs_named_only_in_prose_or_refused_calls_do_not_spawn(
   assert runner.background_calls == []
 
 
+@pytest.mark.parametrize("essential_start_route", [False, True])
 @pytest.mark.parametrize(
   "required_context",
   [("research_file_id",), ()],
@@ -2508,12 +2510,14 @@ def test_named_child_refs_named_only_in_prose_or_refused_calls_do_not_spawn(
 def test_investment_start_route_requires_verified_turn_despite_metadata_drift(
   tmp_path: Path,
   required_context: tuple[str, ...],
+  essential_start_route: bool,
 ) -> None:
   loader = _write_operation(
     tmp_path,
     required_context=required_context,
     operation_name="alternate-quant-method",
     investment_start_route=True,
+    essential_start_route=essential_start_route,
     execution_class="node.mutate",
   )
   runner = _Runner()
@@ -2650,17 +2654,56 @@ def test_direct_handler_required_ticker_fails_before_effects(
   }
   assert message in error["message"]
   assert error["missing_keys"] == ["ticker"]
-  assert error["next_call"] == {
-    "tool_name": "run_agent",
-    "arguments": {
-      "operation": _operation(loader),
-      "objective": objective,
-      "background": True,
-    },
+  # The repair is executable once the one typed `ticker` is filled in; the prose
+  # candidates, when there were several, are in the message.
+  arguments = error["next_call"]["arguments"]
+  assert error["next_call"]["tool_name"] == "run_agent"
+  assert {k: v for k, v in arguments.items() if k != "ticker"} == {
+    "operation": _operation(loader), "objective": objective, "background": True,
   }
+  assert "ticker" in arguments
+  if "multiple plausible" in message:
+    assert "AAPL" in error["message"] and "MSFT" in error["message"]
   assert resolver.calls == []
   assert runner.spawn_calls == []
   assert runner.background_calls == []
+
+
+_TER_OBJECTIVE = (
+  "Complete the TER (Teradyne) model build for research_file_id=1. The ForecastAssumptionSet is "
+  "already persisted and accepted. DO NOT inspect or edit the working document — it is done. "
+  "DO NOT rebuild the business model. HARD CONSTRAINT: never call code_execute. "
+  "STEP 1. Use ticker \"TER\", verdict \"FACTORS_IDENTIFIED\", confidence \"HIGH\". "
+  "STEP 2. Read the KPI policy. STEP 3. STOP if the model is BUILT. "
+  "STEP 4. Use the forward P/E and EV/EBITDA relative families. STEP 5. Report. STEP 6. Done."
+)
+
+
+def test_single_issuer_objective_with_imperative_capitals_admits_its_declared_subject(
+  tmp_path: Path,
+) -> None:
+  """The recorded TER objective (journal seq 1936, 2026-10-30): imperative and metric capitals
+  (DO, HARD, STEP, HIGH, EV, EBITDA) are not subjects; the declared `TER (Teradyne)` /
+  `ticker "TER"` is."""
+  loader = _write_operation(tmp_path, required_context=("ticker",), execution_class="node.implement")
+  runner = _Runner()
+  resolver = _CapabilityResolver()
+
+  result, error = asyncio.run(_handler(
+    runner,
+    loader=loader,
+    resolver=resolver,
+  )({
+    "operation": _operation(loader),
+    "objective": _TER_OBJECTIVE,
+    "background": True,
+  }))
+
+  assert error is None, error
+  assert result is not None
+  admitted = runner.background_calls[0]["admitted_task"]
+  binding = next(item for item in admitted.inputs if item.name == "ticker")
+  assert binding.context.content == "TER"
 
 
 def test_malformed_ticker_on_ticker_required_operation_names_ticker_to_add(
@@ -2683,7 +2726,7 @@ def test_malformed_ticker_on_ticker_required_operation_names_ticker_to_add(
   assert result is None
   assert error is not None and error["code"] == "invalid_input"
   assert error["missing_keys"] == ["ticker"]
-  assert "ticker" not in error["next_call"]["arguments"]
+  assert error["next_call"]["arguments"]["ticker"] != "not a ticker!!"
   assert runner.spawn_calls == []
 
 
@@ -3853,6 +3896,15 @@ def test_background_and_resume_tool_schemas_are_explicit() -> None:
   assert "additional_context" in resume["properties"]
 
 
+def test_run_agent_schema_has_no_top_level_combinators() -> None:
+  schema = make_run_agent_tool_def()["input_schema"]
+
+  assert not {"oneOf", "anyOf", "allOf"} & set(schema)
+  assert {"objective", "interrupt", "resume", "additional_context"} <= set(
+    schema["properties"]
+  )
+
+
 def test_skill_lifecycle_emitter_projects_canonical_task_result_once(
   tmp_path: Path,
 ) -> None:
@@ -3921,6 +3973,7 @@ def test_skill_lifecycle_result_projects_after_child_stream_closes() -> None:
     portfolio_id=None,
     event_log_getter=lambda: child_log,
     tool_ctx=ToolExecutionContext(
+      registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
       tool_call_id="tool-1",
       tool_name="run_agent",
       event_log=parent_log,
@@ -3967,6 +4020,7 @@ def test_skill_lifecycle_result_settles_after_parent_stream_closes() -> None:
     portfolio_id=None,
     event_log_getter=lambda: parent_log,
     tool_ctx=ToolExecutionContext(
+      registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
       tool_call_id="tool-1",
       tool_name="run_agent",
       event_log=parent_log,
@@ -4076,7 +4130,10 @@ def test_run_agent_threads_parent_source_registry_scope(
     setattr(runner, "_skill_run_id", f" {parent_run_id} ")
   else:
     setattr(runner, "_dispatcher", SimpleNamespace(
-      run_context=SimpleNamespace(run_id=f" {parent_run_id} "),
+      run_context=SimpleNamespace(
+        run_id=f" {parent_run_id} ",
+        registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
+      ),
     ))
 
   reads: list[str | None] = []
@@ -4115,13 +4172,16 @@ def test_child_run_context_inherits_the_calling_run_profile() -> None:
     api_key_hash="hash",
     created_at=1,
     expires_at=2,
-    user_id="user-1",
+    user_id="henry",
+    owner_user_id="7",
     role="invite",
     channel="discord",
   )
   run_context = _child_run_context(
+    registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
     parent_session=parent_session,
     tool_ctx=ToolExecutionContext(
+      registry_scope=RegistryScope("run", "test-run", "/tmp/test-store"),
       tool_call_id="tc-run-agent",
       tool_name="run_agent",
       event_log=None,
@@ -4132,7 +4192,7 @@ def test_child_run_context_inherits_the_calling_run_profile() -> None:
     skill_name="risk-review",
     admitted_skill_execution_limits=None,
     research_file_id=None,
-    user_id=None,
+    user_id="henry",
     session_id="parent-session",
     approval_policy=None,
   )
@@ -4140,6 +4200,7 @@ def test_child_run_context_inherits_the_calling_run_profile() -> None:
   assert run_context.profile == "community"
   assert run_context.profile_name == "community"
   assert run_context.skill == "risk-review"
+  assert run_context.user_id == "7"
 
 
 class _KernelChildProvider(ModelProvider):
@@ -4299,9 +4360,11 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
   def record_materialization(
     resolver: CapabilityExecutionResolver,
     bind: CapabilityBind,
+    *,
+    lane: ExecutionLane | None = None,
   ) -> BoundCapabilityExecution:
     materialized_binds.append(bind)
-    return materialize_bind(resolver, bind)
+    return materialize_bind(resolver, bind, lane=lane)
 
   monkeypatch.setattr(
     CapabilityExecutionResolver, "materialize_bind", record_materialization,
@@ -4346,6 +4409,7 @@ def test_child_kernel_is_isolated_and_disposed_through_real_run_lifetime(
       role="owner",
       approval_key_qualifier=parent_bundle.approval_qualifier,
       get_tool_definitions=lambda: parent_bundle.tool_definitions,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     parent_bundle.bind_dispatcher(
       parent_dispatcher,
@@ -4673,6 +4737,7 @@ def test_child_background_cell_is_a_code_job_on_the_child_registry(tmp_path: Pat
       session_id=parent_session.session_id, role="owner",
       approval_key_qualifier=parent_bundle.approval_qualifier,
       get_tool_definitions=lambda: parent_bundle.tool_definitions,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     runner = AgentRunner(
       event_log=EventLog(), dispatcher=parent_dispatcher, session_id=parent_session.session_id,

@@ -394,7 +394,7 @@ def test_replay_settles_only_when_retry_receives_response(monkeypatch, retry_out
     )
     replacement = _certainty_manager(Session(2))._servers["certainty-mcp"]
 
-    async def replace(*_args):
+    async def replace(*_args, **_kwargs):
       assert report.certainty == "unknown"
       if retry_outcome == "reconnect_failure":
         raise RuntimeError("startup failed before retry send")

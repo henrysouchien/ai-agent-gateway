@@ -7,6 +7,8 @@ from pathlib import Path
 import stat
 from typing import Iterable
 
+from .run_control import run_control_root
+
 
 class ResearchFileActivityLease:
   """One process-safe operational lease for a research-file writer boundary."""
@@ -63,13 +65,13 @@ def try_acquire_research_file_activity(
   """
 
   normalized_id = _research_file_id(research_file_id)
-  _workspace, workspace_descriptor = _open_workspace(Path(workspace_dir))
+  _control_root, control_descriptor = _open_control_root(Path(workspace_dir))
   directory_descriptors: list[int] = []
   descriptor = -1
   try:
-    owner_uid = os.fstat(workspace_descriptor).st_uid
+    owner_uid = os.fstat(control_descriptor).st_uid
     locks_descriptor = _open_or_create_owned_directory(
-      workspace_descriptor,
+      control_descriptor,
       ".locks",
       owner_uid=owner_uid,
       private=False,
@@ -111,7 +113,7 @@ def try_acquire_research_file_activity(
       os.close(descriptor)
     for directory_descriptor in reversed(directory_descriptors):
       os.close(directory_descriptor)
-    os.close(workspace_descriptor)
+    os.close(control_descriptor)
 
 
 def try_acquire_research_file_activity_set(
@@ -142,11 +144,11 @@ def try_acquire_research_file_activity_set(
       lease.release()
 
 
-def _open_workspace(raw_workspace: Path) -> tuple[Path, int]:
+def _open_control_root(raw_workspace: Path) -> tuple[Path, int]:
   expanded = raw_workspace.expanduser()
   if expanded.is_symlink():
     raise ValueError("research file activity workspace cannot be a symlink")
-  workspace = expanded.resolve()
+  workspace = run_control_root(expanded)
   workspace.mkdir(parents=True, exist_ok=True)
   path_info = workspace.lstat()
   if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISDIR(path_info.st_mode):

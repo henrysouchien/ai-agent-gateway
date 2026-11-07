@@ -14,6 +14,7 @@ from hank_model_transport.auth import (
   derive_auth_mechanism_and_entitlement,
 )
 from .session_capabilities import normalize_session_capabilities
+from hank_model_transport.user_provider_keys import USER_KEY_PROVIDERS
 
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,12 @@ PUBLIC_AUTH_CONFIG_FIELDS: frozenset[str] = frozenset(
   "rate_table_version",
 })
 
+def validate_user_key_providers(providers: frozenset[str], *, field_name: str) -> frozenset[str]:
+  if not isinstance(providers, frozenset) or not providers <= frozenset(USER_KEY_PROVIDERS):
+    raise ValueError(f"{field_name} must be a frozenset of supported user-key providers")
+  return providers
+
+
 @dataclass
 class ResolverResult:
   user_id: str
@@ -104,6 +111,8 @@ class ResolverResult:
   capabilities: frozenset[str] = frozenset()
   model_entitled_capabilities: frozenset[str] = frozenset()
   model_entitled_keys: frozenset[str] = frozenset()
+  enrolled_user_key_providers: frozenset[str] = frozenset()
+  unavailable_user_key_providers: frozenset[str] = frozenset()
   # Entitlements the resolver named that no registered capability matches.
   # They grant nothing (the intersection below); this field is where a session
   # reads which ones were dropped.
@@ -112,6 +121,14 @@ class ResolverResult:
   )
 
   def __post_init__(self) -> None:
+    self.enrolled_user_key_providers = validate_user_key_providers(
+      self.enrolled_user_key_providers, field_name="enrolled_user_key_providers",
+    )
+    self.unavailable_user_key_providers = validate_user_key_providers(
+      self.unavailable_user_key_providers, field_name="unavailable_user_key_providers",
+    )
+    if self.enrolled_user_key_providers & self.unavailable_user_key_providers:
+      raise ValueError("user-key provider enrollment cannot be both known and unavailable")
     if self.credential_principal not in {"user", "service"}:
       raise ValueError(
         "credential_principal must be declared as 'user' or 'service'"
@@ -178,6 +195,28 @@ class NoCredentialError(Exception):
     )
 
 
+class SessionDriverUserKeyMissing(NoCredentialError):
+  """The session driver's provider has no enrolled user key (``user_key_missing``).
+
+  Every caller refuses it as the ``NoCredentialError`` it is. Only ``/chat/init``
+  with a verified commercial claim opens ``pending`` as a metered-pending session:
+  it holds no credential, and each turn binds only a verified metered V4's seat.
+  """
+
+  def __init__(self, message: str, *, provider: str, pending: ResolverResult) -> None:
+    super().__init__(message)
+    if (
+      provider not in USER_KEY_PROVIDERS
+      or pending.credential_principal != "user"
+      or pending.allow_service_for_interactive
+      or pending.auth_config.provider != provider
+      or provider in pending.enrolled_user_key_providers
+    ):
+      raise ValueError("a metered-pending start is a keyless user start for its provider")
+    self.provider = provider
+    self.pending = pending
+
+
 class CredentialsTimeoutError(Exception):
   def __init__(self, message: str | None = None) -> None:
     super().__init__(
@@ -223,5 +262,6 @@ __all__ = [
   "CrossUserReuseError",
   "MissingUserIdError",
   "NoCredentialError",
+  "SessionDriverUserKeyMissing",
   "ResolverResult",
 ]

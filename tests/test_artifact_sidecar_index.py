@@ -11,10 +11,12 @@ if str(PKG_DIR) not in sys.path:
   sys.path.insert(0, str(PKG_DIR))
 
 from agent_gateway.artifact_sidecar_index import (  # noqa: E402
+  artifact_sidecar_index_path,
   get_artifact_sidecar_index_row,
   get_artifact_sidecar_index_row_by_ref,
   register_skill_artifact_sidecar,
 )
+from agent_gateway.run_control import run_control_root  # noqa: E402
 
 
 def test_register_skill_artifact_sidecar_indexes_ticker_metadata(tmp_path: Path) -> None:
@@ -58,6 +60,27 @@ def test_register_skill_artifact_sidecar_indexes_ticker_metadata(tmp_path: Path)
   assert row["origin_ref"] == '{"id":42,"kind":"research_file"}'
   assert row["created_ts"] == "2026-06-18T12:00:00+00:00"
   assert row["content_hash"]
+
+
+def test_sidecar_index_lives_in_run_control_root_outside_the_workspace(tmp_path: Path) -> None:
+  workspace = tmp_path / "users" / "alice" / "workspace"
+  sidecar_path = workspace / "artifacts" / "PCTY" / "model-review" / "run-a.json"
+  _write_json(sidecar_path, {"artifact_id": "run-a", "ticker": "PCTY", "skill": "model-review"})
+
+  register_skill_artifact_sidecar(workspace_dir=workspace, sidecar_path=sidecar_path)
+
+  index_path = artifact_sidecar_index_path(workspace)
+  assert index_path == run_control_root(workspace) / "artifacts" / "_index" / "artifact_sidecars.sqlite3"
+  assert index_path.is_file()
+  assert index_path.parent.parent.parent == workspace.resolve().parent / "control"
+  assert not (workspace / "artifacts" / "_index").exists()
+  row = get_artifact_sidecar_index_row_by_ref(
+    workspace_dir=workspace,
+    artifact_kind="skill_artifact",
+    artifact_ref="artifacts/PCTY/model-review/run-a.json",
+  )
+  assert row is not None
+  assert row["user_id"] == "alice"
 
 
 def test_register_skill_artifact_sidecar_indexes_portfolio_metadata(tmp_path: Path) -> None:

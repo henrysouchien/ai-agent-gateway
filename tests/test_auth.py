@@ -152,6 +152,8 @@ def test_resolver_result_dataclass_and_credentials_resolver_async_contract() -> 
     "capabilities",
     "model_entitled_capabilities",
     "model_entitled_keys",
+    "enrolled_user_key_providers",
+    "unavailable_user_key_providers",
     "unknown_model_entitled_capabilities",
   ]
   assert result.user_id == "alice"
@@ -165,6 +167,8 @@ def test_resolver_result_dataclass_and_credentials_resolver_async_contract() -> 
   assert result.model_entitled_capabilities == frozenset()
   assert result.model_entitled_keys == frozenset()
   assert result.unknown_model_entitled_capabilities == frozenset()
+  assert result.enrolled_user_key_providers == frozenset()
+  assert result.unavailable_user_key_providers == frozenset()
   assert result.auth_config is auth_config
 
 

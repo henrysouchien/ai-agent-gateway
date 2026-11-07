@@ -13,6 +13,7 @@ from .research_file_current_projection import (
   load_research_file_current_projection,
 )
 from .secret_boundary import sanitize_tool_event
+from .server_compaction import PREVIOUS_TURN_RECAP_HEADER
 from .skill_lifecycle import drain_owned_lifecycle_task
 
 Message = dict[str, Any]
@@ -226,6 +227,25 @@ class SessionContextBuilder:
       messages.append(self._interrupted_run_to_message(interrupted_context, latest_state_update))
     messages.extend(tail_messages)
     return truncate_to_last_compaction(messages, compaction_as_text=False)
+
+  async def aging_stubs(self) -> dict[str, str]:
+    """``tool_use_id -> stub`` for every logged result registered to age.
+
+    The receipt records the stub on its durable ``tool_call_complete``
+    (``aging_stub``); a runner whose history is rebuilt from the log reloads
+    them so results from earlier turns age too (``tool_result_aging``).
+    """
+
+    entries, _ = await self.agent_session_log.query_current_strict(
+      event_types={"tool_call_complete"},
+      exclude_entry=lambda entry: entry.event.get("role") == "sub_agent",
+    )
+    return {
+      entry.event["tool_call_id"]: entry.event["aging_stub"]
+      for entry in entries
+      if isinstance(entry.event.get("tool_call_id"), str)
+      and isinstance(entry.event.get("aging_stub"), str)
+    }
 
   async def _latest_interrupted_run_context(
     self,
@@ -576,6 +596,11 @@ class SessionContextBuilder:
         group = [message]
         groups.append(group)
         content = message["content"]
+        if message["role"] == "user" and isinstance(content, list):
+          # An inline tool_result already answers its call in place.
+          for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+              pending_calls.pop(str(block.get("tool_use_id") or ""), None)
         if message["role"] == "assistant" and isinstance(content, list):
           tool_ids = [str(block["id"]) for block in content if block.get("type") == "tool_use"]
           if tool_ids:
@@ -594,6 +619,22 @@ class SessionContextBuilder:
           "tool_use_id": tool_id,
           "content": json.dumps({"status": "awaiting_approval", "approval_id": approval_id}),
         })
+
+    # Parking can stop dispatch before another call in the same assistant
+    # batch even starts. Keep its absence explicit in replay, without
+    # settling the durable call or replacing a result recorded later.
+    for tool_id, batch in pending_calls.items():
+      batch.result_blocks.append({
+        "type": "tool_result",
+        "tool_use_id": tool_id,
+        "is_error": True,
+        "content": json.dumps({
+          "error": {
+            "code": "tool_interrupted",
+            "message": "The run ended without a tool result; execution may not have completed.",
+          },
+        }),
+      })
 
     for batch in batches:
       if batch.result_blocks:
@@ -615,7 +656,7 @@ class SessionContextBuilder:
     if event_type == "session_recap":
       return {
         "role": "user",
-        "content": "## Previous turn recap\n\n" + json.dumps(_recap_replay_projection(event), sort_keys=True, default=str),
+        "content": f"{PREVIOUS_TURN_RECAP_HEADER}\n\n" + json.dumps(_recap_replay_projection(event), sort_keys=True, default=str),
       }
 
     if event_type == "assistant_message":

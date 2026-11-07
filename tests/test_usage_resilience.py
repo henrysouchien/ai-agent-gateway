@@ -3,7 +3,9 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
-import multiprocessing
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -21,11 +23,6 @@ from agent_gateway.usage_resilience import (
 
 
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
-
-
-def _trip_breaker_in_child(path: str) -> None:
-  CommercialUsageCircuitBreaker(path).trip("child worker incident", now=NOW)
-
 
 def _payload(event_id: str) -> dict:
   payload = {
@@ -87,11 +84,29 @@ def test_circuit_state_is_process_shared_and_byok_grace_is_bounded(tmp_path) -> 
 
 def test_circuit_trip_is_visible_to_sibling_process(tmp_path) -> None:
   state = tmp_path / "circuit.json"
-  context = multiprocessing.get_context("fork")
-  process = context.Process(target=_trip_breaker_in_child, args=(str(state),))
-  process.start()
-  process.join(timeout=5)
-  assert process.exitcode == 0
+  # Fresh interpreter, not fork: this worker is multi-threaded, and fork
+  # deadlocks the child (exitcode stays None under EC2 xdist).
+  package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+  env = dict(os.environ)
+  env["PYTHONPATH"] = os.pathsep.join([package_root, env.get("PYTHONPATH", "")])
+  script = (
+    "from datetime import datetime, timezone\n"
+    "import sys\n"
+    "from agent_gateway.usage_resilience import CommercialUsageCircuitBreaker\n"
+    "CommercialUsageCircuitBreaker(sys.argv[1]).trip(\n"
+    "    'child worker incident',\n"
+    "    now=datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc),\n"
+    ")\n"
+  )
+  child = subprocess.run(
+    [sys.executable, "-c", script, str(state)],
+    env=env,
+    capture_output=True,
+    text=True,
+    timeout=30,
+    check=False,
+  )
+  assert child.returncode == 0, child.stderr
   sibling = CommercialUsageCircuitBreaker(state)
   with pytest.raises(CommercialUsageCircuitOpen, match="child worker incident"):
     sibling.assert_work_allowed("metered", now=NOW)

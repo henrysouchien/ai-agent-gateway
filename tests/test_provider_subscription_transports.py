@@ -298,6 +298,22 @@ def test_ollama_cloud_credential_is_api_key() -> None:
   assert provider.has_active_credential(blank) is False
   assert provider.has_active_credential(other) is False
 
+def test_ollama_cloud_default_client_bounds_dead_connection_reads() -> None:
+  client = OllamaCloudProvider().create_client({"api_key": _API_KEY})
+  try:
+    assert client.timeout.read == 60.0
+  finally:
+    asyncio.run(client.aclose())
+
+@pytest.mark.parametrize("provider_cls", [OllamaLocalProvider, OllamaCloudProvider])
+def test_ollama_stall_error_is_a_transport_failure(provider_cls) -> None:
+  failure = provider_cls().classify_credential_failure(
+    provider_base.StreamStallError(0.01),
+  )
+
+  assert failure is not None
+  assert failure.kind == "transport"
+
 
 def test_antigravity_create_client_without_project_id_names_login() -> None:
   provider = GoogleAntigravityProvider()
@@ -536,9 +552,17 @@ def test_both_gemini_adapters_reduce_the_fms_persist_shape_to_the_wire_subset() 
     "description": "persist a forecast set",
     "input_schema": {
       "type": "object",
-      "properties": {"values": period_map, "refs": {"$ref": "#/$defs/Map"}},
+      "properties": {
+        "values": period_map,
+        "refs": {"$ref": "#/$defs/Map"},
+        "critical_factors_ref": {
+          "type": "object",
+          "required": ["artifact_id", "content_sha256"],
+          "additionalProperties": True,
+        },
+      },
       "$defs": {"Map": period_map},
-      "required": ["values"],
+      "required": ["values", "undeclared_prop"],
     },
   }]
 
@@ -563,6 +587,8 @@ def test_both_gemini_adapters_reduce_the_fms_persist_shape_to_the_wire_subset() 
     refs = declaration["parameters"]["properties"]["refs"]
     assert refs["type"] == "object"
     assert refs["minProperties"] == 1
+    assert declaration["parameters"]["required"] == ["values"]
+    assert "required" not in declaration["parameters"]["properties"]["critical_factors_ref"]
 
 
 

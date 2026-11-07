@@ -6,10 +6,12 @@ import json
 import logging
 import time
 from collections.abc import Iterable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 import re
 from typing import Any, Awaitable, Callable, Literal, Protocol, TypeGuard
+from uuid import uuid4
 
 from agent_workflow_contracts import (
   AdmittedTask,
@@ -1467,6 +1469,18 @@ async def job_output_handles(durable_log: Any, *, job_id: str) -> frozenset[str]
   return frozenset(outputs)
 
 
+def _completion_task_read(task: asyncio.Task[Any] | None) -> dict[str, Any] | None:
+  """Inspect task presence without interpreting it as child settlement."""
+
+  if task is None:
+    return None
+  try:
+    done = task.done()
+  except Exception as exc:
+    return {"ref": str(id(task)), "done": None, "inspection_error": type(exc).__name__}
+  return {"ref": str(id(task)), "done": done, "inspection_error": None}
+
+
 class TaskRegistry:
   def __init__(
     self,
@@ -1477,6 +1491,8 @@ class TaskRegistry:
     owner: RegistryOwner | None = None,
   ) -> None:
     self._tasks: dict[str, TaskEntry] = {}
+    self._completion_epoch = uuid4().hex
+    self._completion_coverage: Literal["current", "unknown"] = "current"
     # Ids a resume successor has taken over. Recorded when the successor
     # enters the registry, so it outlives the successor's eviction and does
     # not depend on replay order.
@@ -1497,6 +1513,64 @@ class TaskRegistry:
     self._owner_entry_retired = False
     if owner is not None:
       self.bind_owner(owner)
+
+  def completion_read(
+    self,
+    *,
+    exclude_task_id: str | None = None,
+  ) -> dict[str, Any]:
+    """Copy observed child facts; replay never establishes complete coverage."""
+
+    entries = [
+      entry for entry in self._tasks.values()
+      if entry.task_id != exclude_task_id
+    ]
+    state_counts = {state.value: 0 for state in TaskState}
+    children: list[dict[str, Any]] = []
+    for entry in entries:
+      state_counts[entry.state.value] += 1
+      children.append({
+        "task_id": entry.task_id,
+        "state": entry.state.value,
+        "sub_agent_id": deepcopy(entry.metadata.get("sub_agent_id")),
+        "reconstructed_from_log": entry.reconstructed_from_log,
+        "registration_persistence_state": entry.registration_persistence_state,
+        "registration_persistence_error": entry.registration_persistence_error,
+        "completion_persistence_state": entry.completion_persistence_state,
+        "completion_persistence_error": entry.completion_persistence_error,
+        "completion_finalizer_detached": entry.completion_finalizer_detached,
+        "pending_final_state": (
+          entry.pending_final_state.value
+          if entry.pending_final_state is not None else None
+        ),
+        "requires_skill_result": "required_skill_lifecycle" in entry.metadata,
+        "required_skill_lifecycle": deepcopy(
+          entry.metadata.get("required_skill_lifecycle")
+        ),
+        "required_skill_result_settled": entry.required_skill_result_settled,
+        "required_skill_result_projected": entry.required_skill_result_projected,
+        "required_skill_result_task": _completion_task_read(
+          entry.required_skill_result_task
+        ),
+        "initialization_task": _completion_task_read(entry.initialization_task),
+        "start_hook_invoked": entry.start_hook_invoked,
+        "notification_generation": entry.notification_generation,
+        "notification_delivery_state": entry.notification_delivery_state,
+        "completion_callback_present": entry.completion_callback is not None,
+        "completion_callback_invoked": entry.completion_callback_invoked,
+        "park_callback_present": entry.park_callback is not None,
+        "park_callback_invoked": entry.park_callback_invoked,
+      })
+    return {
+      "epoch": self._completion_epoch,
+      "coverage": self._completion_coverage,
+      "observed_count": len(children),
+      "count": (
+        len(children) if self._completion_coverage == "current" else None
+      ),
+      "state_counts": state_counts,
+      "children": children,
+    }
 
   def bind_owner(self, owner: RegistryOwner) -> None:
     """Name the job this registry's children belong to and link its tree.
@@ -2257,6 +2331,7 @@ class TaskRegistry:
     advance the sequence so new registrations never collide with drained
     durable identities.
     """
+    self._completion_coverage = "unknown"
     grouped: dict[str, dict[str, Any]] = {}
     global_skill_results: list[dict[str, Any]] = []
     max_suffix: int | None = None
@@ -2330,7 +2405,6 @@ class TaskRegistry:
         "sub_agent_id",
         "parent_turn_id",
         "call_index",
-        "task_type",
         "capability_bind",
         "parent_session_id",
         "original_task_id",

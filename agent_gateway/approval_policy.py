@@ -10,11 +10,15 @@ import traceback
 import uuid
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, datetime
-from typing import Any, Literal, Mapping, NoReturn, Protocol, get_args
+from typing import Any, Awaitable, Callable, Literal, Mapping, NoReturn, Protocol, TYPE_CHECKING, get_args
 
 from .ui_blocks_run import UiBlocksRunContext, current_ui_blocks_run
 from .skill_limits import SkillExecutionLimits
+from .registry_scope import DeclaredRegistryScope
 from hank_model_transport.policy_imports import load_server_policy_module
+
+if TYPE_CHECKING:
+  from .runner_state import FinalAnswerVerdict
 
 
 ToolClass = Literal[
@@ -80,6 +84,18 @@ ApprovalOutcome = Literal[
 
 TerminalDecision = Literal["approved", "denied", "auto_approved", "auto_denied", "expired"]
 
+# Dispatcher error codes for a call that did not run because of the approval
+# decision. Binding mismatches and a still-open wait (`awaiting_approval`) are
+# not members. `tool_dispatcher` emits these; consumers import this set.
+TerminalApprovalErrorCode = Literal[
+  "approval_required",
+  "user_denied",
+  "approval_expired",
+]
+TERMINAL_APPROVAL_ERROR_CODES: frozenset[str] = frozenset(
+  get_args(TerminalApprovalErrorCode)
+)
+
 
 def utc_now() -> datetime:
   return datetime.now(UTC)
@@ -133,6 +149,36 @@ def _validate_approval_identity(request: ApprovalRequest) -> None:
 
 def sha256_args(value: Any) -> str:
   return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+# A persisted approval request is also an approval audit record, and the audit
+# writer refuses one record past APPROVAL_AUDIT_MAX_RECORD_BYTES. A display
+# copy therefore never carries an unbounded string; the exact arguments stay
+# bound by their hash, never by this copy.
+APPROVAL_DISPLAY_MAX_STRING_CHARS = 4096
+
+
+def bounded_approval_display(value: Any) -> Any:
+  """Project JSON-like arguments for display: long strings keep a bounded head.
+
+  A string past ``APPROVAL_DISPLAY_MAX_STRING_CHARS`` becomes its head plus a
+  marker naming the full length and its SHA-256, so the copy still identifies
+  the exact text it abbreviates. Structure, keys and short values are kept.
+  """
+
+  if isinstance(value, str):
+    if len(value) <= APPROVAL_DISPLAY_MAX_STRING_CHARS:
+      return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return (
+      f"{value[:APPROVAL_DISPLAY_MAX_STRING_CHARS]}"
+      f"…[truncated: {len(value)} chars, sha256:{digest}]"
+    )
+  if isinstance(value, dict):
+    return {key: bounded_approval_display(item) for key, item in value.items()}
+  if isinstance(value, list):
+    return [bounded_approval_display(item) for item in value]
+  return value
 
 
 class ApprovalPolicyError(RuntimeError):
@@ -225,6 +271,8 @@ class RunContext:
   run_id: str | None = None
   profile: str = "chat"
   profile_name: str | None = None
+  # Autonomous launchers set this when invoke_skill never mints a fresh run identity.
+  autonomous: bool = False
   channel: str = "web"
   skill: str | None = None
   admitted_skill_execution_limits: SkillExecutionLimits | None = None
@@ -234,10 +282,16 @@ class RunContext:
   parent_approval_id: str | None = None
   delegation: DelegationGrant | None = None
   policy_bundle_hash: str = "unknown"
+  # Declared once at construction, carried by value; never re-assigned (registry-scope-carrier-design.md).
+  registry_scope: DeclaredRegistryScope
   ui_blocks_run: UiBlocksRunContext | None = field(
     default_factory=current_ui_blocks_run,
     repr=False,
   )
+  final_answer_check: Callable[
+    [str], Awaitable[FinalAnswerVerdict | None]
+  ] | None = field(default=None, repr=False)
+  final_answer_check_mode: Literal["hold", "append", "off"] = "hold"
 
 
 @dataclass(kw_only=True)

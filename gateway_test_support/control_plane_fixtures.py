@@ -16,6 +16,8 @@ from agent_gateway.runner import AgentRunner
 from agent_gateway.server import ChatRuntime, GatewayServerConfig, create_gateway_app
 from agent_gateway.session import GatewaySession, session_owner_user_id
 from agent_gateway.tool_dispatcher import ToolDispatcher
+from agent_gateway.approval_policy import RunContext
+from agent_gateway.registry_scope import NoRegistryScope
 
 from .control_plane_identity import fake_identity_resolver, fake_mcp_user_key_lookup
 
@@ -40,6 +42,13 @@ class _ControlTestRunner(AgentRunner):
         local_tool_handlers={},
         event_log=event_log,
         session_id=session_id,
+        run_context=RunContext(
+          user_id=session_owner_user_id(gateway_session),
+          request_id=f"req-{session_id}",
+          session_id=session_id,
+          channel=str(channel or gateway_session.channel or "web"),
+          registry_scope=NoRegistryScope(),
+        ),
       ),
       session_id=session_id,
       capability_execution=capability_execution,

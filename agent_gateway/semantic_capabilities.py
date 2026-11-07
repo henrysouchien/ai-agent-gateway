@@ -123,12 +123,6 @@ DEFAULT_SEMANTIC_CAPABILITY_REGISTRY = SemanticCapabilityRegistry((
   SemanticCapabilitySpec(
     name="research.source/v1",
   ),
-  # Dataset-shaped needs bind no live tool: they are read by the autonomous
-  # prefetch hook, which is why ``data_requirements`` could be deleted
-  # outright (D-B8-2).
-  SemanticCapabilitySpec(
-    name="market-data.history/v1",
-  ),
 ))
 
 

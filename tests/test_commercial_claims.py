@@ -153,6 +153,22 @@ def test_verifier_accepts_valid_offline_claim_and_overlapping_keys() -> None:
 
 
 @pytest.mark.parametrize(
+  ("payload_changes", "expected"),
+  (
+    ({"schema_version": True}, "unknown_schema"),
+    ({"schema_version": 1.0}, "unknown_schema"),
+    ({"environment": []}, "invalid_environment"),
+    ({"environment": {"name": "prod"}}, "invalid_environment"),
+  ),
+)
+def test_payload_wrong_typed_fields_have_declared_refusals(payload_changes, expected) -> None:
+  with pytest.raises(CommercialClaimError, match=expected):
+    CommercialClaimVerifier._validate_payload(
+      _payload(**payload_changes), key_id="commercial-signing-v1"
+    )
+
+
+@pytest.mark.parametrize(
   ("payload_changes", "trust_changes", "now", "expected"),
   (
     ({"schema_version": 2}, {}, NOW + 1, "unknown_schema"),

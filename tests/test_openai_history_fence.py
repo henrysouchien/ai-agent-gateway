@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 import agent_gateway.autonomous as autonomous_module
+from agent_gateway.registry_scope import NoRegistryScope
 from agent_gateway import AgentSessionLog, SessionContextBuilder
 from agent_gateway.event_log import EventLog
 from hank_model_transport.openai_history_fence import (
@@ -239,6 +240,7 @@ def _gateway_session() -> GatewaySession:
     created_at=1,
     expires_at=2,
     user_id="alice",
+    owner_user_id="alice",
   )
 
 
@@ -321,6 +323,7 @@ def test_package_autonomous_missing_epoch_fails_before_client_construction(
       autonomous_module.run_autonomous(
         "system",
         "hello",
+        registry_scope=NoRegistryScope(),
         **_openai_bound_execution(),
         session_id="caller-durable-id",
         user_id="alice",
@@ -341,6 +344,7 @@ def test_package_autonomous_state_dir_missing_epoch_fails_before_client_construc
       autonomous_module.run_autonomous(
         "system",
         "hello",
+        registry_scope=NoRegistryScope(),
         **_openai_bound_execution(),
         state_dir=tmp_path,
         user_id="alice",
@@ -374,6 +378,7 @@ def test_package_autonomous_ephemeral_openai_run_does_not_require_epoch(
     autonomous_module.run_autonomous(
       "system",
       "hello",
+      registry_scope=NoRegistryScope(),
       **_openai_bound_execution(),
       user_id="alice",
       billing_mode="byok",

@@ -502,12 +502,14 @@ def sanitize_tool_event(
       sink=sink,
       boundary=boundary,
     )
-  if event_type == "user_message" and isinstance(projected.get("content"), list):
-    projected["content"] = _sanitize_typed_blocks(
-      projected["content"],
-      sink=sink,
-      boundary=boundary,
-    )
+  if event_type == "user_message":
+    for field in ("content", "analyst_content"):
+      if isinstance(projected.get(field), list):
+        projected[field] = _sanitize_typed_blocks(
+          projected[field],
+          sink=sink,
+          boundary=boundary,
+        )
   return projected
 
 

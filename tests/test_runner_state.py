@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -159,7 +160,7 @@ def test_background_tasks_completed_user_message_shapes_reminder() -> None:
   }
 
 
-def test_turn_reminder_state_combines_background_and_notification_reminders() -> None:
+def test_turn_reminder_state_keeps_background_and_notification_reminders_apart() -> None:
   state = turn_reminder_state(
     "background",
     "notification",
@@ -167,7 +168,10 @@ def test_turn_reminder_state_combines_background_and_notification_reminders() ->
     max_notifications_per_turn=2,
   )
 
-  assert state.text == "background\n\nnotification"
+  # The background line rides the request tail; the notification block is the
+  # system prompt's.
+  assert state.text == "background"
+  assert state.notification_reminder == "notification"
   assert state.peeked_notification_count == 2
   assert state.delivered == ()
 
@@ -212,7 +216,13 @@ def test_turn_reminder_state_preserves_single_reminders_and_empty_state() -> Non
     "notification",
     pending_notification_count=1,
     max_notifications_per_turn=5,
-  ).text == "notification"
+  ).notification_reminder == "notification"
+  assert turn_reminder_state(
+    "",
+    "notification",
+    pending_notification_count=1,
+    max_notifications_per_turn=5,
+  ).text == ""
   assert turn_reminder_state(
     "",
     "",
@@ -225,6 +235,29 @@ def test_turn_reminder_state_preserves_single_reminders_and_empty_state() -> Non
     pending_notification_count=4,
     max_notifications_per_turn=2,
   ).delivered == ()
+
+
+def test_turn_reminder_state_carries_the_record_reminder_apart_from_text() -> None:
+  from agent_gateway.runner_state import record_reminder_hash
+
+  state = turn_reminder_state(
+    "background",
+    "",
+    pending_notification_count=0,
+    max_notifications_per_turn=2,
+    record_reminder="[Run record — calls: 1 ok]",
+  )
+  # The record is the request tail's last reminder, after `text`'s parts, so
+  # it travels separately from `text`.
+  assert state.text == "background"
+  assert state.record_reminder == "[Run record — calls: 1 ok]"
+  assert record_reminder_hash(state.record_reminder) == (
+    "sha256:" + hashlib.sha256(b"[Run record \xe2\x80\x94 calls: 1 ok]").hexdigest()
+  )
+  assert record_reminder_hash("") is None
+  assert turn_reminder_state(
+    "", "", pending_notification_count=0, max_notifications_per_turn=2,
+  ).record_reminder == ""
 
 
 def test_completed_assistant_content_blocks_filters_tool_use_blocks() -> None:

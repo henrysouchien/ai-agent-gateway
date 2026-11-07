@@ -10,6 +10,8 @@ runner renamed it ``internal_error``, message only; (seq 62) a stored-model
 """
 
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
@@ -25,7 +27,7 @@ if str(PKG_DIR) not in sys.path:
 
 from agent_gateway import ToolDispatcher
 from agent_gateway.mcp_client import McpClientManager
-from agent_gateway.tool_dispatcher_helpers import ToolResult
+from agent_gateway.tool_dispatcher_helpers import ToolExecutionContext, ToolResult
 
 
 class _NullMcp(McpClientManager):
@@ -68,6 +70,7 @@ def _dispatch(exc: Exception, tool_input: dict[str, Any]) -> ToolResult:
     mcp_client=_NullMcp(),
     local_tool_handlers={"planned_write": _RaisingPlannedHandler(exc)},
     plan_validator=_unused_validator,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   return asyncio.run(dispatcher.dispatch("call-plan", "planned_write", tool_input))
 
@@ -134,6 +137,7 @@ def _dispatch_local(exc: Exception, tool_input: dict[str, Any]) -> ToolResult:
     role="owner",
     mcp_client=_NullMcp(),
     local_tool_handlers={"local_write": _RaisingLocalTool(exc)},
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   return asyncio.run(dispatcher.dispatch("call-exec", "local_write", tool_input))
 
@@ -160,6 +164,29 @@ def test_local_tool_error_carries_type_field_code_and_next_call() -> None:
     "tool_name": "get_historical_foundation_context",
     "arguments": {"ticker": "HUBS"},
   }
+
+def test_unbound_research_file_activity_is_a_typed_local_tool_refusal() -> None:
+  async def handler(
+    _arguments: dict[str, Any], *, tool_ctx: ToolExecutionContext, **_kwargs: object
+  ) -> ToolResult:
+    tool_ctx.ensure_research_file_activity(Path("/unused"), 1)
+    return {"ok": True}, None
+
+  dispatcher = ToolDispatcher(
+    capability_bind=TEST_CAPABILITY_BIND,
+    role="owner",
+    mcp_client=_NullMcp(),
+    local_tool_handlers={"research_activity": handler},
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
+  )
+
+  result, error = asyncio.run(dispatcher.dispatch("call-activity", "research_activity", {}))
+
+  assert result is None and error is not None
+  assert error["code"] == "local_tool_failed"
+  assert error["data"]["error_type"] == "ResearchFileActivityOwnerUnavailable"
+  assert error["data"]["owner_code"] == "research_file_activity_owner_unavailable"
+  assert error["data"]["retryable"] is False
 
 
 class _ComparativeAnalysisRow(BaseModel):

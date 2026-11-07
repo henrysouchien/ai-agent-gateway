@@ -25,6 +25,10 @@ from agent_gateway.approvals import (
   _cancel_pending_approval_and_unblock,
   _release_cancelled_approval,
 )
+from agent_gateway.approval_store import (
+  BATCH_CANCELLED_REASON,
+  GATEWAY_SHUTDOWN_REASON,
+)
 from agent_gateway.batch_approval_projection import (
   ApprovalProjection,
   BatchApprovalProjectionRegistry,
@@ -42,6 +46,16 @@ from hank_model_transport.capability_execution import (
   CapabilityExecutionResolver,
   MaterializedCredential,
 )
+from hank_model_transport.user_provider_keys import (
+  USER_KEY_PROVIDERS,
+  NO_API_KEY_CONSUMER,
+  IdentityUnresolved,
+  ResolveContext,
+  UserProviderKeyError,
+  installed_user_key_pools,
+  parse_user_key_handle_id,
+  user_key_handle_id,
+)
 from model_authority.capabilities import GATEWAY_EXECUTED_CAPABILITY_IDS
 from model_authority.registry import ProductModelRegistry
 from model_authority.selection import ProductModelSelectionPolicy
@@ -49,9 +63,23 @@ from agent_gateway.claim_signing_authority import (
   GatewayClaimSigningAuthority,
 )
 from agent_gateway.role_validation import require_exact_role
+from agent_gateway.run_settings import RunSettingsError
 from agent_gateway.session import AuthManager, GatewaySession
+from agent_gateway.single_user_policy import (
+  ApprovalSettings,
+  ApprovalSettingsPinError,
+  pin_approval_settings,
+)
+from agent_gateway.user_identity_mapping import RunOwnerUnresolved, risk_user_id_for
 
-from agent_gateway.admission import AdmittedContext, ParentContext, Refusal, SpawnRequest, root_context
+from agent_gateway.admission import (
+  AdmittedContext,
+  ParentContext,
+  Refusal,
+  SpawnRequest,
+  default_root_provenance,
+  root_context,
+)
 from agent_workflow_contracts import OperationUnavailable, ResolvedAuthority
 from agent_workflow_contracts.research_file_contract import MAX_RESEARCH_FILE_ID, is_research_file_id
 from .corpus_readiness import (
@@ -424,7 +452,7 @@ class BatchTaskRegistry:
             batch_id=batch_id,
             authenticated=None,
             app_state=None,
-            reason="gateway_shutdown",
+            reason=GATEWAY_SHUTDOWN_REASON,
           )
           if approval_error is None:
             approval_error = warning
@@ -733,6 +761,42 @@ def build_batches_router(*, auth: AuthManager) -> APIRouter:
   return router
 
 
+def _batch_user_key_context(authenticated_session: GatewaySession | None) -> ResolveContext:
+  """The one resolve context a batch's enrollment probe and its lease share."""
+
+  return ResolveContext(
+    consumer_key_hash=(authenticated_session.api_key_hash[:16] if authenticated_session is not None else NO_API_KEY_CONSUMER),
+    channel=authenticated_session.channel if authenticated_session is not None else None,
+    session_id=authenticated_session.session_id if authenticated_session is not None else None,
+  )
+
+
+def _enrolled_batch_user_key_providers(
+  *,
+  risk_user_id: int,
+  authenticated_session: GatewaySession,
+) -> frozenset[str]:
+  """Providers Risk holds an enrolled key for, read without leasing.
+
+  ``UserKeyPools.enrolled`` is the probe. A Risk outage or pools that are not
+  installed is not enrolled, never an error: the session's deployment handle
+  keeps serving it, exactly as before user-owned keys.
+  """
+
+  enrolled: set[str] = set()
+  for provider in USER_KEY_PROVIDERS:
+    try:
+      if installed_user_key_pools().enrolled(
+        risk_user_id=risk_user_id,
+        provider=provider,
+        context=_batch_user_key_context(authenticated_session),
+      ):
+        enrolled.add(provider)
+    except UserProviderKeyError:
+      continue
+  return frozenset(enrolled)
+
+
 def _batch_capability_execution_context(
   *,
   app_state: Any,
@@ -772,11 +836,9 @@ def _batch_capability_execution_context(
   if not tenant_id:
     raise RuntimeError("tenant_id is required for capability-bound batch")
 
-  service_handles = dict(
-    getattr(gateway_config, "service_provider_handles", {}) or {}
-  )
+  service_admission = getattr(gateway_config, "service_admission", None)
+  service_handles: dict[str, CredentialHandle] = {}
   user_handles: dict[str, CredentialHandle] = {}
-  run_scoped_user_providers: set[str] = set()
   session_handle: CredentialHandle | None = None
 
   if authenticated_session is not None:
@@ -805,15 +867,102 @@ def _batch_capability_execution_context(
         raise RuntimeError(
           "batch session credential tenant does not match gateway tenant"
         )
-      if session_handle.principal == "user":
-        user_handles[session_handle.provider] = session_handle
-        run_scoped_user_providers.add(session_handle.provider)
-      else:
-        service_handles[session_handle.provider] = session_handle
       if not isinstance(authenticated_session.auth_config, dict):
         raise RuntimeError(
           "selected batch session credential has no credential material"
         )
+      if session_handle.principal == "user":
+        user_handles[session_handle.provider] = session_handle
+  try:
+    if authenticated_session is None:
+      try:
+        risk_user_id = risk_user_id_for(actor_id)
+      except RunOwnerUnresolved as exc:
+        raise IdentityUnresolved(None) from exc
+    else:
+      risk_user_id = authenticated_session.risk_user_id
+    if risk_user_id is None:
+      raise IdentityUnresolved(None)
+    # Legacy fallback identities carry 0. That is not a user-key lease: R4,
+    # Bedrock, and owner-seat binds keep their service handles. A lease is
+    # refused only when one is actually selected.
+    positive_risk_user_id = (
+      risk_user_id if type(risk_user_id) is int and risk_user_id >= 1 else None
+    )
+    # An authenticated session serves a provider the user has not enrolled from
+    # its deployment handle (no lease is attempted). A sessionless dispatch has
+    # no deployment fallback (N2): every provider stays a user-key handle, and
+    # one with no enrolled key is the typed credential_unavailable at the lease.
+    user_key_handles: dict[str, CredentialHandle] = {}
+    if positive_risk_user_id is not None:
+      if authenticated_session is None:
+        key_providers = frozenset(USER_KEY_PROVIDERS)
+      else:
+        key_providers = _enrolled_batch_user_key_providers(
+          risk_user_id=positive_risk_user_id,
+          authenticated_session=authenticated_session,
+        )
+      user_key_handles = {
+        provider: CredentialHandle(
+          handle_id=user_key_handle_id(risk_user_id=positive_risk_user_id, provider=provider),
+          provider=provider,
+          principal="user",
+          tenant_id=tenant_id,
+          actor_id=actor_id,
+        )
+        for provider in USER_KEY_PROVIDERS
+        if provider in key_providers
+      }
+  except UserProviderKeyError as exc:
+    raise CapabilityResolutionError(
+      "credential_unavailable",
+      exc.user_message,
+      capability_id=SESSION_DRIVER_CAPABILITY,
+      model_key=required_bind.model_key if required_bind is not None else None,
+    ) from exc
+  for provider, handle in user_key_handles.items():
+    user_handles.setdefault(provider, handle)
+
+  def _deployment_served(provider: str) -> bool:
+    # Only an authenticated session keeps the deployment handle for a provider
+    # with no enrolled key; sessionless dispatch never does (N2).
+    return (
+      authenticated_session is not None
+      and provider in USER_KEY_PROVIDERS
+      and provider not in user_key_handles
+    )
+
+  for provider, handle in (
+    getattr(gateway_config, "service_provider_handles", {}) or {}
+  ).items():
+    if (
+      provider not in {*USER_KEY_PROVIDERS, "anthropic_bedrock"}
+      or _deployment_served(provider)
+      or (
+        service_admission is not None
+        and service_admission(handle, risk_user_id=risk_user_id)
+      )
+    ):
+      service_handles[provider] = handle
+  if session_handle is not None and session_handle.principal == "service":
+    if (
+      session_handle.provider not in {*USER_KEY_PROVIDERS, "anthropic_bedrock"}
+      or _deployment_served(session_handle.provider)
+      or (
+        service_admission is not None
+        and service_admission(
+          session_handle,
+          risk_user_id=risk_user_id,
+          auth_config=authenticated_session.auth_config if authenticated_session is not None else None,
+        )
+      )
+    ):
+      service_handles[session_handle.provider] = session_handle
+    else:
+      session_handle = None
+  for provider in service_handles:
+    if provider in user_key_handles and user_handles.get(provider) == user_key_handles[provider]:
+      del user_handles[provider]
 
   entitled_capabilities = frozenset(GATEWAY_EXECUTED_CAPABILITY_IDS)
   entitled_model_keys = frozenset(
@@ -831,7 +980,7 @@ def _batch_capability_execution_context(
     service_provider_handles=service_handles,
     entitled_capabilities=entitled_capabilities,
     entitled_model_keys=entitled_model_keys,
-    run_scoped_user_providers=frozenset(run_scoped_user_providers),
+    run_scoped_user_providers=frozenset(user_handles),
   )
   service_materializer = getattr(
     gateway_config,
@@ -847,6 +996,22 @@ def _batch_capability_execution_context(
     raise RuntimeError("batch capability adapter resolver is not configured")
 
   def _materialize(handle: CredentialHandle) -> MaterializedCredential:
+    key_identity = parse_user_key_handle_id(handle.handle_id)
+    if user_key_handles.get(handle.provider) == handle and key_identity is not None:
+      try:
+        lease = installed_user_key_pools().lease(
+          risk_user_id=key_identity[0],
+          provider=key_identity[1],
+          context=_batch_user_key_context(authenticated_session),
+        )
+      except UserProviderKeyError as exc:
+        raise CapabilityResolutionError(
+          "credential_unavailable",
+          exc.user_message,
+          capability_id=SESSION_DRIVER_CAPABILITY,
+          model_key=required_bind.model_key if required_bind is not None else None,
+        ) from exc
+      return MaterializedCredential(handle=handle, auth_config=lease.auth_config())
     if session_handle is not None and handle is session_handle:
       if authenticated_session is None:
         raise RuntimeError(
@@ -871,7 +1036,7 @@ def _batch_capability_execution_context(
       )
     materialized = service_materializer(
       handle,
-      user_scope=authenticated_session.risk_user_id if authenticated_session is not None else user_id,
+      user_scope=risk_user_id,
     )
     if not isinstance(materialized, MaterializedCredential):
       raise RuntimeError(
@@ -895,6 +1060,8 @@ def _batch_capability_execution_context(
       if authenticated_session is not None
       else None
     ),
+    risk_user_id=positive_risk_user_id,
+    user_key_handles=user_key_handles,
   )
   execution = (
     resolver.materialize_bind(required_bind)
@@ -1166,7 +1333,8 @@ async def dispatch_batch_in_process(
     (
       capability_execution_resolver,
       session_driver_execution,
-    ) = _batch_capability_execution_context(
+    ) = await asyncio.to_thread(
+      _batch_capability_execution_context,
       app_state=app_state,
       user_id=user_id,
       authenticated_session=authenticated_session,
@@ -1391,6 +1559,23 @@ async def _reconcile_batch_dispatch_replay(
   }
 
 
+def batch_launch_approval_settings(registry: Any, batch_id: int) -> ApprovalSettings:
+  """The snapshot the batch row holds, parsed by the approval owner.
+
+  A missing or malformed record is refused. This does not read the live file.
+  Both launch entries (the detached `POST /batches` task and the CLI
+  `run_batch` path through `run_acquired_batch`) pin what this returns.
+  """
+
+  try:
+    return ApprovalSettings.from_record(registry.launch_approval_settings(batch_id))
+  except RunSettingsError as exc:
+    raise ApprovalSettingsPinError(
+      f"Batch {batch_id} carries invalid approval settings ({exc}); "
+      "re-run it from the start."
+    ) from exc
+
+
 def _acquire_and_start_batch(
   payload: dict[str, Any],
   *,
@@ -1523,29 +1708,39 @@ def _acquire_and_start_batch(
         selection_snapshot=capture_selection_snapshot(
           capability_execution_resolver.selection_policy,
         ),
+        selection_provenance=default_root_provenance(
+          capability_execution_resolver.selection_policy,
+        ),
       )
       return _batch_backend(app_state).stage_admitter(
         parent, capability_execution_resolver, skill_application.operation_catalog
       )
 
-    return asyncio.create_task(
-      _run_acquired_batch_containing_system_exit(
-        _batch_backend(app_state).controller,
-        batch_id,
-        payload,
-        registry=registry,
-        parent_session=parent_session,
-        _identity=(user_id, user_email),
-        _on_finalize=None,
-        capability_execution_resolver=capability_execution_resolver,
-        session_driver_execution=session_driver_execution,
-        captured_run_context_factory=(
-          _captured_run_context_factory
-        ),
-        admit_stage_factory=_admit_stage_factory,
-        skill_application=skill_application,
-      )
-    )
+    launch_settings = batch_launch_approval_settings(registry, batch_id)
+
+    async def _run_pinned_batch() -> Any:
+      # The detached task is a headless run. Pin the row's launch snapshot
+      # for its whole body, including every stage and a parked continuation,
+      # so a later flip of the operator file cannot change a decision.
+      with pin_approval_settings(launch_settings):
+        return await _run_acquired_batch_containing_system_exit(
+          _batch_backend(app_state).controller,
+          batch_id,
+          payload,
+          registry=registry,
+          parent_session=parent_session,
+          _identity=(user_id, user_email),
+          _on_finalize=None,
+          capability_execution_resolver=capability_execution_resolver,
+          session_driver_execution=session_driver_execution,
+          captured_run_context_factory=(
+            _captured_run_context_factory
+          ),
+          admit_stage_factory=_admit_stage_factory,
+          skill_application=skill_application,
+        )
+
+    return asyncio.create_task(_run_pinned_batch())
 
   if scope is None:
     task = _create_batch_task()
@@ -1639,7 +1834,7 @@ async def _complete_authorized_batch_cancellation(
       batch_id=batch_id,
       authenticated=authenticated,
       app_state=app_state,
-      reason="batch_cancelled",
+      reason=BATCH_CANCELLED_REASON,
     )
     if approval_error is None:
       approval_error = warning
@@ -1702,7 +1897,7 @@ async def _complete_authorized_batch_cancellation(
         batch_id=batch_id,
         authenticated=None,
         app_state=app_state,
-        reason="batch_cancelled",
+        reason=BATCH_CANCELLED_REASON,
       )
       if approval_error is None:
         approval_error = warning
@@ -1748,17 +1943,13 @@ async def _complete_authorized_batch_cancellation(
       )
   batch_digest = registry.get_batch_digest(batch_id)
   if str(batch_digest.get("status") or "") not in _TERMINAL_BATCH_STATUSES:
-    transition = getattr(registry, "transition_status_if_current", None)
-    if callable(transition):
-      transitioned = transition(
-        batch_id,
-        "cancelled",
-        expected_statuses=set(_ACTIVE_BATCH_STATUSES),
-      )
-      if transitioned is True:
-        progress.boundary_crossed = True
-    else:
-      registry.set_status(batch_id, "cancelled")
+    transitioned = registry.transition_status_if_current(
+      batch_id,
+      "cancelled",
+      expected_statuses=set(_ACTIVE_BATCH_STATUSES),
+    )
+    if transitioned is True:
+      progress.boundary_crossed = True
     batch_digest = registry.get_batch_digest(batch_id)
     if str(batch_digest.get("status") or "") in _TERMINAL_BATCH_STATUSES:
       progress.boundary_crossed = True
@@ -2063,18 +2254,12 @@ def _force_rerun_retry_spec(batch: dict[str, Any], *, ticker: str) -> dict[str, 
 
 
 def _set_status_if_not_terminal(registry: Any, batch_id: int, status: str, *, error: str | None = None) -> None:
-  transition = getattr(registry, "transition_status_if_current", None)
-  if callable(transition):
-    transition(
-      batch_id,
-      status,
-      expected_statuses=set(_ACTIVE_BATCH_STATUSES),
-      error=error,
-    )
-    return
-  current_status = str(registry.get_batch_digest(batch_id).get("status") or "")
-  if current_status not in _TERMINAL_BATCH_STATUSES:
-    registry.set_status(batch_id, status, error=error)
+  registry.transition_status_if_current(
+    batch_id,
+    status,
+    expected_statuses=set(_ACTIVE_BATCH_STATUSES),
+    error=error,
+  )
 
 
 def _require_batch_user_event_bus(app_state: Any) -> object:

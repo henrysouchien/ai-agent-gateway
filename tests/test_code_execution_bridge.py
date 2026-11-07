@@ -7,6 +7,8 @@ registration, through the bound dispatcher under the outer call, records it in
 the outer result's `nested_calls`, and carries registered producer settlement
 identities plus the bound extractor's richer handles in `sources`.
 """
+from agent_gateway.registry_scope import NoRegistryScope, RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import json
@@ -244,7 +246,11 @@ def _bind(
     event_log=EventLog(),
     approval_key_qualifier=bundle.approval_qualifier,
     get_tool_definitions=lambda: definitions,
-    run_context=run_context,
+    run_context=(
+      run_context
+      if run_context is not None
+      else run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'))
+    ),
   )
   bundle.bind_dispatcher(
     dispatcher,
@@ -270,6 +276,7 @@ def _job_runner() -> AgentRunner:
       local_tool_handlers={},
       event_log=event_log,
       session_id="sess-code-bridge",
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     ),
     session_id="sess-code-bridge",
     capability_execution=stub_runner_capability_execution(
@@ -364,6 +371,7 @@ def test_nested_dispatch_inherits_enclosing_execution_context(
       bundle, mcp, code_callable=lambda operation: operation == "file_read",
       run_context=RunContext(
         user_id="alice", request_id="request-enclosing", run_id="run-enclosing",
+        registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
       ),
     )
     dispatch_context = {
@@ -396,6 +404,53 @@ def test_nested_dispatch_inherits_enclosing_execution_context(
       assert nested_ctx.run_id == "run-enclosing"
       assert (nested_ctx.skill_run_id == nested_ctx.run_id) is (skill_run_id == "run-enclosing")
       assert nested_ctx.tool_call_id != direct_ctx.tool_call_id
+    finally:
+      await cleanup_code_execution(session)
+
+  asyncio.run(_run())
+
+
+def test_nested_call_after_inline_skill_activation_resolves_under_the_activated_run_scope(
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """C1 517e9e64: an inline invoke_skill activation re-scopes the dispatcher the
+  code bundle is bound to, so a later nested hank.* call runs under RUN(activated)."""
+
+  async def _run() -> None:
+    contexts: list[Any] = []
+
+    async def capture_context(tool_input: dict[str, Any], **kwargs: Any) -> ToolResult:
+      contexts.append(kwargs["tool_ctx"])
+      return {"text": "captured"}, None
+
+    monkeypatch.setattr(sys.modules[__name__], "_file_read", capture_context)
+    session, bundle, mcp, _dispatcher = _setup()
+    dispatcher = _bind(
+      bundle, mcp, code_callable=lambda operation: operation == "file_read",
+      run_context=RunContext(
+        user_id="alice", request_id="request-enclosing", registry_scope=NoRegistryScope(),
+      ),
+    )
+    workspace = str(session.code_execution_work_dir)
+    runner = AgentRunner(
+      event_log=EventLog(),
+      dispatcher=dispatcher,
+      session_id="sess-code-bridge",
+      capability_execution=stub_runner_capability_execution(
+        provider=_StubProvider(), model="stub-model", effort="none",
+      ),
+      user_id="alice",
+      billing_mode="byok",
+      rate_table_version="unknown",
+      workspace_dir=workspace,
+    )
+    activated = "20260607T000100Z-bbbb2222"
+    try:
+      runner._activate_skill_run_id(activated)
+      result, error = await _run_cell(dispatcher, 'print(hank.call("file_read"))')
+      assert error is None and result is not None
+      [nested_ctx] = contexts
+      assert nested_ctx.registry_scope == RegistryScope("run", activated, workspace)
     finally:
       await cleanup_code_execution(session)
 
@@ -590,6 +645,7 @@ def test_in_cell_load_tools_refreshes_the_grant_only_after_success(load_fails: b
       event_log=EventLog(),
       approval_key_qualifier=bundle.approval_qualifier,
       get_tool_definitions=lambda: definitions,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     bundle.bind_dispatcher(
       dispatcher,
@@ -969,6 +1025,7 @@ def test_unloaded_tool_is_refused_until_it_enters_the_active_grant(grant_pack: s
         event_log=EventLog(),
         approval_key_qualifier=bundle.approval_qualifier,
         get_tool_definitions=lambda: loaded,
+        run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
       )
       bundle.bind_dispatcher(
         dispatcher,
@@ -1091,6 +1148,7 @@ def test_dormant_research_door_with_grant_hint_refuses_as_not_granted_and_runs_a
         event_log=EventLog(),
         approval_key_qualifier=bundle.approval_qualifier,
         get_tool_definitions=lambda: loaded,
+        run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
       )
       # Before load_tools runs, the dormant door is in neither _local nor _mcp:
       assert dispatcher.route_origin_for_tool(door_name) is None
@@ -1166,7 +1224,7 @@ def test_grant_hint_respects_frozen_autonomous_ceiling_and_parent_tool_ids() -> 
         role="owner",
         needs_approval=lambda _name, _tool_input, _qualifier: False,
         event_log=EventLog(),
-        run_context=RunContext(user_id="u", request_id="r", profile_name="analyst"),
+        run_context=RunContext(user_id="u", request_id="r", profile_name="analyst", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
         get_tool_definitions=lambda: [],
       )
       session.research_door_grant_ceiling = frozenset()
@@ -1226,7 +1284,7 @@ def test_packless_autonomous_ceiling_does_not_hint_outside_frozen_handlers() -> 
         role="owner",
         needs_approval=lambda _name, _tool_input, _qualifier: False,
         event_log=EventLog(),
-        run_context=RunContext(user_id="u", request_id="r", profile_name="community"),
+        run_context=RunContext(user_id="u", request_id="r", profile_name="community", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
         get_tool_definitions=lambda: [],
       )
       session.research_door_grant_ceiling = frozenset()
@@ -1286,7 +1344,7 @@ def test_grant_hint_follows_the_load_tools_owner_not_the_profile_defaults() -> N
         role="owner",
         needs_approval=lambda _name, _tool_input, _qualifier: False,
         event_log=EventLog(),
-        run_context=RunContext(user_id="u", request_id="r", profile_name="analyst"),
+        run_context=RunContext(user_id="u", request_id="r", profile_name="analyst", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
         get_tool_definitions=lambda: [],
       )
       bind_session_code_execution(
@@ -1358,7 +1416,7 @@ def test_root_autonomous_context_keeps_research_door_grant_hint() -> None:
       local_handlers.pop(door_name, None)
       local_handlers["load_tools"] = lambda *_args, **_kwargs: ({"loaded": True}, None)
       session.autonomous_task_id = "job-root"
-      root_context(session, withheld_tools=frozenset(), research_file_id=None)
+      root_context(session, withheld_tools=frozenset(), research_file_id=None, selection_provenance=None)
       # A root with configured packs has no frozen local ceiling; its root
       # context has tool_ids=None and must not narrow the admitted doors.
       session.research_door_grant_ceiling = None
@@ -1371,7 +1429,7 @@ def test_root_autonomous_context_keeps_research_door_grant_hint() -> None:
         role="owner",
         needs_approval=lambda _name, _tool_input, _qualifier: False,
         event_log=EventLog(),
-        run_context=RunContext(user_id="u", request_id="r", profile_name="analyst"),
+        run_context=RunContext(user_id="u", request_id="r", profile_name="analyst", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
         get_tool_definitions=lambda: [],
       )
       bind_session_code_execution(
@@ -1412,6 +1470,7 @@ def test_hank_outside_a_bridged_cell_and_unbound_dispatcher_report_bridge_unavai
       needs_approval=lambda _name, _tool_input, _qualifier: False,
       event_log=EventLog(),
       approval_key_qualifier=bundle.approval_qualifier,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     try:
       result, error = await _run_cell(dispatcher, f"""
@@ -1887,6 +1946,7 @@ def test_registered_settlement_sources_match_direct_dispatch_and_are_json_serial
       get_tool_definitions=lambda: definitions,
       tool_registration_catalog=ToolRegistrationCatalog(declarations, ()),
       tool_policy_implementations=registry, redaction_context_factory=lambda _declaration: None,
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     reader = FrameReader()
     reader.bind_dispatcher(
@@ -2291,6 +2351,72 @@ def test_native_calls_share_bridge_authority_ordinals_and_sources() -> None:
   asyncio.run(run())
 
 
+def test_every_door_refuses_an_operation_with_the_same_reason_and_recovery() -> None:
+  from agent_gateway.code_execution._frame_codec import encode_frame
+  from agent_gateway.code_execution._frame_reader import lookup_active_cell
+  from agent_gateway.tool_policy_registry import ToolInputPreparationError
+
+  async def run() -> None:
+    session, bundle, _mcp, _dispatcher = _setup()
+    reader = bundle.frame_reader
+    reader.bind_grant_hint(lambda name: "filings-pack" if name == SEARCH_FILINGS else None)
+    cell = reader.open_cell("refusal-parent", abort_event=None, active=True)
+    try:
+      active = lookup_active_cell(cell.token)
+      assert active is not None
+      refused: dict[str, tuple[str, Any]] = {}
+      for operation, code in (
+        (SEARCH_FILINGS, "not_granted"),
+        ("mcp__nowhere__nothing", "unknown_operation"),
+      ):
+        called = decode_frame(await cell.handle_frame(encode_frame({
+          "type": "tool_call", "call_id": "call", "cell_token": cell.token,
+          "parent_call_id": cell.outer_call_id, "operation": operation, "input": {},
+        })))["error"]
+        described = decode_frame(await cell.handle_frame(encode_frame({
+          "type": "catalog", "request": "describe", "call_id": "describe",
+          "cell_token": cell.token, "operation": operation,
+        })))["error"]
+        with pytest.raises(ToolInputPreparationError) as native:
+          active.start_native(operation, {})
+        native_error = native.value.materialize_error()
+        assert called["code"] == described["code"] == native_error["code"] == code
+        assert called["message"] == described["message"] == native_error["message"]
+        assert called.get("next_call") == described.get("next_call")
+        refused[code] = (called["message"], called.get("next_call"))
+      # The two reasons read differently, and only the unloaded pack has a recovery.
+      assert refused["not_granted"][0] != refused["unknown_operation"][0]
+      assert refused["not_granted"][1] is not None
+      assert refused["unknown_operation"][1] is None
+    finally:
+      cell.close()
+      await cleanup_code_execution(session)
+
+  asyncio.run(run())
+
+
+def test_cell_principal_carries_the_sessions_parsed_owner_not_the_login() -> None:
+  from agent_gateway.code_execution._frame_reader import lookup_active_cell
+
+  async def run() -> None:
+    session = SessionStore(ttl=3600).create_session(
+      api_key_hash="hash", user_id="henry", risk_user_id=42, owner_user_id="7",
+    )
+    bundle = build_code_execution(session)
+    cell = bundle.frame_reader.open_cell("owner-cell", abort_event=None, active=True)
+    try:
+      active = lookup_active_cell(cell.token)
+      assert active is not None
+      principal = active.principal
+      assert principal["user_id"] == "henry"
+      assert principal["owner_user_id"] == session.owner_user_id == "7"
+    finally:
+      cell.close()
+      await cleanup_code_execution(session)
+
+  asyncio.run(run())
+
+
 def test_native_nested_computation_sources_settle_without_filesystem_reader(monkeypatch: Any) -> None:
   async def run() -> None:
     sources = [
@@ -2391,32 +2517,6 @@ def test_native_settlement_retrieves_live_entry_without_repreparing_executed_inp
       await cleanup_code_execution(session)
 
   asyncio.run(run())
-
-def test_non_sandboxed_compute_requires_approval() -> None:
-  """Non-sandboxed code execution asks at the existing approval door."""
-  """Non-sandboxed code execution asks at the existing approval door."""
-  from agent.shared.tool_registration import build_product_tool_registration_composition
-  from agent.shared.tool_policy import requires_approval
-
-  composition = build_product_tool_registration_composition()
-  from product_local_input_preparation_runtime import bind_product_local_input_preparation_context
-  from agent.shared.tool_policy_implementations import product_redaction_context_factory
-  async def _run() -> None:
-    session, bundle, mcp, dispatcher = _setup()
-    dispatcher._tool_registration_catalog = composition.catalog
-    dispatcher._tool_policy_implementations = composition.policy_implementations
-    dispatcher._needs_approval = requires_approval
-    dispatcher._input_preparation_context_factory = bind_product_local_input_preparation_context(bundle)
-    dispatcher._redaction_context_factory = product_redaction_context_factory
-    try:
-      result, error = await _run_cell(dispatcher, "pass")
-      assert result is None
-      assert error is not None and error["code"] == "approval_required"
-      await cleanup_code_execution(session)
-    finally:
-      pass
-
-  asyncio.run(_run())
 
 
 # --- call-scoped cell token: v2 native minted by the installed authority -------

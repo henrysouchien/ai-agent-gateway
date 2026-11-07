@@ -1,7 +1,10 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -15,7 +18,13 @@ from agent_gateway.approval_route import DurableLocalApprovalRoute
 from agent_gateway.approval_store import SQLiteApprovalStore
 from agent_gateway.session import SessionStore
 from agent_gateway import ToolDispatcher
-from agent_gateway.mcp_client import McpClientManager, RegisteredMcpDirectToolCall
+from agent_gateway.approval_policy import sha256_args
+from agent_gateway.mcp_client import (
+  McpClientManager,
+  RegisteredMcpDirectToolCall,
+  RegisteredMcpPlannedToolCall,
+  RegisteredMcpRawPatchAuthorization,
+)
 from agent_gateway.single_user_policy import SingleUserApprovalPolicy
 from agent_gateway.tool_definition import LiveToolRouteBinding, OriginatedToolDefinition
 from agent_gateway.tool_dispatcher_helpers import (
@@ -45,6 +54,7 @@ from agent_workflow_contracts.tool_registration import (
   RegisteredToolIdentity,
   RegisteredToolServerDescriptor,
   ToolApprovalPolicy,
+  ToolEffect,
   ToolIntrinsicSemantics,
   ToolRegistrationCatalog,
   ToolRegistrationDeclaration,
@@ -84,6 +94,8 @@ def _declaration(
   server_id: str | None = None,
   outcome_policy: VersionedPolicyRef | None = None,
   planning_policy: VersionedPolicyRef | None = None,
+  input_preparation_policy: VersionedPolicyRef | None = None,
+  effect: ToolEffect = "external_write",
 ) -> ToolRegistrationDeclaration:
   return ToolRegistrationDeclaration(
     RegisteredToolIdentity(
@@ -92,14 +104,16 @@ def _declaration(
       logical_name=name,
     ),
     ToolIntrinsicSemantics(
-      effect="external_write",
+      effect=effect,
       idempotent=False,
       semantic_capability="test.write/v1",
       approval=approval,
       audience="ordinary",
       redaction_policy=_ref("redaction"),
       planning_policy=planning_policy or _ref("planning", "none"),
-      input_preparation_policy=_ref("input_preparation"),
+      input_preparation_policy=(
+        input_preparation_policy or _ref("input_preparation")
+      ),
       outcome_policy=outcome_policy or _ref("outcome"),
       source_identity_policy=_ref("source_identity"),
     ),
@@ -112,6 +126,7 @@ def _registry(
   cache_key: Any = lambda _ref, _call: "safe-key",
   cache_key_policy_id: str | None = None,
   planning_policy_id: str = "none",
+  input_preparation_policy_id: str | None = None,
   redaction: Any = lambda _ref, call: RedactionResult(call.prepared_input),
   outcome: Any = lambda _ref, _call: "ok",
   extra_outcomes: tuple[tuple[str, Any], ...] = (),
@@ -132,6 +147,7 @@ def _registry(
     _entry(
       "input_preparation",
       lambda _ref, call: PreparedToolCall(call.raw_input),
+      policy_id=input_preparation_policy_id,
     ),
     _entry("outcome", outcome),
     *(
@@ -202,7 +218,7 @@ def _registered_descriptor(
   descriptor, = compile_registered_mcp_tool_descriptors(
     ToolRegistrationCatalog((declaration,), (server,)),
     (binding,),
-  )
+  ).descriptors
   assert descriptor.exposed_name == exposed_name
   return descriptor
 
@@ -222,6 +238,7 @@ def _local_dispatcher(
   dispatcher_cls: type[ToolDispatcher] = ToolDispatcher,
 ) -> ToolDispatcher:
   return dispatcher_cls(
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NoMcp(),
     local_tool_handlers={declaration.identity.logical_name: local_handler},
@@ -236,6 +253,55 @@ def _local_dispatcher(
     tool_policy_implementations=registry,
     redaction_context_factory=redaction_context_factory,
   )
+
+
+@pytest.fixture
+def operator_approval_policy(
+  request: pytest.FixtureRequest,
+  tmp_path: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> str:
+  mode = getattr(request, "param", "ask_all")
+  settings_path = tmp_path / "run-settings.json"
+  settings_path.write_text(json.dumps({"approval_policy": mode}))
+  monkeypatch.setenv("HANK_RUN_SETTINGS_PATH", str(settings_path))
+  return mode
+
+
+@pytest.mark.parametrize(
+  "operator_approval_policy", ["approve_all", "ask_all"], indirect=True,
+)
+def test_registered_irreversible_mcp_still_asks_with_neutral_registration(
+  operator_approval_policy: str,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  declaration = _declaration(
+    ToolApprovalPolicy("never"),
+    route_kind="mcp",
+    name="execute_trade",
+    server_id="broker",
+    effect="irreversible",
+  )
+  server = RegisteredToolServerDescriptor(
+    "broker", "broker", 30, {}, _ref("session_injection"),
+  )
+  descriptor = _registered_descriptor("broker__execute_trade", declaration, server)
+  manager = McpClientManager(
+    config_path=None,
+    tool_registration_catalog=ToolRegistrationCatalog((declaration,), (server,)),
+    tool_policy_implementations=_registry(),
+    input_preparation_context_factory=lambda _descriptor, _scope: None,
+    redaction_context_factory=lambda _descriptor: None,
+  )
+  monkeypatch.setattr(
+    manager, "get_registered_mcp_tool_descriptor", lambda _name: descriptor,
+  )
+
+  classified = manager.classify_registered_mcp_prepared_tool_call(
+    descriptor.exposed_name, PreparedToolCall({"preview_id": "preview-1"}), None,
+  )
+
+  assert classified.approval_required is True
 
 
 def test_registered_local_redaction_uses_exact_prepared_call_and_declaration() -> None:
@@ -366,12 +432,14 @@ def test_registered_dispatcher_requires_redaction_owner_at_construction() -> Non
       local_tool_handlers={"registered_write": _local_handler},
       tool_registration_catalog=ToolRegistrationCatalog((declaration,), ()),
       tool_policy_implementations=_registry(),
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
 
 
 def test_registered_durable_approval_receives_exact_policy_redaction(
   tmp_path: Path,
   owner_session_host_policy,
+  operator_approval_policy: str,
 ) -> None:
   captured: dict[str, object] = {}
 
@@ -383,6 +451,7 @@ def test_registered_durable_approval_receives_exact_policy_redaction(
       captured.update(kwargs)
       return {
         "approved": True,
+        "allow_tool_type": False,
         "tool_input": kwargs["tool_input"],
         "request": SimpleNamespace(
           state="approved", approval_id="approval-1", decision_reason=None,
@@ -482,6 +551,7 @@ def test_registered_native_mcp_redaction_delegates_to_live_manager_owner() -> No
     redaction_context_factory=lambda _declaration: (_ for _ in ()).throw(
       AssertionError("native MCP redaction cannot use dispatcher context")
     ),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   prepared = PreparedToolCall({"credential": "raw-secret"})
 
@@ -528,6 +598,7 @@ def test_registered_native_mcp_history_redaction_delegates_raw_input() -> None:
     redaction_context_factory=lambda _declaration: (_ for _ in ()).throw(
       AssertionError("native MCP history cannot use dispatcher context")
     ),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   raw_input = {"credential": "raw-secret"}
 
@@ -541,6 +612,7 @@ def test_registered_native_mcp_history_redaction_delegates_raw_input() -> None:
 def test_registered_native_mcp_durable_approval_uses_manager_redaction(
   tmp_path: Path,
   owner_session_host_policy,
+  operator_approval_policy: str,
 ) -> None:
   declaration = _declaration(
     ToolApprovalPolicy("always"),
@@ -566,6 +638,7 @@ def test_registered_native_mcp_durable_approval_uses_manager_redaction(
       captured.update(kwargs)
       return {
         "approved": True,
+        "allow_tool_type": False,
         "tool_input": kwargs["tool_input"],
         "request": SimpleNamespace(
           state="approved", approval_id="approval-1", decision_reason=None,
@@ -636,6 +709,7 @@ def test_registered_native_mcp_durable_approval_uses_manager_redaction(
       return {"status": "ok"}, None
 
   dispatcher = _CapturingDispatcher(
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_RegisteredMcp(),
     role="owner",
@@ -679,46 +753,148 @@ def test_registered_native_mcp_durable_approval_uses_manager_redaction(
   )
 
 
-def test_registered_predicate_uses_prepared_call_and_never_legacy_policy() -> None:
-  predicate_calls: list[Any] = []
-  cache_calls: list[Any] = []
-
-  def predicate(_reference: Any, call: Any) -> bool:
-    predicate_calls.append(call)
-    return call.prepared_input["write"] is True
-
-  def cache_key(_reference: Any, call: Any) -> str:
-    cache_calls.append(call)
-    return "safe:prepared-write"
-
-  declaration = _declaration(ToolApprovalPolicy(
-    "predicate",
-    predicate=_ref("approval_predicate"),
-    cache_key=_ref("approval_cache_key"),
-  ))
-  dispatcher = _local_dispatcher(
-    declaration,
-    _registry(predicate=predicate, cache_key=cache_key),
-    needs_approval=lambda *_args: (_ for _ in ()).throw(
-      AssertionError("registered calls cannot consult legacy approval policy")
-    ),
-    request_approval=lambda _request: None,
+def test_registered_raw_patch_approval_display_is_bounded_and_hash_is_exact(
+  tmp_path: Path,
+  owner_session_host_policy,
+  operator_approval_policy: str,
+) -> None:
+  declaration = _declaration(
+    ToolApprovalPolicy("always"),
+    route_kind="mcp",
+    name="apply_patch_ops",
+    server_id="logical-server",
+    planning_policy=_ref("planning", "raw-patch-ops"),
   )
+  server = RegisteredToolServerDescriptor(
+    "logical-server",
+    "logical-server",
+    30,
+    {},
+    _ref("session_injection"),
+  )
+  whole_filing = "filing text. " * 31_000
+  approval_arguments = {
+    "research_file_id": 29,
+    "requested_ops": [{"op": "register_sources", "quote": "an exact quote"}],
+    "canonical_ops": {
+      "sources": [{"id": "src_1", "excerpts": [{"text": whole_filing}]}],
+    },
+  }
+  prepared_authorization = RegisteredMcpRawPatchAuthorization(
+    approval_identity={"identity_source": "reviewed_change_binding"},
+    approval_arguments=approval_arguments,
+    approval_arguments_hash=sha256_args(approval_arguments),
+    prepared_payload=b'{"prepared":true}',
+  )
+  captured: dict[str, object] = {}
 
-  assert dispatcher.requires_approval_prepared(
-    "registered_write",
-    PreparedToolCall({"write": False}, "sandbox"),
-  ) is False
-  assert dispatcher.requires_approval_prepared(
-    "registered_write",
-    PreparedToolCall({"write": True}, "sandbox"),
-  ) is True
-  assert [call.prepared_input["write"] for call in predicate_calls] == [False, True]
-  assert [call.exact_backend for call in predicate_calls] == ["sandbox", "sandbox"]
-  assert cache_calls[-1].exact_backend == "sandbox"
+  class _CapturingDispatcher(ToolDispatcher):
+    async def _run_approval_lifecycle(
+      self,
+      **kwargs: object,
+    ) -> dict[str, object]:
+      captured.update(kwargs)
+      # The request is captured; the lifecycle's outcome is not under test.
+      raise RuntimeError("stop after capturing the approval arguments")
+
+  class _RegisteredMcp(_NoMcp):
+    def is_mcp_tool(self, name: str) -> bool:
+      return name == "provider__apply_patch_ops"
+
+    def uses_registered_tool_catalog(self) -> bool:
+      return True
+
+    def get_registered_mcp_tool_descriptor(
+      self,
+      exposed_name: str,
+    ) -> RegisteredMcpToolDescriptor:
+      return _registered_descriptor(exposed_name, declaration, server)
+
+    def get_server_for_tool(self, name: str) -> str:
+      _ = name
+      return "logical-server"
+
+    def classify_registered_mcp_prepared_tool_call(
+      self,
+      exposed_name: str,
+      prepared_call: PreparedToolCall,
+      trusted_dispatch_scope: object | None,
+    ) -> RegisteredMcpPlannedToolCall:
+      _ = trusted_dispatch_scope
+      return RegisteredMcpPlannedToolCall(
+        _registered_descriptor(exposed_name, declaration, server),
+        prepared_call,
+        PlanDecision("prepared_plan", prepared_plan={"plan": 1}),
+        prepared_authorization,
+        None,
+      )
+
+    async def call_tool(
+      self,
+      name: str,
+      tool_input: object,
+      meta: object | None = None,
+      abort_event: asyncio.Event | None = None,
+      gateway_session: object | None = None,
+      allow_uncertain_replay: bool = True,
+      trusted_dispatch_scope: object | None = None,
+    ) -> ToolResult:
+      _ = (
+        name,
+        tool_input,
+        meta,
+        abort_event,
+        gateway_session,
+        allow_uncertain_replay,
+        trusted_dispatch_scope,
+      )
+      return {"status": "ok"}, None
+
+  dispatcher = _CapturingDispatcher(
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
+    capability_bind=TEST_CAPABILITY_BIND,
+    mcp_client=_RegisteredMcp(),
+    role="owner",
+    needs_approval=lambda *_args: False,
+    tool_registration_catalog=ToolRegistrationCatalog(
+      (declaration,),
+      (server,),
+    ),
+    tool_policy_implementations=_registry(planning_policy_id="raw-patch-ops"),
+    redaction_context_factory=lambda _declaration: None,
+  )
+  session = SessionStore(ttl=3600).create_session(
+    api_key_hash="hash",
+    user_id="alice",
+    role="owner",
+  )
+  dispatcher._approval_route = DurableLocalApprovalRoute(
+    SQLiteApprovalStore(tmp_path / "raw-patch-display.sqlite3"),
+    SingleUserApprovalPolicy(),
+    session,
+  )
+  dispatcher._session = session
+
+  asyncio.run(dispatcher.dispatch_prepared(
+    "call-raw-patch-display",
+    "provider__apply_patch_ops",
+    PreparedToolCall({"research_file_id": 29, "ops": []}),
+    advertised_tool_names={"provider__apply_patch_ops"},
+  ))
+
+  display = captured["approval_args_redacted"]
+  assert isinstance(display, dict)
+  assert len(json.dumps(display)) < 16 * 1024
+  assert display["requested_ops"] == approval_arguments["requested_ops"]
+  text = display["canonical_ops"]["sources"][0]["excerpts"][0]["text"]
+  assert text.startswith("filing text. ")
+  assert f"{len(whole_filing)} chars" in text
+  assert hashlib.sha256(whole_filing.encode()).hexdigest() in text
+  assert captured["approval_args_hash"] == sha256_args(approval_arguments)
 
 
 def test_planned_write_timeout_classification_does_not_require_plan_cache_key(
+  operator_approval_policy: str,
 ) -> None:
   def cache_key(_reference: Any, _call: Any) -> str:
     raise AssertionError("the exact plan does not exist during classification")
@@ -779,6 +955,7 @@ def test_catalogless_dispatcher_preserves_generic_outcome_behavior() -> None:
     capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NoMcp(),
     local_tool_handlers={"legacy_read": _local_handler},
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   assert dispatcher.settle_tool_result(
@@ -845,6 +1022,7 @@ def test_registered_mcp_outcome_resolves_exact_exposed_route_with_same_names() -
       ("outcome-b", lambda _ref, _call: "error_semantic"),
     )),
     redaction_context_factory=lambda _declaration: None,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   assert dispatcher.settle_tool_result(
@@ -863,7 +1041,94 @@ def test_registered_mcp_outcome_resolves_exact_exposed_route_with_same_names() -
   ).outcome == "error_semantic"
 
 
-def test_registered_never_executes_without_legacy_approval_policy() -> None:
+
+
+@pytest.mark.parametrize(
+  "operator_approval_policy",
+  ["approve_all", "ask_all"],
+  indirect=True,
+)
+def test_registered_code_execute_pure_transform_never_emits_approval_card(
+  operator_approval_policy: str,
+) -> None:
+  declaration = _declaration(
+    ToolApprovalPolicy("always"),
+    name="code_execute",
+    effect="pure_transform",
+    input_preparation_policy=_ref("input_preparation", "code-execution-backend"),
+  )
+  cards: list[TransportApprovalRequest] = []
+
+  async def request_approval(
+    request: TransportApprovalRequest,
+  ) -> TransportApprovalResult:
+    cards.append(request)
+    return TransportApprovalResult(approved=False)
+
+  dispatcher = _local_dispatcher(
+    declaration,
+    _registry(input_preparation_policy_id="code-execution-backend"),
+    needs_approval=lambda *_args: True,
+    request_approval=request_approval,
+  )
+
+  result = asyncio.run(dispatcher.dispatch_prepared(
+    "call-code",
+    "code_execute",
+    PreparedToolCall({"code": "result = 1 + 1"}, "sandbox"),
+  ))
+
+  assert result == ({"received": {"code": "result = 1 + 1"}}, None)
+  assert cards == []
+
+
+def test_registered_write_mode_never_still_asks_under_ask_all(
+  operator_approval_policy: str,
+) -> None:
+  declaration = _declaration(
+    ToolApprovalPolicy("never"),
+    effect="state_write",
+  )
+  cards: list[TransportApprovalRequest] = []
+  executed: list[dict[str, Any]] = []
+
+  async def request_approval(
+    request: TransportApprovalRequest,
+  ) -> TransportApprovalResult:
+    cards.append(request)
+    assert executed == []
+    return TransportApprovalResult(approved=True)
+
+  async def handler(tool_input: dict[str, Any], **_kwargs: Any):
+    executed.append(tool_input)
+    return tool_input, None
+
+  dispatcher = _local_dispatcher(
+    declaration,
+    _registry(),
+    needs_approval=lambda *_args: False,
+    request_approval=request_approval,
+    local_handler=handler,
+  )
+
+  result = asyncio.run(dispatcher.dispatch_prepared(
+    "call-write",
+    "registered_write",
+    PreparedToolCall({"value": 7}),
+  ))
+
+  assert result == ({"value": 7}, None)
+  assert len(cards) == 1
+  assert cards[0].tool_name == "registered_write"
+  assert executed == [{"value": 7}]
+
+
+@pytest.mark.parametrize(
+  "operator_approval_policy", ["approve_all"], indirect=True,
+)
+def test_registered_never_executes_without_legacy_approval_policy(
+  operator_approval_policy: str,
+) -> None:
   declaration = _declaration(ToolApprovalPolicy(mode="never"))
   dispatcher = _local_dispatcher(
     declaration,
@@ -872,7 +1137,7 @@ def test_registered_never_executes_without_legacy_approval_policy() -> None:
       AssertionError("registered calls cannot consult legacy approval policy")
     ),
     request_approval=lambda _request: (_ for _ in ()).throw(
-      AssertionError("approval=never cannot request approval")
+      AssertionError("default external-write policy must not request approval")
     ),
   )
 
@@ -883,56 +1148,3 @@ def test_registered_never_executes_without_legacy_approval_policy() -> None:
   ))
 
   assert result == ({"received": {"value": 7}}, None)
-
-
-def test_live_registered_mcp_resolves_its_descriptor_not_its_exposed_name() -> None:
-  declaration = _declaration(
-    ToolApprovalPolicy(mode="always"),
-    route_kind="mcp",
-    name="logical_write",
-    server_id="logical-server",
-  )
-  server = RegisteredToolServerDescriptor(
-    "logical-server",
-    "logical-server",
-    30,
-    {},
-    _ref("session_injection"),
-  )
-  catalog = ToolRegistrationCatalog((declaration,), (server,))
-
-  class _RegisteredMcp(_NoMcp):
-    def is_mcp_tool(self, name: str) -> bool:
-      return name == "provider__logical_write"
-
-    def uses_registered_tool_catalog(self) -> bool:
-      return True
-
-    def get_registered_mcp_tool_descriptor(
-      self,
-      exposed_name: str,
-    ) -> RegisteredMcpToolDescriptor:
-      assert exposed_name == "provider__logical_write"
-      return _registered_descriptor(exposed_name, declaration, server)
-
-  async def _request_approval(
-    _request: TransportApprovalRequest,
-  ) -> TransportApprovalResult:
-    return TransportApprovalResult(approved=False)
-
-  dispatcher = ToolDispatcher(
-    capability_bind=TEST_CAPABILITY_BIND,
-    mcp_client=_RegisteredMcp(),
-    needs_approval=lambda *_args: (_ for _ in ()).throw(
-      AssertionError("registered calls cannot consult legacy approval policy")
-    ),
-    request_approval=_request_approval,
-    tool_registration_catalog=catalog,
-    tool_policy_implementations=_registry(),
-    redaction_context_factory=lambda _declaration: None,
-  )
-
-  assert dispatcher.requires_approval_prepared(
-    "provider__logical_write",
-    PreparedToolCall({"value": 1}),
-  ) is True

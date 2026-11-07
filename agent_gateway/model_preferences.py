@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 from threading import RLock
 import time
+from typing import Literal
 from uuid import UUID
 
 from model_authority.binding import ModelSelectionIntent
@@ -20,6 +21,64 @@ class ModelPresetReference:
   name: str
   policy_revision: str
   updated_at: int
+
+
+class StoredPreferenceError(ValueError):
+  """A stored preference or preset column whose SQLite type is not the schema's.
+
+  ``scope`` names which actor-visible row it is (``preference`` with its
+  ``capability_id``, ``user_preset`` or ``firm_preset``) so the HTTP boundary
+  can name the repair that row's owner has. The stored bytes are not changed.
+  """
+
+  def __init__(
+    self,
+    message: str,
+    *,
+    column: str,
+    scope: Literal["preference", "user_preset", "firm_preset"],
+    capability_id: str | None = None,
+  ) -> None:
+    super().__init__(message)
+    self.column = column
+    self.scope = scope
+    self.capability_id = capability_id
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredRow:
+  """One stored row parsed once into typed columns.
+
+  SQLite affinity lets a BLOB or number sit in a TEXT column, and a BLOB in an
+  INTEGER column; neither is ever a key, a name or a timestamp.
+  """
+
+  row: sqlite3.Row
+  scope: Literal["preference", "user_preset", "firm_preset"]
+  capability_id: str | None = None
+
+  def _refuse(self, column: str, expected: str, value: object) -> StoredPreferenceError:
+    return StoredPreferenceError(
+      f"stored preference column {column} must be {expected}, got {type(value).__name__}",
+      column=column,
+      scope=self.scope,
+      capability_id=self.capability_id,
+    )
+
+  def text(self, column: str) -> str:
+    value = self.row[column]
+    if type(value) is not str:
+      raise self._refuse(column, "text", value)
+    return value
+
+  def optional_text(self, column: str) -> str | None:
+    return None if self.row[column] is None else self.text(column)
+
+  def integer(self, column: str) -> int:
+    value = self.row[column]
+    if type(value) is not int:
+      raise self._refuse(column, "an integer", value)
+    return value
 
 
 class ModelPreferenceStore:
@@ -117,9 +176,10 @@ class ModelPreferenceStore:
       ).fetchone()
     if row is None:
       return None
+    stored = _StoredRow(row, "preference", capability)
     return ModelSelectionIntent(
-      model_key=str(row["model_key"]),
-      effort=str(row["effort"]) if row["effort"] is not None else None,
+      model_key=stored.text("model_key"),
+      effort=stored.optional_text("effort"),
       source="saved_preference",
     )
 
@@ -196,13 +256,17 @@ class ModelPreferenceStore:
     return tenant, actor
 
   @staticmethod
-  def _preset_reference(row: sqlite3.Row | None) -> ModelPresetReference | None:
+  def _preset_reference(
+    row: sqlite3.Row | None,
+    scope: Literal["user_preset", "firm_preset"],
+  ) -> ModelPresetReference | None:
     if row is None:
       return None
+    stored = _StoredRow(row, scope)
     return ModelPresetReference(
-      name=str(row["name"]),
-      policy_revision=str(row["policy_revision"]),
-      updated_at=int(row["updated_at"]),
+      name=stored.text("name"),
+      policy_revision=stored.text("policy_revision"),
+      updated_at=stored.integer("updated_at"),
     )
 
   def get_user_preset(
@@ -217,7 +281,7 @@ class ModelPreferenceStore:
         """,
         identity,
       ).fetchone()
-    return self._preset_reference(row)
+    return self._preset_reference(row, "user_preset")
 
   def put_user_preset(
     self, *, tenant_id: str, actor_id: str, name: str, policy_revision: str,
@@ -268,7 +332,7 @@ class ModelPreferenceStore:
         """,
         (identity,),
       ).fetchone()
-    return self._preset_reference(row)
+    return self._preset_reference(row, "firm_preset")
 
   def put_firm_preset(
     self, *, commercial_account_id: UUID, name: str, policy_revision: str,
@@ -301,4 +365,4 @@ class ModelPreferenceStore:
       return cursor.rowcount > 0
 
 
-__all__ = ["ModelPreferenceStore", "ModelPresetReference"]
+__all__ = ["ModelPreferenceStore", "ModelPresetReference", "StoredPreferenceError"]

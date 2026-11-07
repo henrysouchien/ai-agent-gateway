@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+
 from test_code_execution_bridge import (
   FRED_SERIES, GET_FILINGS, _filings_extractor, _policy, _run_cell, _setup,
   _CaptureMcp, _DISPATCH_SEMANTICS, _bind,

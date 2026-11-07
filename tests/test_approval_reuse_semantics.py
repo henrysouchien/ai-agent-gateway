@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
@@ -66,7 +68,7 @@ def _request(
     tool_class="state_write",
     tool_args_redacted={"ticker": "AAPL"},
     args_hash="args-hash",
-    run_context=RunContext(user_id="alice", request_id="request-1"),
+    run_context=RunContext(user_id="alice", request_id="request-1", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     approval_reuse_mode=mode,  # type: ignore[arg-type]
     approval_reuse_key=key,
   )
@@ -162,7 +164,7 @@ def test_resume_cannot_change_approval_reuse_identity(tmp_path: Any) -> None:
       SingleUserApprovalPolicy(),
       SessionStore(ttl=3600).create_session(api_key_hash="hash", user_id="alice"),
     ),
-    run_context=RunContext(user_id="alice", request_id="request-resume"),
+    run_context=RunContext(user_id="alice", request_id="request-resume", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
   with pytest.raises(RuntimeError, match="constraint changed"):
@@ -250,7 +252,7 @@ def test_disabled_reuse_skips_lookup_and_disallows_persistence() -> None:
   decision = _run(policy.decide(
     payload=payload,
     request=request,
-    run_context=RunContext(user_id="alice", request_id="request-1"),
+    run_context=RunContext(user_id="alice", request_id="request-1", registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   ))
 
   assert decision.outcome == "auto_approve"
@@ -333,6 +335,7 @@ def test_dynamic_ask_disables_registered_exact_reuse() -> None:
     tool_registration_catalog=ToolRegistrationCatalog((declaration,), ()),
     tool_policy_implementations=registry,
     redaction_context_factory=lambda _declaration: None,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   captured: dict[str, Any] = {}
 

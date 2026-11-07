@@ -1015,6 +1015,7 @@ def test_strict_current_query_validates_after_bounded_page_is_full(
     for seq in range(1, 101)
   ]
   rows[90] = b'{"seq":91,"timestamp":91,"event": BROKEN\n'
+  rows[95] = b'{"seq":96,"timestamp":96,"event": BROKEN\n'
   active.write_bytes(b"".join(rows))
 
   with pytest.raises(session_log_module.AgentSessionLogCurrentIntegrityError):

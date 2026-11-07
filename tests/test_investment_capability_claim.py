@@ -1,12 +1,13 @@
 # ruff: noqa: E402
 
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 
 import asyncio
 import base64
 import hashlib
-import inspect
 import json
 import sys
 from pathlib import Path
@@ -218,6 +219,7 @@ def _dispatcher(
       withheld_tools=frozenset(),
       research_binding=AdmittedResearchBinding(research_file_id=2),
       approval_route=NO_APPROVAL_ROUTE,
+      selection_provenance=None,
     ),
   )
   return ToolDispatcher(
@@ -241,6 +243,7 @@ def _dispatcher(
       admitted_skill_execution_limits=_limits_for_skill(skill),
       research_file_id=research_file_id,
       policy_bundle_hash=policy_bundle_hash,
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
   )
 
@@ -424,9 +427,6 @@ def test_claim_grant_is_the_bound_skill_declaration(
       tool_name="get_investment_run",
       skill="market-scan",
     )
-  assert "approved_budget" not in inspect.signature(
-    issue_investment_capability_claim
-  ).parameters
 
 
 def test_market_scan_claim_is_exact_and_has_no_quant_budget_or_origin(
@@ -1560,6 +1560,7 @@ def test_sessionless_job_dispatch_returns_typed_issuer_unavailable(
       run_id="sessionless-job",
       profile="analyst",
       channel="excel",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
   )
   result, error = _dispatch(
@@ -1598,6 +1599,7 @@ def test_uncaptured_session_returns_typed_job_principal_gap(
     channel="excel",
     role="owner",
     mcp_meta_inject_servers=frozenset({"idea-workbench-mcp"}),
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   result, error = _dispatch(
     dispatcher, tool_call_id="call-uncaptured-job", tool_name=tool_name,
@@ -1625,6 +1627,7 @@ def test_session_without_admitted_tenant_cannot_mint_job_principal(
       withheld_tools=frozenset(),
       research_binding=AdmittedResearchBinding(),
       approval_route=NO_APPROVAL_ROUTE,
+      selection_provenance=None,
     ),
   )
   result, error = _dispatch(
@@ -1652,6 +1655,7 @@ def test_sessionless_dispatch_identity_retains_actual_admitted_tenant(
     withheld_tools=frozenset(),
     research_binding=AdmittedResearchBinding(),
     approval_route=NO_APPROVAL_ROUTE,
+    selection_provenance=None,
   )
   identity = DispatchIdentity(
     context=admitted if tenant is not None else None,
@@ -1676,6 +1680,7 @@ def test_sessionless_dispatch_identity_retains_actual_admitted_tenant(
       run_id=admitted.job_id,
       profile="analyst",
       channel="excel",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
   )
   result, error = _dispatch(
@@ -1809,6 +1814,7 @@ def test_in_process_child_context_precedes_parent_credential_session(
       run_id=child_context.job_id,
       profile="analyst",
       channel="excel",
+      registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store'),
     ),
   )
   executing_context = child_dispatcher._executing_context()

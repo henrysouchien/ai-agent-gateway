@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import sys
@@ -85,6 +87,7 @@ def _make_runner(*, stream_stall_timeout: float | None = None) -> AgentRunner:
     local_tool_handlers={},
     event_log=event_log,
     session_id="sess_watchdog",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   return AgentRunner(
     event_log=event_log,
@@ -194,6 +197,7 @@ def test_runner_preserves_extra_auth_config_keys_for_provider_create_client() ->
     local_tool_handlers={},
     event_log=EventLog(),
     session_id="sess_passthrough",
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   runner = AgentRunner(
     event_log=EventLog(),

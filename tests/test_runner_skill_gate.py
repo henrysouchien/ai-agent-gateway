@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import DeclaredRegistryScope, NoRegistryScope, RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import sys
 from pathlib import Path
@@ -48,21 +50,31 @@ def _capability_execution():
   )
 
 
-def _make_dispatcher(event_log: EventLog | None = None) -> ToolDispatcher:
+def _make_dispatcher(
+  event_log: EventLog | None = None,
+  *,
+  registry_scope: DeclaredRegistryScope = RegistryScope("run", "test-run", "/tmp/test-store"),
+) -> ToolDispatcher:
   return ToolDispatcher(
     capability_bind=TEST_CAPABILITY_BIND,
     mcp_client=_NullMcpClient(),
     local_tool_handlers={},
     event_log=event_log or EventLog(),
     session_id="sess-skill-gate",
+    run_context=run_context_for_test(registry_scope=registry_scope),
   )
 
 
-def _make_runner(tool_names: list[str] | None = None) -> AgentRunner:
+def _make_runner(
+  tool_names: list[str] | None = None,
+  *,
+  registry_scope: DeclaredRegistryScope = NoRegistryScope(),
+  workspace_dir: str | None = None,
+) -> AgentRunner:
   event_log = EventLog()
   return AgentRunner(
     event_log=event_log,
-    dispatcher=_make_dispatcher(event_log),
+    dispatcher=_make_dispatcher(event_log, registry_scope=registry_scope),
     session_id="sess-skill-gate",
     capability_execution=_capability_execution(),
     excluded_tools={"always_hidden"},
@@ -70,6 +82,7 @@ def _make_runner(tool_names: list[str] | None = None) -> AgentRunner:
     user_id="alice",
     billing_mode="byok",
     rate_table_version="unknown",
+    workspace_dir=workspace_dir,
   )
 
 
@@ -117,7 +130,6 @@ def test_default_tool_definitions_falls_back_to_mcp_client_and_empty_list() -> N
 
   assert default_tool_definitions(None, _McpClientWithTools(mcp_tools)) is mcp_tools
   assert default_tool_definitions(None, None) == []
-  assert gateway_runner._default_tool_definitions is default_tool_definitions
   assert _make_runner_with_mcp_tools(mcp_tools)._default_tool_definitions() is mcp_tools
 
 
@@ -146,9 +158,11 @@ def test_runner_skill_gate_delegates_filter_and_activate() -> None:
 
 def test_runner_skill_run_id_rotates_only_outside_top_level_lifecycle() -> None:
   runner = _make_runner(["read"])
+  old_context = runner._dispatcher.run_context
   runner._skill_run_id = "20260607T000000Z-aaaa1111"
   runner._activate_skill_run_id("20260607T000100Z-bbbb2222")
   assert runner._skill_run_id == "20260607T000100Z-bbbb2222"
+  assert runner._dispatcher.run_context is old_context
 
   runner._activate_skill_run_id(" not valid ")
   assert runner._skill_run_id == "20260607T000100Z-bbbb2222"
@@ -156,3 +170,36 @@ def test_runner_skill_run_id_rotates_only_outside_top_level_lifecycle() -> None:
   runner._top_level_skill_lifecycle = object()  # type: ignore[assignment]
   runner._activate_skill_run_id("20260607T000200Z-cccc3333")
   assert runner._skill_run_id == "20260607T000100Z-bbbb2222"
+
+
+def test_inline_skill_run_activation_rebinds_no_registry_scope(tmp_path: Path) -> None:
+  workspace_dir = str(tmp_path)
+  runner = _make_runner(registry_scope=NoRegistryScope(), workspace_dir=workspace_dir)
+  old_context = runner._dispatcher.run_context
+  old_run_id = old_context.run_id
+  activated_run_id = "20260607T000100Z-bbbb2222"
+
+  runner._activate_skill_run_id(activated_run_id)
+
+  run_context = runner._dispatcher.run_context
+  assert run_context is not old_context
+  assert run_context.run_id == activated_run_id
+  assert run_context.registry_scope == RegistryScope("run", activated_run_id, workspace_dir)
+  assert old_context.run_id == old_run_id
+  assert old_context.registry_scope == NoRegistryScope()
+
+
+def test_inline_skill_run_activation_preserves_session_registry_scope(tmp_path: Path) -> None:
+  workspace_dir = str(tmp_path)
+  registry_scope = RegistryScope("session", "sess-skill-gate", workspace_dir)
+  runner = _make_runner(registry_scope=registry_scope, workspace_dir=workspace_dir)
+  old_context = runner._dispatcher.run_context
+  old_run_id = old_context.run_id
+  activated_run_id = "20260607T000100Z-bbbb2222"
+
+  runner._activate_skill_run_id(activated_run_id)
+
+  assert runner._skill_run_id == activated_run_id
+  assert runner._dispatcher.run_context is old_context
+  assert old_context.registry_scope is registry_scope
+  assert old_context.run_id == old_run_id

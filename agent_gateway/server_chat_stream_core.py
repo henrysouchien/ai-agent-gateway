@@ -161,6 +161,58 @@ async def cleanup_stream_subscriber(
     await gather_fn(pump_task, return_exceptions=True)
 
 
+class _CitationHoldProjection:
+  """Hold client output without changing the durable log or its sequence space."""
+
+  def __init__(self) -> None:
+    self._active = False
+    self._held: list[LogEntry] = []
+    self._turn_complete = False
+    self._check_started = False
+
+  def flush(self, *, withhold_text: bool = False) -> list[LogEntry]:
+    held = self._held
+    self._held = []
+    self._turn_complete = False
+    self._check_started = False
+    if withhold_text:
+      return [entry for entry in held if entry.event.get("type") != "text_delta"]
+    return held
+
+  def append(self, entry: LogEntry) -> list[LogEntry]:
+    event_type = entry.event.get("type")
+    if event_type == "citation_hold_active":
+      if entry.event.get("mode") != "hold":
+        raise ValueError("citation_hold_active requires hold mode")
+      released = self.flush()
+      self._active = True
+      return [*released, entry]
+    if not self._active:
+      return [entry]
+    if event_type == "answer_revision_started" and entry.event.get("mode") == "hold":
+      released = self.flush(withhold_text=True)
+      self._active = False
+      return [*released, entry]
+    if event_type in {
+      "tool_calls_planned", "tool_call_start", "tool_approval_request", "stream_complete", "error",
+    }:
+      return [*self.flush(), entry]
+    released = []
+    if event_type == "text_delta":
+      if self._turn_complete and not self._check_started:
+        released = self.flush()
+      self._held.append(entry)
+      return released
+    if self._held:
+      self._held.append(entry)
+      if event_type == "turn_complete":
+        self._turn_complete = True
+      elif event_type == "citation_check_started":
+        self._check_started = True
+      return []
+    return [entry]
+
+
 async def stream_subscriber_sse(
   *,
   session: GatewaySession,
@@ -185,21 +237,32 @@ async def stream_subscriber_sse(
 ) -> AsyncIterator[bytes]:
   event_log = active_turn.event_log
   terminal_sent = False
+  resume_after_seq = subscriber.last_sent_seq
+  last_read_seq = resume_after_seq
+  projection = _CitationHoldProjection()
 
-  def render(entry: Any) -> tuple[bytes | None, str | None, bool]:
-    """Return (chunk, adapted event type, fatal) for one log entry."""
-    subscriber.last_sent_seq = int(entry.seq)
-    event = event_for_wire_fn(entry, event_log)
+  def project(entry: LogEntry) -> list[LogEntry]:
+    nonlocal last_read_seq
+    last_read_seq = int(entry.seq)
     if write_transcript:
       write_turn_transcript_entry_fn(
         active_turn,
         int(entry.seq),
-        event,
+        event_for_wire_fn(entry, event_log),
         transcript_dir=transcript_dir,
         session_id=session.session_id,
         user_id=session.user_id,
         channel=channel,
       )
+    return projection.append(entry)
+
+  def visible(entries: list[LogEntry]) -> list[LogEntry]:
+    return [entry for entry in entries if int(entry.seq) > resume_after_seq]
+
+  def render(entry: Any) -> tuple[bytes | None, str | None, bool]:
+    """Return (chunk, adapted event type, fatal) for one log entry."""
+    subscriber.last_sent_seq = int(entry.seq)
+    event = event_for_wire_fn(entry, event_log)
 
     try:
       adapted_event = adapt_event_fn(event, session.schema_version)
@@ -255,15 +318,16 @@ async def stream_subscriber_sse(
       if pump_exc is not None and not log_has_terminal(event_log):
         event_log.close(str(pump_exc) or type(pump_exc).__name__)
 
-    for entry in (entry for entry in event_log.entries if int(entry.seq) > subscriber.last_sent_seq):
-      chunk, event_type, fatal = render(entry)
-      if chunk is not None:
-        yield chunk
-      if fatal:
-        terminal_sent = True
-        return
-      if event_type in TERMINAL_EVENT_TYPES:
-        terminal_sent = True
+    for pending_entry in (entry for entry in event_log.entries if int(entry.seq) > last_read_seq):
+      for entry in visible(project(pending_entry)):
+        chunk, event_type, fatal = render(entry)
+        if chunk is not None:
+          yield chunk
+        if fatal:
+          terminal_sent = True
+          return
+        if event_type in TERMINAL_EVENT_TYPES:
+          terminal_sent = True
     if terminal_sent:
       return
 
@@ -280,18 +344,25 @@ async def stream_subscriber_sse(
       reason = (str(pump_exc) or type(pump_exc).__name__) if pump_exc is not None else "stream closed"
       synthesized = [{"type": "error", "error": reason}]
     for event in synthesized:
-      entry = LogEntry(seq=subscriber.last_sent_seq + 1, timestamp=0.0, event=event)
-      chunk, event_type, fatal = render(entry)
-      if chunk is not None:
-        yield chunk
-      if fatal:
-        return
-      if event_type in TERMINAL_EVENT_TYPES:
-        terminal_sent = True
+      pending_entry = LogEntry(seq=last_read_seq + 1, timestamp=0.0, event=event)
+      for entry in visible(project(pending_entry)):
+        chunk, event_type, fatal = render(entry)
+        if chunk is not None:
+          yield chunk
+        if fatal:
+          return
+        if event_type in TERMINAL_EVENT_TYPES:
+          terminal_sent = True
 
   # Filtered log entries do not count as wire activity.
   keepalive_deadline = monotonic_fn() + keepalive_seconds
   try:
+    # Replay the prefix for state only: a cursor may start after the activation
+    # marker or inside a still-undecided draft.
+    for entry in event_log.entries:
+      if int(entry.seq) > resume_after_seq:
+        break
+      projection.append(entry)
     while True:
       try:
         item = await wait_for_fn(
@@ -309,16 +380,23 @@ async def stream_subscriber_sse(
         continue
 
       if item is done_marker:
+        for entry in visible(projection.flush()):
+          chunk, _event_type, fatal = render(entry)
+          if chunk is not None:
+            yield chunk
+          if fatal:
+            return
         return
 
-      chunk, event_type, fatal = render(item)
-      if chunk is not None:
-        keepalive_deadline = monotonic_fn() + keepalive_seconds
-        yield chunk
-      if fatal:
-        return
-      if event_type in TERMINAL_EVENT_TYPES:
-        terminal_sent = True
+      for entry in visible(project(item)):
+        chunk, event_type, fatal = render(entry)
+        if chunk is not None:
+          keepalive_deadline = monotonic_fn() + keepalive_seconds
+          yield chunk
+        if fatal:
+          return
+        if event_type in TERMINAL_EVENT_TYPES:
+          terminal_sent = True
   finally:
     await cleanup_stream_subscriber(active_turn, subscriber.subscriber_id)
 

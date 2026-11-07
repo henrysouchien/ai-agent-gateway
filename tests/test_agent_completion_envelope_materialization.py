@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
+from gateway_test_support.run_context_test_support import run_context_for_test
+from agent_gateway.registry_scope import NoRegistryScope
 
 import asyncio
 import hashlib
@@ -593,6 +595,7 @@ async def test_long_failure_reason_still_queues_completion(
     event_log=EventLog(),
     dispatcher=_NoDispatchDispatcher(
       capability_bind=_dispatcher_execution_557.bind,
+      run_context=run_context_for_test(registry_scope=NoRegistryScope()),
       mcp_client=McpClientManager(config_path=None),
       local_tool_handlers={},
       event_log=EventLog(),

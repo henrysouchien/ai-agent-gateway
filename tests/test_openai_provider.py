@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 # ruff: noqa: E402
 
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
@@ -61,6 +63,52 @@ def test_normalize_messages_missing_tool_result_carries_native_error() -> None:
       "data": {"next_call": None},
     },
   }
+
+
+def test_a_tool_result_message_with_text_beside_its_results_answers_its_calls() -> None:
+  # The request-tail reminders ride the last tool-result message, so that
+  # message holds text beside its results: it still answers its calls, and
+  # only a call with no result gets the synthetic one.
+  provider = OpenAIProvider()
+  model_info = provider.get_model_info("gpt-5.6")
+  messages = [
+    {"role": "user", "content": "go"},
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}},
+        {"type": "tool_use", "id": "call_2", "name": "lookup", "input": {}},
+      ],
+    },
+    {
+      "role": "user",
+      "content": [
+        {"type": "tool_result", "tool_use_id": "call_1", "content": "{}"},
+        {"type": "text", "text": "[reminder]"},
+      ],
+    },
+  ]
+
+  normalized = provider.normalize_messages(messages, model_info)
+
+  assert [message["role"] for message in normalized] == [
+    "user", "assistant", "user", "user",
+  ]
+  synthetic = normalized[2]["content"]
+  assert [block["tool_use_id"] for block in synthetic] == ["call_2"]
+  assert json.loads(synthetic[0]["content"])["error"]["code"] == "missing_tool_result"
+  assert normalized[3] == messages[2]
+
+  answered = [*messages[:2], {
+    **messages[2],
+    "content": [
+      messages[2]["content"][0],
+      {"type": "tool_result", "tool_use_id": "call_2", "content": "{}"},
+      messages[2]["content"][1],
+    ],
+  }]
+  assert provider.normalize_messages(answered, model_info) == answered
+
 
 
 class _EventStream:
@@ -938,6 +986,7 @@ def test_runner_executes_responses_tool_loop_and_replays_function_output() -> No
         auth_config={"api_key": "sk-test", "max_tokens": 512},
       )
   dispatcher = Dispatcher(
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     capability_bind=_dispatcher_execution_885.bind,
     mcp_client=McpClientManager(config_path=None),
     local_tool_handlers={"lookup": dispatch_lookup},
@@ -1134,6 +1183,7 @@ def test_standalone_runner_keeps_raw_execution_separate_from_safe_history(
     get_tool_definitions=lambda: [tool_definition],
     local_tool_class_resolver=lambda _name: "read",
     local_catalog_action_resolver=lambda _name: None,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
   session_log = AgentSessionLog(path=tmp_path / "sessions" / "redaction.jsonl")
   runner = AgentRunner(
@@ -1286,6 +1336,7 @@ def test_shipped_openai_alias_is_retained_by_real_agent_runner_response() -> Non
   execution = _shipped_openai_execution(Provider())
   event_log = EventLog(session_id="openai-reported-identity")
   dispatcher = Dispatcher(
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     capability_bind=execution.bind,
     mcp_client=McpClientManager(config_path=None),
     local_tool_handlers={},

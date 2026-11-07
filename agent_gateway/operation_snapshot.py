@@ -130,6 +130,7 @@ def build_agent_operation_snapshot(
   terminal_on_persist: bool = True,
   result_requires_persist: bool = False,
   children: Sequence[str] = (),
+  essential_routes: Sequence[str] = (),
 ) -> AgentOperationSnapshot:
   """Build the canonical immutable snapshot from scalar and wire values."""
 
@@ -179,6 +180,9 @@ def build_agent_operation_snapshot(
   child_names = _snapshot_sequence(children, field_name="children")
   if any(type(child_name) is not str for child_name in child_names):
     raise TypeError("children must contain strings")
+  essential = _snapshot_sequence(essential_routes, field_name="essential_routes")
+  if any(type(route) is not str for route in essential):
+    raise TypeError("essential_routes must contain strings")
   prompt_text = compose_operation_instructions(resolved_instructions)
   methodology = _contract_ref(
     namespace="skill-methodology",
@@ -214,6 +218,7 @@ def build_agent_operation_snapshot(
     terminal_on_persist=terminal_on_persist,
     result_requires_persist=result_requires_persist,
     children=child_names,
+    essential_routes=tuple(sorted(set(essential))),
     result_modes=("narrative",),
     projection_contracts=(),
   )

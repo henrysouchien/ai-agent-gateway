@@ -5,7 +5,10 @@ import os
 import uuid
 from typing import Any, Callable, Dict
 
-from agent_workflow_contracts.context_refs import project_persist_envelope_delta
+from agent_workflow_contracts.context_refs import (
+  project_persist_envelope_delta,
+  project_report_envelope_receipt,
+)
 from .autonomous_event_channel import autonomous_event_fits_frame
 from .tool_result_spill import SpillPublication, SpillSink, normalize_spill_sink, write_spill_set
 from .tool_result_semantics import status_error_has_detail
@@ -443,8 +446,20 @@ def _fms_terminal_entry(
   *,
   tool_name: str,
 ) -> Dict[str, Any] | None:
-  """The semantic receipt that stands for a settled ``fms_persist_*`` result."""
-  if not tool_name.startswith("fms_persist_") or is_error_tool_result_entry(entry, content):
+  """The semantic receipt that stands for a settled FMS door result.
+
+  ``fms_persist_*`` keeps the delta receipt (identity, refs, undo handle).
+  ``fms_report_*`` keeps only the analyst-facing outcome: filesystem paths and
+  citation-machinery instructions stay on the published artifact, never in the
+  text the model copies into the answer.
+  """
+  if is_error_tool_result_entry(entry, content):
+    return None
+  if tool_name.startswith("fms_persist_"):
+    project = project_persist_envelope_delta
+  elif tool_name.startswith("fms_report_"):
+    project = project_report_envelope_receipt
+  else:
     return None
   try:
     parsed_dict = json.loads(content)
@@ -452,7 +467,7 @@ def _fms_terminal_entry(
     return None
   if not isinstance(parsed_dict, dict):
     return None
-  delta = project_persist_envelope_delta(parsed_dict)
+  delta = project(parsed_dict)
   if delta is None:
     return None
   projected_entry = dict(entry)

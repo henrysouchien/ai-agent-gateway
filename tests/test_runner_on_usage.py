@@ -1,3 +1,5 @@
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 from gateway_test_support.autonomous_launch_test_support import TEST_CAPABILITY_BIND
 import asyncio
 import json
@@ -77,38 +79,6 @@ from gateway_test_support.capability_execution_test_support import (  # noqa: E4
 )
 
 
-def test_runner_usage_wrappers_resolve_parent_module_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
-  monkeypatch.setattr(gateway_runner, "_usage_has_tokens", lambda usage_totals: usage_totals.get("patched") == 1)
-  monkeypatch.setattr(gateway_runner, "_usage_delta", lambda before, after: {"patched": after["x"] - before["x"]})
-
-  assert AgentRunner._usage_has_tokens({"patched": 1}) is True
-  assert AgentRunner._usage_delta({"x": 2}, {"x": 5}) == {"patched": 3}
-
-  runner = object.__new__(AgentRunner)
-  runner._usage_user_id = "alice"
-  runner._full_session_id = "sess"
-  runner._request_id = "req"
-  runner._parent_turn_id = "turn"
-  runner._provider = _UsageProvider()
-  runner._rate_table_version = "v1"
-  runner._billing_mode = "metered"
-  runner._channel = "web"
-  runner._estimate_usage_cost = lambda _model, _usage_totals: CostEstimate(total=0.5)  # type: ignore[method-assign]
-  runner._dispatcher = SimpleNamespace(capture_spawning_turn=lambda: SimpleNamespace(context=None))  # type: ignore[assignment]
-  runner._model_fallback_hop = None
-  monkeypatch.setattr(gateway_runner, "time", SimpleNamespace(time=lambda: 42.0))
-  monkeypatch.setattr(
-    gateway_runner,
-    "_build_usage_event",
-    lambda **kwargs: {"patched": kwargs},
-  )
-
-  event = AgentRunner._build_usage_event(runner, model="model", usage_totals={"input_tokens": 1})
-  assert isinstance(event, dict)
-
-  assert event["patched"]["timestamp"] == 42.0
-  assert event["patched"]["cost_total"] == 0.5
-  assert event["patched"]["provider_name"] == "stub"
 
 
 def _run(coro):
@@ -1014,6 +984,7 @@ def _make_dispatcher(
     event_log=event_log or EventLog(),
     session_id="sess-parent",
     get_tool_definitions=None,
+    run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
   )
 
 
@@ -1695,9 +1666,10 @@ def test_spawn_sub_agent_emits_usage_with_parent_turn_id(tmp_path: Path) -> None
     created_at=1,
     expires_at=2,
     user_id="alice",
+    owner_user_id="alice",
     auth_config={"api_key": "k", "model": "claude-sonnet-4-6"},
   )
-  root_context(sub_session, withheld_tools=frozenset(), research_file_id=None)
+  root_context(sub_session, withheld_tools=frozenset(), research_file_id=None, selection_provenance=None)
   child_runner_ref: list[Any] = []
   result, error = _run(
     parent_runner.spawn_sub_agent(
@@ -1770,10 +1742,10 @@ def test_native_compaction_block_counts_once_in_session_summary(
   class _NativeCompactionProvider(_UsageProvider):
     def __init__(self) -> None:
       self.calls = 0
-      self.system_prompts: list[Any] = []
+      self.request_tails: list[Any] = []
 
     def build_request_params(self, **kwargs: Any) -> dict[str, Any]:
-      self.system_prompts.append(kwargs["system_prompt"])
+      self.request_tails.append(kwargs["messages"][-1]["content"])
       return {}
 
     async def stream(self, client: Any, params: dict[str, Any]):
@@ -1869,8 +1841,8 @@ def test_native_compaction_block_counts_once_in_session_summary(
   assert summaries[0].compaction_count == 1
   assert provider.calls == 2
   assert all(
-    "Context at 60%" in str(prompt)
-    for prompt in provider.system_prompts
+    "Context at 60%" in str(tail)
+    for tail in provider.request_tails
   )
   assert sum(
     entry.event.get("type") == "compaction"

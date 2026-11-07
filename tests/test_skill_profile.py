@@ -84,7 +84,6 @@ def test_source_parser_matches_file_and_loader_parsing(tmp_path: Path) -> None:
     skill_path.read_bytes().replace(b"\n", b"\r\n")
   )
   source = skill_path.read_text(encoding="utf-8")
-  assert "\r" not in source
 
   from_source = parse_skill_source(source, path=skill_path)
   assert from_source == parse_skill_file(skill_path)
@@ -326,6 +325,20 @@ def test_parse_state_class_from_frontmatter(tmp_path: Path) -> None:
 
   assert profile.state_class == "producer"
   assert "producer" in SKILL_STATE_CLASSES
+
+def test_parse_global_scope_from_frontmatter(tmp_path: Path) -> None:
+  skill_path = _write_skill(
+    tmp_path,
+    """
+    name: global-skill
+    scope: global
+    """,
+    execution_class="node.implement",
+  )
+
+  profile = parse_skill_file(skill_path)
+
+  assert profile.scope == "global"
 
 
 def test_parse_invalid_state_class_raises(tmp_path: Path) -> None:

@@ -3,15 +3,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-TESTS_DIR = Path(__file__).resolve().parent
-if str(TESTS_DIR) not in sys.path:
-  sys.path.insert(0, str(TESTS_DIR))
 
 from agent_gateway import AgentRunner, AgentSessionLog, TaskRegistry, TaskState
 from hank_model_transport.capability_execution import CapabilityExecutionResolver
@@ -19,7 +15,7 @@ from hank_model_transport.providers import ModelInfo, StreamEvent
 from agent_gateway.session import GatewaySession
 from agent_gateway.skills import SkillLoader
 from agent_gateway.sub_agent import (
-  make_resume_handler, make_run_agent_handler, make_run_agent_tool_def,
+  make_resume_handler, make_run_agent_handler,
 )
 from agent_gateway.transcript import reconstruct_messages_for_task
 from gateway_test_support.capability_execution_test_support import (
@@ -127,7 +123,7 @@ semantic_metadata:
     )
     session = GatewaySession(
       session_id="sess-parent", api_key_hash="hash", created_at=1, expires_at=2,
-      user_id="alice", role="owner",
+      user_id="alice", owner_user_id="alice", role="owner",
     )
 
     self.session = session
@@ -337,13 +333,6 @@ def test_live_child_interrupt_and_model_resume_preserve_sibling_and_authority(
   asyncio.run(case())
 
 
-def test_run_agent_schema_has_no_top_level_combinators() -> None:
-  schema = make_run_agent_tool_def()["input_schema"]
-
-  assert not {"oneOf", "anyOf", "allOf"} & set(schema)
-  assert {"objective", "interrupt", "resume", "additional_context"} <= set(
-    schema["properties"]
-  )
 
 
 def test_run_agent_resume_without_installed_resume_handler_is_structured(
@@ -556,7 +545,7 @@ def test_child_approval_continuation_retains_prepark_tool_use(
     live.session.approval_route = DurableLocalApprovalRoute(
       store, FixedOutcomeApprovalPolicy("request_user_approval"), live.session,
     )
-    root_context(live.session, withheld_tools=frozenset(), research_file_id=None)
+    root_context(live.session, withheld_tools=frozenset(), research_file_id=None, selection_provenance=None)
     live.require_approval = True
     live.provider.release["first"].set()
     try:

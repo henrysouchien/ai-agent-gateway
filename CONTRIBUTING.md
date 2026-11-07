@@ -15,7 +15,7 @@ If you only need one provider, install the matching extra instead.
 From the package root:
 
 ```bash
-pytest tests
+pytest --import-mode=importlib tests
 ```
 
 If you touch examples, it is also worth checking that the example entry points still parse:

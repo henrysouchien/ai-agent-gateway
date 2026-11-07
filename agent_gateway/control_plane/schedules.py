@@ -20,7 +20,12 @@ from fastapi import APIRouter, Body, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationInfo, field_validator, model_validator
 from model_authority.selection import capture_selection_snapshot
 
-from agent_gateway.admission import ParentContext, root_context, root_context_from_identity
+from agent_gateway.admission import (
+  ParentContext,
+  default_root_provenance,
+  root_context,
+  root_context_from_identity,
+)
 from agent_gateway.approval_route import ControlPlaneApprovalRoute
 from agent_workflow_contracts.models import AdmittedResearchBinding, AdmittedTenant
 from agent_gateway.autonomous_capability_handoff import AutonomousLaunchAdmissionRefused
@@ -37,6 +42,9 @@ from .runs_helpers import (
   _autonomous_task_for_user,
 )
 from .runs_models import DispatchScope
+from agent_gateway.artifact_paths import user_desk_root
+from agent_gateway.user_identity_mapping import parse_storage_identity
+from agent_gateway.session import session_owner_user_id
 
 
 logger = logging.getLogger(__name__)
@@ -119,32 +127,16 @@ def _parse_utc_datetime(value: Any) -> datetime | None:
   return parsed.astimezone(timezone.utc)
 
 
-def _user_data_dir(owner_user_id: object) -> Path:
-  # A user id is a path segment: user A's store must never resolve into user
-  # B's directory or outside the data root, so traversal segments are refused.
-  normalized = str(owner_user_id or "").strip()
-  if not normalized:
-    raise ValueError("user_id is required for per-user store access")
-  candidate = Path(normalized)
-  if candidate.is_absolute() or any(
-    part in {"", ".", ".."} for part in candidate.parts
-  ):
-    raise ValueError(
-      f"invalid user_id for filesystem-backed storage: {normalized!r}"
-    )
-  return user_data_dir() / "users" / normalized
+def schedule_store_path_for(owner_user_id: str) -> Path:
+  return user_desk_root(user_data_dir(), owner_user_id) / _AGENT_RUN_SCHEDULE_FILENAME
 
 
-def schedule_store_path_for(owner_user_id: object) -> Path:
-  return _user_data_dir(owner_user_id) / _AGENT_RUN_SCHEDULE_FILENAME
-
-
-def schedule_store_for(owner_user_id: object) -> "AgentRunScheduleStore":
+def schedule_store_for(owner_user_id: str) -> "AgentRunScheduleStore":
   return AgentRunScheduleStore(schedule_store_path_for(owner_user_id))
 
 
 def agent_run_schedule_users_root() -> Path:
-  return _user_data_dir("schedule-store-root-probe").parent
+  return user_data_dir() / "users"
 
 
 @dataclass(frozen=True)
@@ -555,16 +547,7 @@ def compute_agent_schedule_next_run_at(
 
 
 def _schedule_owner_user_id(session: GatewaySession) -> str:
-  owner_user_id = getattr(session, "owner_user_id", None)
-  if isinstance(owner_user_id, str) and owner_user_id.strip():
-    return owner_user_id.strip()
-  try:
-    risk_user_id = int(getattr(session, "risk_user_id", 0) or 0)
-  except (TypeError, ValueError):
-    risk_user_id = 0
-  if risk_user_id > 0:
-    return str(risk_user_id)
-  return str(session.user_id)
+  return session_owner_user_id(session)
 
 
 def _capability_fields(*, owned: bool, enabled: bool) -> dict[str, bool]:
@@ -681,6 +664,9 @@ class AgentRunScheduleStore:
     except (OSError, ValueError) as exc:
       self._mark_unreadable(exc)
       raise ScheduleStoreUnreadableError(self.path, exc) from exc
+    for item in schedules:
+      if item.get("kind") == _AGENT_RUN_SCHEDULE_KIND:
+        item["owner_user_id"] = parse_storage_identity(item.get("owner_user_id")).storage_id
     self._mark_readable()
     return payload
 
@@ -698,8 +684,7 @@ class AgentRunScheduleStore:
     return records
 
   def list_for_owner(self, owner_user_id: str) -> list[dict[str, Any]]:
-    owner = str(owner_user_id)
-    return [record for record in self._all_records() if str(record.get("owner_user_id") or "") == owner]
+    return [record for record in self._all_records() if record["owner_user_id"] == owner_user_id]
 
   def get_for_owner(self, owner_user_id: str, identifier: str) -> dict[str, Any] | None:
     normalized = str(identifier or "").strip()
@@ -738,7 +723,7 @@ class AgentRunScheduleStore:
 
     schedules = [item for item in stored.get("schedules") or [] if isinstance(item, dict)]
     if any(
-      str(item.get("owner_user_id") or "") == owner_user_id and str(item.get("name") or "") == payload.name
+      item.get("owner_user_id") == owner_user_id and str(item.get("name") or "") == payload.name
       for item in schedules
     ):
       raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Schedule name already exists")
@@ -804,7 +789,7 @@ class AgentRunScheduleStore:
     schedules = [item for item in stored.get("schedules") or [] if isinstance(item, dict)]
     target_index: int | None = None
     for index, item in enumerate(schedules):
-      if str(item.get("owner_user_id") or "") != owner_user_id:
+      if item.get("owner_user_id") != owner_user_id:
         continue
       if identifier in {str(item.get("schedule_id") or ""), str(item.get("name") or "")}:
         target_index = index
@@ -816,7 +801,7 @@ class AgentRunScheduleStore:
     if payload.name is not None and payload.name != record.get("name"):
       if any(
         index != target_index
-        and str(item.get("owner_user_id") or "") == owner_user_id
+        and item.get("owner_user_id") == owner_user_id
         and str(item.get("name") or "") == payload.name
         for index, item in enumerate(schedules)
       ):
@@ -879,7 +864,7 @@ class AgentRunScheduleStore:
     for item in schedules:
       if (
         deleted is None
-        and str(item.get("owner_user_id") or "") == owner_user_id
+        and item.get("owner_user_id") == owner_user_id
         and identifier in {str(item.get("schedule_id") or ""), str(item.get("name") or "")}
       ):
         deleted = dict(item)
@@ -1008,7 +993,7 @@ class AgentRunScheduleRunner:
   def __init__(
     self,
     *,
-    store_for: Callable[[object], AgentRunScheduleStore] = schedule_store_for,
+    store_for: Callable[[str], AgentRunScheduleStore] = schedule_store_for,
     users_root: Path | None = None,
     autonomous_registry: AutonomousRegistry,
     user_event_bus_factory: Callable[[], Any | None] | None = None,
@@ -1106,7 +1091,8 @@ class AgentRunScheduleRunner:
       store = self._stores_by_path.get(canonical)
       if store is None:
         try:
-          resolved = self.store_for(path.parent.name)
+          owner_user_id = parse_storage_identity(path.parent.name).storage_id
+          resolved = self.store_for(owner_user_id)
         except (TypeError, ValueError):
           logger.error("Skipping schedule store with invalid owner path: %s", path)
           continue
@@ -1127,7 +1113,7 @@ class AgentRunScheduleRunner:
     now: datetime | None = None,
   ) -> dict[str, Any] | None:
     exact_live_role = require_exact_role(live_role)
-    store = self.store_for(record.get("owner_user_id"))
+    store = self.store_for(record["owner_user_id"])
     return await self._fire_record(
       store,
       record,
@@ -1229,7 +1215,7 @@ class AgentRunScheduleRunner:
         parent = root_context_from_identity(
           tenant=AdmittedTenant(
             tenant_id=registry._tenant_id,
-            storage_id=str(record.get("owner_user_id") or ""),
+            storage_id=record["owner_user_id"],
             role=dispatch_role,
           ),
           job_id=claim_id or schedule_id,
@@ -1246,6 +1232,7 @@ class AgentRunScheduleRunner:
             if selection_policy is not None
             else None
           ),
+          selection_provenance=default_root_provenance(selection_policy),
         )
       dispatch_scope = dispatch.get("dispatch_scope")
       if not isinstance(dispatch_scope, dict):
@@ -1283,7 +1270,7 @@ class AgentRunScheduleRunner:
         channel=str(record.get("channel") or "web"),
         user_id=user_id,
         user_email=user_email,
-        owner_user_id=str(record.get("owner_user_id") or ""),
+        owner_user_id=record["owner_user_id"],
         user_slug=record.get("user_slug") if isinstance(record.get("user_slug"), str) else None,
         risk_user_id=record.get("risk_user_id") if isinstance(record.get("risk_user_id"), int) else None,
         user_aliases=record.get("user_aliases") if isinstance(record.get("user_aliases"), list) else None,
@@ -1521,7 +1508,7 @@ def build_schedules_router(
   *,
   auth: AuthManager,
   operator_schedule_backend: OperatorScheduleBackend | None = None,
-  agent_schedule_store_for: Callable[[object], AgentRunScheduleStore] | None = None,
+  agent_schedule_store_for: Callable[[str], AgentRunScheduleStore] | None = None,
   agent_schedule_runner: AgentRunScheduleRunner | None = None,
   dispatch_scope_validator: Callable[[Any, dict[str, Any]], Any] | None = None,
 ) -> APIRouter:
@@ -1705,6 +1692,9 @@ def build_schedules_router(
           capture_selection_snapshot(agent_schedule_runner.autonomous_registry.selection_policy)
           if agent_schedule_runner.autonomous_registry.selection_policy is not None
           else None
+        ),
+        selection_provenance=default_root_provenance(
+          agent_schedule_runner.autonomous_registry.selection_policy,
         ),
       ),
     )

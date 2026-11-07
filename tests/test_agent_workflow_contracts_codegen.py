@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -13,10 +12,7 @@ from jsonschema import Draft202012Validator
 
 from model_authority.binding import CAPABILITY_RESOLUTION_CODES
 from agent_workflow_contracts import parse_delivery_envelope
-
-
-ROOT = Path(__file__).resolve().parents[3]
-GENERATED = ROOT / "packages" / "agent-workflow-contracts" / "agent_workflow_contracts" / "generated"
+from gateway_test_support.agent_workflow_contracts_test_support import GENERATED
 
 
 

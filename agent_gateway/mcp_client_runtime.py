@@ -200,26 +200,38 @@ async def close_contexts(
   return failure
 
 
+class McpConfigError(ValueError):
+  """A configured MCP config file exists but is not a usable config document."""
+
+
 def read_claude_config(
   config_path: Path | None,
   *,
   json_load: Callable[[Any], Any],
-  logger: logging.Logger,
 ) -> dict[str, Any]:
+  """Return the config object, ``{}`` when no file is configured or it does not exist.
+
+  A file that exists but cannot be read, is not a JSON object, or carries a non-object
+  ``mcpServers`` raises ``McpConfigError``; it is never treated as an absent config.
+  """
   if config_path is None or not config_path.exists():
     return {}
 
   try:
     with open(config_path, "r", encoding="utf-8") as f:
       data = json_load(f)
-  except Exception as exc:
-    logger.warning("Failed to read %s: %s", config_path, exc)
-    return {}
+  except (OSError, ValueError) as exc:
+    raise McpConfigError(f"MCP config {config_path} is unreadable or not valid JSON: {exc}") from exc
 
-  return data if isinstance(data, dict) else {}
+  if not isinstance(data, dict):
+    raise McpConfigError(f"MCP config {config_path} must be a JSON object")
+  if "mcpServers" in data and not isinstance(data["mcpServers"], dict):
+    raise McpConfigError(f"MCP config {config_path} field 'mcpServers' must be a JSON object")
+  return data
 
 
 __all__ = [
+  "McpConfigError",
   "McpStdioTerminationFallbackFilter",
   "cancel_mcp_tool_call",
   "close_contexts",

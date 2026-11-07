@@ -15,6 +15,10 @@ import pytest
 from agent_gateway import approval_store as approval_store_module
 from agent_gateway.approval_policy import ApprovalRequest, ApprovalVote
 from agent_gateway.approval_store import (
+  BATCH_CANCELLED_REASON,
+  CONVERSATION_CLOSED_REASON,
+  GATEWAY_SHUTDOWN_REASON,
+  RUN_CANCELLED_REASON,
   PersistentGrantCancellationFenced,
   SQLiteApprovalStore,
 )
@@ -318,7 +322,7 @@ def test_post_commit_audit_failure_wake_recovers_same_process(
             expected_channel="tui",
             decider_id="owner",
             decider_role="owner",
-            decision_reason="run_cancelled",
+            decision_reason=RUN_CANCELLED_REASON,
             autonomous_delivery=_delivery(suffix),
           )
     finally:
@@ -406,6 +410,116 @@ def test_cancellation_fence_wins_before_publication(
     ):
       pytest.fail("fenced decision reached the append body")
   assert _get_delivery(store, "fenced")["state"] == "pending"
+
+
+def _cancel(
+  store: SQLiteApprovalStore,
+  suffix: str,
+  *,
+  decider_id: str,
+  decider_role: str | None = None,
+  decision_reason: str,
+) -> tuple[ApprovalRequest, bool, bool]:
+  return asyncio.run(
+    store.terminalize_pending_for_cancellation(
+      f"approval-{suffix}",
+      expected_tool_call_id=f"tool-{suffix}",
+      expected_user_id="owner",
+      expected_request_id=f"run-{suffix}",
+      expected_run_id=f"run-{suffix}",
+      expected_session_id=f"session-{suffix}",
+      expected_channel="tui",
+      decider_id=decider_id,
+      decider_role=decider_role,
+      decision_reason=decision_reason,
+    )
+  )
+
+
+def _vote_row_count(store: SQLiteApprovalStore, suffix: str) -> int:
+  connection = sqlite3.connect(store.path)
+  try:
+    row = connection.execute(
+      "SELECT COUNT(*) FROM approval_votes WHERE approval_id = ?",
+      (f"approval-{suffix}",),
+    ).fetchone()
+  finally:
+    connection.close()
+  return int(row[0])
+
+
+def test_cancellation_denies_pending_without_vote_and_first_terminal_wins(
+  tmp_path: Path,
+) -> None:
+  store = SQLiteApprovalStore(
+    tmp_path / "approvals.sqlite3",
+    audit_emitter=RecordingAuditEmitter(),
+  )
+  asyncio.run(store.create(_request("pending")))
+  cancelled, transitioned, identity_matches = _cancel(
+    store,
+    "pending",
+    decider_id="owner",
+    decider_role="owner",
+    decision_reason=RUN_CANCELLED_REASON,
+  )
+  assert (transitioned, identity_matches) == (True, True)
+  assert cancelled.state == "denied"
+  assert cancelled.decision == "denied"
+  assert cancelled.decision_reason == RUN_CANCELLED_REASON
+  assert _vote_row_count(store, "pending") == 0
+
+  repeated, transitioned, identity_matches = _cancel(
+    store,
+    "pending",
+    decider_id="other",
+    decision_reason=BATCH_CANCELLED_REASON,
+  )
+  assert (transitioned, identity_matches) == (False, True)
+  assert repeated.state == "denied"
+  assert repeated.decision_reason == RUN_CANCELLED_REASON
+
+  _create_decision(store, "decided")
+  decided, transitioned, identity_matches = _cancel(
+    store,
+    "decided",
+    decider_id="owner",
+    decision_reason=RUN_CANCELLED_REASON,
+  )
+  assert (transitioned, identity_matches) == (False, True)
+  assert decided.state == "approved"
+  assert decided.decision_reason == "reviewed"
+  assert _vote_row_count(store, "decided") == 1
+
+
+@pytest.mark.parametrize(
+  "reason",
+  [
+    RUN_CANCELLED_REASON,
+    BATCH_CANCELLED_REASON,
+    GATEWAY_SHUTDOWN_REASON,
+    CONVERSATION_CLOSED_REASON,
+  ],
+)
+def test_cancellation_reasons_are_stored_verbatim_on_a_denied_request(
+  tmp_path: Path,
+  reason: str,
+) -> None:
+  store = SQLiteApprovalStore(
+    tmp_path / "approvals.sqlite3",
+    audit_emitter=RecordingAuditEmitter(),
+  )
+  asyncio.run(store.create(_request("pending")))
+  cancelled, transitioned, identity_matches = _cancel(
+    store,
+    "pending",
+    decider_id="owner",
+    decision_reason=reason,
+  )
+  assert (transitioned, identity_matches) == (True, True)
+  assert cancelled.state in approval_store_module.TERMINAL_STATES
+  assert cancelled.decision == "denied"
+  assert cancelled.decision_reason == reason
 
 
 def test_exact_duplicate_reconciliation_is_idempotent(

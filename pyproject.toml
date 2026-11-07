@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-agent-gateway"
-version = "0.31.1"
+version = "0.32.0"
 description = "Generic AI agent gateway with MCP tool support and streaming"
 readme = "README.md"
 license = "MIT"
@@ -17,12 +17,13 @@ dependencies = [
   "PyYAML",
   "mcp>=2,<3",
   "fastmcp>=4,<5",
-  "hank-model-authority>=1.7.17,<2",
-  "hank-model-transport>=1.0.2,<2",
+  "hank-model-authority>=1.7.37,<2",
+  "hank-model-transport>=1.2.1,<2",
   "agent-workflow-contracts>=1,<2",
-  "hank-contracts>=1.6,<2",
+  "hank-contracts>=1.8.3,<2",
   "httpx>=0.28.1",
   "httpx2>=2.5,<3",
+  "psutil>=7,<8",
   "pydantic",
   "uvicorn>=0.42.0",
 ]
@@ -64,6 +65,3 @@ agent_gateway = [
   "contracts/usage-reconciliation-v3/*.json",
   "run_settings.defaults.json",
 ]
-
-[tool.pytest.ini_options]
-addopts = "--import-mode=importlib"

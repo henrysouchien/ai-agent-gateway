@@ -806,10 +806,13 @@ async def learning_fork_host_runner(
   parent_session = cast(GatewaySession, parent._gateway_session)
   config = cast(LearningForkConfig, parent_session.learning_fork_config)
   # The fork continues on its exact frozen credential generation, as an
-  # ordinary child's resume does; CapabilityResolutionError when it cannot.
+  # ordinary child's resume does, in the lane admission recorded for it (none
+  # on forks admitted before the lane: unknown, plan seats only);
+  # CapabilityResolutionError when it cannot.
   execution = materialize_frozen_bind(
     cast(CapabilityExecutionResolver, parent.capability_execution.resolver),
     admitted.model_bind,
+    selection_lane=wire.selection_lane,
     user_scope=parent_session.risk_user_id,
     base_config=parent_session.auth_config or {},
   )
@@ -857,7 +860,7 @@ async def learning_fork_host_runner(
     approval_route=approval_route,
     local_handler_scopes={
       "memory_write": lambda stock: config.scope_memory_write(
-        stock, fork_id=fork_id, user_id=parent_session.user_id,
+        stock, fork_id=fork_id, user_id=cast(str, parent_session.owner_user_id),
       ),
     },
     call_index=0,
@@ -1238,7 +1241,7 @@ def spawn_learning_fork(
       "memory_write": lambda stock: config.scope_memory_write(
         stock,
         fork_id=fork_id,
-        user_id=work_item.user_id,
+        user_id=work_item.owner,
       ),
     },
     call_index=0,

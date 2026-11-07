@@ -1,4 +1,6 @@
 from __future__ import annotations
+from agent_gateway.registry_scope import RegistryScope
+from gateway_test_support.run_context_test_support import run_context_for_test
 
 import asyncio
 from collections.abc import AsyncIterator
@@ -81,6 +83,7 @@ def test_failed_stream_turn_detaches_as_error(tmp_path: Path, context_length: bo
       local_tool_handlers={},
       event_log=event_log,
       session_id="sess_failed_stream",
+      run_context=run_context_for_test(registry_scope=RegistryScope('run', 'test-run', '/tmp/test-store')),
     )
     runner = AgentRunner(
       event_log=event_log,

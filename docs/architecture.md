@@ -287,6 +287,13 @@ role). A per-user stdio entry is a spawned child. Either way, a per-user host
 task owns the lifecycle: it hands the connected state to the caller, keeps the
 connection until it is retired, and then closes it.
 
+Standalone callers without a gateway session or a bound signer must supply a
+positive integer `meta.user_id` for a remote-claim-minted HTTP connection.
+Boolean, string, floating-point, zero, and missing values are refused before
+per-user connection selection. Callers carry the parsed numeric identity from
+their entry boundary; textual ids remain the wire representation for headers
+and configuration rendering.
+
 A child is retired by the periodic idle reaper, by a replacement (forced
 refresh, near broker expiry, changed credential binding, dead transport), by
 instance-cap eviction, or by a transport failure on a dispatch. Retirement
@@ -361,7 +368,7 @@ Important nuance:
 
 ### Persistent grants and per-call authorization
 
-A persistent grant is eligibility to mint authorization for a new invocation; it is not itself executable authority. The default `SingleUserApprovalPolicy` neither looks up nor mints grants: it asks a human only for the `irreversible` class (a live order), decides every such call fresh with `allow_persistent_grant=False`, and auto-approves every other class. The store keeps grant rows and their revocation path (`revoke_persistent_grant`) for existing rows and for a custom policy (`GATEWAY_APPROVAL_POLICY_CLASS`). A custom policy that matches a grant returns its ID as `grant_reference`; the gateway still creates a new durable approval request for the invocation and records `authorization_mode=PERSISTENT_GRANT` plus that ID in `grant_reference`.
+A persistent grant is eligibility to mint authorization for a new invocation; it is not itself executable authority. The default `SingleUserApprovalPolicy` (policy version `5`) neither looks up nor mints grants. It decides from three operator settings, every call fresh, with `allow_persistent_grant=False`: `approval_policy` is `approve_all` or `ask_all`; `approve_live_orders` is a boolean, and a live order (`irreversible`) asks unless that boolean is true; `fresh_human_owner` always asks. `ask_all` also asks for every class except `read`, `support`, and `pure_transform`. `code_execute` is `pure_transform` and never asks. The store keeps grant rows and their revocation path (`revoke_persistent_grant`) for existing rows and for a custom policy (`GATEWAY_APPROVAL_POLICY_CLASS`). A custom policy that matches a grant returns its ID as `grant_reference`; the gateway still creates a new durable approval request for the invocation and records `authorization_mode=PERSISTENT_GRANT` plus that ID in `grant_reference`.
 
 The per-call row binds the current actor, tool, redacted argument projection and argument hash, policy identity, and request context. For exact-planned tools, the row also binds the current plan/change identity; the trusted carrier separately proves that identity is linked to the prepared payload. The dispatcher revalidates the row against the carrier immediately before execution. For FMS ChangeSet writes, the effect interpreter rechecks the live base before the first effect. A grant therefore never authorizes reuse of a prior plan or bypasses the current validation owned by an exact executor.
 
@@ -495,7 +502,7 @@ Key details:
 
 - background tasks are stored on the `AgentRunner`, not the session
 - a universal concurrency semaphore limits parallel sub-agents (default 4)
-- the runner injects a system prompt reminder listing active background tasks after compaction pauses, so the model stays aware of pending work
+- the runner appends a reminder listing active background tasks to the request tail (after the history, never the system prompt), so the model stays aware of pending work
 - on runner shutdown, pending background tasks are awaited (up to 30 seconds) or cancelled
 - `on_before_background` and `on_background_complete` callbacks let consumers hook into the lifecycle
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Sequence, Set, Tuple
 
@@ -10,7 +11,9 @@ from .runner_budget import (
 )
 from model_authority.thinking import parse_effort
 from .tool_dispatcher_approval_lifecycle import ApprovalPark
+from .tool_result_aging import ToolResultAging, age_tool_results
 from .tool_result_compaction import model_tool_result_max_chars
+from .registry_scope import DeclaredRegistryScope
 
 
 def normalized_run_config(
@@ -78,6 +81,62 @@ def user_turn_message(content: Any) -> Dict[str, Any]:
   return {"role": "user", "content": content}
 
 
+def request_messages_aged(
+  messages: List[Dict[str, Any]],
+  containment: Any,
+  stubs: Mapping[str, str] | None,
+) -> List[Dict[str, Any]]:
+  """``messages`` as a provider request carries them once old results have aged.
+
+  ``tool_result_aging_after_replies`` is the switch: while it is ``None`` the
+  request is ``messages`` itself. The durable ``messages`` are never changed;
+  ``stubs`` holds what the receipt registered for each result that may age.
+  """
+  after_replies = containment.tool_result_aging_after_replies
+  if after_replies is None or not stubs:
+    return messages
+  return age_tool_results(
+    messages,
+    aging=ToolResultAging(
+      after_replies=after_replies,
+      min_chars=containment.tool_result_aging_min_chars,
+      step_replies=containment.tool_result_aging_step_replies,
+    ),
+    stubs=stubs,
+  )
+
+
+def request_messages_with_reminders(
+  messages: List[Dict[str, Any]],
+  reminders: Sequence[str],
+) -> List[Dict[str, Any]]:
+  """The messages one provider request sends, ending with its reminders.
+
+  Every per-request reminder (context pressure, background tasks, wrap-up, the
+  run record) changes from one request to the next, so they go after the
+  history, in the given order, and never into the
+  system prompt or the durable ``messages``: the system prompt, tools and
+  history stay byte-stable for the provider prefix cache. The non-empty
+  reminders are joined into one text block. A trailing user message (the
+  prompt, or tool results) is copied with that block appended, so roles keep
+  alternating; otherwise the block is its own user message. ``messages`` is
+  returned as-is when every reminder is empty.
+  """
+  reminder_text = "\n\n".join(filter(None, reminders))
+  if not reminder_text:
+    return messages
+  tail = messages[-1] if messages else None
+  if tail is None or tail.get("role") != "user":
+    return [*messages, user_turn_message(reminder_text)]
+  content = tail.get("content")
+  if isinstance(content, str):
+    blocks: List[Any] = [{"type": "text", "text": content}] if content else []
+  else:
+    blocks = list(content or [])
+  blocks.append({"type": "text", "text": reminder_text})
+  return [*messages[:-1], {**tail, "content": blocks}]
+
+
 def background_tasks_completed_user_message() -> Dict[str, Any]:
   return user_turn_message(
     "[System: New background-task notifications are included above. Use those "
@@ -96,11 +155,31 @@ def tool_execution_order_indices(
 
 @dataclass(frozen=True)
 class TurnReminderState:
+  # The background-task reminder: a request-tail reminder
+  # (``request_messages_with_reminders``), never the system prompt.
   text: str
   peeked_notification_count: int
   # The notification objects this request's reminder renders — the
   # delivered set acked at that request's response boundary (A-M7).
   delivered: Tuple[Any, ...] = ()
+  # The child-result trust policy and queued notifications. Unlike ``text`` it
+  # is a standing instruction, so it rides the system prompt (system-authored)
+  # and is not part of ``text``; "" where child results are not possible.
+  notification_reminder: str = ""
+  # The run-record part alone (what this run stored and did). It is NOT part
+  # of ``text``: the record is the last of the request-tail reminders
+  # (``request_messages_with_reminders``), after ``text``, so it is
+  # carried separately. Hashed into the context
+  # manifest as ``record_reminder_hash`` so a run shows what the turn was
+  # told; "" when the record is empty.
+  record_reminder: str = ""
+
+
+def record_reminder_hash(record_reminder: str) -> str | None:
+  """Content hash of the record reminder in the ``system_prompt_hash`` form; None when empty."""
+  if not record_reminder:
+    return None
+  return f"sha256:{hashlib.sha256(record_reminder.encode('utf-8')).hexdigest()}"
 
 
 def turn_reminder_state(
@@ -110,15 +189,18 @@ def turn_reminder_state(
   pending_notification_count: int,
   max_notifications_per_turn: int,
   delivered: Sequence[Any] = (),
+  record_reminder: str = "",
 ) -> TurnReminderState:
   return TurnReminderState(
-    text="\n\n".join(filter(None, [background_reminder, notification_reminder])),
+    text=background_reminder,
     peeked_notification_count=(
       min(pending_notification_count, max_notifications_per_turn)
       if notification_reminder
       else 0
     ),
     delivered=tuple(delivered),
+    notification_reminder=notification_reminder,
+    record_reminder=record_reminder,
   )
 
 
@@ -128,6 +210,18 @@ def completed_assistant_content_blocks(content_blocks: List[Any]) -> List[Any]:
     for block in content_blocks
     if not (isinstance(block, dict) and block.get("type") == "tool_use")
   ]
+
+
+@dataclass(frozen=True)
+class FinalAnswerVerdict:
+  mode: Literal["hold", "append"]
+  violation_count: int
+  revise_message: str
+  # The repair turn's text, before the runner emits it: the check's owner
+  # splices the returned clauses into the draft (``hold``), so the client still
+  # shows one answer and no other byte of the draft changes. ``None`` streams
+  # the repair turn's text as produced (``append``).
+  text_transform: Callable[[str], str] | None = None
 
 
 @dataclass(frozen=True)
@@ -696,13 +790,6 @@ def usage_cache_status(usage_totals: Dict[str, int]) -> str:
   return "miss"
 
 
-@dataclass(frozen=True)
-class RegistryScope:
-  scope_type: str
-  scope_id: str
-  store_dir: str
-
-
 @dataclass
 class ToolResultContext:
   """Context passed to `on_tool_result` hooks.
@@ -726,7 +813,7 @@ class ToolResultContext:
   provider_id: str | None = None
   skill_run_id: str | None = None
   workspace_dir: str | None = None
-  registry_scope: RegistryScope | None = None
+  registry_scope: DeclaredRegistryScope = field(kw_only=True)
   batch_id: int | str | None = None
   # Runtime-built, never model-visible: the bounded projection of what a
   # delegated child actually read, stripped from the tool result before the

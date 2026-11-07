@@ -14,7 +14,7 @@ from agent_workflow_contracts.models import AdmittedTenant
 from ..agent_telemetry import make_prepare_env_with_agent_telemetry
 from ..runner import ToolResultContext
 from ..secret_boundary import SecretBoundary, sanitization_failure_tool_input, sanitize_boundary_value
-from ..session import GatewaySession
+from ..session import GatewaySession, session_owner_user_id
 from ..task_registry import TASK_NOTIFICATION_INLINE_PAYLOAD_MAX_BYTES, TaskState
 from ..tool_dispatch_classification import (
   build_dispatch_record_from_sources, classify_semantic_tool_error, resolve_dispatch_entry,
@@ -146,6 +146,7 @@ def _code_job_result_context(
     boundary=boundary,
   )
   return ToolResultContext(
+    registry_scope=replace(dispatcher.run_context.registry_scope),
     tool_name="code_execute",
     tool_input=prepared_call.materialize_input(),
     redacted_tool_input=redacted if isinstance(redacted, dict) else sanitization_failure_tool_input(),
@@ -227,6 +228,7 @@ def build_code_execution(
     session.code_execution_frame_reader = FrameReader(
       principal={
         "user_id": session.user_id,
+        "owner_user_id": session_owner_user_id(session),
         "user_email": session.user_email,
         "risk_user_id": session.risk_user_id,
       },

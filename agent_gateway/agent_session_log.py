@@ -4,8 +4,9 @@ import asyncio
 from collections import deque
 from collections.abc import Iterator, Mapping, Set as AbstractSet
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import errno
+import hashlib
 import json
 import logging
 import math
@@ -78,7 +79,32 @@ class AgentSessionLogStorageSecurityError(RuntimeError):
 
 
 class AgentSessionLogCurrentIntegrityError(RuntimeError):
-  """A source-owned current-log scan found an ambiguous durable record."""
+  """A source-owned current-log scan or append found an ambiguous durable record."""
+
+
+class _TornCurrentLineError(AgentSessionLogCurrentIntegrityError):
+  """A current-log line that is not JSON text: torn bytes, not a bad envelope."""
+
+
+@dataclass(frozen=True, slots=True)
+class AgentSessionLogQuarantinedLine:
+  """One torn, newline-terminated line a strict current scan skipped.
+
+  The scan tolerates exactly one such line and names it here; a second torn
+  line, an unterminated tail, or any structurally ambiguous envelope still
+  raises ``AgentSessionLogCurrentIntegrityError``. ``after_seq`` and
+  ``before_seq`` are the neighbouring accepted sequences, so every sequence
+  the line may have carried lies strictly between them (``before_seq`` is
+  ``None`` while no accepted entry follows the line).
+  """
+
+  path: Path
+  offset: int
+  length: int
+  sha256: str
+  reason: str
+  after_seq: int | None
+  before_seq: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -667,6 +693,7 @@ class AgentSessionLog:
       active_handle.close()
     self._max_active_bytes = self._configured_max_active_bytes()
     self._pending_append_futures: set[asyncio.Future[LogEntry]] = set()
+    self._quarantined_lines: tuple[AgentSessionLogQuarantinedLine, ...] = ()
     self._gateway_session = gateway_session
 
     self._active_offset_cache = ActiveFileOffsetCache()
@@ -679,6 +706,12 @@ class AgentSessionLog:
   @property
   def gateway_session(self) -> GatewaySession | None:
     return self._gateway_session
+
+  @property
+  def quarantined_lines(self) -> tuple[AgentSessionLogQuarantinedLine, ...]:
+    """Torn lines the latest completed strict current scan skipped."""
+
+    return self._quarantined_lines
 
   @staticmethod
   def path_for_session(base_dir: str | Path, session_ref: AgentSessionRef) -> Path:
@@ -777,6 +810,10 @@ class AgentSessionLog:
           handle.seek(0, os.SEEK_END)
           offset = handle.tell()
           previous_seq = self._latest_seq_for_append(handle)
+          # The reverse scan parks this handle inside a last line longer
+          # than one chunk. Resume at the end captured above; writing at
+          # the scan offset overwrites that line.
+          handle.seek(offset)
           timestamp = time.time()
           entries = (
             LogEntry(seq=previous_seq + 1, timestamp=timestamp, event=events[0]),
@@ -788,6 +825,11 @@ class AgentSessionLog:
             handle.write(first + second)
             handle.flush()
             os.fsync(handle.fileno())
+            self._require_exact_append_growth(
+              handle,
+              size_before=offset,
+              written=len(first) + len(second),
+            )
             self._update_manifest_latest_seq_locked(entries[1].seq)
           except BaseException:
             handle.seek(offset)
@@ -1079,6 +1121,81 @@ class AgentSessionLog:
 
     return self._latest_seq_current_strict_locked_sync()
 
+  def completion_read(self, *, runner_id: str) -> dict[str, Any]:
+    """Copy current durable facts for one runner, never infer success from detach.
+
+    The cursor is the strict source snapshot, not a filtered list offset.
+    ``pending_appends`` is log-wide: an unacknowledged append cannot be
+    attributed to this runner. Read failures remain explicitly unknown.
+    """
+    from .research_file_current_projection import (
+      load_research_file_current_projection_sync,
+    )
+
+    facts: dict[str, Any] = {
+      "runner_id": runner_id,
+      "status": "no_target" if not runner_id else "missing",
+      "cursor": None,
+      "revision": None,
+      "attach": None,
+      "terminal": None,
+      "receipts": [],
+      "detach": None,
+      "pending_appends": len(self.pending_append_futures),
+      "error": None,
+    }
+    if not runner_id:
+      return facts
+    try:
+      snapshot_seq = self.latest_seq_current_strict_sync()
+      projection = load_research_file_current_projection_sync(
+        self, snapshot_max_seq=snapshot_seq,
+      )
+      entries, _ = self.query_current_strict_sync(
+        runner_id=runner_id,
+        after_seq=projection.cutoff_seq + 1,
+        before_seq=snapshot_seq,
+        order="asc",
+        exclude_entry=projection.excludes,
+      )
+    except Exception as exc:
+      facts["status"] = "unknown"
+      facts["error"] = {
+        "type": type(exc).__name__,
+        "message": str(exc),
+      }
+      return facts
+    facts["cursor"] = snapshot_seq
+    facts["revision"] = snapshot_seq
+    attachments = [
+      entry for entry in entries if entry.event.get("type") == "attach"
+    ]
+    sub_agent_id = (
+      attachments[-1].event.get("sub_agent_id") if attachments else None
+    )
+    own_entries = [
+      entry for entry in entries
+      if entry.event.get("runner_id") == runner_id
+      and entry.event.get("sub_agent_id") == sub_agent_id
+    ]
+    receipt_types = {
+      "task_completed", "agent_completion", "skill_result_captured",
+      "workflow_output_attached", "stream_complete", "error", "session_recap",
+    }
+    for entry in own_entries:
+      fact = {"seq": entry.seq, "event": deepcopy(entry.event)}
+      event_type = entry.event.get("type")
+      if event_type == "attach":
+        facts["attach"] = fact
+      if event_type in receipt_types:
+        facts["receipts"].append(fact)
+      if event_type in {"stream_complete", "error"}:
+        facts["terminal"] = fact
+      if event_type == "detach":
+        facts["detach"] = fact
+    facts["status"] = "observed" if own_entries else "missing"
+    return facts
+
   async def ensure_private_replay_storage(self) -> None:
     await asyncio.to_thread(self._ensure_private_replay_storage_sync)
 
@@ -1298,6 +1415,11 @@ class AgentSessionLog:
           handle.write(payload)
           handle.flush()
           os.fsync(handle.fileno())
+          self._require_exact_append_growth(
+            handle,
+            size_before=file_size,
+            written=len(payload),
+          )
         self._update_manifest_latest_seq_locked(seq)
       finally:
         fcntl.flock(mutex_file.fileno(), fcntl.LOCK_UN)
@@ -1461,6 +1583,7 @@ class AgentSessionLog:
     ]
     segments.append(_Segment(self.path, 0, 0, active=True))
     previous_seq: int | None = None
+    quarantined: AgentSessionLogQuarantinedLine | None = None
     for segment in segments:
       active_identity: ActiveFileIdentity | None = None
       if segment.active:
@@ -1487,16 +1610,48 @@ class AgentSessionLog:
           if not raw:
             completed = handle.tell() >= file_size
             break
-          entry = self._parse_entry_current_strict(raw)
+          try:
+            entry = self._parse_entry_current_strict(raw)
+          except _TornCurrentLineError as exc:
+            # A newline-terminated line is an acknowledged record boundary,
+            # so a torn one is damage the scan can name and step over once.
+            # The unterminated tail is the writer's recovery to settle.
+            if quarantined is not None or not raw.endswith(b"\n"):
+              raise AgentSessionLogCurrentIntegrityError(
+                *exc.args
+              ) from exc.__cause__
+            quarantined = AgentSessionLogQuarantinedLine(
+              path=segment.path,
+              offset=offset,
+              length=len(raw),
+              sha256=hashlib.sha256(raw).hexdigest(),
+              reason=str(exc.__cause__),
+              after_seq=previous_seq,
+              before_seq=None,
+            )
+            continue
           if entry is None:
             continue
+          # The torn line consumed an unknown number of sequences: the first
+          # accepted entry after it only has to advance, once.
+          unbridged = (
+            quarantined
+            if quarantined is not None and quarantined.before_seq is None
+            else None
+          )
           if entry.seq <= 0 or (
             previous_seq is not None
-            and entry.seq != previous_seq + 1
+            and (
+              entry.seq <= previous_seq
+              if unbridged is not None
+              else entry.seq != previous_seq + 1
+            )
           ):
             raise AgentSessionLogCurrentIntegrityError(
               "durable session-log current sequence order is ambiguous"
             )
+          if unbridged is not None:
+            quarantined = replace(unbridged, before_seq=entry.seq)
           previous_seq = entry.seq
           if segment.active:
             self._update_cache(
@@ -1510,6 +1665,50 @@ class AgentSessionLog:
           active_identity=active_identity,
           file_size=file_size,
         )
+    self._record_quarantined_line(quarantined)
+
+  def _record_quarantined_line(
+    self,
+    quarantined: AgentSessionLogQuarantinedLine | None,
+  ) -> None:
+    previous = self._quarantined_lines
+    self._quarantined_lines = () if quarantined is None else (quarantined,)
+    if quarantined is not None and not any(
+      (known.path, known.offset, known.sha256)
+      == (quarantined.path, quarantined.offset, quarantined.sha256)
+      for known in previous
+    ):
+      log.warning(
+        "Quarantined torn line in %s at offset %d (%d bytes, sha256 %s, %s); "
+        "sequences between %s and %s are unaccounted",
+        quarantined.path,
+        quarantined.offset,
+        quarantined.length,
+        quarantined.sha256,
+        quarantined.reason,
+        quarantined.after_seq,
+        quarantined.before_seq,
+      )
+
+  def _require_exact_append_growth(
+    self,
+    handle: Any,
+    *,
+    size_before: int,
+    written: int,
+  ) -> None:
+    """Prove one locked append grew the active file by exactly its bytes.
+
+    A write that lands anywhere but the end, or an unlocked writer that
+    interleaves, leaves a size other than ``size_before + written``.
+    """
+
+    size_after = os.fstat(handle.fileno()).st_size
+    if size_after != size_before + written:
+      raise AgentSessionLogCurrentIntegrityError(
+        "durable session-log append grew the active file by "
+        f"{size_after - size_before} bytes, not the {written} written"
+      )
 
   def _parse_entry_current_strict(self, raw: bytes) -> LogEntry | None:
     stripped = raw.strip()
@@ -1521,7 +1720,7 @@ class AgentSessionLog:
         object_pairs_hook=self._strict_json_object,
       )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-      raise AgentSessionLogCurrentIntegrityError(
+      raise _TornCurrentLineError(
         "durable session-log current projection is ambiguous"
       ) from exc
     if not isinstance(payload, dict):
@@ -1681,11 +1880,15 @@ class AgentSessionLog:
     return max(manifest_latest, self._latest_seq_from_handle(active_handle))
 
   def _latest_seq_from_handle(self, handle: Any) -> int:
-    for raw, is_last_line in self._iter_lines_reverse(handle):
-      entry = self._parse_entry(raw, is_last_line=is_last_line)
-      if entry is not None:
-        return entry.seq
-    return 0
+    position = handle.tell()
+    try:
+      for raw, is_last_line in self._iter_lines_reverse(handle):
+        entry = self._parse_entry(raw, is_last_line=is_last_line)
+        if entry is not None:
+          return entry.seq
+      return 0
+    finally:
+      handle.seek(position)
 
   def _active_file_identity(self) -> ActiveFileIdentity | None:
     opened = self._open_active_file(missing_ok=True)
@@ -3170,6 +3373,7 @@ __all__ = [
   "AgentSessionLogCurrentIntegrityError",
   "AgentSessionLogEnumerationError",
   "AgentSessionLogLocation",
+  "AgentSessionLogQuarantinedLine",
   "AgentSessionLogStorageSecurityError",
   "AgentSessionLogWriteLeaseSet",
   "AgentSessionRef",

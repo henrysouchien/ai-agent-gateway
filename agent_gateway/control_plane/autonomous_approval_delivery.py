@@ -188,6 +188,7 @@ def admit_delegated_executable_capture(
       envelope.session_authority.to_gateway_session(),
       withheld_tools=frozenset(),
       research_file_id=envelope.workload.research_file_id,
+      selection_provenance=envelope.selection_provenance,
     )
     tenant = context.tenant
     job_id = launch["job_id"] if launch is not None else context.job_id

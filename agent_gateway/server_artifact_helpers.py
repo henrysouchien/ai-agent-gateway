@@ -15,7 +15,9 @@ from fastapi.responses import JSONResponse
 from hank_contracts.agent_api import canonical_agent_api_claim_bytes
 
 from .auth import ChannelMismatchError, CredentialsTimeoutError, CrossUserReuseError, MissingUserIdError, NoCredentialError
-from .session import AuthManager
+from .subject_assertion import SubjectVerificationUnavailable
+from .session import AuthManager, session_owner_user_id
+from .user_identity_mapping import StorageIdentityFinding, parse_storage_identity
 from hank_model_transport.user_runtime_credentials import bundle_storage_id, load_user_runtime_credentials
 from .claim_signing_authority import GatewayClaimSigningAuthority
 from .server_models import (
@@ -25,6 +27,7 @@ from .server_models import (
   _AGENT_API_CLAIM_NONCE_HEX_LENGTH,
 )
 
+_AGENT_API_CLAIM_MAX_TTL_SECONDS = 600
 log = logging.getLogger("agent_gateway.server_artifact_helpers")
 
 def _model_to_dict(model: Any) -> Dict[str, Any]:
@@ -54,19 +57,6 @@ def _default_control_skills_dir() -> Path:
 
 def _default_autonomous_api_dir() -> Path:
   return Path(__file__).resolve().parents[3] / "api"
-
-
-def _default_autonomous_log_dir() -> Path | None:
-  explicit = os.getenv("AGENT_GATEWAY_AUTONOMOUS_LOG_DIR", "").strip()
-  if explicit:
-    return Path(explicit).expanduser()
-  gateway_log_dir = os.getenv("GATEWAY_LOG_DIR", "").strip()
-  if gateway_log_dir:
-    return Path(gateway_log_dir).expanduser() / "autonomous"
-  legacy_agents_log_dir = os.getenv("AGENTS_MCP_LOG_DIR", "").strip()
-  if legacy_agents_log_dir:
-    return Path(legacy_agents_log_dir).expanduser()
-  return None
 
 
 def _resolve_compaction_trigger(runtime_val: int | None, config_val: int | None) -> int | None:
@@ -127,19 +117,20 @@ def _artifact_auth_dependency(request: Request) -> str:
     if auth_manager is None:
       raise HTTPException(status_code=503, detail="Gateway auth manager unavailable")
     session, _claims = auth_manager.verify_token_with_payload(token)
-    risk_user_id = int(getattr(session, "risk_user_id", 0) or 0)
-    if risk_user_id > 0:
-      return str(risk_user_id)
-    return session.user_id
+    return session_owner_user_id(session)
 
   claim = _verify_signed_user_claim(request)
   bundle = load_user_runtime_credentials(os.environ)
   if bundle is None:
-    return str(claim["user_id"])
-  storage_id = bundle_storage_id(bundle, claim["user_id"], claim["user_email"])
-  if storage_id is None:
-    raise HTTPException(status_code=401, detail="Invalid signed user claim")
-  return storage_id
+    storage_id = claim["user_id"]
+  else:
+    storage_id = bundle_storage_id(bundle, claim["user_id"], claim["user_email"])
+    if storage_id is None:
+      raise HTTPException(status_code=401, detail="Invalid signed user claim")
+  try:
+    return parse_storage_identity(storage_id).storage_id
+  except StorageIdentityFinding as exc:
+    raise HTTPException(status_code=401, detail="Invalid signed user claim") from exc
 
 
 def _extract_agent_claim_headers(headers: Mapping[str, Any]) -> dict[str, str] | None:
@@ -170,6 +161,8 @@ def _verify_agent_claim_headers(
   if issued_at > current_time + _AGENT_API_CLAIM_CLOCK_SKEW_SECONDS:
     return None
   if current_time > expiry:
+    return None
+  if expiry < issued_at or expiry - issued_at > _AGENT_API_CLAIM_MAX_TTL_SECONDS:
     return None
 
   user_id = str(claim_headers.get("user_id") or "")
@@ -272,6 +265,9 @@ def _error_payload(
     if user_id is not None:
       payload["user_id"] = user_id
     return 400, payload
+
+  if isinstance(exc, SubjectVerificationUnavailable):
+    return exc.status_code, exc.error_body(user_id=user_id)
 
   if isinstance(exc, HTTPException):
     payload = {
