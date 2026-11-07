@@ -22,12 +22,12 @@ _MCP_TOOL_DESCRIPTION_GUIDANCE: dict[str, str] = {
     "use transcripts_read for transcript results."
   ),
   "transcripts_read": (
-    "Argument guidance: read from transcript search/list results only. Copy document_id, section, "
-    "char_start, char_end, and offset_frame from transcripts_search or transcripts_list results. "
-    "The only supported section values are prepared_remarks and qa; omit section if uncertain. "
-    "Do not use filings_read for transcript document_ids. With search-hit offsets, preserve the "
-    "returned offset_frame; use offset_frame='scoped' only for offsets relative to the selected "
-    "transcript section/window."
+    "Argument guidance: read from transcript search/list results only. Copy document_id from "
+    "transcripts_search or transcripts_list results. To read a search hit, copy that hit's "
+    "char_start, char_end and offset_frame ('document'); pass offset_frame='document' with hit offsets "
+    "even when a hit omits it. With no window, read one "
+    "section instead: the only supported section values are prepared_remarks and qa; omit section if "
+    "uncertain. Do not use filings_read for transcript document_ids."
   ),
   "get_filings": (
     "Argument guidance: this is not a broad filing-list endpoint. Call only after deriving a "
@@ -138,8 +138,8 @@ _MCP_TOOL_PROPERTY_DESCRIPTION_GUIDANCE: dict[str, dict[str, str]] = {
       "omit if uncertain."
     ),
     "offset_frame": (
-      "Use 'document' for offsets from search hits. Use 'scoped' only for offsets known to be relative "
-      "to the selected section/window."
+      "Use 'document' with the document-frame char_start/char_end copied from a search hit. With no "
+      "window, omit the offsets and read the section."
     ),
   },
   "transcripts_read": {
@@ -149,16 +149,16 @@ _MCP_TOOL_PROPERTY_DESCRIPTION_GUIDANCE: dict[str, dict[str, str]] = {
     ),
     "section": "Optional transcript section enum: prepared_remarks or qa only. Omit if uncertain.",
     "char_start": (
-      "Optional integer offset copied from a transcript hit. Use with the same offset_frame as the hit; "
-      "omit if uncertain."
+      "Optional integer document-frame offset copied from a transcript hit; pass with "
+      "offset_frame='document'. Omit if uncertain."
     ),
     "char_end": (
-      "Optional integer offset copied from a transcript hit. Use with the same offset_frame as the hit; "
-      "omit if uncertain."
+      "Optional integer document-frame offset copied from a transcript hit; pass with "
+      "offset_frame='document'. Omit if uncertain."
     ),
     "offset_frame": (
-      "Use the offset_frame returned by transcripts_search/list. Use 'scoped' only for section/window-"
-      "relative offsets; do not mix document offsets with scoped offsets."
+      "Pass 'document' with the document-frame char_start/char_end copied from a transcript hit. With "
+      "no window, omit the offsets and read the section (prepared_remarks or qa)."
     ),
   },
   "get_filings": {

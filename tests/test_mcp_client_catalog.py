@@ -19,7 +19,7 @@ if str(PKG_DIR) not in sys.path:
 import agent_gateway.mcp_client as mcp_client_module
 from agent_gateway.mcp_client import McpClientManager, _ConnectedServerState, _ServerState
 from agent_gateway.mcp_client_connections import McpClientSession
-from agent_gateway.mcp_client_catalog import apply_collision_filtering
+from agent_gateway.mcp_client_catalog import apply_collision_filtering, materialize_published_tool_definition
 from agent_workflow_contracts.tool_registration import (
   McpInputPreparationRoute,
   index_mcp_input_preparation_routes,
@@ -172,6 +172,24 @@ def test_apply_collision_filtering_handles_collisions_prefixes_and_hidden_fields
   assert logger.warnings[0][1:3] == ("builtin_tool", "first")
   assert logger.warnings[1][1:4] == ("shared_tool", "second", "first")
   assert len(logger.infos) == 3
+
+
+def test_corpus_read_overlay_teaches_document_frame_and_never_recommends_scoped() -> None:
+  names = ("document_id", "section", "char_start", "char_end", "offset_frame")
+  for tool_name in ("filings_read", "transcripts_read"):
+    published = materialize_published_tool_definition(
+      {"name": tool_name, "description": "", "input_schema": {"type": "object", "properties": {n: {} for n in names}}},
+      prefix="",
+      strip_input_fields=set(),
+    )
+    properties = published["input_schema"]["properties"]
+    guidance = [published["description"], *(prop.get("description", "") for prop in properties.values())]
+    assert not any("scoped" in text for text in guidance), tool_name
+    assert "'document'" in properties["offset_frame"]["description"], tool_name
+    assert "returned by transcripts_search" not in properties["offset_frame"]["description"], tool_name
+  assert "offset_frame='document'" in published["description"]
+  assert "pass offset_frame='document' with hit offsets" in published["description"]
+
 
 
 
